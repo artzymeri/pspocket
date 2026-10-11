@@ -10319,3 +10319,47 @@ from an integer, so double precision floors them alike on every host.
 Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
 4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
 up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
+
+## D-913 · 2026-10-11 · cellPngEnc as Sony's libpngenc answers and writes it (part 1)
+
+D-597's comparison of cellPngEnc with libpngenc.sprx (firmware 4.92) showed 134 of 616 observations differing (D-911):
+pspocket's library (D-566) was RPCS3's checks on libpng 1.6. Sony's module was read (its exports, its encoder thread,
+its chunk setters; nothing of it in the repository) and pspocket's rewritten to do what it does; the comparison, widened
+and made independent of libpngenc's thread timing, now shows 0 of 1,834 observations differing.
+What libpngenc is, and pspocket's now:
+- **The handle** is the work memory's first 128-byte boundary (RPCS3: the memory itself). Open over memory already open
+  makes a new encoder there (pspocket refused it). QueryAttr's memory and Open's checks were right; a priority of -1
+  is refused too.
+- **Two queues.** EncodePicture queues a command (four at most: BUSY); libpngenc's thread encodes them while fewer than
+  four streams wait. WaitForInput is BUSY with four commands waiting, not four streams (pspocket refused a fifth picture).
+  Reset, with fewer than five streams waiting (else BUSY), turns the commands waiting into streams of state STREAM_SKIP
+  and leaves libpngenc's abort flag up: the next picture is skipped too (STREAM_SKIP, no bytes). Reset keeps the streams
+  (pspocket dropped them). pspocket encodes a command as soon as there is room, on the calling thread.
+- **EncodePicture's checks** (ARG): no colour conversion but RGBA or ARGB to RGB and gray and alpha to gray (pspocket
+  also added an opaque alpha); a filter set needs one of libpng's filter bits (0 is refused); a buffer needs more than
+  0x30 bytes; the pitch is measured in the encoded colour space's samples (an RGBA picture encoded as RGB needs 3 bytes
+  a pixel, and the stream then fails FATAL when the row cannot hold the picture's own); a palette picture needs its
+  PLTE; the SPU encoder takes 2560 columns at 8 bits, 1280 at 16. Every ancillary chunk is checked: its fields
+  (palette sizes against the bit depth, tRNS and bKGD against the palette given before them and the bit depth, sBIT 1 to
+  the depth, cHRM's white point at most 0.8 and each point's x + y at most 1, gAMA up to 21474.83, sRGB 0 to 3, units
+  0 to 1 or 0 to 2, tIME's fields, iTXt's language, sPLT's depths and 8-bit entries, pCAL's parameters, unknown chunks'
+  locations), and the memory the chunks take (libpngenc's own measure of each string and buffer) against addMemSize:
+  with addMemSize 0, any text, iCCP, sPLT, pCAL or unknown chunk is refused.
+- **The PNG is libpng 1.2.8's**: chunks in 1.2.8's order (gAMA, sRGB, iCCP, sBIT, cHRM before PLTE; PLTE, tRNS, bKGD,
+  hIST, oFFs, pCAL, sCAL, pHYs, tIME, sPLT, the texts after it), unknown chunks before PLTE, after it or after IDAT by
+  their location, unsafe ones too; IDAT in 2048-byte chunks; gAMA and cHRM from the floats png_set_* keeps, times 100000
+  by the PPU's fused multiply-add, truncated (gAMA 0.45455 is 45455; 21474.83 is 2147483008); sCAL's numbers by
+  libpngenc's own "%d.%06de%+03d" ("1.000000e-03"; pspocket printed ".001"); a text's length is its strlen, an empty
+  zTXt is a tEXt. libpngenc installs no warning handler, so each of libpng's warnings ends the stream with FATAL: a
+  keyword with spaces to tidy, a PLTE on a gray picture, a tRNS out of range or on an alpha picture, a cHRM point past
+  0.8 as a float (0.8 itself), a palette background past the palette or the bit depth, an hIST whose count is not the
+  palette's, an unknown chunk's location 0 or 3. A 1-bit sample a byte is any byte but 0 (libpng's packing).
+- **A stream too long for its buffer**: what fits is written a chunk piece at a time (the signature, IHDR, the first
+  IDAT's header), then STREAM_OVERFLOW with streamSize 0 and processedLine the rows written before the write that
+  failed (pspocket wrote what fitted and gave its size).
+The PNG is written here rather than by the build's libpng 1.6, which orders and checks chunks otherwise; IDAT, zTXt and
+iCCP are zlib's of the build with libpng 1.2.8's settings (the window bits tidied as 1.2 does), so their bytes may
+differ from zlib 1.2.3's for the same pixels and texts (notes in the comparison, D-597).
+Tests: tests/hle/test_pngenc_compare.cpp (0 of 1,834 against Sony's; PSPOCKET_COMPARE_SELF=1 agrees with itself);
+tests/hle/test_imgenc.cpp updated to Sony's answers (the queues and Reset's skips, the refusals, FATAL for a keyword to
+tidy, the memory of a text, 1.2.8's chunk order, sCAL's and gAMA's bytes, a buffer too small).
