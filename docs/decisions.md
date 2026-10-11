@@ -11491,3 +11491,189 @@ same modes and outputs).
 The count (scripts/progress.py): 6,211 of 6,625 library functions pspocket's own before D-670 and 188 answered as
 RPCS3's stubs; after D-674, 6,242 and 157 (cellNetCtl 11, cellBGDLUtility 4, cellSysutilAp 2, cellAuthDialogUtility
 2, cellGameExec 4, cellRtcAlarm 5, cellImeJpUtility 1, cellSysutilAvconfExt 2: every one of these libraries' cells).
+
+## D-675 · 2026-10-11 · cellSysutilAvc2's chat with nobody else in it: streaming, LeaveChat, the target, voice detection, unverified
+
+libsysutil_avc2 is always native (D-175), and 16 of its functions were RPCS3's stubs (D-182: a log, then CELL_OK). They
+are pspocket's own now (runtime/hle/src/cellSysutilAvc2.cpp), unverified (D-594: made from RPCS3's header and the
+library's neighbours, without Sony's module; the library is always native, so the marker only records that). This
+decision is the chat's eight (StartStreaming, StopStreaming, LeaveChat, SetStreamingTarget, SetStreamPriority,
+StartVoiceDetection, StopVoiceDetection, and the states the others need); D-676 is the video chat's eight. With them,
+cellSysutilAvc2 is 54 of 54 pspocket's own, and the library chart 6,258 of 6,625 (from 6,211, D-675 to D-679: 47).
+
+**The console modelled.** One that never reaches a peer: PSN offline (D-139, D-185: matching 2 makes no context, so
+there is no room), the network disconnected (cellNetCtl, D-024), no camera and no microphone (D-187). D-187 answers the
+join as succeeded (RPCS3's TODOs: JOIN_SUCCEEDED, "nobody to talk to"), and games run on that answer today, so it is
+kept: the chat a game joins here has nobody else in it.
+- **The chat.** JoinChat and JoinChatRequest (D-187) now mark it joined; LeaveChat, LeaveChatRequest and an unload of
+  the voice chat (Unload, UnloadAsync, Unload2 and UnloadAsync2 with VOICE_CHAT) end it, at the call (an asynchronous
+  unload's event still drops the callback when it runs, as before).
+- **StartStreaming, StopStreaming.** NOT_INITIALIZED with neither chat loaded (as cellSysutilAvc2Unload answers, RPCS3);
+  INVALID_STATUS outside a chat (there is nothing to stream in: the stub's CELL_OK is not what the library answers then,
+  and INVALID_STATUS is the AV chat's state error, which libsysutil's own AV chat requests answer, D-534); in one,
+  CELL_OK: streaming starts, to nobody, and stops; either twice changes nothing. Leaving the chat stops it.
+  StartStreaming2 and StopStreaming2 (D-187: the media type checked, nothing else) are unchanged.
+- **LeaveChat.** LeaveChatRequest's synchronous form: the chat left at once with no event (as the synchronous JoinChat
+  joins with none), CELL_OK also with no chat joined (as LeaveChatRequest answers). Its arguments are not read: RPCS3
+  registers it with none, and by JoinChat's they would be an event ID and parameter to write, which a wrong guess would
+  write into the game's data.
+- **SetStreamingTarget(target).** RPCS3's CellSysutilAvc2StreamingTarget, by pointer as RPCS3 has it (20 bytes: the
+  mode, then a team ID, a CellSysutilAvc2RoomMemberList or a CellSysutilAvc2MemberIpAndPortList): ROOM, TEAM, PRIVATE
+  (members) or DIRECT (members at addresses and ports, the direct streaming modes). INVALID_ARGUMENT for a null target
+  or one that is not guest memory (logged with the call site, D-042), another mode, a list of no member, or a list that
+  is null or not guest memory; then NOT_INITIALIZED with no chat loaded; else kept as given. No member is checked
+  against a room (there is none) and none is reached.
+- **SetStreamPriority(priority).** Kept as given once the library is loaded (NOT_INITIALIZED before): its values are not
+  known, so none is refused.
+- **StartVoiceDetection, StopVoiceDetection.** The voice chat's (NOT_INITIALIZED without its callback); switched on and
+  off. No microphone, so nothing is ever detected: no CELL_AVC2_EVENT_SYSTEM_VOICE_DETECTED is sent.
+- **Order.** An argument's check first, then the library's state, as libsysutil's AV chat requests check the transition
+  before the load (D-534).
+D-187's functions answer as before; only JoinChat, JoinChatRequest, LeaveChatRequest and the unloads now keep the chat's
+state.
+To check on the Mac against libsysutil_avc2.sprx (always native: read it, or run it on pspocket's lv2 as D-534 ran
+libsysutil): LeaveChat's arguments; SetStreamingTarget's target, by pointer or by value; SetStreamPriority's values;
+whether streaming needs a joined chat and the error then (INVALID_STATUS or NO_SESSION), and whether StopStreaming
+without streaming is one; whether StartStreaming2 and StopStreaming2 need the chat too; NOT_INITIALIZED before a load;
+the target's checks (a DIRECT target in the normal streaming mode, the member limits); voice detection without a
+microphone.
+Tests: tests/hle/test_avc.cpp "[avc2]": every call before a load; streaming outside a chat, in one joined by request and
+by the synchronous call, after LeaveChat and LeaveChatRequest (with their events), after an unload of the voice chat and
+a load again; each target mode, its refusals and memory that is not guest memory; the priority; voice detection with no
+event; a video chat alone (no voice detection, streaming in a chat); UnloadAsync ending it at the call; the 16 functions
+registered under their names, unverified.
+
+## D-676 · 2026-10-11 · cellSysutilAvc2's video chat: the game's windows and the screen, kept as it set them, nothing drawn, unverified
+
+The other eight of D-675's sixteen (CreateWindow, DestroyWindow, ShowWindow, HideWindow, SetWindowPosition,
+SetWindowSize, ShowScreen, HideScreen) and ChangeVideoResolution, on the same console.
+- **The video chat** is loaded by Load or LoadAsync with a video chat's parameters (D-187's checks), which now keep its
+  max_video_windows and max_video_resolution; Unload2 and UnloadAsync2 with VIDEO_CHAT, Unload and UnloadAsync unload it
+  and drop its windows and screen. A second load keeps its windows (RPCS3 refuses no second load). Unload answers
+  CELL_OK when only a video chat is loaded: RPCS3's looks at the voice chat's callback alone, as it keeps nothing of the
+  video chat, and so answered NOT_INITIALIZED with something loaded.
+- **CreateWindow(member_id).** NOT_INITIALIZED without the video chat; WINDOW_ALREADY_EXISTS for a member's second;
+  TOO_MANY_WINDOWS past max_video_windows; else a window, hidden. Any member ID (16 bits): pspocket has no room to check
+  it against (matching 2 is offline), and its GetPlayerInfo answers any member as joined (D-187); the custom video
+  window's 0xFFF0 counts like the others. A joined chat is not needed: a game may lay windows out before it joins.
+- **DestroyWindow, ShowWindow, HideWindow, SetWindowPosition(member, x, y, z), SetWindowSize(member, width, height).**
+  NOT_INITIALIZED without the video chat, WINDOW_NOT_FOUND for a member with no window; the floats from f1.. (D-503)
+  kept as given (in the load's coordinates form; no range is known to check).
+- **ShowScreen, HideScreen.** The screen the windows are on, switched; NOT_INITIALIZED without the video chat.
+- **ChangeVideoResolution(resolution).** QQVGA or QVGA, else INVALID_ARGUMENT (checked first); NOT_INITIALIZED without
+  the video chat; INVALID_ARGUMENT past the load's max_video_resolution when the load named one of the two (RPCS3's load
+  takes any); kept. No camera sends at either here.
+- **The getters (D-187's) report what the game set.** GetScreenShowStatus the screen's status (0 until shown);
+  GetWindowShowStatus a window's (0 for a member with none, as before); GetWindowPosition and GetWindowSize the window's
+  position and size once the game set them, each output checked first (INVALID_ARGUMENT, logged, for one that is not
+  guest memory), and before that nothing, as D-187's wrote nothing: there the system's own layout would be read, which
+  is not known here, and a value made up would read as Sony's. Nothing is drawn: pspocket has no overlay for the
+  windows. (D-187's "the windows and the screen are never shown" becomes "shown as the game switches them, not drawn".)
+To check on the Mac: the errors and their order (CreateWindow with only a voice chat or before a join; whether the
+custom window counts against the limit; when TOO_MANY_PEER_WINDOWS is answered); a new window's show status and layout,
+and what the getters write before the game sets anything; GetWindowShowStatus for a member with no window
+(WINDOW_NOT_FOUND?); the screen's first status; ChangeVideoResolution's check against the load; Unload with only a video
+chat.
+Tests: tests/hle/test_avc.cpp "[avc2]": each call without the video chat and with only the voice chat; windows to the
+limit, twice for a member, the custom window's ID, a member ID past 16 bits; shown, hidden, positioned and sized, read
+back (nothing written before), a member with no window, outputs null or not guest memory; the screen; the resolution
+against the load's; a window destroyed and its place taken; the video chat unloaded by Unload2, UnloadAsync2 (its event
+keeping the callback) and Unload, alone and with the voice chat.
+
+## D-677 · 2026-10-11 · cellSysutilAvcExt's 14: the panel through libsysutil, each player's window kept, detections with no device, unverified
+
+libsysutil_avc_ext is always native too; its 14 stubs are pspocket's own (runtime/hle/src/sysutil_misc.cpp), unverified
+(D-594). cellSysutilAvcExt is 30 of 30. AvcExt extends the AV chat of cellSysutil (cellSysutilAvcLoadAsync, pspocket's
+own, D-183 and D-534) with its panel, windows and name plates, for a console with no system software behind the AV chat
+and no camera or microphone.
+- **ShowPanelEx(transition), HidePanelEx(transition): libsysutil's request.** libsysutil exports 0x44F288A7 for the AV
+  chat's library: the panel's show state with a transition (D-534 read it, and compared it with Sony's libsysutil), and
+  its own cellSysutilAvcShowPanel and HidePanel send it with -1. The two call it through the registry with the panel
+  shown (1) or hidden (0): INVALID_ARGUMENT for a transition past EXPONENT (signed: NONE, -1, passes), INVALID_STATUS
+  for an AV chat not loaded or loaded for voice only, and for one loaded for video the request to the system software,
+  which pspocket's console does not have (its channels closed, D-534): CELL_AVC_ERROR_UNKNOWN, as
+  cellSysutilAvcShowPanel answers here. Here the stub's CELL_OK is not what a console with no system software answers,
+  and libsysutil's own code says what it does answer.
+- **SetWindowPosition, SetWindowRotation(player, x, y, z, transition).** RPCS3's stubs, checked as RPCS3 checks
+  SetWindowAlpha: INVALID_ARGUMENT for a null player or a transition past EXPONENT (NONE refused too); the transition
+  after the three floats from r7 (D-678).
+- **Each player's window kept, D-187's setters too.** AvcExt now keys windows by the player's online ID (SceNpId's first
+  16 characters, as sceNpUtilCmpNpId tells NP IDs apart; the pointer checked for guest memory first, INVALID_ARGUMENT
+  and the call site logged when it is not). SetWindowAlpha, SetWindowSize, SetWindowPosition, SetWindowRotation,
+  ShowWindow, HideWindow and SetWindowZorder keep what they set; GetWindowPosition, GetWindowRotation, GetWindowSize,
+  GetWindowAlpha and GetWindowShowStatus write it (each output checked first), and nothing before the game set it, as
+  D-187's getters wrote nothing (the system's own layout is not known here). Any player is taken, as D-187's setters
+  take any: the windows are the system's to draw, and nothing is drawn. GetSurfacePointer is unchanged: no video comes,
+  so there is no surface.
+- **The name plates.** SetShowNamePlate and SetHideNamePlate keep them shown or hidden; GetNamePlateShowStatus writes
+  that once set (nothing before).
+- **SetChatMode(mode)** keeps the mode as given (its values are not known). **SetChatGroup**: RPCS3 registers it with no
+  arguments and nothing public describes them, so none is read (a wrong guess would read the game's data as players);
+  logged with a count, CELL_OK: there is nobody else in the chat to group.
+- **Start/StopCameraDetection, Start/StopMicDetection, Start/StopVoiceDetection** switch the detections; with no camera
+  or microphone nothing is ever detected, and no event (CAMERA_DETECTED, MIC_DETECTED, VOICE_DETECTED) is sent.
+- **The AV chat's own state is not looked at** but by the panel's request: D-187's neighbours look at none, and an error
+  there could change a game's path, so these keep RPCS3's answer, now with their checks and state. libsysutil_avc_ext
+  probably sends its window, name plate, chat and detection requests to the system as libsysutil sends the panel and
+  the muting (D-534), which pspocket's console would refuse (UNKNOWN); only the panel's path is known. What AvcExt keeps
+  lasts while the process runs (it does not reach into the AV chat's load and unload, which are cellSysutil's).
+To check on the Mac against libsysutil_avc_ext.sprx: that ShowPanelEx and HidePanelEx call 0x44F288A7 (that it is this
+module that imports it) and what they check first; whether the other functions send requests to the system software
+(they would then answer UNKNOWN here, as the panel does); SetChatGroup's and SetChatMode's arguments; the window
+functions' answers for a player not in the chat and with no AV chat loaded; what the getters write before anything is
+set; the name plates' first state; the detections' events.
+Tests: tests/hle/test_avc.cpp "[avcext]": the panel with no AV chat, one for voice and one for video (UNKNOWN, as
+cellSysutilAvcShowPanel), the transitions; two players' windows, a third NP ID with Alice's online ID and other bytes
+after it (the same window), each value read back, nothing written before, the refusals (transitions, a null player, one
+that is not guest memory, outputs that are not); the name plates; the chat mode and group; the six detections with the
+AV chat loaded and no event but the load's; the 14 registered under their names, unverified.
+
+## D-678 · 2026-10-11 · cellSysutilAvcExt: SetWindowAlpha's and SetWindowSize's transition came from the float's register
+
+A bug in D-187. SetWindowAlpha(player_id, float alpha, transition) and SetWindowSize(player_id, float size_x, float
+size_y, transition) read the transition as RPCS3's binder does, floats from f1.. and integers from r3.. skipping no
+register: from r4. On a PS3 each float takes its slot in the arguments' sequence (the PPC64 ELF ABI, which pspocket's
+typed binding follows, D-503), so the transition is in r5 after one float and r6 after two, and r4 (r5) holds whatever
+the caller left there. A game's good transition was refused (INVALID_ARGUMENT) when r4 held more than 4, and a bad one
+taken when it held 0 to 4. Both now take their floats as typed arguments and the transition after them, as D-677's
+SetWindowPosition and SetWindowRotation (r7, after three). cellSysutilAvc2's float functions take no integer after their
+floats, and their floats were read from f1.. already.
+Test (tests/hle/test_avc.cpp): garbage in the floats' registers before a good transition answers CELL_OK, 0 there before
+a bad one INVALID_ARGUMENT (the old binding answered the opposite); D-187's test passed the transition in r4 and now
+passes it after the floats' slots.
+
+## D-679 · 2026-10-11 · cellVideoPlayerUtility as a console with no system video player: nothing opens, unverified
+
+cellVideoPlayerUtility is libsysutil_video_player.sprx, internal module 0xF048 (RPCS3 cellSysmodule.cpp), which
+cellSysmoduleLoadModule refuses and only cellSysmoduleLoadModuleEx loads (RPCS3's two lists, D-179): the system
+software's video player lent to an application: content opened, controlled and closed, its pictures (stereo ones too),
+its status, the volume, start and stop positions, content still downloading (SetDownloadPosition, SetTransferComplete,
+GetTransferPictureInfo) and thumbnails. Always native (libsysutil*). RPCS3 registers the 17 names with no arguments
+(rpcs3/Emu/Cell/Modules/cellVideoPlayerUtility.cpp: UNIMPLEMENTED_FUNC answering CELL_OK) and has no header; nothing
+public describes the library. pspocket's (runtime/hle/src/cellVideoPlayerUtility.cpp) is the smallest library those
+names describe on a console whose system software has no video player to lend; unverified (D-594). 17 of 17.
+- **Initialize and Finalize** bracket the library, a process each: a second Initialize, and anything else before
+  Initialize or after Finalize, answers CELL_ESTAT.
+- **Open and StartThumbnail** answer CELL_ENOTSUP ("not supported"): nothing is opened, no thumbnail started.
+- **The other 13** (Close, PlaybackControl, GetOutputPicture, GetOutputStereoPicture, GetPlaybackStatus,
+  GetTransferPictureInfo, GetVolume, SetVolume, SetDownloadPosition, SetStartPosition, SetStopPosition,
+  SetTransferComplete, EndThumbnail) answer CELL_ESTAT: nothing is open.
+- **No argument is read or written**: their types are not known, and a pointer guessed wrong would be read, or written,
+  in the caller's data. Each refusal is logged once a function and reason, then at debug level (a player is polled
+  every frame).
+- **Error codes**: the library's own are not known; these are lv2's (sys/return_code.h, rpcs3/Emu/Cell/ErrorCodes.h),
+  which the system libraries share, as cellLibprof's (D-638).
+- **Why an error at Open** rather than RPCS3's CELL_OK: with CELL_OK and nothing written, a caller polls a status that
+  never changes (its movie never ends) and draws pictures never written; refused at Open, it falls back to its own
+  playback, or skips the movie, at once. Initialize succeeds, so a caller that sets the library up as it starts goes on.
+- **Future work, not made half-way.** No title pspocket runs is known to import it. Should one (a runtime log names
+  cellVideoPlayer*), read libsysutil_video_player.sprx on the Mac for the signatures and structures: pspocket's cellSail
+  (its player over cellDmux, cellVdec and cellAdec, D-562) could then serve the playback (Open as a cellSail player over
+  the file, or over the stream as it downloads; the output pictures from its video frames; the status, positions and
+  volume from its own). Without the signatures every part of it would be a guess in the caller's memory.
+To check on the Mac against libsysutil_video_player.sprx: the signatures and structures, the error codes, whether
+Initialize or Open fails on a system without the player (and with what), whether the volume and the positions need
+content open, the thumbnail's calls.
+Tests: tests/hle/test_videoplayer.cpp "[videoplayer]": every function before Initialize and after Finalize, a second
+Initialize, Open and StartThumbnail refused three times over with the other 13, every argument register pointing at a
+pattern no call changes, Initialize again, a process each; the 17 registered under their names, unverified.
