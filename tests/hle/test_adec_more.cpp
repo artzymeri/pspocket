@@ -1,9 +1,11 @@
-// cellAdec's cores of D-621 and D-622 on FFmpeg: Dolby Digital Plus, MPEG-2 AAC, MP3 Surround, ATRAC3 multichannel,
-// TrueHD, DTS (the core, DTS-HD, the DTS-HD core, DTS Express) and WMA 1 and 2. Streams FFmpeg's encoders write in the
-// tests' own FFmpeg (E-AC-3, AC-3, AAC, DTS, TrueHD, WMA 1 and 2: PSPOCKET_FFMPEG_ENCODERS, D-577), or frames built
-// here (MP3, ATRAC3): decoded through pspocket's cellAdec, the PCM against FFmpeg's own decoding of the same units
-// (TrueHD's against the signal put in, exactly), every item, information block, PTS and error. The tests need FFmpeg
-// (D-606). No game data.
+// cellAdec's cores of D-621 and D-622 on FFmpeg, and their modules' exports (D-623): Dolby Digital Plus, MPEG-2 AAC,
+// MP3 Surround, ATRAC3 multichannel, TrueHD, DTS (the core, DTS-HD, the DTS-HD core, DTS Express) and WMA (WMA 1 and 2,
+// WMA Pro, WMA Lossless). Streams FFmpeg's encoders write in the tests' own FFmpeg (E-AC-3, AC-3, AAC, DTS, TrueHD, WMA
+// 1 and 2: PSPOCKET_FFMPEG_ENCODERS, D-577), or frames built here (MP3, ATRAC3, WMA Lossless's raw PCM tiles, WMA Pro's
+// silent frames): decoded through pspocket's cellAdec, or through a core's own table as a firmware module drives it
+// (WMA Pro and Lossless, which libadec has no type for), the PCM against FFmpeg's own decoding of the same units
+// (TrueHD's and WMA Lossless's against the signal put in, exactly), every item, information block, PTS and error. Only
+// the first test runs without FFmpeg (D-606). No game data.
 
 #include <catch_amalgamated.hpp>
 
@@ -35,6 +37,97 @@ extern "C" {
 using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::adec_test;
+
+namespace {
+
+// The cores of D-621 and D-622: each module's table and PTS function (RPCS3's names and NIDs), the cellAdec type its
+// context carries, the tag its operations' names end with.
+struct NewCore {
+    const char* library;
+    u32 table_nid;
+    const char* pts;
+    u32 pts_nid;
+    u32 type;
+    const char* tag;
+};
+constexpr NewCore kNewCores[] = {
+    {"cellDDPdec", 0xF5E9C15C, "_SceAdecCorrectPtsValue_Ddp", 0xEE2731D3, 8, "Ddp"},
+    {"cellM2AACdec", 0xAC2F0831, "_SceAdecCorrectPtsValue_Aac", 0x7CBA9865, 7, "Aac"},
+    {"cellMP3Sdec", 0x292CDF0A, "_SceAdecCorrectPtsValue_Mp3s", 0x73A2C895, 23, "Mp3s"},
+    {"cellAtrac3multidec", 0xC20C6BD7, nullptr, 0, 31, "atrac3multi"},
+    {"cellTRHDdec", 0xE88E381B, "_SceAdecCorrectPtsValue_truehd", 0x75080F7B, 9, "truehd"},
+    {"cellDTSdec", 0x15248EC5, "_SceAdecCorrectPtsValue_DtsCore", 0x8C7AD5ED, 10, "DtsCore"},
+    {"cellDTSHDdec", 0x51AC2B6C, "_SceAdecCorrectPtsValue_DtsHd", 0xF3AF1093, 21, "DtsHd"},
+    {"cellDTSHDCOREdec", 0x6C8F4F1C, "_SceAdecCorrectPtsValue_DtsHd_Core", 0xD4C180D4, 30, "DtsHd_Core"},
+    {"cellDTSLBRdec", 0x8C50AF52, "_SceAdecCorrectPtsValue_DtsLbr", 0x185591D6, 19, "DtsLbr"},
+    {"cellWMAdec", 0x88320B10, "_SceAdecCorrectPtsValue_wma", 0x46E6C806, 18, "wma"},
+    {"cellWMAPROdec", 0xA8BAC670, "_SceAdecCorrectPtsValue_WmaPro", 0x8D45F21A, 28, "WmaPro"},
+    {"cellWMALSLdec", 0x602AAB16, "_SceAdecCorrectPtsValue_WmaLsl", 0xF2F9C183, 29, "WmaLsl"},
+};
+constexpr const char* kOps[12] = {"GetMemSize", "Open", "Close", "StartSeq", "EndSeq", "DecodeAu", "GetVersion",
+    "Realign", "ReleasePcm", "GetPcmHandleNum", "GetBsiInfoSize", "OpenExt"};
+#if PSPOCKET_HAVE_FFMPEG
+constexpr bool kFfmpeg = true;
+#else
+constexpr bool kFfmpeg = false;
+#endif
+
+} // namespace
+
+// What needs no FFmpeg: the exports are there exactly when the cores are, firmware-first (D-563), under RPCS3's NIDs;
+// libadec's types for CELP and CELP 8 kHz (FFmpeg decodes no MPEG-4 CELP) and the reserved 28 and 29 get no core of
+// pspocket's.
+TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and markers; none for CELP or types 28 and 29 "
+          "(D-623)",
+    "[hle][adec]")
+{
+    const hle::Registry& reg = hle::registry();
+    const bool ffmpeg = reg.find_variable("cellDDPdec", 0xF5E9C15C) != nullptr;
+    CHECK(ffmpeg == kFfmpeg);
+    for (const NewCore& c : kNewCores) {
+        INFO(c.library);
+        CHECK((reg.find_variable(c.library, c.table_nid) != nullptr) == ffmpeg);
+        CHECK(reg.is_firmware_first(c.library) == ffmpeg);
+        if (c.pts) {
+            CHECK(c.pts_nid == recomp::nid_of(c.pts));
+            CHECK((reg.find(c.library, c.pts_nid) != nullptr) == ffmpeg);
+        }
+        for (const char* op : kOps) {
+            const std::string name = std::format("_CellAdecCoreOp{}_{}", op, c.tag);
+            CHECK((reg.find("cellAdec", recomp::nid_of(name)) != nullptr) == ffmpeg);
+        }
+    }
+    CHECK(reg.find_variable("cellCelpDec", 0xFFE42C22) == nullptr);
+    CHECK(reg.find_variable("cellCelp8Dec", 0xF0190C6C) == nullptr);
+    CHECK_FALSE(reg.is_firmware_first("cellAdec"));
+
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const Call call = hle_calls(f, t);
+    const auto query = [&](u32 type) {
+        ps_write32(b, kType, type);
+        return call("cellAdecQueryAttr", 0x7E4A4A49, {kType, kAttr});
+    };
+    // No firmware here: CELP, CELP 8 kHz and the reserved types have no core (FATAL); 26 and 27 are invalid (ARG).
+    for (const u32 type : {11u, 25u, 28u, 29u}) {
+        INFO("type " << type);
+        CHECK(query(type) == 0x80610001);
+    }
+    CHECK(query(26) == 0x80610003);
+    CHECK(query(27) == 0x80610003);
+    for (const u32 type : {7u, 8u, 9u, 10u, 18u, 19u, 21u, 23u, 30u, 31u}) {
+        INFO("type " << type);
+        if (!ffmpeg) {
+            CHECK(query(type) == 0x80610001);
+            continue;
+        }
+        CHECK(query(type) == 0);
+        CHECK(ps_read32(b, kAttr) > 0x200);
+        CHECK(ps_read32(b, kAttr + 4) == 0x492000);
+        CHECK(ps_read32(b, kAttr + 8) == 0x01000000);
+    }
+}
 
 #if PSPOCKET_HAVE_FFMPEG
 
@@ -470,6 +563,146 @@ bool close_to(const std::vector<float>& a, const std::vector<float>& b, double t
     return true;
 }
 
+// ---- a core driven through its own exported table, as a firmware module drives it (D-591)
+
+// The four notifications as guest functions (AUDONE r3 handle r4 arg; PCMOUT r3 handle r4 PCM r5 size r6 arg r7 a
+// pointer to the information's address r8 PTS type r9 error; ERROR r3 error r4 arg; SEQDONE r3 arg), each appending
+// its type and arguments (eight words, the information's address read through r7) to the log at its argument.
+constexpr u32 kNoteCode = kData + 0x6000, kNoteOpds = kData + 0x7000, kNoteLog = kData + 0x8000;
+constexpr u32 kTableRes = kArgs + 0x100, kTableAttr = kArgs + 0x120, kTableAu = kArgs + 0x140, kTableVer = kArgs + 0x160;
+
+void write_notifications(u8* b)
+{
+    std::vector<u32> code;
+    const u32 arg_reg[4] = {4, 6, 4, 3};
+    for (u32 k = 0; k < 4; k++) {
+        ps_write32(b, kNoteOpds + 8 * k, kNoteCode + 4 * static_cast<u32>(code.size()));
+        ps_write32(b, kNoteOpds + 8 * k + 4, 0);
+        const u32 a = arg_reg[k];
+        for (const u32 w : {as::lwz(11, 0, a), as::slwi(12, 11, 5), as::add(12, 12, a), as::li(0, static_cast<s32>(k)),
+                 as::stw(0, 0x20, 12), as::stw(3, 0x24, 12), as::stw(4, 0x28, 12), as::stw(5, 0x2C, 12),
+                 as::stw(6, 0x30, 12)})
+            code.push_back(w);
+        if (k == 1) {
+            code.push_back(as::lwz(10, 0, 7));
+            code.push_back(as::stw(10, 0x34, 12));
+        } else {
+            code.push_back(as::stw(7, 0x34, 12));
+        }
+        for (const u32 w : {as::stw(8, 0x38, 12), as::stw(9, 0x3C, 12), as::lwsync(), as::addi(11, 11, 1),
+                 as::stw(11, 0, a), as::li(3, 0), as::blr()})
+            code.push_back(w);
+    }
+    for (usize i = 0; i < code.size(); i++) ps_write32(b, kNoteCode + 4 * static_cast<u32>(i), code[i]);
+    std::memset(b + kNoteLog, 0, 0x4000);
+}
+
+u32 notes(u8* b) { return load32_acquire(b, kNoteLog); }
+u32 note_word(u8* b, u32 n, u32 w) { return ps_read32(b, kNoteLog + 0x20 + 0x20 * n + 4 * w); }
+u32 notes_of(u8* b, u32 type)
+{
+    u32 c = 0;
+    for (u32 n = 0; n < notes(b); n++) c += note_word(b, n, 0) == type;
+    return c;
+}
+
+struct TableRun {
+    std::vector<std::string> lines;
+    std::vector<Out> outs;          // PTS: the PCMOUT's type in pts_upper, its error in status
+    std::vector<u32> notes;         // each notification's type, in order
+    u32 mem = 0, version = 0, handles = 0, bsi_size = 0;
+};
+
+// The core of `table` (CellAdecCoreOps) opened at kDecoderMem, its sequence started with `param`, the units decoded one
+// at a time, each PCM realigned into kPcm and released, then the sequence ended and the core closed.
+TableRun run_table(Fixture& f, GuestThread& t, u32 table, const std::vector<u8>& param, const Feed& feed)
+{
+    u8* b = f.base();
+    TableRun run;
+    const auto op = [&](u32 i, std::initializer_list<u64> args) {
+        return static_cast<u32>(hle::call_guest(t.ctx, ps_read32(b, table + 4 * i), args));
+    };
+    const auto r = [&](const char* name, u32 i, std::initializer_list<u64> args) {
+        const u32 v = op(i, args);
+        run.lines.push_back(std::format("{} -> {:#x}", name, v));
+        return v;
+    };
+    write_notifications(b);
+    r("getMemSize", 0, {kTableAttr});
+    run.mem = ps_read32(b, kTableAttr);
+    op(6, {kTableVer});
+    run.version = ps_read32(b, kTableVer);
+    run.handles = op(9, {});
+    run.bsi_size = op(10, {});
+    REQUIRE(run.mem <= kDecoderMemSize);
+    const u32 res[5] = {run.mem, kDecoderMem, 1000, 200, 0x4000};
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kTableRes + 4 * i, res[i]);
+    const u32 core = kDecoderMem;
+    if (r("open", 1, {core, kNoteOpds, kNoteLog, kNoteOpds + 8, kNoteLog, kNoteOpds + 16, kNoteLog, kNoteOpds + 24,
+            kNoteLog, kTableRes}) != 0)
+        return run;
+    std::memcpy(b + kParam, param.data(), param.size());
+    if (r("startSeq", 3, {core, kParam}) == 0) {
+        u32 outs = 0;
+        for (u32 k = 0; k < feed.aus.size(); k++) {
+            const u32 at = kStream + 0x2000 * (k % 16);
+            REQUIRE(feed.aus[k].size() <= 0x2000);
+            std::memcpy(b + at, feed.aus[k].data(), feed.aus[k].size());
+            const bool missing = std::find(feed.missing.begin(), feed.missing.end(), k) != feed.missing.end();
+            ps_write32(b, kTableAu + 0, at);
+            ps_write32(b, kTableAu + 4, feed.au_size ? feed.au_size : static_cast<u32>(feed.aus[k].size()));
+            ps_write32(b, kTableAu + 8, missing ? kTsInvalid : 0);
+            ps_write32(b, kTableAu + 12, missing ? kTsInvalid : 0x1000 + feed.step * k);
+            ps_write64(b, kTableAu + 16, 0x77000000 + k);
+            const u32 pcm_handle = k % run.handles;
+            if (r("decodeAu", 5, {core, pcm_handle, kTableAu}) != 0) continue;
+            if (!wait_until([&] { return notes_of(b, 1) >= outs + 1; })) {
+                run.lines.push_back("no PCMOUT");
+                break;
+            }
+            u32 n = 0, seen = 0;
+            for (; n < notes(b); n++)
+                if (note_word(b, n, 0) == 1 && seen++ == outs) break;
+            outs++;
+            Out o;
+            o.handle = note_word(b, n, 1);
+            const u32 pcm = note_word(b, n, 2);
+            o.size = note_word(b, n, 3);
+            const u32 bsi = note_word(b, n, 5);
+            o.pts_upper = note_word(b, n, 6);
+            o.status = note_word(b, n, 7);
+            o.bsi.assign(b + bsi, b + bsi + feed.bsi_size);
+            REQUIRE(o.size <= kPcmSpan);
+            std::memset(b + kPcm, 0xCC, kPcmSpan);
+            if (r("realign", 7, {core, kPcm, pcm}) == 0) o.pcm.assign(b + kPcm, b + kPcm + o.size);
+            r("releasePcm", 8, {core, pcm_handle, kPcm});
+            run.outs.push_back(std::move(o));
+        }
+        r("endSeq", 4, {core});
+        if (!wait_until([&] { return notes_of(b, 3) >= 1; })) run.lines.push_back("no SEQDONE");
+    }
+    r("close", 2, {core});
+    for (u32 n = 0; n < notes(b); n++) run.notes.push_back(note_word(b, n, 0));
+    return run;
+}
+
+std::string all(const TableRun& run)
+{
+    std::string s;
+    for (const std::string& l : run.lines) s += l + "\n";
+    for (const u32 n : run.notes) s += std::format("note {}\n", n);
+    return s;
+}
+
+// pspocket's _SceAdecCorrectPtsValue_* of a module, linked as a module importing it would have it.
+u32 pts_function(Fixture& f, const char* library, u32 nid)
+{
+    REQUIRE(hle::registry().find(library, nid) != nullptr);
+    const u32 d = f.hle->link_function(library, nid, {});
+    REQUIRE(d != 0);
+    return d;
+}
+
 } // namespace
 
 // ---- the codecs' parameters and frames built here
@@ -690,6 +923,78 @@ std::function<void(AVCodecContext*)> wma_setup(const WmaParam& p)
         std::memcpy(av->extradata, extra.data(), extra.size());
         av->extradata_size = static_cast<int>(extra.size());
     };
+}
+
+u32 log2_floor(u32 v) { return 31 - static_cast<u32>(std::countl_zero(v)); }
+
+// A WMA Lossless packet of `block` bytes as FFmpeg's wmalosslessdec.c reads one: the packet header (sequence number
+// `seq`, no bits of a previous frame), then one frame (length-prefixed: decode flags 0x40) whose one subframe is a raw
+// PCM tile of `bits`-bit samples, every channel's in turn; zeros after it. At 48 kHz, decode flags 0x46 make 512-sample
+// frames.
+std::vector<u8> wmalsl_packet(u32 seq, const std::vector<std::vector<s32>>& pcm, u32 bits, u32 block)
+{
+    const u32 log2_frame = log2_floor(block) + 4;
+    const u32 samples = static_cast<u32>(pcm[0].size()), channels = static_cast<u32>(pcm.size());
+    BitWriter w;
+    w.put(seq & 15, 4);
+    w.put(0, 1);          // seekable frame in packet
+    w.put(0, 1);          // not spliced
+    w.put(0, log2_frame); // no bits of a previous frame
+    w.put(log2_frame + 5 + bits * channels * samples + 2, log2_frame); // the frame's length in bits
+    w.put(0, 1); // tile_aligned
+    w.put(0, 1); // no skip
+    w.put(0, 1); // not a seekable tile
+    w.put(1, 1); // a raw PCM tile
+    w.put(0, 1); // no padding zeroes
+    for (u32 c = 0; c < channels; c++)
+        for (u32 i = 0; i < samples; i++) w.put(static_cast<u32>(pcm[c][i]) & ((1u << bits) - 1), bits);
+    w.put(0, 1); // (the bit the decoder passes over)
+    w.put(0, 1); // no more frames
+    std::vector<u8> p = w.bytes;
+    REQUIRE(p.size() <= block);
+    p.resize(block, 0);
+    return p;
+}
+
+// A WMA Pro packet of `block` bytes (mono; decode flags 0x46: length-prefixed 512-sample frames of one subframe at 48
+// kHz) holding `frames` silent frames: each its length, no trimming, no extended header, the reserved bit, and its one
+// channel's coefficients not transmitted.
+std::vector<u8> wmapro_silent_packet(u32 seq, u32 frames, u32 block)
+{
+    const u32 log2_frame = log2_floor(block) + 4;
+    BitWriter w;
+    w.put(seq & 15, 4);
+    w.put(0, 2);
+    w.put(0, log2_frame); // no bits of a previous frame
+    for (u32 k = 0; k < frames; k++) {
+        w.put(log2_frame + 6, log2_frame); // the frame's length in bits
+        w.put(0, 1); // no trimming
+        w.put(0, 1); // no extended header
+        w.put(0, 1); // the reserved bit
+        w.put(0, 1); // the channel's coefficients not transmitted
+        w.put(0, 1); // (the bit the decoder passes over)
+        w.put(k + 1 < frames, 1); // more frames
+    }
+    std::vector<u8> p = w.bytes;
+    REQUIRE(p.size() <= block);
+    p.resize(block, 0);
+    return p;
+}
+
+// Whether two runs of a decoder showed the same: answers, sizes, version, callbacks and every PCM out.
+bool same_runs(const CoreRun& a, const CoreRun& b)
+{
+    if (a.lines != b.lines || a.mem != b.mem || a.version_upper != b.version_upper ||
+        a.version_lower != b.version_lower || a.callbacks != b.callbacks || a.outs.size() != b.outs.size())
+        return false;
+    for (usize i = 0; i < a.outs.size(); i++) {
+        const Out& x = a.outs[i];
+        const Out& y = b.outs[i];
+        if (x.handle != y.handle || x.status != y.status || x.size != y.size || x.pts_upper != y.pts_upper ||
+            x.pts_lower != y.pts_lower || x.user_data != y.user_data || x.bsi != y.bsi || x.pcm != y.pcm)
+            return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -1540,6 +1845,293 @@ TEST_CASE("cellAdec: WMA on FFmpeg, WMA 2 and WMA 1 that FFmpeg's encoders wrote
     const CoreRun e = run_core(f.base(), hle_calls(f, t), kTypeWma, wma_param(good), bad);
     INFO(all(e));
     CHECK(flow_ok(e, 3, {{1, kFatal}}));
+}
+
+TEST_CASE("cellAdec: WMA Lossless on FFmpeg through cellWMALSLdec's table as a firmware module drives it: raw PCM "
+          "tiles built here decoded exactly, information, the PTS function, refusals (D-622, D-623)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_decoder_by_name("wmalossless"))
+        SKIP("this FFmpeg has no wmalossless decoder (build-ffmpeg.sh before D-620)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    const u32 table = f.hle->link_variable("cellWMALSLdec", 0x602AAB16);
+    REQUIRE(table != 0);
+    const u32 pts = pts_function(f, "cellWMALSLdec", 0xF2F9C183);
+    for (const u32 bits : {16u, 24u}) {
+        DYNAMIC_SECTION(bits << "-bit")
+        {
+            // Stereo at 48 kHz, 512 samples a frame, one frame a 2112-byte packet (3168 for 24 bits).
+            const u32 block = bits == 16 ? 2112 : 3168;
+            const auto input = tones(48000, 512 * 20, {700, 1900}, 0.6);
+            Feed feed;
+            feed.bsi_size = 0x40;
+            feed.step = 960;
+            std::vector<std::vector<s32>> samples(2);
+            for (u32 c = 0; c < 2; c++)
+                for (const double x : input[c])
+                    samples[c].push_back(bits == 16 ? static_cast<s32>(std::lround(x * 32767)) : to24(x));
+            for (u32 k = 0; k < 20; k++) {
+                std::vector<std::vector<s32>> frame(2);
+                for (u32 c = 0; c < 2; c++) frame[c].assign(samples[c].begin() + 512 * k, samples[c].begin() + 512 * (k + 1));
+                feed.aus.push_back(wmalsl_packet(k, frame, bits, block));
+            }
+            WmaParam p{.tag = 0x163, .channels = 2, .rate = 48000, .avg_bytes = block * 48000 / 512, .block = block,
+                .bits = bits, .mask = 3, .options = 0x46};
+            const TableRun run = run_table(f, t, table, wma_param(p), feed);
+            INFO(all(run));
+            CHECK(run.handles == 3);
+            CHECK(run.bsi_size == 0x40);
+            CHECK(run.version == 0x01000000);
+            REQUIRE(run.outs.size() == 20);
+            const Ref ref = reference("wmalossless", feed.aus, wma_setup(p), block);
+            for (u32 k = 0; k < 20; k++) {
+                INFO("access unit " << k);
+                const Out& o = run.outs[k];
+                CHECK(o.size == 512 * 2 * 4);
+                CHECK(o.pcm == pcm_of(ref.units[k]));
+                CHECK(o.pts_upper == 36); // the PTS type: the core's own correction
+                CHECK(o.status == 0);
+                CHECK(be32(o.bsi, 0x00) == 48000);
+                CHECK(be32(o.bsi, 0x04) == 2);
+                CHECK(be32(o.bsi, 0x08) == 3);
+                CHECK(be32(o.bsi, 0x0C) == 512);
+                CHECK(be32(o.bsi, 0x18) == bits);
+                CHECK(be32(o.bsi, 0x1C) == 8 * p.avg_bytes);
+                CHECK(be32(o.bsi, 0x28) == 0x163);
+                CHECK(be32(o.bsi, 0x2C) == block);
+                CHECK(be32(o.bsi, 0x30) == 0x46);
+                for (u32 c = 0; c < 2; c++) {
+                    const auto got = channel_of(o.pcm, 2, c);
+                    u32 differ = 0;
+                    for (u32 i = 0; i < 512; i++) {
+                        const s32 v = samples[c][512 * k + i];
+                        differ += got[i] != static_cast<float>(v) / (bits == 16 ? 32768.0f : 8388608.0f);
+                    }
+                    CHECK(differ == 0); // lossless
+                }
+            }
+            // Every unit's AUDONE then PCMOUT, SEQDONE last.
+            std::vector<u32> want;
+            for (u32 k = 0; k < 20; k++) {
+                want.push_back(0);
+                want.push_back(1);
+            }
+            want.push_back(3);
+            CHECK(run.notes == want);
+            // _SceAdecCorrectPtsValue_WmaLsl as libadec calls it: the core's last PTS plus its frame's 960 ticks.
+            constexpr u32 kTs = kArgs + 0x180;
+            const auto correct = [&](u32 upper, u32 lower) {
+                ps_write32(b, kTs, upper);
+                ps_write32(b, kTs + 4, lower);
+                return static_cast<u32>(hle::call_guest(t.ctx, pts, {kDecoderMem, kTs}));
+            };
+            CHECK(correct(0, 0x5000) == 0);
+            CHECK(correct(kTsInvalid, kTsInvalid) == 0);
+            CHECK(ps_read32(b, kTs + 4) == 0x5000 + 960);
+        }
+    }
+    // Refused by startSeq: WMA 2's format given to the lossless core, and 20-bit samples.
+    for (const WmaParam& refused : {WmaParam{.tag = 0x161, .bits = 16, .mask = 3}, WmaParam{.tag = 0x163, .bits = 20}}) {
+        const TableRun r = run_table(f, t, table, wma_param(refused), Feed{});
+        CHECK(std::find(r.lines.begin(), r.lines.end(), "startSeq -> 0x80610003") != r.lines.end());
+    }
+}
+
+TEST_CASE("cellAdec: WMA Pro on FFmpeg through cellWMAPROdec's table, silent frames built here (FFmpeg has no WMA Pro "
+          "encoder): the packets, the first frame held back, information, refusals (D-622, D-623)",
+    "[hle][adec]")
+{
+    if (!avcodec_find_decoder_by_name("wmapro")) SKIP("this FFmpeg has no wmapro decoder (build-ffmpeg.sh before D-620)");
+    InterpretMisses interpret;
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    const u32 table = f.hle->link_variable("cellWMAPROdec", 0xA8BAC670);
+    REQUIRE(table != 0);
+    Feed feed;
+    feed.step = 2880;
+    for (u32 k = 0; k < 6; k++) feed.aus.push_back(wmapro_silent_packet(k, 3, 64));
+    WmaParam p{.tag = 0x162, .channels = 1, .rate = 48000, .avg_bytes = 2000, .block = 64, .bits = 16, .mask = 4,
+        .options = 0x46};
+    const TableRun run = run_table(f, t, table, wma_param(p), feed);
+    INFO(all(run));
+    REQUIRE(run.outs.size() == 6);
+    const Ref ref = reference("wmapro", feed.aus, wma_setup(p), 64);
+    for (u32 k = 0; k < 6; k++) {
+        INFO("access unit " << k);
+        const Out& o = run.outs[k];
+        CHECK(o.size == (k == 0 ? 2u : 3u) * 512 * 4); // the decoder holds the first frame back
+        CHECK(o.pcm == pcm_of(ref.units[k]));
+        CHECK(o.pts_upper == 35);
+        CHECK(o.status == 0);
+        for (const float s : channel_of(o.pcm, 1, 0)) REQUIRE(s == 0.0f);
+        CHECK(be32(o.bsi, 0x04) == 1);
+        CHECK(be32(o.bsi, 0x08) == 4);
+        CHECK(be32(o.bsi, 0x18) == 16);
+        CHECK(be32(o.bsi, 0x28) == 0x162);
+        CHECK(be32(o.bsi, 0x34) == 1);
+    }
+    for (const WmaParam& refused : {WmaParam{.tag = 0x163, .channels = 1, .mask = 4}, WmaParam{.tag = 0x162, .bits = 0},
+             WmaParam{.tag = 0x162, .channels = 9}}) {
+        const TableRun r = run_table(f, t, table, wma_param(refused), Feed{});
+        CHECK(std::find(r.lines.begin(), r.lines.end(), "startSeq -> 0x80610003") != r.lines.end());
+    }
+}
+
+// ---- D-623: the tables of the cellAdec types through pspocket's front end, as Sony's libadec drives them
+
+TEST_CASE("cellAdec: each new core through pspocket's own operation table, as a firmware module drives it (D-623)",
+    "[hle][adec]")
+{
+    InterpretMisses interpret;
+    struct Case {
+        u32 index; // in kNewCores
+        std::vector<u8> param;
+        Feed feed;
+    };
+    std::vector<Case> cases;
+    const auto input2 = tones(48000, 48000 / 4, {1000, 2500});
+    const auto input6 = tones(48000, 48000 / 4, {500, 800, 1200, 60, 1700, 2300});
+    if (avcodec_find_encoder_by_name("eac3")) {
+        const Encoded enc = encode("eac3", 48000, "5.1(side)", 640000, input6);
+        Feed feed;
+        feed.bsi_size = 0x44;
+        feed.step = 2880;
+        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 5);
+        feed.missing = {2};
+        cases.push_back({0, ac3_param({}), feed});
+    }
+    if (avcodec_find_encoder_by_name("aac")) {
+        const Encoded enc = encode("aac", 48000, "stereo", 128000, input2);
+        Feed feed;
+        feed.bsi_size = 0x80;
+        feed.step = 1920;
+        for (u32 k = 0; k < 6; k++) feed.aus.push_back(adts(enc.extradata, enc.packets[k], 1));
+        feed.missing = {3};
+        cases.push_back({1, be32s({1, 0, 0, 0}), feed});
+    }
+    {
+        Feed feed;
+        feed.bsi_size = 0x1C;
+        for (u32 k = 0; k < 4; k++) feed.aus.push_back(mp3_frame(2, {45, 100}));
+        feed.missing = {2};
+        cases.push_back({2, be32s({4}), feed});
+    }
+    {
+        Feed feed;
+        feed.bsi_size = 0x10;
+        feed.step = 3840;
+        for (u32 k = 0; k < 4; k++) feed.aus.push_back(concat({atrac3_unit(100), atrac3_unit(60)}));
+        feed.missing = {2};
+        cases.push_back({3, be32s({2, 0, 384, 0x84, 2}), feed});
+    }
+    if (avcodec_find_encoder_by_name("truehd")) {
+        const Encoded enc = encode("truehd", 48000, "stereo", 0, input2);
+        Feed feed;
+        feed.step = 300;
+        for (u32 k = 0; k < 6; k++)
+            feed.aus.push_back(concat({enc.packets[4 * k], enc.packets[4 * k + 1], enc.packets[4 * k + 2],
+                enc.packets[4 * k + 3]}));
+        feed.missing = {2};
+        cases.push_back({4, layout_param(0), feed});
+    }
+    if (avcodec_find_encoder_by_name("dca")) {
+        const Encoded enc = encode("dca", 48000, "stereo", 768000, input2);
+        Feed feed;
+        feed.step = 960;
+        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 6);
+        feed.missing = {3};
+        for (const u32 i : {5u, 6u, 7u, 8u}) cases.push_back({i, layout_param(0), feed});
+    }
+    if (avcodec_find_encoder_by_name("wmav2")) {
+        const Encoded enc = encode("wmav2", 44100, "stereo", 128000, tones(44100, 44100 / 2, {1000, 2500}));
+        WmaParam p;
+        p.block = enc.block_align;
+        p.options = u32{enc.extradata[4]} | u32{enc.extradata[5]} << 8;
+        Feed feed;
+        feed.step = 4180;
+        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 6);
+        feed.missing = {5}; // past the packets the decoder finishes no frame of
+        cases.push_back({9, wma_param(p), feed});
+    }
+    CHECK(cases.size() >= 3);
+    for (const Case& c : cases) {
+        const NewCore& core = kNewCores[c.index];
+        DYNAMIC_SECTION(core.library)
+        {
+            CoreRun direct, tabled;
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                direct = run_core(f.base(), hle_calls(f, t), core.type, c.param, c.feed);
+                CHECK(ps_read32(f.base(), kDecoderMem + 0x34) == 0); // pspocket's own core, called directly
+            }
+            {
+                BigFixture f;
+                GuestThread t(f, 0, "ppu");
+                const u32 table = link_own_table(f, core.library, core.table_nid);
+                if (core.pts) link_own_function(f, core.library, core.pts_nid);
+                tabled = run_core(f.base(), hle_calls(f, t), core.type, c.param, c.feed);
+                CHECK(ps_read32(f.base(), kDecoderMem + 0x34) == table);
+                for (u32 op = 0; op < 11; op++) {
+                    INFO(kOps[op]);
+                    CHECK(guest_calls(f, "cellAdec", std::format("_CellAdecCoreOp{}_{}", kOps[op], core.tag)) > 0);
+                }
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_pcm_out") == c.feed.aus.size());
+                CHECK(guest_calls(f, "cellAdec", "_pspocket_adec_notify_seq_done") == 1);
+                if (core.pts) CHECK(guest_calls(f, core.library, core.pts) == c.feed.aus.size());
+            }
+            INFO(all(direct));
+            INFO(all(tabled));
+            CHECK(direct.outs.size() == c.feed.aus.size());
+            CHECK(flow_ok(direct, static_cast<u32>(c.feed.aus.size()), {}));
+            CHECK(pts_ok(direct, c.feed));
+            CHECK(same_runs(direct, tabled));
+        }
+    }
+}
+
+// D-623: each _SceAdecCorrectPtsValue_* on a core context as its open leaves it (test_adec_cores.cpp's D-591 test):
+// a missing PTS follows the core's last by that frame's length, a given one is kept; half a timestamp, a core of
+// another codec or a timestamp outside guest memory is FATAL.
+TEST_CASE("cellAdec: the new cores' own PTS functions (D-623)", "[hle][adec]")
+{
+    BigFixture f;
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    constexpr u32 kCore = kDecoderMem, kPts = kArgs + 0x100;
+    namespace fx = hle::adec::ffcore::fx;
+    for (const NewCore& c : kNewCores) {
+        if (!c.pts) continue;
+        INFO(c.pts);
+        const u32 d = pts_function(f, c.library, c.pts_nid);
+        const auto correct = [&](u32 upper, u32 lower) {
+            ps_write32(b, kPts, upper);
+            ps_write32(b, kPts + 4, lower);
+            return static_cast<u32>(hle::call_guest(t.ctx, d, {kCore, kPts}));
+        };
+        std::memset(b + kCore, 0, fx::size);
+        ps_write32(b, kCore + fx::type, c.type);
+        ps_write32(b, kCore + fx::prev_pts, kTsInvalid);
+        ps_write32(b, kCore + fx::prev_pts + 4, kTsInvalid);
+        ps_write32(b, kCore + fx::duration, 300);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // none before: none
+        CHECK(ps_read32(b, kPts + 4) == kTsInvalid);
+        CHECK(correct(0, 0x1000) == 0);              // kept, and the last
+        ps_write32(b, kCore + fx::duration, 960);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // the last plus its frame's 300
+        CHECK(ps_read32(b, kPts) == 0);
+        CHECK(ps_read32(b, kPts + 4) == 0x1000 + 300);
+        CHECK(correct(kTsInvalid, kTsInvalid) == 0); // that one plus its 960
+        CHECK(ps_read32(b, kPts + 4) == 0x1000 + 300 + 960);
+        CHECK(correct(kTsInvalid, 5) == kFatal);     // half a timestamp
+        ps_write32(b, kCore + fx::type, 4);          // an MP3 core
+        CHECK(correct(0, 0x2000) == kFatal);
+        ps_write32(b, kCore + fx::type, c.type);
+        CHECK(static_cast<u32>(hle::call_guest(t.ctx, d, {kCore, 0x30000000})) == kFatal); // not guest memory
+    }
 }
 
 #endif
