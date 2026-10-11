@@ -11061,3 +11061,41 @@ answers, PCM, information and callbacks it gives through pspocket's front end; W
 (16 and 24 bits) decoded exactly through cellWMALSLdec's table, and WMA Pro's silent frames built here (FFmpeg has no
 encoder) through cellWMAPROdec's, the first frame held back as the decoder does; each PTS function's corrections and
 refusals. The HLE NID check covers the new names.
+
+## D-624 · 2026-10-11 · cellDmuxPamf's raw elementary stream core from RPCS3, unverified: D-594's marker for a variable
+
+D-592 left g_cell_dmux_core_ops_raw_es (0x9728A0E9, the table with which libraries other than libdmux demux one bare
+elementary stream) to Sony's module for two reasons: the PPU side's raw variants were not written, and which
+implementation serves is decided per library, so neither marking cellDmuxPamf firmware-first (Sony's module would take
+the compared PAMF table with it) nor leaving it unmarked (an uncompared raw core would displace Sony's) fitted. Both are
+answered now:
+- **The raw variants** (runtime/hle/src/cellDmuxPamf.cpp; RPCS3 cellDmuxPamf.cpp's _CellDmuxCoreOpSetStream, QueryEsAttr
+  and EnableEs with raw_es): the filter read as a raw stream's (its bytes 2 and 3 the stream and private stream IDs, bit
+  7 of byte 8 AVC: RPCS3 get_stream_ids), no specific information for its units (so QueryEsAttr's memory size is the
+  PAMF stream's less the access unit queue's specific information), and the demuxer told the stream is raw (EnableEs;
+  SetStream's stream information carries the flag as RPCS3's does). The core's SPU side had RPCS3's raw path already
+  (D-194): each 2048-byte section straight into the one enabled stream's parser, no pack, PES packet or program end
+  code, so no timestamps and no random access points. The table is the PAMF table's fourteen entries with those three
+  replaced (internal functions of cellDmux named _CellDmuxCoreOpSetStream_raw_es, _CellDmuxCoreOpQueryEsAttr_raw_es and
+  _CellDmuxCoreOpEnableEs_raw_es: RPCS3's <true> instances), laid out when first linked as D-592's is.
+- **Unverified variables** (hle.hpp Variable::unverified, Registry::is_unverified_variable; runtime/loader/src/lle.cpp):
+  D-594's marker, for a variable. The loader's per-game choice treats an import of an unverified variable as one of a
+  variable the host lacks while the library's firmware module can serve: a game's import library importing it goes to
+  that module, and a firmware module importing it brings the module in, where the system software has it; with none, the
+  host's serves, the variable included. The raw table is unverified; the PAMF table (compared with libdmuxpamf, D-194)
+  is not, and cellDmuxPamf is not firmware-first. So what a system with the firmware gets is unchanged (Sony's
+  libdmuxpamf, for a module importing the raw table, as before), and without the firmware the raw table is pspocket's
+  instead of unlinked. An unverified variable counts as pspocket's own, as an unverified function does.
+To check on the Mac: the raw table against libdmuxpamf's (a raw AVC and a raw ATRAC3plus stream through both,
+firmware_compare.hpp); once they agree, the marker goes, with a decision of its own.
+
+The count: 6,210 of 6,625 library functions pspocket's own before, 6,211 after. With D-623 the audio decoder cores and
+the demultiplexer cores are all pspocket's but CELP's four (D-623).
+
+Tests: tests/hle/test_dmux.cpp: the demultiplexer with raw_es, an AVC stream's units cut at their delimiters (one split
+between two sections), without timestamps or random access, the last on a flush, and no program end code; an ATRAC3plus
+stream's frames likewise. The raw table driven from guest code as the D-592 test drives the PAMF one: its entries; a raw
+filter's attributes (no specific information); a PAMF filter read as a raw one refused (UNKNOWN_STREAM); a raw AVC
+stream's four units notified with RPCS3's arguments (no timestamps, no specific information) and released; flush,
+disable, close. tests/hle/test_lle.cpp: an import of the raw table, a game's or a module's, goes to libdmuxpamf where it
+is installed and to pspocket's table where not; an import of the PAMF table stays on the host either way.
