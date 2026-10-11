@@ -10492,3 +10492,37 @@ end to end the pitch by zero crossings and the pan.
 To compare on the Mac: the pitch and volume registers against Sony's (the comparison reads them back through
 libsynth2, D-644), the pan law and mono, panEx and the rear pair, the effect's CLEAR and cores, the output modes'
 values.
+
+## D-644 · 2026-10-11 · libsnd3's comparison with Sony's libsnd3, ready for the Mac
+
+libsnd3 was made without Sony's module (D-640 to D-643); as D-597's comparisons do for the other firmware-first
+libraries, tests/hle/test_snd3_compare.cpp sends the same calls with the same synthetic inputs to pspocket's libsnd3 and
+to Sony's, each half in a process of its own, so that the Mac only has to run it and read the differences. Each half
+has its own libsynth2: both libraries are firmware-first, so the loader gives Sony's libsnd3 module Sony's libsynth2
+module (loaded with it as its import), and pspocket's half has pspocket's two (D-610: never one with the other's). The
+inputs: the bank of test_snd.cpp (D-641's layout) and its songs, built by snd3_writer.hpp (shared by both tests), and
+vag_writer.hpp's looped and one-shot sines put into each half's sound memory with cellSoundSynth2VoiceTrans.
+Observations (1,361):
+- every answer: before Init; Note2Pitch and Pitch2Note over 399 and 366 arguments; Init's checks (each followed by an
+  Exit, should Sony's take one) and its queues; BindSoundData's refusals and two banks; tone key-ons by note and by
+  pitch with a key-on parameter, their checks; each voice parameter and its checks; reserve mode and the Voice*
+  key-ons; holds; programs, NoteOff, GetVoice, SetSustainHold; the effect and the output modes; a queue of two and one
+  requests; an SMF's bind, its refusals, every getter and setter, Play, PlayEx, AddTempo, Pause, Resume, the channels,
+  Stop and Unbind;
+- what libsnd3 left in its libsynth2, read back with libsynth2's getters: the cores' master and effect volumes after
+  Init and after a hall, the effect area's start, both cores' KON, KOFF and mix switches after Init, after key-ons and
+  around a queued block, and each voice it touched (pitch, volumes, ADSR, start address);
+- what Synthesis and SynthesisEx render (floats within 5/32768, the rear pair too), the voices' statuses and envelopes,
+  GetVoice's and GetVoiceByID's 16 bytes (filled with 0xEE first);
+- the SMF player's timing as each block's loudness (the left side's RMS, within 0.002) over a play, two plays, a faster
+  tempo, a pause and its resume, a lower velocity and pan, a channel taken out;
+- notes (not compared): the contexts' bytes after BindSoundData and SMFBind.
+Where to look first on the Mac: BindSoundData's answer and the first key-on's registers (if Sony's module refuses the
+bank or plays other values, D-641's tone and program records are laid out otherwise: read a libsnd3 game's own HD3
+beside the registers Sony's module writes for it); the voice each key-on takes (D-640); the pitch and volume registers
+(D-643); the queue's timing (D-640); the loudness timeline (D-642). Running it: on the Mac
+`PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare][snd3]"`;
+anywhere, PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice: 0 of 1,361 observations differ, and pspocket's own
+values are checked against test_snd.cpp's. In every ctest run: each function it calls is in the NID database under
+libsnd3 (or libsynth2, for the getters and VoiceTrans) by that name, pspocket's own, the library firmware-first. When
+the halves match, libsnd3's marker and the test's [.] go together, with a decision of their own.
