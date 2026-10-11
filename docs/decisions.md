@@ -10305,3 +10305,190 @@ Running it: `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash
 marker (a decision of its own). Here, PSPOCKET_COMPARE_SELF=1: 0 of 342 observations differ, and pspocket's half
 answers as test_rudp.cpp; without either it skips. In every ctest run: each of the 31 functions is in the NID database
 under cellRudp, is pspocket's own, and the library is firmware-first.
+
+## D-640 · 2026-10-11 · libsnd3 pspocket's own, firmware-first: the library over libsynth2's exports, its voices and request queue
+
+libsnd3 is Sony's sound library over libsynth2 (D-610): sound banks (HD3 headers, their BD3 samples in libsynth2's
+sound memory) played by tone or by MIDI channel and program, and Standard MIDI Files played over a bank. RPCS3
+(rpcs3/Emu/Cell/Modules/libsnd3.cpp and .h) has every signature, the error codes and the structures
+(CellSnd3KeyOnParam, CellSnd3VoiceBitCtx, CellSnd3DataCtx's 32 bytes, CellSnd3SmfCtx's 352, CellSnd3RequestQueueCtx);
+its bodies are stubs. No Sony module was at hand: all 50 functions are made from what is public (D-641 for the banks,
+D-642 for the SMFs, D-643 for the pitch, volumes and effect) and from the most plausible reading where nothing says,
+each such choice listed below to check on the Mac. The library is firmware-first (D-563).
+- **libsynth2 through its exports**, as Sony's libsnd3 reaches it: the firmware module's when the loader linked one for
+  the process (Registry::add_imports, D-197: libsnd3's ten imports of libsynth2), else pspocket's own through the
+  registry. With both libraries firmware-first a process never pairs Sony's libsnd3 with pspocket's libsynth2 or the
+  reverse (D-610), and whichever serves libsynth2 there is one synthesizer.
+- **Init**(maxVoice, samples, queue): voices 0 to maxVoice - 1 (1 to 48: the SPU2's two cores of 24, voice n is core
+  n / 24's voice n % 24) are the library's, the rest the game's own through libsynth2; `samples` (1 to 65535,
+  Generate's u16) the frames each Synthesis makes; `queue` NULL or a CellSnd3RequestQueueCtx whose two buffers are guest
+  memory of a request at least. Else PARAM; a second Init ALREADY. It calls cellSoundSynth2Init(0): CELL_OK, and Exit
+  ends libsynth2 too; ALREADY_INITIALIZED (the game initialised it first, to transfer its BD3), and libsynth2 is used as
+  it is and left to the game; any other answer, or no libsynth2 in the process, SYNTH. Then both cores' master volumes
+  0x3FFF (libsd's cold start leaves them 0), the library's voices into both dry mixes and out of both effect mixes,
+  keyed off; the other voices' bits as they were. Exit keys the library's voices off and lets the banks, the SMFs and
+  the queue go. Before Init every call is NOTINIT but Note2Pitch and Pitch2Note (arithmetic) and KeyOffByID (0).
+- **The request queue** lets other threads than the one calling Synthesis make calls: libsynth2 is told only by the
+  Synthesis caller, before and after the block it generates. The front queue's requests (a key-on, a voice's new
+  pitch and volumes, the effect) are told before the next block, the rear queue's (the key-offs) after it, so a note
+  keyed on and off between two Synthesis calls still sounds for a block (the reading of "front" and "rear": two queues
+  of their own sizes suit two roles better than a double buffer of one). Each holds its size / 32 requests (a request's
+  32 bytes are pspocket's reckoning); a call whose requests do not all fit answers REQUESTQUEFULL and changes nothing.
+  The requests are kept by the library, not written into the game's buffers (their layout is Sony's). The library's own
+  state (voices, IDs, holds) changes at the call, so GetVoice and VoiceGetStatus answer at once. Without a queue each
+  call tells libsynth2 at once. Synthesis: the front requests, the SMFs' events in the block (D-642), Generate, the rear
+  requests and the SMFs' key-offs, then each sounding voice's envelope read back (ENVX).
+- **Voices.** An automatic key-on (NoteOn, NoteOnByTone, KeyOnByTone, an SMF's note) takes the lowest free voice not
+  reserved; with none, a released voice; else the playing one of the lowest priority (its tone's) not above the new
+  note's, the oldest first; with none the note is not played (CELL_OK, logged), as a MIDI synthesizer drops one. A voice
+  is free again after a block that leaves its envelope at 0 if it was keyed off, or had played a block before (its
+  one-shot sample ended: libsynth2 stops a voice at a loop end without repeat). A request queued for a stolen voice's
+  earlier key-on is dropped. VOICENUM for a voice number past maxVoice.
+- **Reserve mode** (VoiceSetReserveMode 1, 0 back, else PARAM): a reserved voice is the game's: the automatic key-ons
+  never take it, and VoiceNoteOnByTone and VoiceKeyOnByTone play only on a reserved voice, else RESERVEDVOICE (that
+  error code's most plausible reading).
+- **Key-on IDs**, the caller's: KeyOffByID keys off every voice keyed on with the ID and answers how many (RPCS3 types
+  it u32, not an error code: 0 before Init, or when the rear queue has no room, logged); GetVoiceByID and
+  GetVoice(channel, ID) write CellSnd3VoiceBitCtx as libsd's voice masks: core c's word has bit v for its voice v,
+  core[2] and core[3] zero; a voice counts while it sounds (keyed on or releasing).
+- **Sustain hold**: a held voice's key-off (NoteOff, VoiceKeyOff, KeyOffByID) waits for the hold's end
+  (VoiceSetSustainHold, SetSustainHold(channel, hold, ID); NoteOn's `sustain` holds the voices it starts);
+  VoiceAllKeyOff keys every voice off, held or not.
+- VoiceGetStatus: 0 free, 1 keyed on (or held), 2 keyed off and sounding. VoiceGetEnvelope: ENVX after the last block.
+- Sixteen banks (SOUNDDATAFULL) and sixteen SMFs (SMFFULL) at once, their IDs from 0 (Sony's limits are not known).
+  The contexts (CellSnd3DataCtx, CellSnd3SmfCtx) are checked to be guest memory and nothing is written into them: the
+  library keeps its state itself. Every pointer is checked before use: a wrong one is PARAM (SMFCTX for an SMF's
+  context), never a host fault.
+Tests: tests/hle/test_snd.cpp, test_hle "[snd3]", 18 cases, 27,769 checks. A recording libsynth2 in guest code, linked
+as a firmware module's exports would be (each call logged with its arguments, SetParam's and SetSwitch's registers
+kept, its answers set by the test): every register a key-on, a parameter, a key-off and the effect write, in their
+order around Generate; Init's setup and the cases of libsynth2's answer; the queue's front and rear, full and dropped;
+allocation, stealing by priority and age, reserve mode, holds, IDs and the bit masks; every argument check and error
+of the 50, NOTINIT before Init. End to end on pspocket's libsynth2 (D-610) with vag_writer.hpp's sounds: a tone's pitch
+counted in zero crossings at its base note and an octave up, the pan, the release, a one-shot's end freeing its voice,
+SynthesisEx's silent rear pair, an SMF heard, the reverb's tail. The count: 5,993 of 6,625 library functions
+pspocket's own before, 6,043 after (libsnd3's 50 of 50).
+To compare on the Mac (D-644): front and rear and the request size; the allocation and stealing order; RESERVEDVOICE;
+KeyOffByID's answer; VoiceGetStatus's values; the IDs and the limits; what Init sets in libsynth2; what Sony keeps in
+the contexts; the voice bits' layout.
+
+## D-641 · 2026-10-11 · libsnd3's HD3 banks: the header and VAG table as vgmstream reads them, the tones and programs inferred from the PS2's HD bank
+
+What is public of the PS3's HD3 (vgmstream src/meta/hd3_bd3.c, read for its facts, no code taken): the header "P3HD",
++0x04 the size of the rest, +0x08 a version (0x00020000), +0x10, +0x14 and +0x18 the offsets of the chunks "P3PG"
+(programs), "P3TN" (tones) and "P3VA" (the VAG table); P3VA's +0x04 the size of the rest, +0x14 its highest entry's
+index ("often there is an extra subsong than written"), 16-byte entries from +0x20: the sample's offset in the BD3,
+its rate, its size, -1. The BD3 is PS-ADPCM. Of P3PG vgmstream notes only that it "seems mostly empty and contains
+number of subsongs towards the end", of P3TN "config/volumes". Their ancestor is the PS2's HD bank of Sony's sound
+tools, whose "SCEI" chunks VGMTrans reads (src/main/formats/SonyPS2/SonyPS2InstrSet.h and .cpp, facts read): each chunk
+a highest index and a table of offsets to its records (0xFFFFFFFF none); the Sample param (42 bytes: the VAG index,
+velocity range, velocity follows, base note, detune, pan, group, priority, volume, ADSR1, ADSR2, key follows, LFO,
+SPU attributes with the direct and effect sends), the Program param (36 bytes: its split blocks' offset from the
+program, their number and size (20), volume, pan, transpose, detune, key follow pan, attributes, LFO) and the Split
+block (20 bytes: the sample set, the note range, cross fade, bend ranges, key follows, volume, pan, transpose,
+detune); a split whose high note is below its low plays up to 127; pans 0-127 about 64.
+Inferred (nothing public describes the PS3's tone and program records): P3TN and P3PG have P3VA's chunk header (the
+highest index at +0x14) and, from +0x20, the PS2's table of offsets from the chunk (0 or 0xFFFFFFFF none); a tone is
+the PS2's Sample param in the PPU's byte order (the tone is what NoteOnByTone's toneIndex names, the PS2's sample); a
+program is the PS2's Program param and its splits the PS2's Split blocks, the sample set read as a tone (the PS3's three
+chunks for the PS2's four: the sample sets folded into the splits, a tone's velocity range picking a program note's
+layers). A bank with P3PG's offset 0 has tones only (NoteOn finds no program).
+- Played: a tone's VAG, base note, detune (1/128 semitones, libsd's fine), pan, priority, volume, ADSR1 and ADSR2 as the
+  SPU2's registers, and its SPU attribute bits 0x04 and 0x08 (sent to the effect, left and right; the dry sends always
+  on, so a tone is never silent for a bit read wrong); a program's volume, pan, transpose and detune; a split's tone,
+  note range, bend ranges (1/128 semitones; 0 two semitones), volume, pan, transpose and detune. Not played: the
+  velocity and key follows, the LFOs, cross fades and groups.
+- BindSoundData(ctx, hd3, synthMemOffset): the BD3 already at synthMemOffset in sound memory (the game transfers it with
+  cellSoundSynth2VoiceTrans); a VAG plays from synthMemOffset plus its offset. The header (its size from +0x04, at most
+  16 MB, all guest memory) is read and kept at the bind: a header changed afterwards is not seen. FORMAT for what is not
+  such a bank (the magic, a chunk outside the header, more than 65,536 entries, an entry past its chunk, a VAG past 2 MB
+  or at a rate past 1 MHz, a tone of a missing VAG or a base note or volume past 127, a program's or split's volume past
+  127, a split of a missing tone or past note 127, split blocks under 20 bytes, more than 65,536 splits in all), the
+  reason logged; PARAM for no context or header, an offset past 2 MB, or a VAG ending past sound memory at that offset.
+  The VAG table's -1 is not used (loops are the ADPCM's flags).
+- UnbindSoundData keys the bank's voices off; the SMFs over it stop (D-642).
+Tests: banks built in the test, bound and let go, each FORMAT and PARAM case; tones-only banks; the split rule; the
+bank's fields in the registers (D-643); damaged copies fuzzed ("[fuzz]": 1,501 inputs, 186 accepted).
+To compare on the Mac, first: a libsnd3 game's own HD3 against this layout and Sony's module's answers (the tone and
+program records are the guess most likely wrong: a real bank read this way most likely answers FORMAT, its reason
+logged), the header's other words, whether the header is copied at the bind.
+
+## D-642 · 2026-10-11 · libsnd3's SMF player: the file read at the bind, its events block by block
+
+- Reading (the MIDI 1.0 specification's file format): MThd (6 to 4,096 bytes, format 0 or 1, at least one track,
+  ticks a quarter note), then the MTrk chunks, other chunks skipped (64 at most); SMFBind takes no size, so the file
+  ends with its last track (at most 4 MB, each chunk guest memory). Events with running status; tempo (meta 0x51) kept,
+  end of track (0x2F) ends the track, other metas and system exclusive skipped. SMF for format 2 (independent songs),
+  SMPTE time, no track or a division of 0, and in a track a data byte past 127 or with no running status, a delta of
+  more than four bytes, a system message, an event past its track. The tracks are merged by time, a track's events
+  before the next track's at the same tick, read once at the bind.
+- Timing: each Synthesis plays the SMFs for its block of `samples` frames at 48 kHz: the events that fall in the block,
+  told before it is generated (their key-offs after it, as the queue's rear, D-640). Integer time without drift: a
+  tick is tempo * 48,000 units of 1/(10^6 * division) samples, a block samples * 10^6 * division; the time past the
+  last event goes on into the next block. Tempo: the song's (500,000 microseconds a quarter note until it says, 120
+  BPM); SMFAddTempo(addTempo) adds beats a minute, added up over calls (the tempo at least 1 BPM), from the next block
+  (the part of a tick played kept); SMFGetTempo answers the tempo playing in beats a minute, rounded (before a play,
+  the song's tempo at tick 0).
+- SMFPlay(velocity, pan, count), SMFPlayEx(+ panEx): from the start at the next Synthesis; count 0 for ever (PS1
+  libsnd's SSPLAY_INFINITY), else that many times: at the song's end (its last track's) the notes still on are keyed
+  off and it starts again within the same block, once a block at most (a song shorter than a block, or of a tick at a
+  tempo of microseconds, cannot hold the block up); a song of no length plays once. Then stopped. PARAM for a velocity
+  or pan past 127, HD3ID when its bank was let go. SMFGetPlayStatus: 0 stopped (or played to its end), 1 playing, 2
+  paused. Pause keys its voices off at once and keeps its place (the time paused does not count); Resume goes on from
+  it; Stop keys off and goes back to the start; Pause and Resume of an SMF not in that state change nothing.
+- Notes: the channel's program (Program Change, bank select MSB * 128 plus it; one the bank lacks is not played,
+  logged once) as NoteOn plays it (D-641), with the channel's volume (CC 7, MIDI's default 100) and expression (CC 11)
+  and the play velocity as factors over 127, the channel's pan (CC 10) and the play pan as offsets from 64, the pitch
+  bend over the split's range or, once the song sets it, RPN 0's (CC 101/100 both 0, data entry CC 6 semitones and
+  CC 38 cents); sustain (CC 64 from 64) holds the channel's voices; CC 120 all sound off, CC 123 all notes off, CC 121
+  resets expression, bend, sustain and the RPN. A change of volume, pan, expression or bend, or of the play velocity or
+  pan (SMFSetPlayVelocity, SMFSetPlayPanpot), tells the sounding voices again. Not played: modulation, pressure, NRPNs.
+- SMFSetPlayChannel(bit n for channel n, past 16 bits PARAM): the channels that play, the voices of one taken out keyed
+  off at once; SMFGetPlayChannel writes it. SMFGetKeyOnID(channel 0-15): the key-on ID of the SMF's notes on that
+  channel, 0x80000000 | smfID << 8 | channel (pspocket's numbering), for cellSnd3GetVoice. The pans ex are kept and
+  answered (D-643).
+- SMFBind: SMFCTX for a context that is not guest memory, PARAM for no file, HD3ID for a bank not bound, SMF for a file
+  not played (its reason logged), SMFFULL past sixteen; SMFUnbind keys off its voices; every SMF call on an ID not bound
+  SMFID.
+Tests: songs built in the test played block by block against the recording libsynth2: each key-on and key-off in its
+block (ticks of 50 samples, blocks of 256), twice and for ever, a tempo in the song, SMFAddTempo before a play and
+between two blocks, pause and resume, stop; the play velocity, pans and channels, every controller, the bend and RPN
+0, a program of another bank; each refusal; end to end a note heard and its voice freed; damaged songs fuzzed
+("[fuzz]": 1,501 inputs, 122 accepted).
+To compare on the Mac: the status values; the tempo's unit and SMFAddTempo's adding up; count 0; what a loop does with
+held notes; the key-on IDs; Pause's key-off; whether events keep the block's time as here; format 2 and SMPTE time; loop
+markers in a song (none are played here).
+
+## D-643 · 2026-10-11 · libsnd3's pitch, volumes and pans, the effect and the output modes
+
+- Note2Pitch and Pitch2Note are libsd's arithmetic as libsynth2 has it (D-614), computed in libsnd3 (the same answers
+  as libsynth2's over a sweep in the tests).
+- A voice's pitch. Played by note (NoteOnByTone, NoteOn, an SMF): the note plus the program's and split's transposes
+  (0 to 127) against the tone's base note, plus the fine offsets in 1/128 semitones (the tone's, program's and split's
+  detunes, the key-on's addPitch and VoiceSetPitch's, the bend): 0x1000 * 2^(offset / 12) with libsd's tables (shifted
+  up past two octaves too, unlike Note2Pitch's answer), times the VAG's rate / 48,000 (the SPU2 plays 0x1000 at 48
+  kHz), at most 0x3FFF. KeyOnByTone(pitch): the pitch relative to the tone's own, 0x1000 its VAG at its own rate (as
+  cellSnd3Note2Pitch answers for the tone's centre), times 2^(fine offsets / 1536), times the rate / 48,000.
+  VoiceSetPitchBend: MIDI's 14 bits, 0x2000 in the middle, over the bend range up or down.
+- A voice's volume: 0x3FFF times the velocity and the tone's, program's and split's volumes, each over 127 (an SMF's
+  voice also its channel's volume and expression and the play velocity), rounded. Its pan: the key-on's (0-127, 64 the
+  middle) plus the tone's, program's and split's (and an SMF's channel's and play pan's) offsets from 64, clamped: the
+  left at full to 64, then down to 0 at 127; the right up from 0 to full at 64 (a balance, both full in the middle).
+  SetOutputMode(1) mono gives both sides the full volume, 0 stereo; another mode OUTPUTMODE (the values are pspocket's
+  reading). Sony's curves are not known: these are linear.
+- PanEx (front to rear: CellSnd3KeyOnParam's panEx, VoiceSetPanpotEx, the SMFs' pan ex): checked and kept, not applied.
+  libsynth2's SPU2 is stereo and Generate gives the rear pair silence (D-612); how Sony's libraries put a voice to the
+  rear is not known. SynthesisEx gives Generate the four buffers, Synthesis the front two and NULL.
+- CellSnd3KeyOnParam: vel, pan and panEx bytes, a pad, s32 addPitch (8 bytes); NULL takes 127, 64, 64, 0; a value past
+  127 PARAM.
+- SetEffectType(type, returnVol, delay, feedback): libsd's effect modes 0 (off) to 9 on both cores,
+  cellSoundSynth2SetEffectAttr(core, {core, mode with SD_EFFECT_MODE_CLEAR, returnVol, returnVol, delay, feedback}) (the
+  work area zeroed, so no echo of the last mode plays in the new one), the core's effect bit (SetCoreAttr
+  EFFECT_ENABLE) on for a mode and off for 0; a mode past 9, a delay or feedback past 127 PARAM. A tone's voice sends
+  to it by the tone's attribute bits (D-641).
+Tests: the registers of key-ons by note, by pitch and through programs, with transposes, detunes, rates, velocities,
+volumes, pans, bends and bend ranges, against the rules above; mono and stereo; the effect's attributes and core bits;
+end to end the pitch by zero crossings and the pan.
+To compare on the Mac: the pitch and volume registers against Sony's (the comparison reads them back through
+libsynth2, D-644), the pan law and mono, panEx and the rear pair, the effect's CLEAR and cores, the output modes'
+values.
