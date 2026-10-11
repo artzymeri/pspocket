@@ -5,8 +5,9 @@
 // Emu/RSX/Utils/rsx_utils.h).
 //
 // Implemented: every function RPCS3 implements in these modules (D-183; save data: cellSaveData.cpp; the on-screen
-// keyboard: cellOskDialog.cpp; the game data checks: cellGame.cpp); the ones RPCS3 leaves as stubs are answered from
-// rpcs3_stubs.inc (D-182). There is no dialog UI yet, so the user answers a dialog with buttons at once
+// keyboard: cellOskDialog.cpp; the game data checks: cellGame.cpp), and pspocket's own of the two RPCS3 leaves as
+// stubs (D-674: cellAudioOutUnregisterDevice, cellVideoOutGetResolutionAvailability2, unverified). There is no
+// dialog UI yet, so the user answers a dialog with buttons at once
 // (show_msg_dialog), and cellMsgDialogClose's timed close happens at a cellSysutilCheckCallback.
 //
 // The console reported is RPCS3's default one, which also suits a fixed iPhone target: one HDMI display at 720p
@@ -85,6 +86,7 @@ enum : u32 {
 
     CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER = 0x8002b242,
     CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE = 0x8002b243,
+    CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND = 0x8002b244,
     CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT = 0x8002b245,
 
     CELL_MSGDIALOG_ERROR_PARAM = 0x8002b301,
@@ -120,6 +122,7 @@ std::string result_name(s32 r)
     case CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE: return "CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE";
     case CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER: return "CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER";
     case CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE: return "CELL_AUDIO_OUT_ERROR_PARAMETER_OUT_OF_RANGE";
+    case CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND: return "CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND";
     case CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT: return "CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT";
     case CELL_MSGDIALOG_ERROR_PARAM: return "CELL_MSGDIALOG_ERROR_PARAM";
     case CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED: return "CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED";
@@ -186,6 +189,7 @@ enum class Fn : u8 {
     AudioOutGetDeviceInfo,
     AudioOutGetSoundAvailability2,
     Avconf,
+    VideoOutGetResolutionAvailability2,
     Count,
 };
 
@@ -882,11 +886,8 @@ s32 cellVideoOutGetDeviceInfo(PPUContext& ctx, u32 video_out, u32 device_index, 
 }
 
 // The result is a boolean, not an error code.
-s32 cellVideoOutGetResolutionAvailability(PPUContext&, u32 video_out, u32 resolution_id, u32 aspect, u32 option)
+s32 resolution_availability(const Call& call, u32 video_out, u32 resolution_id, u32 aspect)
 {
-    const Call call(Fn::VideoOutGetResolutionAvailability, kInfoCalls, kChan,
-        "cellVideoOutGetResolutionAvailability(videoOut {}, resolution {:#x}, aspect {}, option {})", video_out,
-        resolution_id, aspect, option);
     const auto available = [&](bool yes) { return call.ok(yes ? 1 : 0, "{}", yes ? "available" : "not available"); };
     switch (video_out) {
     case CELL_VIDEO_OUT_PRIMARY:
@@ -895,6 +896,25 @@ s32 cellVideoOutGetResolutionAvailability(PPUContext&, u32 video_out, u32 resolu
     case CELL_VIDEO_OUT_SECONDARY: return available(false);
     }
     return call(error(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT));
+}
+
+s32 cellVideoOutGetResolutionAvailability(PPUContext&, u32 video_out, u32 resolution_id, u32 aspect, u32 option)
+{
+    const Call call(Fn::VideoOutGetResolutionAvailability, kInfoCalls, kChan,
+        "cellVideoOutGetResolutionAvailability(videoOut {}, resolution {:#x}, aspect {}, option {})", video_out,
+        resolution_id, aspect, option);
+    return resolution_availability(call, video_out, resolution_id, aspect);
+}
+
+// cellSysutilAvconfExt's second form (D-674; RPCS3: a todo with no arguments, answering 0, which as this boolean says
+// "not available" for every mode): the public form's first three arguments and answer, for the one display; what the
+// form adds (r6 on) is logged, not read. Unverified (D-594).
+s32 cellVideoOutGetResolutionAvailability2(PPUContext& ctx, u32 video_out, u32 resolution_id, u32 aspect)
+{
+    const Call call(Fn::VideoOutGetResolutionAvailability2, kInfoCalls, kAvconfChan,
+        "cellVideoOutGetResolutionAvailability2(videoOut {}, resolution {:#x}, aspect {}, r6 {:#x}, r7 {:#x})",
+        video_out, resolution_id, aspect, ctx.gpr[6], ctx.gpr[7]);
+    return resolution_availability(call, video_out, resolution_id, aspect);
 }
 
 // cellSysutilAvconfExt. gamma is a float argument, so it arrives in f1 (the typed binding passes integer registers
@@ -1293,14 +1313,36 @@ s32 cellAudioOutGetSoundAvailability2(PPUContext&, u32 audio_out, u32 type, u32 
 }
 
 // cellSysutilAvconfExt's audio devices besides the built-in outputs: none. Registering one gives device 0 (RPCS3),
-// the rest checks its arguments and answers CELL_OK.
+// the rest checks its arguments and answers CELL_OK. The registrations are counted (D-674), for
+// cellAudioOutUnregisterDevice.
+struct AudioOutDevices {
+    std::mutex mutex;
+    u32 registered = 0; // registrations of device 0 not unregistered yet
+};
+
 s32 cellAudioOutRegisterDevice(PPUContext&, u64 device_type, u32 name, u32 option, u32 config)
 {
     const Call call(Fn::Avconf, kInfoCalls, kAvconfChan,
         "cellAudioOutRegisterDevice(deviceType {:#x}, name {:#x}, option {:#x}, config {:#x})", device_type, name,
         option, config);
     if (option || !name) return call(error(CELL_AUDIO_IN_ERROR_ILLEGAL_PARAMETER)); // RPCS3's (sic) error
+    AudioOutDevices& d = state<AudioOutDevices>();
+    std::lock_guard lock(d.mutex);
+    d.registered++;
     return call.ok(0, "device 0");
+}
+
+// cellAudioOutUnregisterDevice(deviceNumber) (D-674; RPCS3: a todo answering CELL_OK): a device registered and not
+// unregistered yet (device 0, the only number cellAudioOutRegisterDevice gives) is unregistered; any other number is
+// DEVICE_NOT_FOUND. Unverified (D-594).
+s32 cellAudioOutUnregisterDevice(PPUContext&, u32 device_number)
+{
+    const Call call(Fn::Avconf, kInfoCalls, kAvconfChan, "cellAudioOutUnregisterDevice({})", device_number);
+    AudioOutDevices& d = state<AudioOutDevices>();
+    std::lock_guard lock(d.mutex);
+    if (device_number != 0 || d.registered == 0) return call(error(CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND));
+    d.registered--;
+    return call(lv2::CELL_OK);
 }
 
 s32 cellAudioOutSetDeviceMode(PPUContext&, u32 mode)
@@ -2047,6 +2089,8 @@ void register_cellSysutil(Registry& r)
         PS_HLE_FUNC(0xEB6C50FB, cellAudioInSetDeviceMode),
         PS_HLE_FUNC(0xEB6FCFF1, cellAudioInRegisterDevice),
         PS_HLE_FUNC(0xFA6BCC17, cellAudioInUnregisterDevice),
+        PS_HLE_UNVERIFIED(0x0BDDEF7D, cellAudioOutUnregisterDevice), // D-674
+        PS_HLE_UNVERIFIED(0x21036F4E, cellVideoOutGetResolutionAvailability2),
     });
 }
 
