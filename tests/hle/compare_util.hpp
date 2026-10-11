@@ -219,7 +219,7 @@ public:
     void group(std::string name) { group_ = std::move(name); }
     void line(std::string key, std::string value)
     {
-        step(key);
+        step(key + " -> " + value.substr(0, 120));
         lines.push_back({std::move(key), std::move(value), {}, 0, group_});
     }
     // Values compared within `tolerance` (relative to the larger past 1, else absolute).

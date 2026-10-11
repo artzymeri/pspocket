@@ -10319,3 +10319,53 @@ from an integer, so double precision floors them alike on every host.
 Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
 4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
 up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
+
+## D-914 · 2026-10-11 · cellFiber, cellKey2char, cellSpurs' last functions and libsynth2 against Sony's modules (part 1: cellFiber)
+
+D-911 found Sony's libfiber faulting at its second cellFiberPpuInitializeScheduler (a write to guest 0x8076004C). The
+cause was the comparison's set-up, not pspocket's engine: `_cellFiberPpuInitialize(tlsVariable)` takes the address of a
+TLS variable of the game's (the SDK's cellFiberPpuInitialize passes it) and keeps its offset from r13; libfiber keeps
+each thread's state at r13 plus that offset. The test called it with no argument, so r3 still held the previous answer
+(NOSYSINIT, 0x80760020), on threads whose r13 was 0. Now every thread of the comparison has a TLS block of the fixture's
+TLS image with r13 where lv2 puts it, and the variable's address is passed (libfiber answers the offset, -0x7000, in
+r3; pspocket's answers it too).
+
+Other inputs Sony's code cannot take, found as the comparison then went on, are left out with a comment saying what
+libfiber does with them on a PS3: a context whose entry returns (a zero word follows the call: an illegal
+instruction); CreateFiber on a scheduler never made (it links the fiber through a null pointer), over a live fiber, or
+over an ended one not yet joined (linked twice); JoinFiber from a thread before anything can run the fiber (it waits on
+an lv2 event flag for ever); a worker control's fiber made after Shutdown, then Finalize, and Finalize of a control
+never made or finalized twice (each fails libfiber's assertion at fiber_ppu_util_worker_control.c line 172, which ends
+the process); ContextCheckStackLimit from a thread (it reads the stack limit of no context, at 0x248).
+
+What D-568's library (made without the module) then showed, 15 differences over the first six scenarios: the attribute
+initializers write a magic word (0x44007515864E5F4C for schedulers and worker controls, 0xF784E782F9EA9359 for fibers,
+0x992D3B630B7DF290 for contexts), the SDK version at +8 and the name "*NO NAME*"; contexts need no
+_cellFiberPpuInitialize, and no stack is too small; FinalizeScheduler is BUSY until every fiber is joined; a fiber with
+an exit callback cannot be joined (INVAL: the callback takes the joiner's place) and is gone at its end; SendSignal's
+numWorker is the number of threads inside the scheduler (1 under RunFibers, 0 outside); the fiber-only calls answer
+PERM before looking at their arguments (SetPriority(4) from a thread is PERM); RunFibers returns once nothing is
+runnable, with autoCheckFlags too (the flags are looked at when the scheduler picks, at most every interval); a worker
+control's Finalize before Shutdown is STAT.
+
+Rather than bend D-568's model (each fiber a host thread passing a baton) to all of that, pspocket's cellFiber is now the
+port of libfiber written in D-537's session from the module and dropped at integration when D-568 landed first:
+libfiber's structures where libfiber lays them out in guest memory, its run queues, lock-free lists, waiting records
+and traces, and its context switches as non-local jumps to the thread's innermost guest entry (D-161) through resume
+stubs. Brought up to date (libc's guest_range and guest_strnlen, a name clash), its two reads of a fiber's flag word
+made atomic as D-571 asks, the firmware-first mark kept until part 2. Over the comparison, widened from 212 to 435
+observations in ten scenarios (the scheduler trace in five modes and sizes, its header and records with the timebase
+left out; every function's pointer, alignment and state checks from threads, fibers, contexts and the worker control;
+a fiber's signal to itself, priorities changed inside, the worker control's polling modes and event queue functions),
+it differs from Sony's libfiber in nothing. Among what it matches: a trace buffer of 0x80 bytes holds no record, and
+libfiber's full test (the next index equal to the count) never stops the records, which run past its end.
+
+The port carries the limitation Sony's module has running on pspocket: a fiber that waits inside cellSpursJq's or
+cellSync2's native code (they call cellFiberPpuWaitSignal through a guest call) must be resumed on the same thread after
+any fiber that waited there later. D-568's host threads did not have it; a game with the system software installed
+had it already, with Sony's libfiber.
+
+Tests: tests/hle/test_fiber.cpp rewritten for libfiber's answers (a TLS block per thread, every call through the
+export's descriptor as a game's stub makes it), 10 cases; test_fiber_compare.cpp's two new scenarios and its Self-mode
+checks of pspocket's own half. compare_util.hpp's PSPOCKET_COMPARE_TRACE now prints each line's value with its key;
+PSPOCKET_COMPARE_ONLY=<text> runs only the fiber scenarios whose name has it. The comparison takes under a second.
