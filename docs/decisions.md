@@ -12315,3 +12315,17 @@ and both formats:
   window starts a block (as before) and otherwise for lane 0 only (seen where the output window's column is the input
   window's scaled: lane 0 of every block after the first then starts one siting earlier than the formula).
 The comparison: 12 of 791 to 7, all the edge-adaptive interlace conversion (interpolation type 2).
+
+## D-913 · 2026-10-11 · cellVpost's edge-adaptive interlace conversion, from libvpost's program (part 12)
+
+Interpolation type 2's kernel was read from libvpost's interlace program by evaluating it with symbolic pixels (in
+scratch, nothing of it in the repository): each made pixel between the field's rows above (U) and below (D) is the
+byte mean, rounded up, of U[x + d] and D[x - d], d one of 0 (straight down), -1 (up-left to down-right) and +1:
+- A direction's cost is mean(mean(|U[x+d-1] - D[x-d-1]|, |U[x+d+1] - D[x-d+1]|), mean(|U[x+d] - D[x-d]|, 0)), every
+  mean of two bytes rounded up (avgb): the side pairs weigh a quarter each, the centre pair a quarter, with libvpost's
+  roundings, not a sum of three.
+- The cheaper diagonal (up-left on a tie) is taken when straight down costs more than it (no margin; part 6 had two).
+- Columns past the row's ends are mirrored with the edge column repeated (-1 is 0, -2 is 1; past the last likewise).
+- The chroma is averaged straight, the field's edge rows as before.
+cellVpostExec no longer logs that type 2 may differ. Test: test_vpost.cpp's edge-adaptive case (a tie between the
+diagonals, which the sum took the other way, and a mirrored edge). The comparison: 7 of 791 to 0.

@@ -302,6 +302,40 @@ TEST_CASE("cellVpost: the bilinear scaler, windows on black, YUV out, the pictur
     CHECK(g.call("cellVpostClose", h) == 0);
 }
 
+TEST_CASE("cellVpost: the edge-adaptive interlace conversion", "[hle][vpost]")
+{
+    // Interpolation type 2 as libvpost's interlace program: each direction's cost the rounded-up byte mean of its side
+    // pairs' mean and half its centre pair (no sums), the up-left diagonal on a tie, columns past the edge mirrored.
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    const u32 h = open(g, kYuv);
+    Pic p = flat(64, 32, 100, 128, 128);
+    const u8 up[5] = {102, 32, 34, 199, 181}, down[5] = {23, 253, 53, 135, 76};
+    for (u32 i = 0; i < 5; i++) {
+        p.y[4 * 64 + 39 + i] = up[i];
+        p.y[6 * 64 + 39 + i] = down[i];
+    }
+    const u8 edge_up[4] = {200, 250, 250, 200}, edge_down[4] = {200, 60, 60, 60};
+    for (u32 i = 0; i < 4; i++) {
+        p.y[10 * 64 + i] = edge_up[i];
+        p.y[12 * 64 + i] = edge_down[i];
+    }
+    Ctrl c;
+    c.exec_type = 3; // ITOP_PFRM: the top field kept, the bottom's rows made
+    c.ipc = 2;
+    c.out_w = 64;
+    c.out_h = 32;
+    REQUIRE(exec(g, h, p, c) == 0);
+    const auto y_at = [&](u32 x, u32 y) { return ps_read8(b, kOut + y * 64 + x); };
+    CHECK(y_at(41, 5) == 84);  // the diagonals tie at 49 under straight's 77: up-left (32, 135); sums took up-right
+    CHECK(y_at(40, 5) == 29);
+    CHECK(y_at(42, 5) == 167);
+    CHECK(y_at(0, 11) == 200); // column -1 is column 0, -2 column 1 (clamping them would give 225)
+    CHECK(y_at(20, 5) == 100);
+    CHECK(g.call("cellVpostClose", h) == 0);
+}
+
 TEST_CASE("cellVpost: Exec's checks", "[hle][vpost]")
 {
     Fixture f;

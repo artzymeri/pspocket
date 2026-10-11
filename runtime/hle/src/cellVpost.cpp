@@ -396,14 +396,22 @@ Matrix matrix_of(u32 matrix, u32 range)
 
 // The interlace conversion (libvpost's second stage): the field of `parity` kept, the other's rows made from it. Type 0
 // repeats the field's row (above for the top field, below for the bottom), type 1 averages the rows above and below as
-// bytes (rounded up), type 2 averages them along the direction of three (left, down, right) whose three pixels about it
-// differ least (a diagonal taken only when two or more less than straight down, the left one on a tie); the chroma's
-// rows the field's alike, averaged straight for types 1 and 2. Rows past the picture's edge are the field's nearest.
+// bytes (rounded up), type 2 averages them along one of three directions (straight down, or the diagonals up-left to
+// down-right and up-right to down-left), read from libvpost's interlace program: each direction's cost is the byte mean
+// (rounded up, as every mean here) of the mean of its two side pairs' absolute differences and half its centre pair's;
+// a diagonal (the cheaper, up-left on a tie) is taken only when straight down costs more. Columns past the row's ends
+// are mirrored (the edge column repeated). The chroma's rows the field's alike, averaged straight for types 1 and 2.
+// Rows past the picture's edge are the field's nearest.
 void deinterlace_plane(const Plane& in, u32 parity, u32 type, bool luma, Plane& out)
 {
     out = in;
     const u32 w = in.w, h = in.h;
-    const auto at = [&](u32 row, s32 x) { return static_cast<s32>(in.at(static_cast<u32>(std::clamp<s32>(x, 0, static_cast<s32>(w) - 1)), row)); };
+    const auto at = [&](u32 row, s32 x) {
+        const s32 last = static_cast<s32>(w) - 1;
+        const s32 c = x < 0 ? -x - 1 : x > last ? 2 * last + 1 - x : x;
+        return static_cast<s32>(in.at(static_cast<u32>(std::clamp(c, 0, last)), row));
+    };
+    const auto mean = [](s32 a, s32 b) { return (a + b + 1) >> 1; };
     for (u32 r = 0; r < h; r++) {
         if ((r & 1) == parity) continue;
         const bool has_up = r >= 1, has_down = r + 1 < h;
@@ -415,19 +423,19 @@ void deinterlace_plane(const Plane& in, u32 parity, u32 type, bool luma, Plane& 
         }
         const u32 up = r - 1, down = r + 1;
         for (u32 x = 0; x < w; x++) {
+            const s32 sx = static_cast<s32>(x);
             s32 d = 0;
             if (type == 2 && luma) {
+                // Direction dir: the up row at x + dir + i against the down row at x - dir + i, i from -1 to 1.
                 const auto cost = [&](s32 dir) {
-                    s32 c = 0;
-                    for (s32 i = -1; i <= 1; i++)
-                        c += std::abs(at(up, static_cast<s32>(x) + dir + i) - at(down, static_cast<s32>(x) - dir + i));
-                    return c;
+                    const auto diff = [&](s32 i) { return std::abs(at(up, sx + dir + i) - at(down, sx - dir + i)); };
+                    return mean(mean(diff(-1), diff(1)), mean(diff(0), 0));
                 };
                 const s32 c0 = cost(0), cl = cost(-1), cr = cost(1);
-                const s32 dd = cl <= cr ? -1 : 1, cd = cl <= cr ? cl : cr;
-                if (cd + 2 < c0) d = dd;
+                const s32 dd = cl > cr ? 1 : -1, cd = cl > cr ? cr : cl;
+                if (c0 > cd) d = dd;
             }
-            out.at(x, r) = static_cast<u8>((at(up, static_cast<s32>(x) + d) + at(down, static_cast<s32>(x) - d) + 1) >> 1);
+            out.at(x, r) = static_cast<u8>(mean(at(up, sx + d), at(down, sx - d)));
         }
     }
 }
@@ -561,7 +569,7 @@ bool window_ok(const Window& w, u32 width, u32 height)
 
 struct State {
     std::mutex mutex;
-    bool exec_type_logged = false, scaler_logged = false;
+    bool scaler_logged = false;
     Filters filters;
 };
 
@@ -623,15 +631,6 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
     if (!in_guest(ctx, in_pic, in_size) || !in_guest(ctx, out_pic, out_size) || !in_guest(ctx, info, 88)) {
         log_call_site(ctx, base, "cellVpostExec: a picture is not in guest memory");
         return error(CELL_VPOST_ERROR_E_ARG_CTRL_INVALID);
-    }
-    {
-        State& s = state();
-        std::lock_guard lock(s.mutex);
-        if (ipc == 2 && (exec_type >= 3) && !s.exec_type_logged) {
-            s.exec_type_logged = true;
-            PS_LOG_INFO(kChan, "cellVpostExec: interlace conversion type 2: libvpost's edge-adaptive average, a few "
-                               "pixels of a picture may differ (D-913)");
-        }
     }
     State& st = state();
     const Filters* filters = scaler >= 2 ? filters_of(st) : nullptr;
