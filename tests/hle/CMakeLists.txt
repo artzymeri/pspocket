@@ -61,6 +61,10 @@ target_sources(test_hle PRIVATE
 # cellAdec's decoder threads when the game overwrites a decoder's context while it is open (D-645).
 target_sources(test_hle PRIVATE test_adec_context.cpp)
 
+# cellVideoPlayerUtility as a console with no system video player (D-679): test_hle "[videoplayer]". The AV chat's
+# stubs made pspocket's own (D-675 to D-678) are in test_avc.cpp: test_hle "[avc2]", "[avcext]".
+target_sources(test_hle PRIVATE test_videoplayer.cpp)
+
 # pspocket-boot end to end: a synthetic program that reads an unmapped guest address must be reported with the guest
 # address and the PPU instruction address (CLAUDE.md rule 5), not die with a bare signal.
 add_executable(make_boot_programs make_boot_programs.cpp)

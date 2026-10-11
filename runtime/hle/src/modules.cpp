@@ -36,6 +36,7 @@ void register_cellSearch(Registry& r);
 void register_cellMusic(Registry& r);
 void register_media_export(Registry& r);
 void register_cellSysutilAvc2(Registry& r);
+void register_cellVideoPlayerUtility(Registry& r);
 void register_cellImeJp(Registry& r);
 void register_cellRec(Registry& r);
 void register_cellPamf(Registry& r);
@@ -136,6 +137,7 @@ void register_all_modules(Registry& r)
     register_cellMusic(r);
     register_media_export(r);
     register_cellSysutilAvc2(r);
+    register_cellVideoPlayerUtility(r);
     register_cellImeJp(r);
     register_cellRec(r);
     register_cellPamf(r);
