@@ -30,6 +30,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "libc_malloc.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/syscalls.hpp"
@@ -1227,46 +1228,14 @@ s32 vswprintf_(PPUContext& ctx, u32 buf, u32 n, u32 fmt, u32 ap)
 
 // ------------------------------------------------------------------------------------------------- scanf
 
-class GuestTarget final : public ScanTarget {
+// The scanf family on the SDK's scan engine (libc_scan.hpp, D-907): sscanf and swscanf read the guest string as the
+// SDK's string reader does, the stream forms a byte at a time through the stream (a wide stream's characters are the
+// "C" locale's bytes).
+class StreamIo final : public ScanIo {
 public:
-    GuestTarget(PPUContext& ctx, VarArgs& args) : ctx_(ctx), args_(args) {}
-    u32 next_pointer() override { return static_cast<u32>(args_.next()); }
-    bool put(u32 addr, const u8* data, usize size) override
-    {
-        if (!guest_range(thread_of(ctx_), addr, size)) return false;
-        std::memcpy(gb(ctx_) + addr, data, size);
-        return true;
-    }
-
-private:
-    PPUContext& ctx_;
-    VarArgs& args_;
-};
-
-template <class C>
-class TextInput final : public ScanInput {
-public:
-    explicit TextInput(std::basic_string<C> s) : s_(std::move(s)) {}
-    s64 get() override
-    {
-        const usize i = pos_++;
-        return i < s_.size() ? static_cast<s64>(static_cast<std::make_unsigned_t<C>>(s_[i])) : -1;
-    }
-    void unget(s64) override
-    {
-        if (pos_) pos_--;
-    }
-
-private:
-    std::basic_string<C> s_;
-    usize pos_ = 0;
-};
-
-class StreamInput final : public ScanInput {
-public:
-    StreamInput(PPUContext& ctx, Stream& st) : ctx_(ctx), st_(st) {}
-    s64 get() override { return get_byte(ctx_, st_); }
-    void unget(s64 c) override
+    StreamIo(PPUContext& ctx, Stream& st) : ctx_(ctx), st_(st) {}
+    s32 get() override { return get_byte(ctx_, st_); }
+    void unget(s32 c) override
     {
         if (c >= 0) unget_byte(st_, static_cast<u8>(c));
     }
@@ -1277,28 +1246,17 @@ private:
 };
 
 template <class C>
-s32 scan_text(PPUContext& ctx, const char* fn, std::basic_string<C> input, u32 fmt, VarArgs& args)
+s32 scan_text(PPUContext& ctx, const char* fn, u32 s, u32 fmt, VarArgs& args)
 {
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f) {
-        refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
-        return -1;
-    }
-    TextInput<C> in(std::move(input));
-    GuestTarget out(ctx, args);
-    const int r = scan<C>(*f, in, out);
-    note_problems(ctx, fn, out.problems);
-    return r;
+    GuestTextIo in(ctx, s, sizeof(C) != 1);
+    GuestScanArgs out(ctx, args);
+    return guest_scanf<C>(ctx, fn, fmt, in, out);
 }
 
 template <class C>
 s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& args)
 {
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
+    const auto f = scan_format<C>(ctx, fmt);
     if (!f) {
         refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
         return -1;
@@ -1307,9 +1265,9 @@ s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& arg
     if (!st) return -1;
     std::lock_guard l(st->lock);
     orient(*st, std::is_same_v<C, char> ? -1 : 1);
-    StreamInput in(ctx, *st);
-    GuestTarget out(ctx, args);
-    const int r = scan<C>(*f, in, out);
+    StreamIo in(ctx, *st);
+    GuestScanArgs out(ctx, args);
+    const s32 r = sdk_scanf<C>(in, out, f->c_str());
     note_problems(ctx, fn, out.problems);
     return r;
 }
@@ -1317,45 +1275,25 @@ s32 scan_stream(PPUContext& ctx, const char* fn, u32 file, u32 fmt, VarArgs& arg
 s32 sscanf_(PPUContext& ctx, u32 s, u32 fmt)
 {
     VarArgs a(ctx, 2);
-    const auto input = read_string(thread_of(ctx), s);
-    if (!input) {
-        refuse(ctx, std::format("sscanf: the string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char>(ctx, "sscanf", *input, fmt, a);
+    return scan_text<char>(ctx, "sscanf", s, fmt, a);
 }
 
 s32 vsscanf_(PPUContext& ctx, u32 s, u32 fmt, u32 ap)
 {
     VarArgs a = VarArgs::list(ctx, ap);
-    const auto input = read_string(thread_of(ctx), s);
-    if (!input) {
-        refuse(ctx, std::format("vsscanf: the string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char>(ctx, "vsscanf", *input, fmt, a);
+    return scan_text<char>(ctx, "vsscanf", s, fmt, a);
 }
 
 s32 swscanf_(PPUContext& ctx, u32 s, u32 fmt)
 {
     VarArgs a(ctx, 2);
-    const auto input = read_wstring(thread_of(ctx), s, kMaxString / 4);
-    if (!input) {
-        refuse(ctx, std::format("swscanf: the wide string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char32_t>(ctx, "swscanf", *input, fmt, a);
+    return scan_text<char32_t>(ctx, "swscanf", s, fmt, a);
 }
 
 s32 vswscanf_(PPUContext& ctx, u32 s, u32 fmt, u32 ap)
 {
     VarArgs a = VarArgs::list(ctx, ap);
-    const auto input = read_wstring(thread_of(ctx), s, kMaxString / 4);
-    if (!input) {
-        refuse(ctx, std::format("vswscanf: the wide string at {:#x} runs out of guest memory", s));
-        return -1;
-    }
-    return scan_text<char32_t>(ctx, "vswscanf", *input, fmt, a);
+    return scan_text<char32_t>(ctx, "vswscanf", s, fmt, a);
 }
 
 s32 scanf_(PPUContext& ctx, u32 fmt)

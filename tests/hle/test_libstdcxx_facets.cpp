@@ -875,14 +875,15 @@ TEST_CASE("sys_libstdcxx facets: num_get gathers fields as _Getifld and _Getffld
     // void *: hex.
     CHECK(get("Pv", "0x10203040", kDec, 4).value == 0x10203040);
     CHECK(get("Pv", "abc", kDec, 4).value == 0xABC);
-    // Floats: the field's significant digits, an exponent, the C library's conversion.
+    // Floats: the field's significant digits, an exponent, the C library's conversion (sys_libc's _Stodx and _Stofx,
+    // the SDK's parse, D-907: some values a place off the nearest, as a game's copy of the library gives them).
     const auto dbl = [&](std::string_view text) { return std::bit_cast<double>(get("d", text, kDec, 8).value); };
     CHECK(dbl("3.25") == 3.25);
     CHECK(dbl("-0.000125") == -0.000125);
     CHECK(dbl("1e10") == 1e10);
-    CHECK(dbl("1.5E-3x") == 1.5e-3);
+    CHECK(std::bit_cast<u64>(dbl("1.5E-3x")) == 0x3F589374BC6A7EF9ull); // 1.5e-3 is ...EFA
     CHECK(dbl(".5") == 0.5);
-    CHECK(dbl("12345678901234567890123456789012345678901234567890") == 12345678901234567890123456789012345678901234567890.0);
+    CHECK(std::bit_cast<u64>(dbl("12345678901234567890123456789012345678901234567890")) == 0x4A20E4FEC6D355F1ull);
     CHECK(dbl("0.000000000000000000000000000000000000000000000000000000001") == 1e-57);
     g = get("d", "1e400", kDec, 8);
     CHECK((g.state & kFailb) != 0); // out of range
@@ -890,7 +891,7 @@ TEST_CASE("sys_libstdcxx facets: num_get gathers fields as _Getifld and _Getffld
     CHECK(g.state == (kEofb | kFailb));
     g = get("d", "1e", kDec, 8); // an exponent with no digits fails the field
     CHECK((g.state & kFailb) != 0);
-    CHECK(std::bit_cast<float>(static_cast<u32>(get("f", "0.1", kDec, 4).value)) == 0.1f);
+    CHECK(static_cast<u32>(get("f", "0.1", kDec, 4).value) == 0x3DCCCCCCu); // 0.1f is 0x3DCCCCCD
     CHECK(std::bit_cast<double>(get("e", "2.5e2", kDec, 8).value) == 250.0);
     // The exported _Getifld and _Getffld: the field, its base or power of ten, the iterators moved.
     e.input<1>(U"-0x00ab;");

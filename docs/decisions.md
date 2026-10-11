@@ -9494,3 +9494,73 @@ Tests without the game: tests/hle/test_libc_format.cpp (the behaviours above, _P
 timing as "[.bench]"). Tests changed from the host's output to the SDK's: test_libc_process.cpp (_Printf's "%5.1f" of
 2.25 is "  2.3"), test_libc_stdio.cpp (swprintf's truncated text), test_libstdcxx_facets.cpp (num_put's reference is
 sys_libc's printf now: a pointer's "****1234abcd" without 0x, "-1.235e+03").
+
+## D-907 · 2026-10-10 · sys_libc's formatted input and number parsing as the SDK's C library has them
+
+The last scan and parsing names (D-904's list: _Getfld, _Getint, _Getfloat, _Getstr and their wide forms, _Stopfx,
+_Stoflt, _Stoxflt and theirs; 14 under sys_libc and sys_libm each) are pspocket's own now (runtime/hle/src/
+sys_libc_scan.cpp), and everything sys_libc reads numbers with does what the SDK's code does: the scanf family, _Scanf
+and _WScanf, strtod/strtof/strtold, atof/atoff, strtol to strtoumax, atoi/atol/atoll, the wide wcsto* forms, and the
+_Sto*/_Sto*x/_WSto* conversions, on one engine (runtime/hle/src/libc_scan.hpp, the guest side in libc_scan_guest.hpp).
+The host's correctly rounded strtod and D-508's C99 scan engine are gone from libc_format.hpp. sys_libm's exported
+_Dscale/_FDscale/_LDscale (a denormal result truncated) and _Dtentox/_FDtentox/_LDtentox (x, n, perr) became the SDK's
+too.
+- The references: no firmware module has the C library, so games' statically linked copies. Assassin's Creed's EBOOT
+  (BLES00158, a 2007 SDK) has the parsing (its C++ num_get calls _Stodx, _Stofx, _Stoldx, _Stoulx, _Stolx) but links no
+  scanf; Grand Theft Auto V's (BLES01807, 2013) has the scan engine (sscanf -> _Scanf -> _Getfld and the four
+  conversions) and the 64-bit _Stoullx/_Stollx. The two libraries are different versions: GTA V's newer _Stodx scales
+  in an extended precision and parses 1,918 of 6,137 test texts to other values (0.3, DBL_MAX's text, 5e-324 ...).
+  sys_libc follows Assassin's Creed's parsing (the reference the work was planned on, and the copy D-905's printf is
+  compared with) and GTA V's scan engine on top of it; should pspocket ever prefer the newer SDK, GTA V's _Stodx is the
+  model. Neither game links the wide scan or parse functions (GTA V's wchar_t is 16 bits): those follow the narrow ones'
+  design on sys_libc's 32-bit wchar_t (D-512). The addresses are in inventory/libc-ac/ac-libc-map.txt and
+  inventory/libc-gta5/gta5-libc-map.txt; nothing of the games is in the repository.
+- The SDK's _Sft (32 bytes): +0 pfn (int (*)(void *, int, int)), +4 arg, +8 va_list ap, +12 the format at the
+  conversion, +16 nchar, +20 nget, +24 width, +28 noconv ('*' when suppressed), +29 qual (h l L j t z, 'b' for hh, 'q'
+  for ll), +30 stored. _Getfld(px), _Getint(px), _Getfloat(px), _Getstr(px, sfl: 1 %s, 0 %c, -1 %[) answer 1, 0 or EOF
+  and leave the fields as the SDK's do (ap past what they took, the format at a %[ set's ']', nchar and nget counted).
+- The parsing, as Assassin's Creed's copy computes it: the digits kept as words of nine (seven hex), 18 (14) at most;
+  the first excess integer digit above 4 (7) rounds the last word up, even after an excess 4 ("...45" rounds up); excess
+  fraction digits are dropped. The value is the last word plus the one before times 1e9 (one fused multiply-add), then
+  10^n as a product of 10, 100, 1e4 ... 1e128 (1e256 for each 256 more; a negative n as one over the product) applied to
+  the fraction with one rounding: strtod("0.3") is 0.30000000000000004, "-1.5e3" -1500.0000000000002,
+  "1.7976931348623157e308" an infinity (ERANGE). _Dscale truncates denormals: "5e-324" is the smallest denormal,
+  "3e-324" zero with ERANGE; ERANGE only for a zero or infinite result ("1e-310" none). strtof scales in float, with a
+  1e-32 one float below the nearest (0x0A4FB11E). Hex: words times 2^28 and _Dscale, never ERANGE. The prefix: a NaN
+  is never negative, "nan)" takes the ')', a word that fails half way ("inx", "-i") answers 0 with the end pointer at the
+  failing character; no digits ("-x") give a signed zero with the end at the start; "0x" alone converts nothing, the end
+  at the start. The x forms set *perr and errno both.
+- The integers, Dinkumware's _Stoulx: a bad base sets no errno; "0x" is skipped whatever follows ("0x" alone: nothing
+  converted); an overflow answers ULONG_MAX even for a minus. _Stolx takes its sign and calls _Stoulx on the rest, so
+  "-+5" is -5, "--5" LONG_MIN (ERANGE), "+-5" LONG_MAX. atoi and atol are (int)_Stoul(s, 0, 10): atoi("4294967295") is
+  -1, atoi("2147483648") INT_MIN (no clamping); atoll is (long long)_Stoull.
+- The scan engine, as GTA V's: GETN reads while the field width lasts, then counts a pretended EOF; one push-back
+  through the caller's function. %c with fewer characters than its width stores them and succeeds; "0x" with no hex
+  digit is EOF at the end of input, else a matching failure; "1e" converts as 1.0; floats keep 36 significant and 8
+  exponent digits and go through _Stold (a float target gets the double rounded); integers through _Stoll/_Stoull, their
+  low bits stored (L stores 32 bits, ll and j 64, a value past the type wraps); %C is no conversion; %S is %ls; a
+  literal byte past 127 in the format never matches (compared as a signed char); a literal that meets the end of input
+  answers the count so far (0), only a conversion's input failure before the first assignment EOF; a width past INT_MAX
+  wraps (no width); a '-' in a %[ set that is neither its first nor last character makes a range (a reversed one matches
+  nothing); "nan(" must close and "infin" fails as a whole. A '%' the format ends in reads one character past it there;
+  here that character is a NUL (a matching failure).
+- Deviations: %ls, %lc and %l[ store 32-bit characters (GTA V's 16-bit); a byte past 127 in a format or a %ls input is
+  the "C" locale's single byte here (GTA V's copy, never started, decodes UTF-8 and sets EILSEQ there: a locale
+  question, D-512); the wide engine's %s of a character past 255 is a matching failure (it has no byte form); _Stoflt
+  with a maxsig whose nine-fold overflows an int is refused (the SDK's reads past its table).
+- Tests: tests/hle/test_libc_scan.cpp (694 checks without games: each behaviour above, narrow and wide, the _Sft
+  functions on guest input functions); tests/hle/test_libc_scan_game.cpp ([gamelibc]): Assassin's Creed's _Stodx,
+  _Stofx, _Stoldx and strtod/strtold/strtof/atof (42,959 calls over 6,137 texts: decimal fields of up to 40 digits,
+  printf's texts of random doubles, values near powers of two, hex fields, edge and junk texts, powers of ten added),
+  _Stopfx/_Stoflt/_Stoxflt (14,626), _Stoulx/_Stolx and strtol/strtoul/_Stoul/atoi/atol (42,413 over random bases),
+  the scaling internals (60,000); GTA V's _Stoullx/_Stollx and the 64-bit C functions (54,531), _Scanf (20,000 random
+  formats and inputs and 67 chosen), %ls/%lc/%l[/%S by character (3,000) and _Getfld/_Getint/_Getfloat/_Getstr on random
+  _Sft fields (20,000): 0 differences. For the scan comparisons GTA V's _Stoldx is pointed at sys_libc's _Stold (the
+  engines compared, the parsing being Assassin's Creed's); GTA V's own float parsing is counted, not compared.
+  PSPOCKET_TEST_GTA5_EBOOT and PSPOCKET_TEST_GTA5_LIBC_MAP name GTA V's executable and map. Tests that asserted the
+  host's correctly rounded values now expect the SDK's: tests/hle/test_libc.cpp's strtod and wcstod of "-1.5e3"
+  (-1500.0000000000002), and tests/hle/test_libstdcxx_facets.cpp's num_get of "1.5E-3", a 50-digit integer and float
+  "0.1" (0x3DCCCCCC): sys_libstdcxx's num_get converts through sys_libc's _Stodx and _Stofx, as the game's C++ library
+  through its own, so the last-place differences D-902 counted there are gone.
+- Timing (test_hle "[.libcbench]", the same session before and after, 4,000 mixed texts 20 times): strtod 63 -> 55-62
+  ns, sscanf with four conversions 470-504 -> 438-445 ns.

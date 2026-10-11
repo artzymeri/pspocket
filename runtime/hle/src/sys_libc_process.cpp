@@ -39,6 +39,7 @@
 
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
+#include "libc_scan_guest.hpp"
 #include "libc_malloc.hpp"
 #include "libc_spu_printf.hpp"
 #include "prx.hpp"
@@ -585,54 +586,15 @@ s32 spu_printf_finalize_(PPUContext& ctx)
 
 // ------------------------------------------------------------------------------------------------- _Scanf
 
-// int _Scanf(int (*pfn)(void *, int, int), void *arg, const char *fmt, va_list ap): pfn(arg, 0, 1) gets a character
-// (EOF at the end), pfn(arg, c, 0) pushes c back.
+// int _Scanf(int (*pfn)(void *, int, int), void *arg, const char *fmt, va_list ap): the SDK's scan engine (libc_scan.hpp,
+// D-907) on the caller's function: pfn(arg, 0, 1) gets a character (EOF at the end), pfn(arg, c, 0) pushes c back.
 template <class C>
 s32 scanf_through(PPUContext& ctx, const char* fn, u32 pfn, u32 arg, u32 fmt, u32 ap)
 {
     VarArgs args = VarArgs::list(ctx, ap);
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f) {
-        refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
-        return -1;
-    }
-    class In final : public ScanInput {
-    public:
-        In(PPUContext& c, u32 p, u32 a) : ctx_(c), pfn_(p), arg_(a) {}
-        s64 get() override
-        {
-            const s32 c = static_cast<s32>(call_guest(ctx_, pfn_, {arg_, 0, 1}));
-            return c < 0 ? -1 : (sizeof(C) == 1 ? static_cast<s64>(static_cast<u8>(c)) : static_cast<s64>(static_cast<u32>(c)));
-        }
-        void unget(s64 c) override
-        {
-            if (c >= 0) call_guest(ctx_, pfn_, {arg_, static_cast<u64>(c), 0});
-        }
-
-    private:
-        PPUContext& ctx_;
-        u32 pfn_, arg_;
-    } in(ctx, pfn, arg);
-    class Out final : public ScanTarget {
-    public:
-        Out(PPUContext& c, VarArgs& a) : ctx_(c), a_(a) {}
-        u32 next_pointer() override { return static_cast<u32>(a_.next()); }
-        bool put(u32 addr, const u8* data, usize size) override
-        {
-            if (!guest_range(thread_of(ctx_), addr, size)) return false;
-            std::memcpy(gb(ctx_) + addr, data, size);
-            return true;
-        }
-
-    private:
-        PPUContext& ctx_;
-        VarArgs& a_;
-    } out(ctx, args);
-    const int r = scan<C>(*f, in, out);
-    for (const std::string& p : out.problems) refuse(ctx, std::format("{}: {}", fn, p));
-    return r;
+    GuestScanIo in(ctx, pfn, arg);
+    GuestScanArgs out(ctx, args);
+    return guest_scanf<C>(ctx, fn, fmt, in, out);
 }
 
 s32 _Scanf_(PPUContext& ctx, u32 pfn, u32 arg, u32 fmt, u32 ap) { return scanf_through<char>(ctx, "_Scanf", pfn, arg, fmt, ap); }
