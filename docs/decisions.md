@@ -12280,3 +12280,20 @@ ratios; random pictures with windows, fields and both formats; every case byte f
   last (still in its buffer).
 The comparison: 49 of 791 to 24. Left: the linear-sharp scaler (type 1, 16), reductions past a half with the bilinear
 scaler (4), the edge-adaptive interlace conversion (7, part 6), and the tail bytes after such a reduction.
+
+## D-913 · 2026-10-11 · cellVpost's linear-sharp scaler (part 10)
+
+Scaler type 1 (LINEAR_SHARP), read from libvpost's scaler program (its code paths found by comparing the SPU
+instructions executed for type 0 and type 1 on the same picture, then the type-1 kernel read) and checked byte for byte
+on random pictures, windows and both formats:
+- Only luma, and only where the width changes (else type 0's). For each output row the two source rows about its
+  position are sharpened, then type 0's vertical step between them, then type 0's horizontal pass.
+- The sharpening of a sample: its corners' mean (the byte mean, rounded up, of the means of the up-left/up-right and
+  the down-left/down-right neighbours), the sample plus half its difference from it (rounded down), clamped; then moved
+  toward the median of it and its left and right neighbours by w/256 of their difference (rounded down), w half the
+  byte mean of |up-left - down-right| and |up-right - down-left|, rounded up (no move on flat diagonals, the median on
+  steep ones): edges are sharpened, their ringing held back.
+- Neighbours: the rows above are the picture's (the first output row's its own row); below the picture mirrored, the
+  last row for an output row whose position reaches it; before a window not starting a 16-byte block the picture's
+  column, otherwise and past the window's end the edge sample.
+The comparison: 24 of 791 to 12 (the edge-adaptive interlace conversion, 7; reductions past a half, 5).

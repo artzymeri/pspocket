@@ -171,6 +171,27 @@ u32 v_table(u32 in, u32 out)
     return idx < 5 ? kOrder[idx] : 4;
 }
 
+// libvpost's linear-sharp filter (scaler type 1) of a luma row `b` (`n` samples) with the rows above (`a`) and below
+// (`c`): each sample sharpened by half its difference from the mean of its four diagonal neighbours (byte means, rounded
+// up), clamped; then moved toward the median of it and its left and right neighbours by the diagonal neighbours'
+// differences (a weight in 1/256: half the byte mean of |up-left - down-right| and |up-right - down-left|, rounded up).
+// A neighbour past the row's start is its first sample, past its end its last.
+void sharpen_row(const u8* a, const u8* b, const u8* c, u32 n, u8* out)
+{
+    const auto avg = [](s32 x, s32 y) { return (x + y + 1) >> 1; };
+    const auto at = [n](const u8* r, s32 i) { return static_cast<s32>(r[std::clamp<s32>(i, 0, static_cast<s32>(n) - 1)]); };
+    for (u32 x = 0; x < n; x++) {
+        const s32 i = static_cast<s32>(x);
+        const s32 al = at(a, i - 1), ar = at(a, i + 1), cl = at(c, i - 1), cr = at(c, i + 1);
+        const s32 v = b[x], bl = at(b, i - 1), br = at(b, i + 1);
+        const s32 corners = avg(avg(al, ar), avg(cl, cr));
+        const s32 sharp = std::clamp(v + ((v - corners) >> 1), 0, 255);
+        const s32 median = std::max(std::min(bl, sharp), std::min(std::max(bl, sharp), br));
+        const s32 w = (avg(std::abs(al - cr), std::abs(ar - cl)) + 1) >> 1;
+        out[x] = static_cast<u8>(((sharp << 8) + w * (median - sharp)) >> 8);
+    }
+}
+
 // The scaler (libvpost's third stage): vertically first, then horizontally.
 // - Type 0 (bilinear), and the horizontal pass of type 2: each output a weighted sum of the two samples about its
 //   position (weights in 1/256, the sum rounded down; a row past the window's bottom is the picture's, past the
@@ -195,6 +216,8 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
     // The horizontal 8-tap pass is a copy where the width is kept (the vertical filter is applied at any height).
     const bool four_tap = filters && (scaler == 2 || scaler == 3);
     const bool eight_tap = filters && scaler == 3 && iw_given.w != ow.w;
+    // Type 1's sharpening: luma only, where the width changes.
+    const bool sharp = scaler == 1 && !chroma && iw_given.w != ow.w;
     // Past a halving horizontally, every second column of the window is taken first.
     Plane halved;
     Window iw = iw_given;
@@ -236,6 +259,40 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
                 for (s32 k = 0; k < 4; k++) sum += taps[k] * in.at(col0 + x, static_cast<u32>(rows[k]));
                 tmp.at(x, y) = clamp_byte(sum >> 8);
             }
+        }
+    } else if (sharp) {
+        // Type 1: the two rows about each output row's position each sharpened (with their rows above and below: the
+        // picture's above, but the row itself for the first output row; below the picture mirrored, or the last for an
+        // output row whose position reaches it), then the bilinear step between them.
+        const u32 last = in.h - 1;
+        std::vector<u8> r0s(cols), r1s(cols);
+        // The rows are the window's columns, with the picture's column before them where the window does not start a
+        // 16-byte block (libvpost reads the window from its block); otherwise, and past the window's end, the edge sample.
+        const bool left = (iw.x & 15) != 0, right = false;
+        std::vector<u8> ra(cols + 2), rb(cols + 2), rc(cols + 2), rs(cols + 2);
+        const auto load = [&](u32 rr, std::vector<u8>& v) {
+            const u8* src = in.px.data() + static_cast<usize>(rr) * in.w + col0;
+            std::memcpy(v.data() + 1, src, cols);
+            v[0] = left ? src[-1] : src[0];
+            v[cols + 1] = right ? src[cols] : src[cols - 1];
+        };
+        const auto sharpened = [&](u32 r, bool first, bool clamped, u8* dst) {
+            const u32 up = first || r == 0 ? r : r - 1;
+            const u32 down = r < last ? r + 1 : clamped ? last : last - 1;
+            load(up, ra);
+            load(r, rb);
+            load(down, rc);
+            sharpen_row(ra.data(), rb.data(), rc.data(), cols + 2, rs.data());
+            std::memcpy(dst, rs.data() + 1, cols);
+        };
+        for (u32 y = 0; y < ow.h; y++) {
+            const u32 pos = static_cast<u32>(s64{y} * step_v);
+            const u32 i = pos >> 16, f = (pos >> 8) & 0xFF;
+            const bool clamped = iw.y + i >= last;
+            const u32 r0 = std::min(iw.y + i, last), r1 = std::min(iw.y + i + 1, last);
+            sharpened(r0, y == 0, clamped, r0s.data());
+            sharpened(r1, y == 0, clamped, r1s.data());
+            for (u32 x = 0; x < cols; x++) tmp.at(x, y) = static_cast<u8>((r0s[x] * (256 - f) + r1s[x] * f) >> 8);
         }
     } else {
         for (u32 y = 0; y < ow.h; y++) {
