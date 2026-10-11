@@ -30,6 +30,7 @@
 #include <string_view>
 #include <vector>
 
+#include "firmware_data.hpp"
 #include "guest.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
@@ -139,22 +140,66 @@ struct Window {
     u32 x = 0, y = 0, w = 0, h = 0;
 };
 
-// The bilinear scaler (type 0): vertically first, then horizontally, each output a weighted sum of the two samples
-// about its position (weights in 1/256, the sum rounded down; a row past the window's bottom is the picture's, past the
-// picture's its last; a column past the window's right edge its last).
-// Vertical positions are in 1/65536 of a row (the step rounded down), each row's its own. Horizontal ones are in 1/256,
-// sixteen output columns at a time as libvpost writes them (from a multiple of 16 in the output picture): each lane of
-// the first sixteen a step (in 1/256) from the window's first column, each later sixteen 16 steps on (in 1/65536,
-// rounded down to 1/256). A chroma plane is sited between its luma samples (type A horizontally, both types
-// vertically): its positions start (step - 1) / 4 on
-// (rounded down); for windows at multiples of 16 in both pictures, a negative position in the first sixteen is 0.
-void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow, bool chroma, u32 chroma_type, Plane& out)
+u8 clamp_byte(s64 v) { return static_cast<u8>(std::clamp<s64>(v, 0, 255)); }
+
+// libvpost's filter tables (its scaler's data, read from the installed system software, firmware_data.hpp): seventeen
+// horizontal 8-tap filters of 256 phases in 1/4096, chosen by the reduction, and five vertical 4-tap filters of 64
+// phases in 1/256 (each tap written twice).
+constexpr std::string_view kLibvpostIdentity = "80bd203cbf192a7f13d9317217fa3d5200b9466d3d21417656226ee7a702725f";
+constexpr u64 kFiltersVaddr = 0x4EE0;
+
+struct Filters {
+    bool tried = false, ok = false;
+    std::array<std::array<std::array<s16, 8>, 256>, 17> h{};
+    std::array<std::array<std::array<s16, 4>, 64>, 5> v{};
+};
+
+// The horizontal table for a window `in` wide scaled to `out` (libvpost: out / in times 16 plus 0.6, as a float).
+u32 h_table(u32 in, u32 out)
 {
+    const float r = static_cast<float>(out) / static_cast<float>(in);
+    const u32 idx = static_cast<u32>(static_cast<double>(r) * 16.0 + 0.6);
+    return idx <= 1 ? 0 : idx <= 16 ? idx - 1 : 16;
+}
+
+// The vertical table (times 4 plus 0.6): 0 and 1 the first, then one each, past 4 the last.
+u32 v_table(u32 in, u32 out)
+{
+    const float r = static_cast<float>(out) / static_cast<float>(in);
+    const u32 idx = static_cast<u32>(static_cast<double>(r) * 4.0 + 0.6);
+    static constexpr u32 kOrder[5] = {0, 0, 1, 2, 3};
+    return idx < 5 ? kOrder[idx] : 4;
+}
+
+// The scaler (libvpost's third stage): vertically first, then horizontally.
+// - Type 0 (bilinear), and the horizontal pass of type 2: each output a weighted sum of the two samples about its
+//   position (weights in 1/256, the sum rounded down; a row past the window's bottom is the picture's, past the
+//   picture's its last; a column past the window's right edge its last). Vertical positions are in 1/65536 of a row (the
+//   step rounded down), each row's its own. Horizontal ones are in 1/256, sixteen output columns at a time as libvpost
+//   writes them (from a multiple of 16 in the output picture): each lane of the first sixteen a step (in 1/256) from the
+//   window's first column, each later sixteen 16 steps on (in 1/65536, rounded down to 1/256). A chroma plane is sited
+//   between its luma samples (type A horizontally, both types vertically): its positions start (step - 1) / 4 on
+//   (rounded down); for windows at multiples of 16 in both pictures, a negative position in the first sixteen is 0.
+//   Past a halving horizontally, every second column of the window is taken first.
+// - Types 2 and 3 vertically: libvpost's 4-tap filter of the row's phase (its position's 6 bits below the row) over the
+//   rows above it to two below, the sum in 1/256 rounded down and clamped; rows above the picture are its first, below
+//   it mirrored about its last; an output row whose position reaches the last row is filtered there (its phase 0), the
+//   rows below it the last.
+// - Type 3 horizontally: libvpost's 8-tap filter of the column's phase (positions in 1/256, each its own from the
+//   output's 16-column block, less the window's first lane's whole steps) over the
+//   columns three before it to four after, mirrored before the 16-byte block holding the window's first and after its last; the products summed in pairs, each pair's
+//   sum in 1/16 (rounded down), the four rounded to the nearest and clamped; a copy where the width is kept.
+void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow, bool chroma, u32 chroma_type,
+    u32 scaler, const Filters* filters, Plane& out)
+{
+    // The horizontal 8-tap pass is a copy where the width is kept (the vertical filter is applied at any height).
+    const bool four_tap = filters && (scaler == 2 || scaler == 3);
+    const bool eight_tap = filters && scaler == 3 && iw_given.w != ow.w;
     // Past a halving horizontally, every second column of the window is taken first.
     Plane halved;
     Window iw = iw_given;
     const Plane* src = &in_plane;
-    if (iw.w > 2 * ow.w) {
+    if (!eight_tap && iw.w > 2 * ow.w) {
         halved = {iw.w / 2, in_plane.h, std::vector<u8>(static_cast<usize>(iw.w / 2) * in_plane.h)};
         for (u32 y = 0; y < in_plane.h; y++)
             for (u32 x = 0; x < iw.w / 2; x++) halved.at(x, y) = in_plane.at(iw.x + 2 * x, y);
@@ -165,18 +210,71 @@ void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow
     const u32 step_v = static_cast<u32>((u64{iw.h} << 16) / ow.h), step_h = static_cast<u32>((u64{iw.w} << 16) / ow.w);
     const s32 off_v = chroma ? (static_cast<s32>(step_v) - 0x10000) >> 2 : 0;
     const s32 off_h = chroma && chroma_type == 0 ? (static_cast<s32>(step_h) - 0x10000) >> 10 : 0;
-    const u32 cols = iw.w;
+    // The vertical pass over the window's columns; for the 8-tap filter from the 16-byte block holding its first, as
+    // libvpost reads them (the filter reads before the window into it, mirrored before it; past the window mirrored).
+    const u32 col0 = eight_tap ? iw.x & ~15u : iw.x;
+    const u32 cols = iw.x + iw.w - col0;
     Plane tmp{cols, ow.h, std::vector<u8>(static_cast<usize>(cols) * ow.h)};
-    for (u32 y = 0; y < ow.h; y++) {
-        const u32 pos = static_cast<u32>(std::max<s64>(s64{y} * step_v + off_v, 0));
-        const u32 i = pos >> 16, f = (pos >> 8) & 0xFF;
-        const u32 r0 = std::min(iw.y + i, in.h - 1), r1 = std::min(iw.y + i + 1, in.h - 1);
-        for (u32 x = 0; x < cols; x++)
-            tmp.at(x, y) = static_cast<u8>((in.at(iw.x + x, r0) * (256 - f) + in.at(iw.x + x, r1) * f) >> 8);
+    if (four_tap) {
+        const auto& table = filters->v[v_table(iw.h, ow.h)];
+        const s32 last = static_cast<s32>(in.h) - 1;
+        for (u32 y = 0; y < ow.h; y++) {
+            u32 pos = static_cast<u32>(std::max<s64>(s64{y} * step_v + off_v, 0));
+            const bool clamped = static_cast<s32>(iw.y + (pos >> 16)) >= last;
+            if (clamped) pos = (static_cast<u32>(last) - iw.y) << 16;
+            const s32 i = static_cast<s32>(iw.y + (pos >> 16));
+            const auto& taps = table[(pos >> 10) & 63];
+            s32 rows[4];
+            for (s32 k = 0; k < 4; k++) {
+                s32 r = i - 1 + k;
+                if (r < static_cast<s32>(iw.y)) r = static_cast<s32>(iw.y);
+                if (r > last) r = clamped ? last : 2 * last - r;
+                rows[k] = r;
+            }
+            for (u32 x = 0; x < cols; x++) {
+                s32 sum = 0;
+                for (s32 k = 0; k < 4; k++) sum += taps[k] * in.at(col0 + x, static_cast<u32>(rows[k]));
+                tmp.at(x, y) = clamp_byte(sum >> 8);
+            }
+        }
+    } else {
+        for (u32 y = 0; y < ow.h; y++) {
+            const u32 pos = static_cast<u32>(std::max<s64>(s64{y} * step_v + off_v, 0));
+            const u32 i = pos >> 16, f = (pos >> 8) & 0xFF;
+            const u32 r0 = std::min(iw.y + i, in.h - 1), r1 = std::min(iw.y + i + 1, in.h - 1);
+            for (u32 x = 0; x < cols; x++)
+                tmp.at(x, y) = static_cast<u8>((in.at(col0 + x, r0) * (256 - f) + in.at(col0 + x, r1) * f) >> 8);
+        }
     }
     out.w = ow.w;
     out.h = ow.h;
     out.px.assign(static_cast<usize>(ow.w) * ow.h, 0);
+    if (eight_tap) {
+        const auto& table = filters->h[h_table(iw.w, ow.w)];
+        const s32 n = static_cast<s32>(cols);
+        for (u32 x = 0; x < ow.w; x++) {
+            // Positions as libvpost makes them for the sixteen columns from a multiple of 16 in the output picture,
+            // moved back by the window's first lane's step (rounded down).
+            const u32 f = ow.x & 15;
+            const s64 p = (s64{x + f} * step_h >> 8) - s64{f} * (step_h >> 8) + off_h;
+            const s32 i = static_cast<s32>(iw.x - col0) + static_cast<s32>(p >> 8);
+            const auto& taps = table[static_cast<u64>(p) & 0xFF];
+            u32 c[8];
+            for (s32 k = 0; k < 8; k++) {
+                s32 col = i - 3 + k;
+                if (col < 0) col = -col - 1;
+                if (col > n - 1) col = 2 * n - 1 - col;
+                c[k] = static_cast<u32>(std::clamp(col, 0, n - 1));
+            }
+            for (u32 y = 0; y < ow.h; y++) {
+                s32 sum = 0;
+                for (u32 k = 0; k < 8; k += 2)
+                    sum += (taps[k] * tmp.at(c[k], y) + taps[k + 1] * tmp.at(c[k + 1], y)) >> 8;
+                out.at(x, y) = clamp_byte((sum + 8) >> 4);
+            }
+        }
+        return;
+    }
     const s32 block = static_cast<s32>((u64{step_h} * 16) >> 8), step8 = static_cast<s32>(step_h >> 8);
     const u32 first = ow.x & 15;
     std::array<s32, 16> lane{};
@@ -214,7 +312,6 @@ Matrix matrix_of(u32 matrix, u32 range)
     return {a, b, 128 * 11485, 128 * -2818, 128 * -5850, 128 * 14516};
 }
 
-u8 clamp_byte(s64 v) { return static_cast<u8>(std::clamp<s64>(v, 0, 255)); }
 
 // The interlace conversion (libvpost's second stage): the field of `parity` kept, the other's rows made from it. Type 0
 // repeats the field's row (above for the top field, below for the bottom), type 1 averages the rows above and below as
@@ -266,7 +363,7 @@ Picture deinterlace(const Picture& in, u32 parity, u32 type)
 // The picture the output is made from: the input as it is (the same size, no window), else black (Y 0, or 16 in
 // broadcast range; chroma 128) with the input's window scaled into the output's.
 Picture frame_of(const Picture& in, bool same, const Window& iw, const Window& ow, u32 out_w, u32 out_h, u32 range,
-    u32 chroma)
+    u32 chroma, u32 scaler, const Filters* filters)
 {
     if (same) return in;
     Picture out;
@@ -275,11 +372,11 @@ Picture frame_of(const Picture& in, bool same, const Window& iw, const Window& o
     out.u = {out_w / 2, out_h / 2, std::vector<u8>(static_cast<usize>(out_w / 2) * (out_h / 2), 128)};
     out.v = out.u;
     Plane scaled;
-    scale_plane(in.y, iw, ow, false, chroma, scaled);
+    scale_plane(in.y, iw, ow, false, chroma, scaler, filters, scaled);
     for (u32 y = 0; y < ow.h; y++) std::memcpy(&out.y.at(ow.x, ow.y + y), &scaled.at(0, y), ow.w);
     const Window ciw{iw.x / 2, iw.y / 2, iw.w / 2, iw.h / 2}, cow{ow.x / 2, ow.y / 2, ow.w / 2, ow.h / 2};
     for (auto [src, dst] : {std::pair{&in.u, &out.u}, std::pair{&in.v, &out.v}}) {
-        scale_plane(*src, ciw, cow, true, chroma, scaled);
+        scale_plane(*src, ciw, cow, true, chroma, scaler, filters, scaled);
         for (u32 y = 0; y < cow.h; y++) std::memcpy(&dst->at(cow.x, cow.y + y), &scaled.at(0, y), cow.w);
     }
     return out;
@@ -384,7 +481,31 @@ bool window_ok(const Window& w, u32 width, u32 height)
 struct State {
     std::mutex mutex;
     bool exec_type_logged = false, scaler_logged = false;
+    Filters filters;
 };
+
+// libvpost's filters, read at the first picture that needs them; null without the firmware's module.
+const Filters* filters_of(State& s)
+{
+    std::lock_guard lock(s.mutex);
+    Filters& f = s.filters;
+    if (!f.tried) {
+        f.tried = true;
+        const auto bytes = firmware_module_data(*HleProcess::current(), "libvpost.sprx", kLibvpostIdentity,
+            kFiltersVaddr, 0x12400);
+        if (bytes) {
+            const auto be16 = [&](usize at) { return static_cast<s16>(((*bytes)[at] << 8) | (*bytes)[at + 1]); };
+            for (usize t = 0; t < 17; t++)
+                for (usize ph = 0; ph < 256; ph++)
+                    for (usize k = 0; k < 8; k++) f.h[t][ph][k] = be16(t * 0x1000 + ph * 16 + k * 2);
+            for (usize t = 0; t < 5; t++)
+                for (usize ph = 0; ph < 64; ph++)
+                    for (usize k = 0; k < 4; k++) f.v[t][ph][k] = be16(0x11000 + t * 0x400 + ph * 16 + k * 4);
+            f.ok = true;
+        }
+    }
+    return f.ok ? &f : nullptr;
+}
 
 State& state() { return HleProcess::current()->state<State>(); }
 
@@ -416,7 +537,8 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
     if (!info) return error(CELL_VPOST_ERROR_E_ARG_PICINFO_NULL);
     const u32 fmt = c.out_fmt();
     const u64 in_size = u64{in_w} * in_h + 2 * (u64{in_w / 2} * (in_h / 2));
-    const u64 out_size = fmt == kOutRgba ? u64{out_w} * out_h * 4 : u64{out_w} * out_h + 2 * (u64{out_w / 2} * (out_h / 2));
+    const u64 out_size = fmt == kOutRgba ? u64{out_w} * out_h * 4
+                                         : (u64{out_w} * out_h + 2 * (u64{out_w / 2} * (out_h / 2)) + 15) & ~u64{15};
     if (!in_guest(ctx, in_pic, in_size) || !in_guest(ctx, out_pic, out_size) || !in_guest(ctx, info, 88)) {
         log_call_site(ctx, base, "cellVpostExec: a picture is not in guest memory");
         return error(CELL_VPOST_ERROR_E_ARG_CTRL_INVALID);
@@ -429,9 +551,15 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
             PS_LOG_INFO(kChan, "cellVpostExec: interlace conversion type 2: libvpost's edge-adaptive average, a few "
                                "pixels of a picture may differ (D-913)");
         }
-        if (scaler != 0 && !s.scaler_logged) {
-            s.scaler_logged = true;
-            PS_LOG_WARN(kChan, "cellVpostExec: scaler type {}: scaled with libvpost's bilinear one, not its own (D-913)",
+    }
+    State& st = state();
+    const Filters* filters = scaler >= 2 ? filters_of(st) : nullptr;
+    if (scaler >= 2 && !filters) {
+        std::lock_guard lock(st.mutex);
+        if (!st.scaler_logged) {
+            st.scaler_logged = true;
+            PS_LOG_WARN(kChan, "cellVpostExec: scaler type {}: no libvpost.sprx of firmware 4.92 installed for its "
+                               "filters: scaled with the bilinear one (D-913)",
                 scaler);
         }
     }
@@ -471,7 +599,7 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
     for (const Pass& pass : passes) {
         const bool interlace = pass.field_in && (!pass.field_out || !same);
         const Picture src = interlace ? deinterlace(in, pass.parity, ipc) : in;
-        const Picture out = frame_of(src, same, iw, ow, out_w, out_h, range, chroma);
+        const Picture out = frame_of(src, same, iw, ow, out_w, out_h, range, chroma, scaler, filters);
         // The chroma rows a pixel row takes: the frame's, or (a field kept as one) its field's.
         const bool field_chroma = pass.field_in && !interlace;
         const auto wanted = [&](u32 row) { return !pass.field_out || (row & 1) == pass.parity; };
@@ -485,6 +613,15 @@ s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic
                     std::memcpy(ou + static_cast<usize>(y) * (out_w / 2), out.u.px.data() + static_cast<usize>(y) * (out_w / 2), out_w / 2);
                     std::memcpy(ov + static_cast<usize>(y) * (out_w / 2), out.v.px.data() + static_cast<usize>(y) * (out_w / 2), out_w / 2);
                 }
+            // libvpost writes its chroma sixteen rows at a time from a buffer of sixteen, in 16-byte transfers: past a
+            // picture whose size is no multiple of 16 go the rest of the last transfer, the first bytes of the row
+            // sixteen above the last row's successor (still in the buffer).
+            const usize size = static_cast<usize>(out_w) * out_h + 2 * static_cast<usize>(out_w / 2) * (out_h / 2);
+            const usize pad = ((size + 15) & ~usize{15}) - size;
+            if (!pass.field_out && pad && out_h / 2 >= 16) {
+                const usize row = out_h / 2 - 16;
+                std::memcpy(ov + static_cast<usize>(out_w / 2) * (out_h / 2), out.v.px.data() + row * (out_w / 2), pad);
+            }
             continue;
         }
         const u32 ocw = out_w / 2, och = out_h / 2;

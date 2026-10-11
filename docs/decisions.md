@@ -12255,3 +12255,28 @@ Probes on Sony's module and pspocket's (1,116 size-limited pictures: six encoder
 smooth, noisy and mixed, limits 4 KB to 32 KB, both DCTs, restart intervals): every quality, size, row count and stream
 byte the same. The comparison: 14 of 3,751 to 6 (the SPU encoder's, part 9). The comparisons of cellJpgEnc and cellVpost
 mount the installed /dev_flash in pspocket's half too, as a game has it.
+
+## D-913 · 2026-10-11 · cellVpost's 2x4-tap and 8x4-tap scalers from libvpost's tables; the bytes past a YUV picture (part 9)
+
+libvpost's filter tables are read from the installed system software at the first picture that needs them
+(firmware_data.cpp, part 8: libvpost.sprx of firmware 4.92, its identity checked; nothing committed); without them the
+types fall back to the bilinear scaler, logged once. Found by probes (impulse responses at 16 offsets, both signs, 26
+ratios; random pictures with windows, fields and both formats; every case byte for byte):
+- Scaler type 2 (2X4TAP) is the bilinear scaler horizontally and libvpost's 4-tap filter vertically; type 3 (8X4TAP)
+  the 4-tap vertically and the 8-tap horizontally.
+- The 4-tap vertical filter: one of five tables of 64 phases in 1/256, chosen by out over in times 4 plus 0.6 (as a
+  float; 0 and 1 the first, past 4 the last), the phase the position's 6 bits below the row (positions as the bilinear
+  scaler's, the chroma's sited the same way), over the row above to two below; the sum rounded down, clamped. Rows above
+  the window are its first; below the picture, mirrored about its last. An output row whose position reaches the last
+  row is filtered there at phase 0 with the rows below it the last. It is applied at any height, the same one included.
+- The 8-tap horizontal filter: one of seventeen tables of 256 phases in 1/4096, chosen by out over in times 16 plus 0.6
+  (2 to 16 the table one below, 0 and 1 the first, past 16 the last), the positions in 1/256 each its own (not sixteen
+  at a time): ((x + f) step) / 256 less f whole steps, f the window's column in its 16-column block of the output;
+  taps over three columns before to four after, mirrored after the window's last column and before the 16-byte block
+  holding its first (the columns between are the picture's); the products summed in pairs, each pair's sum in 1/16
+  rounded down, then the four rounded to the nearest and clamped. Where the width is kept the pass is a copy.
+- A YUV output whose size is no multiple of 16: libvpost writes its chroma sixteen rows at a time through a buffer of
+  sixteen in 16-byte transfers, so past the picture go the first bytes of the V row sixteen above the row after the
+  last (still in its buffer).
+The comparison: 49 of 791 to 24. Left: the linear-sharp scaler (type 1, 16), reductions past a half with the bilinear
+scaler (4), the edge-adaptive interlace conversion (7, part 6), and the tail bytes after such a reduction.
