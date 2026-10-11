@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <initializer_list>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -825,6 +826,144 @@ TEST_CASE("_cellSpursLFQueuePushBody and PopBody: a taskset's queues pushed and 
         CHECK(ps_read32(b, kDst) == v);
     }
     CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 0) == code(TASK | kAgain));
+}
+
+TEST_CASE("_cellSpursLFQueuePushBody and PopBody: PPU threads at once on a taskset's queues, three pushing into a "
+          "PPU2SPU one while SPU code pops and tasks waiting in its ring are signalled, three pushing and three popping "
+          "an ANY2ANY one (D-650)", "[hle][spurs][spurs-task2]")
+{
+    constexpr u32 kPushers = 3, kPoppers = 3, kEach = 300, kRing = 4, kWaiters = 3;
+    constexpr u32 kBufs = kData + 0x61000; // a 16-byte buffer per PPU thread
+    Task2Fixture s;
+    u8* b = s.b;
+    std::memset(b + kLfq, 0, 128);
+    REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq, kLfqBuf, 16, kRing, PPU2SPU) == 0);
+    std::vector<u32> waiters;
+    for (u32 k = 0; k < kWaiters; k++) waiters.push_back(s.create(k, waiting_task(0x40 + k), "waiter", true));
+    s.run();
+    for (u32 k = 0; k < kWaiters; k++) REQUIRE(wait_for([&] { return s.report(k) == 1 && s.task_bit(0x50, waiters[k]); }));
+
+    // PPU2SPU: the pushers go on until every waiter was taken and has ended; SPU code pops each pusher's entries in order.
+    {
+        std::atomic<u32> errors{0}, pushers_done{0};
+        std::atomic<bool> enough{false}, stop{false};
+        std::array<std::atomic<u32>, kPushers> pushed{};
+        std::array<u32, kPushers> next{};
+        u32 disorder = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        std::vector<std::thread> pushers;
+        for (u32 t = 0; t < kPushers; t++) {
+            pushers.emplace_back([&, t] {
+                GuestThread g(s.f, 1 + t, "pusher");
+                const u32 buf = kBufs + 16 * t;
+                u32 n = 0;
+                try {
+                    for (; (n < kEach || !enough.load()) && !stop.load(); n++) {
+                        put_entry(b, buf, (t << 16) | n);
+                        if (g.call("_cellSpursLFQueuePushBody", kLfq, buf, 1) != 0) errors++;
+                    }
+                } catch (const lv2::ThreadExit&) { // the process ended (SPU code gave up below)
+                    errors++;
+                }
+                pushed[t] = n;
+                pushers_done++;
+            });
+        }
+        std::thread spu([&] {
+            for (;;) {
+                u32 value = 0;
+                if (!spu_pop(b, kLfq, kLfqBuf, kRing, value)) {
+                    const bool finished = pushers_done.load() == kPushers; // then a last look finds every entry
+                    if (!spu_pop(b, kLfq, kLfqBuf, kRing, value)) {
+                        if (finished) return;
+                        if (std::chrono::steady_clock::now() > deadline) {
+                            stop = true;
+                            return;
+                        }
+                        std::this_thread::yield();
+                        continue;
+                    }
+                }
+                const u32 from = value >> 16, i = value & 0xFFFF;
+                if (from >= kPushers || i != next[from]) disorder++;
+                else next[from] = i + 1;
+            }
+        });
+        // SPU code waits in the push side's ring, one task at a time: a push's completion takes it and signals it
+        // through _cellSpursSendSignal; it resumes and ends, and is joined here.
+        for (u32 k = 0; k < kWaiters; k++) {
+            spu_wait_in_ring(b, kLfq, kPush2, kHs1, waiters[k]);
+            CHECK(wait_for([&] { return s.a.call("cellSpursTryJoinTask2", kTs2, waiters[k], kExit) == 0; },
+                std::chrono::milliseconds(30000)));
+            CHECK(ps_read32(b, kExit) == 0x40 + k);
+            CHECK(s.report(k, 16) == 2);
+        }
+        enough = true;
+        spu.join();
+        if (stop) { // a pusher may wait for room for ever: end the process to unwind it
+            GuestThread x(s.f, 1 + kPushers, "exit");
+            CHECK_THROWS_AS(lv2::sys_process_exit3(*x.t, 0), lv2::ThreadExit);
+        }
+        for (std::thread& t : pushers) t.join();
+        CHECK_FALSE(stop.load());
+        CHECK(errors == 0);
+        CHECK(disorder == 0);
+        for (u32 t = 0; t < kPushers; t++) {
+            INFO("pusher " << t);
+            CHECK(pushed[t] >= kEach);
+            CHECK(next[t] == pushed[t]); // every entry popped once
+        }
+        const u16 pack = line_half(b, kLfq + kPush2);
+        CHECK((pack >> 10 & 0x1F) == (pack & 0x1F)); // nobody left in the ring
+    }
+
+    // ANY2ANY: both sides PPU threads.
+    {
+        std::memset(b + kLfq2, 0, 128);
+        REQUIRE(s.a.call("_cellSpursLFQueueInitialize", kTs2, kLfq2, kLfqBuf + 0x100, 16, kRing, ANY2ANY) == 0);
+        std::atomic<u32> errors{0}, disorder{0};
+        std::vector<std::atomic<u32>> seen(kPushers * kEach);
+        std::vector<std::thread> threads;
+        for (u32 t = 0; t < kPushers; t++) {
+            threads.emplace_back([&, t] {
+                GuestThread g(s.f, 1 + t, "pusher");
+                const u32 buf = kBufs + 16 * t;
+                for (u32 n = 0; n < kEach; n++) {
+                    put_entry(b, buf, (t << 16) | n);
+                    if (g.call("_cellSpursLFQueuePushBody", kLfq2, buf, 1) != 0) errors++;
+                }
+            });
+        }
+        for (u32 c = 0; c < kPoppers; c++) {
+            threads.emplace_back([&, c] {
+                GuestThread g(s.f, 1 + kPushers + c, "popper");
+                const u32 buf = kBufs + 16 * (kPushers + c);
+                std::array<s64, kPushers> last;
+                last.fill(-1);
+                for (u32 n = 0; n < kPushers * kEach / kPoppers; n++) {
+                    if (g.call("_cellSpursLFQueuePopBody", kLfq2, buf, 1) != 0) {
+                        errors++;
+                        continue;
+                    }
+                    const u32 v = ps_read32(b, buf), from = v >> 16, i = v & 0xFFFF;
+                    if (from >= kPushers || i >= kEach || ps_read32(b, buf + 12) != v) {
+                        errors++;
+                        continue;
+                    }
+                    seen[from * kEach + i]++;
+                    if (static_cast<s64>(i) <= last[from]) disorder++; // one pusher's entries reach a popper in order
+                    last[from] = i;
+                }
+            });
+        }
+        for (std::thread& t : threads) t.join();
+        CHECK(errors == 0);
+        CHECK(disorder == 0);
+        u32 once = 0;
+        for (const auto& n : seen) once += n.load() == 1;
+        CHECK(once == kPushers * kEach);
+        CHECK(s.a.call("_cellSpursLFQueuePopBody", kLfq2, kDst, 0) == code(TASK | kAgain));
+    }
 }
 
 TEST_CASE("_cellSpursLFQueuePushBody: a queue of the whole instance (IWL) wakes the workload waiting in its ring with "

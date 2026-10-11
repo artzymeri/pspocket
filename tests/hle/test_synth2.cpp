@@ -9,9 +9,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1249,4 +1251,90 @@ TEST_CASE("libsynth2: each process its own synthesizer", "[hle][synth2]")
     CHECK(s.get_param(vreg(PITCH, 0, 0)) == 0);
     s.init();
     CHECK(s.get_param(vreg(PITCH, 0, 0)) == 0x3FFF);
+}
+
+TEST_CASE("libsynth2: Generate on one thread while another sets registers, keys voices on and off, transfers and "
+          "changes the reverb (D-650)", "[hle][synth2]")
+{
+    constexpr u32 kBlocks = 200, kBlock = 256;
+    constexpr u32 kSetAttr = kData + 0x7F100, kSetSrc = kData + 0x7F200; // the setting thread's own guest memory
+    Synth s;
+    s.init();
+    const std::vector<u8> vag = looped_sine();
+    REQUIRE(vag.size() <= 0xD00);
+    s.load(0x10000, vag);
+    std::memcpy(s.f.base() + kSetSrc, vag.data(), vag.size());
+    for (u32 v = 0; v < 8; v++) {
+        ModelVoice m;
+        m.ssa = 0x10000;
+        m.voll = 0x1000;
+        m.volr = 0x0C00;
+        m.pitch = static_cast<u16>(0x0800 + 0x180 * v);
+        s.setup(v & 1, v, m);
+    }
+    for (u32 core = 0; core < 2; core++) {
+        s.param(creg(MVOLL, core), 0x3FFF);
+        s.param(creg(MVOLR, core), 0x3FFF);
+    }
+    s.sw(reg(KON, 0), 0x55);
+    s.sw(reg(KON, 1), 0xAA);
+
+    std::atomic<u32> blocks{0}, bad{0}, sets{0};
+    std::atomic<bool> done{false};
+    std::thread generator([&] {
+        GuestThread g(s.f, 1, "generate");
+        u8* b = s.f.base();
+        for (u32 n = 0; n < kBlocks; n++) {
+            if (g.call("cellSoundSynth2Generate", kBlock, kOutL, kOutR, kOutLs, kOutRs) != 0) bad++;
+            for (u32 i = 0; i < kBlock; i++) {
+                for (const u32 out : {kOutL, kOutR}) {
+                    const float x = ps_readf32(b, out + 4 * i);
+                    if (!std::isfinite(x) || x < -1.0f || x >= 1.0f) bad++;
+                }
+                if (ps_readf32(b, kOutLs + 4 * i) != 0.0f || ps_readf32(b, kOutRs + 4 * i) != 0.0f) bad++;
+            }
+            blocks++;
+        }
+        done = true;
+    });
+    std::thread setter([&] {
+        GuestThread g(s.f, 2, "set");
+        u8* b = s.f.base();
+        for (u32 n = 0; !done.load(); n++) {
+            const u32 v = n % 8, core = v & 1;
+            g.call("cellSoundSynth2SetSwitch", reg(KON, core), 1u << v);
+            g.call("cellSoundSynth2SetParam", vreg(PITCH, core, v), 0x0400 + n % 0x3000);
+            g.call("cellSoundSynth2SetParam", vreg(VOLL, core, v), n & 0x3FFF);
+            g.call("cellSoundSynth2SetParam", creg(MVOLR, core), 0x2000 + (n & 0x1FFF));
+            if (n % 3 == 0) g.call("cellSoundSynth2SetSwitch", reg(KOFF, core), 1u << ((v + 3) % 8));
+            if (n % 5 == 0) g.call("cellSoundSynth2SetSwitch", reg(VMIXEL, core), n & 0xFFFFFF);
+            if (n % 7 == 0) g.call("cellSoundSynth2SetCoreAttr", kEffectEnable | core, n & 1);
+            if (n % 16 == 0) { // a reverb preset, its area cleared
+                std::memset(b + kSetAttr, 0, 12);
+                ps_write16(b, kSetAttr + 2, static_cast<u16>(0x100 | (n / 16) % 10));
+                ps_write16(b, kSetAttr + 4, 0x3000);
+                ps_write16(b, kSetAttr + 6, 0x3000);
+                ps_write16(b, kSetAttr + 8, 0x20);
+                ps_write16(b, kSetAttr + 10, 0x40);
+                if (g.call("cellSoundSynth2SetEffectAttr", core, kSetAttr) != 0) bad++;
+            }
+            if (n % 32 == 0 && g.call("cellSoundSynth2VoiceTrans", core, 0, kSetSrc, 0x10000, vag.size()) != vag.size())
+                bad++;
+            (void)g.call("cellSoundSynth2GetParam", vreg(ENVX, core, v));
+            (void)g.call("cellSoundSynth2GetSwitch", reg(ENDX, core));
+            (void)g.call("cellSoundSynth2GetAddr", vreg(NAX, core, v));
+            sets++;
+        }
+        g.call("cellSoundSynth2SetParam", vreg(PITCH, 0, 0), 0x1234);
+    });
+    generator.join();
+    setter.join();
+    CHECK(blocks == kBlocks);
+    CHECK(sets > 0);
+    CHECK(bad == 0);
+    CHECK(s.get_param(vreg(PITCH, 0, 0)) == 0x1234); // the last write stays
+    // It goes on rendering, from the test's thread.
+    const auto [l, r] = s.generate(kBlock);
+    CHECK(l.size() == kBlock);
+    CHECK(r.size() == kBlock);
 }
