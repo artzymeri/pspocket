@@ -5,8 +5,9 @@
 // the operation table it exports, as Sony's libadec and RPCS3's cellAdec call it. The core modules are the host's
 // imports of cellAdec (Registry::add_imports): the loader chooses and links them for a game importing cellAdec, as it
 // would for libadec. Where no firmware module gives one, pspocket's own core on FFmpeg serves the codecs it has one of
-// (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; adec_ffmpeg.hpp): firmware first, as D-563 does
-// for whole libraries, until each is compared with Sony's core on the Mac.
+// (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; D-621: Dolby Digital Plus, MPEG-2 AAC, MP3
+// Surround, ATRAC3 multichannel; adec_ffmpeg.hpp): firmware first, as D-563 does for whole libraries, until each is
+// compared with Sony's core on the Mac.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h (get_core_ops, AdecContext, the notifications, the API).
 
 //
@@ -14,7 +15,7 @@
 // - cellAdecQueryAttr's adecVerUpper is 0x492000, Sony's (4.92); RPCS3 has 0x491000.
 // - A codec whose core no firmware module gives (DTS, DTS-HD core, WMA Pro, WMA Lossless; or no firmware installed) is
 //   logged and refused with CELL_ADEC_ERROR_FATAL: Sony's libadec calls through the empty table and crashes, RPCS3
-//   aborts. Unless pspocket has a core of its own for it (D-577), which then serves.
+//   aborts. Unless pspocket has a core of its own for it (D-577, D-621), which then serves.
 // - Pointers RPCS3 dereferences without a check (LLE would fault) are checked; one that is not guest memory is logged
 //   and refused with CELL_ADEC_ERROR_ARG (D-042). A PCM handle out of range is FATAL (LLE reads past the frames).
 

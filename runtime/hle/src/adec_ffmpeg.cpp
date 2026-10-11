@@ -152,8 +152,10 @@ void decode_au(PPUContext& ctx, u32 h, const Spec& spec, Codec& codec, const Cmd
     const u32 output = ps_read32(base, h + fx::output);
     StackVar bsi(ctx, base, std::max<u32>(spec.bsi_size, 4));
     Decoded d;
-    if (!cmd.au_size || !guest_readable(thread(ctx), cmd.au_start, cmd.au_size)) {
-        PS_LOG_ERROR(kChan, "{}: the access unit ({:#x}, {} bytes) is not guest memory", spec.name, cmd.au_start, cmd.au_size);
+    const u32 needed = cmd.au_size ? codec.bytes_needed(cmd.au_size) : 0;
+    if (!needed || !guest_readable(thread(ctx), cmd.au_start, needed)) {
+        PS_LOG_ERROR(kChan, "{}: the access unit ({:#x}, {} bytes, {} read) is not guest memory", spec.name, cmd.au_start,
+            cmd.au_size, needed);
         d = codec.decode(base, 0, 0, output, bsi.addr()); // the codec's answer to an empty unit
     } else {
         d = codec.decode(base, cmd.au_start, cmd.au_size, output, bsi.addr());
@@ -382,11 +384,15 @@ const Spec* spec_of(s32 type)
     case CELL_ADEC_TYPE_AC3: return &kAc3;
     case CELL_ADEC_TYPE_MP3: return &kMp3;
     case CELL_ADEC_TYPE_ATRAC3: return &kAtrac3;
-    case CELL_ADEC_TYPE_MPEG_L1: return &kMpegL1;
     case CELL_ADEC_TYPE_MPEG_L2: return &kMpegL2;
+    case CELL_ADEC_TYPE_M2AAC: return &kM2Aac;
+    case CELL_ADEC_TYPE_EAC3: return &kDdp;
     case CELL_ADEC_TYPE_M4AAC: return &kM4Aac;
     case CELL_ADEC_TYPE_M4AAC_2CH: return &kM4Aac2ch;
+    case CELL_ADEC_TYPE_MPEG_L1: return &kMpegL1;
+    case CELL_ADEC_TYPE_MP3S: return &kMp3s;
     case CELL_ADEC_TYPE_M4AAC_2CH_MOD: return &kM4Aac2chMod;
+    case CELL_ADEC_TYPE_ATRAC3MULTI: return &kAtrac3Multi;
     default: return nullptr;
     }
 }
@@ -471,6 +477,48 @@ int FfDecoder::decode(const u8* data, u32 size, Planar& out, u32 max_samples)
         out.samples += n;
         av_frame_unref(frame_);
     }
+}
+
+// ---- the downmixes the cores share
+
+void stereo_downmix(Planar& p)
+{
+    if (p.channels() <= 2) return;
+    constexpr float k = 0.70710678f;
+    float gl[16] = {}, gr[16] = {};
+    float sum_l = 0, sum_r = 0;
+    for (u32 c = 0; c < p.channels() && c < 16; c++) {
+        switch (p.ids[c]) {
+        case AV_CHAN_FRONT_LEFT:
+        case AV_CHAN_FRONT_LEFT_OF_CENTER:
+        case AV_CHAN_WIDE_LEFT: gl[c] = 1; break;
+        case AV_CHAN_FRONT_RIGHT:
+        case AV_CHAN_FRONT_RIGHT_OF_CENTER:
+        case AV_CHAN_WIDE_RIGHT: gr[c] = 1; break;
+        case AV_CHAN_FRONT_CENTER: gl[c] = gr[c] = k; break;
+        case AV_CHAN_BACK_LEFT:
+        case AV_CHAN_SIDE_LEFT: gl[c] = k; break;
+        case AV_CHAN_BACK_RIGHT:
+        case AV_CHAN_SIDE_RIGHT: gr[c] = k; break;
+        case AV_CHAN_BACK_CENTER: gl[c] = gr[c] = 0.5f; break;
+        default: break; // the LFE and anything else: left out
+        }
+        sum_l += gl[c];
+        sum_r += gr[c];
+    }
+    Planar s;
+    s.ch.assign(2, std::vector<float>(p.samples, 0.0f));
+    s.ids = {AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT};
+    s.samples = p.samples;
+    s.rate = p.rate;
+    for (u32 c = 0; c < p.channels() && c < 16; c++) {
+        const float l = gl[c] / std::max(sum_l, 1.0f), r = gr[c] / std::max(sum_r, 1.0f);
+        for (u32 i = 0; i < p.samples; i++) {
+            s.ch[0][i] += l * p.ch[c][i];
+            s.ch[1][i] += r * p.ch[c][i];
+        }
+    }
+    p = std::move(s);
 }
 
 // ---- MPEG audio headers

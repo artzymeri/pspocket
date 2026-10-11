@@ -1,8 +1,9 @@
 #pragma once
 
-// pspocket's own cellAdec cores on FFmpeg for the codecs whose firmware core serves first (D-577): MP3 (adec_mp3.cpp),
-// MPEG audio layers I and II (adec_mpeg.cpp), MPEG-4 AAC (adec_aac.cpp), AC-3 (adec_ac3.cpp) and ATRAC3
-// (adec_atrac3.cpp). The front end (cellAdec.cpp) opens one only where no firmware module gives the codec's core.
+// pspocket's own cellAdec cores on FFmpeg for the codecs whose firmware core serves first (D-577): MP3 and MP3 Surround
+// (adec_mp3.cpp), MPEG audio layers I and II (adec_mpeg.cpp), MPEG-4 and MPEG-2 AAC (adec_aac.cpp), AC-3 and Dolby
+// Digital Plus (adec_ac3.cpp), and ATRAC3 and ATRAC3 multichannel (adec_atrac3.cpp). The front end (cellAdec.cpp) opens
+// one only where no firmware module gives the codec's core.
 //
 // The common part (adec_ffmpeg.cpp) is shaped as adec_atracx.cpp, RPCS3's port of libatxdec's PPU side
 // (rpcs3/Emu/Cell/Modules/cellAtracXdec.cpp): the core's context in the game's memory at its handle, a command queue of
@@ -62,9 +63,12 @@ public:
     // A sequence with the game's parameters (Spec::param_size bytes, as the game wrote them; Spec::check passed them on
     // the game's thread). CELL_OK, or an error (logged): the sequence's decodes then fail with the codec's error.
     virtual s32 start(const u8* param) = 0;
-    // The access unit at `au` (`size` bytes of guest memory) into the output at `out` (Spec::output_bytes) and the
-    // information block at `bsi` (Spec::bsi_size bytes, zeroed).
+    // The access unit at `au` (`size` bytes of guest memory, bytes_needed(size) of them readable) into the output at
+    // `out` (Spec::output_bytes) and the information block at `bsi` (Spec::bsi_size bytes, zeroed).
     virtual Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) = 0;
+    // The bytes from the unit's start the codec reads: its size (ATRAC3 multichannel reads its tracks' blocks, which
+    // may run past the size its caller gives, D-621).
+    virtual u32 bytes_needed(u32 size) const { return size; }
 };
 
 // A codec's constants and parts.
@@ -85,6 +89,7 @@ struct Spec {
 
 // Each codec file's Spec.
 extern const Spec kMp3, kMpegL1, kMpegL2, kM4Aac, kM4Aac2ch, kM4Aac2chMod, kAc3, kAtrac3;
+extern const Spec kDdp, kM2Aac, kMp3s, kAtrac3Multi; // D-621
 
 // The Spec of a cellAdec type, or null.
 const Spec* spec_of(s32 type);
@@ -152,6 +157,13 @@ constexpr u32 ticks(u32 samples, u32 rate) { return rate ? static_cast<u32>((u64
 
 // A once-per-process log line for a codec's quirk (`key` names it).
 void log_once(std::string_view key, std::string_view line);
+
+// ---- the downmixes the cores share (D-620)
+
+// To two channels: each side its front at 1, the centre and its surrounds at 0.7071 (a back centre at 0.5 to both), the
+// LFE left out, each side over its coefficients' sum so a full-scale input cannot clip (the AAC cores', D-578). A
+// stream of two channels or fewer is left as it is.
+void stereo_downmix(Planar& p);
 
 // Bits read most significant first from host bytes; past the end reads zeros (and `overrun` says so).
 class Bits {

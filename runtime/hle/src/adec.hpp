@@ -5,8 +5,9 @@
 // table of operations (CellAdecCoreOps); the cores report back through four notification functions. pspocket's front
 // end (cellAdec.cpp) keeps the same context, laid out as Sony's, and calls a core through AdecCore: its own (LPCM,
 // adec_lpcm.cpp; ATRAC3plus, adec_atracx.cpp) directly, or Sony's core module through its operation table, as RPCS3's
-// cellAdec calls the LLE cores. For MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3 and ATRAC3 the firmware's core
-// serves first and pspocket's own core on FFmpeg (adec_ffmpeg.hpp) where no firmware module gives one (D-577).
+// cellAdec calls the LLE cores. For MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3 and ATRAC3 (D-577), and Dolby
+// Digital Plus, MPEG-2 AAC, MP3 Surround and ATRAC3 multichannel (D-621) the firmware's core serves first and
+// pspocket's own core on FFmpeg (adec_ffmpeg.hpp) where no firmware module gives one.
 // pspocket's own cores are also the firmware modules' exports, operation tables and PTS functions, for Sony's modules
 // and others to call (adec_tables.cpp, D-591).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h.
@@ -37,6 +38,7 @@ enum : s32 {
     CELL_ADEC_TYPE_ATRAC3 = 5,
     CELL_ADEC_TYPE_MPEG_L2 = 6,
     CELL_ADEC_TYPE_M2AAC = 7,
+    CELL_ADEC_TYPE_EAC3 = 8,
     CELL_ADEC_TYPE_LPCM_BLURAY = 12,
     CELL_ADEC_TYPE_ATRACX_2CH = 13,
     CELL_ADEC_TYPE_ATRACX_6CH = 14,
@@ -45,7 +47,9 @@ enum : s32 {
     CELL_ADEC_TYPE_LPCM_DVD = 17,
     CELL_ADEC_TYPE_M4AAC_2CH = 20,
     CELL_ADEC_TYPE_MPEG_L1 = 22,
+    CELL_ADEC_TYPE_MP3S = 23,
     CELL_ADEC_TYPE_M4AAC_2CH_MOD = 24,
+    CELL_ADEC_TYPE_ATRAC3MULTI = 31,
 };
 
 // The output channel layouts (RPCS3 CellAdecChannel), as LPCM's parameters and information name them.
@@ -63,7 +67,9 @@ constexpr bool is_lpcm(s32 type)
 // core of such a codec, AdecCore::correct_pts).
 constexpr s8 CORRECT_PTS_LPCM_HDMV = 0;
 constexpr s8 CORRECT_PTS_AC3 = 5, CORRECT_PTS_ATRAC3 = 6, CORRECT_PTS_MP3_48000 = 7, CORRECT_PTS_MP3_44100 = 8,
-             CORRECT_PTS_MP3_32000 = 9, CORRECT_PTS_MPEG_L2 = 26, CORRECT_PTS_M4AAC = 29, CORRECT_PTS_MPEG_L1 = 32;
+             CORRECT_PTS_MP3_32000 = 9, CORRECT_PTS_ATRAC3MULTI = 39;
+constexpr s8 CORRECT_PTS_EAC3 = 17, CORRECT_PTS_M2AAC = 25, CORRECT_PTS_MPEG_L2 = 26, CORRECT_PTS_M4AAC = 29,
+             CORRECT_PTS_MPEG_L1 = 32, CORRECT_PTS_MP3S = 33;
 constexpr u32 CODEC_TS_INVALID = 0xFFFFFFFF;
 
 // AdecContext (0x530, the CellAdecHandle): its fields' offsets. res is CellAdecResource (totalMemSize, startAddr,
@@ -157,7 +163,8 @@ std::unique_ptr<AdecCore> make_lpcm_core();
 // build without FFmpeg.
 std::unique_ptr<AdecCore> make_atracx_core(u32 max_channels);
 // pspocket's own core on FFmpeg for a codec whose firmware core serves first (adec_ffmpeg.cpp, D-577): MP3, MPEG audio
-// layers I and II, MPEG-4 AAC (the three types), AC-3 and ATRAC3. None for another type or in a build without FFmpeg.
+// layers I and II, MPEG-4 AAC (the three types), AC-3 and ATRAC3; Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and
+// ATRAC3 multichannel (D-621). None for another type or in a build without FFmpeg.
 std::unique_ptr<AdecCore> make_ffmpeg_core(s32 type);
 
 // What the front end sets in the LPCM core's context (RPCS3 adecOpen, adecSetLpcmBlurayParams, adecSetLpcmDvdParams,
