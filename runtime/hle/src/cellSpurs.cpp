@@ -4774,14 +4774,14 @@ void register_cellSpurs(Registry& r)
         PS_HLE_UNVERIFIED(0xA7A94892, cellSpursJoinTask2),
         PS_HLE_UNVERIFIED(0x838FA4F0, cellSpursTryJoinTask2),
         PS_HLE_UNVERIFIED(0x1EBCF459, cellSpursDestroyTaskset2),
-        PS_HLE_UNVERIFIED(0x13AE18F3, cellSpursTaskExitCodeGet),
-        PS_HLE_UNVERIFIED(0xE717AC73, cellSpursTaskExitCodeTryGet),
-        PS_HLE_UNVERIFIED(0x8A85674D, _cellSpursLFQueuePushBody),
-        PS_HLE_UNVERIFIED(0x35DAE22B, _cellSpursLFQueuePopBody),
+        PS_HLE_FUNC(0x13AE18F3, cellSpursTaskExitCodeGet),
+        PS_HLE_FUNC(0xE717AC73, cellSpursTaskExitCodeTryGet),
+        PS_HLE_FUNC(0x8A85674D, _cellSpursLFQueuePushBody),
+        PS_HLE_FUNC(0x35DAE22B, _cellSpursLFQueuePopBody),
         PS_HLE_UNVERIFIED(0x1656D49F, cellSpursLFQueueAttachLv2EventQueue),
         PS_HLE_UNVERIFIED(0x73E06F91, cellSpursLFQueueDetachLv2EventQueue),
-        PS_HLE_UNVERIFIED(0xD86380D8, cellSpursGetJobPipelineInfo),
-        PS_HLE_UNVERIFIED(0x31F5196B, cellSpursRemoveSystemWorkloadForUtility),
+        PS_HLE_FUNC(0xD86380D8, cellSpursGetJobPipelineInfo),
+        PS_HLE_FUNC(0x31F5196B, cellSpursRemoveSystemWorkloadForUtility),
     });
 }
 

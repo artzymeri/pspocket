@@ -10464,3 +10464,13 @@ calls (UNSCOPED_INFO's went to the next passing REQUIRE). Not native yet, record
 completion, which marks the containers of the tasks it ended (libsre 0x14DF8); libsre's Task2 exit slots (ExitCode2: a
 waiter word and the code with a state byte, joined through them) where D-626 joins through the event flags directly.
 Tests: tests/hle/test_spurs_task2.cpp's container, join, body, pipeline and utility cases follow libsre's answers.
+
+## D-914 · 2026-10-11 · Six of cellSpurs' functions read from libsre lose their unverified mark (part 6)
+
+cellSpursTaskExitCodeGet, cellSpursTaskExitCodeTryGet, _cellSpursLFQueuePushBody, _cellSpursLFQueuePopBody,
+cellSpursGetJobPipelineInfo and cellSpursRemoveSystemWorkloadForUtility are now libsre's (part 5: read from the module,
+0 differences in the comparison), so their D-594 marks go: PS_HLE_FUNC. libsre is always native (no game gets Sony's
+libsre), so nothing a game gets changes. cellSpursCreateTask2, CreateTask2WithBinInfo, JoinTask2, TryJoinTask2,
+DestroyTaskset2 and the LF queue's lv2 event queue attach and detach stay marked: the comparison checks only their
+refusals, and libsre's Task2 exit slots work differently from D-626's (part 5). The comparison, matching, loses its
+[.] and joins the gate (it skips without the firmware).

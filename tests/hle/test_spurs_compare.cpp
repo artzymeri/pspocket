@@ -689,10 +689,10 @@ void put_taskset2(u8* b, u32 size, u32 flag1, u32 flag2)
 // code is stored, so neither half waits); the LF queue's Try bodies on queues empty, full and in between, each
 // direction, rings empty (no signal); the lv2 event queue's refusals; the job pipeline over made-up instances (what
 // libsre answers, and writes into the info area, for each workload ID); the system workload given up or refused.
-// Hidden while they are expected to differ (D-597): "[compare][spurs-task2]" on the Mac;
-// PSPOCKET_COMPARE_SELF=1 runs pspocket's half twice without the firmware.
+// In the gate since D-914 (they match): "[compare][spurs-task2]" alone; PSPOCKET_COMPARE_SELF=1 runs pspocket's half
+// twice without the firmware.
 TEST_CASE("cellSpurs' Task2, exit code, LF queue body, job pipeline and system workload functions against libsre "
-          "(D-626 to D-629)", "[.][hle][lle][compare][spurs][spurs-task2]")
+          "(D-626 to D-629)", "[hle][lle][compare][spurs][spurs-task2]")
 {
     const std::optional<std::string> flash = test_dev_flash();
     const char* self = std::getenv("PSPOCKET_COMPARE_SELF");

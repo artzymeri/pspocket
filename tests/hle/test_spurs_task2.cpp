@@ -303,10 +303,8 @@ TEST_CASE("cellSpurs: the functions made without libsre to compare with, under t
     "[hle][spurs][spurs-task2]")
 {
     for (const char* name : {"cellSpursCreateTask2", "cellSpursCreateTask2WithBinInfo", "cellSpursJoinTask2",
-             "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2", "cellSpursTaskExitCodeGet",
-             "cellSpursTaskExitCodeTryGet", "_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody",
-             "cellSpursLFQueueAttachLv2EventQueue", "cellSpursLFQueueDetachLv2EventQueue", "cellSpursGetJobPipelineInfo",
-             "cellSpursRemoveSystemWorkloadForUtility"}) {
+             "cellSpursTryJoinTask2", "cellSpursDestroyTaskset2", "cellSpursLFQueueAttachLv2EventQueue",
+             "cellSpursLFQueueDetachLv2EventQueue"}) {
         INFO(name);
         const hle::Function* fn = hle::registry().find("cellSpurs", recomp::nid_of(name));
         REQUIRE(fn != nullptr);
@@ -314,9 +312,11 @@ TEST_CASE("cellSpurs: the functions made without libsre to compare with, under t
         CHECK(fn->unverified);
         CHECK_FALSE(fn->internal);
     }
-    // The functions they build on stay verified.
+    // The functions they build on stay verified, and those read from libsre since (D-914).
     for (const char* name : {"cellSpursCreateTaskset2", "cellSpursCreateTaskWithAttribute", "cellSpursTaskExitCodeInitialize",
-             "_cellSpursLFQueueInitialize"}) {
+             "_cellSpursLFQueueInitialize", "cellSpursTaskExitCodeGet", "cellSpursTaskExitCodeTryGet",
+             "_cellSpursLFQueuePushBody", "_cellSpursLFQueuePopBody", "cellSpursGetJobPipelineInfo",
+             "cellSpursRemoveSystemWorkloadForUtility"}) {
         INFO(name);
         CHECK_FALSE(hle::registry().is_unverified("cellSpurs", recomp::nid_of(name)));
     }
