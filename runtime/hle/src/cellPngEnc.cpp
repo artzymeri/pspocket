@@ -1493,7 +1493,7 @@ void register_cellPngEnc(Registry& r)
         PS_HLE_FUNC(0x585269BC, cellPngEncGetStreamInfo),
         PS_HLE_FUNC(0x6AC91DE3, cellPngEncReset),
     });
-    r.firmware_first(kModule);
+    // Compared with libpngenc and matching it, no longer firmware-first (D-913, D-563): games get pspocket's.
 }
 
 #else

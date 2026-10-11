@@ -23,7 +23,7 @@
 using namespace pspocket;
 using namespace pspocket::hle::test;
 
-TEST_CASE("cellPngEnc: the nine functions, firmware first", "[hle][pngenc]")
+TEST_CASE("cellPngEnc: the nine functions, pspocket's own (no longer firmware-first, D-913)", "[hle][pngenc]")
 {
 #if PSPOCKET_HAVE_LIBPNG
     for (const std::string_view name : {"cellPngEncQueryAttr", "cellPngEncOpen", "cellPngEncOpenEx", "cellPngEncClose",
@@ -34,7 +34,7 @@ TEST_CASE("cellPngEnc: the nine functions, firmware first", "[hle][pngenc]")
         REQUIRE(fn != nullptr);
         CHECK(fn->name == name);
     }
-    CHECK(hle::registry().is_firmware_first("cellPngEnc"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellPngEnc"));
 #else
     SKIP("no libpng in this build: cellPngEnc is not pspocket's");
 #endif

@@ -38,13 +38,13 @@ using namespace pspocket;
 using namespace pspocket::hle::test;
 using namespace pspocket::hle::test::compare;
 
-TEST_CASE("cellPngEnc's comparison calls Sony's exports by their names; pspocket's library, firmware first",
-    "[hle][pngenc]")
+TEST_CASE("cellPngEnc's comparison calls Sony's exports by their names; pspocket's library", "[hle][pngenc]")
 {
 #if PSPOCKET_HAVE_LIBPNG
     check_names("cellPngEnc", {"cellPngEncQueryAttr", "cellPngEncOpen", "cellPngEncOpenEx", "cellPngEncClose",
                                   "cellPngEncWaitForInput", "cellPngEncEncodePicture", "cellPngEncWaitForOutput",
-                                  "cellPngEncGetStreamInfo", "cellPngEncReset"});
+                                  "cellPngEncGetStreamInfo", "cellPngEncReset"},
+        /*marked=*/false);
 #else
     SKIP("no libpng in this build: cellPngEnc is not pspocket's");
 #endif
@@ -1211,8 +1211,9 @@ Observed half(const Setup& s, bool sony_half)
 
 } // namespace
 
+// It matches (D-913): no longer hidden, it runs wherever the firmware is (the Mac's gate) and skips elsewhere.
 TEST_CASE("cellPngEnc against Sony's libpngenc: sizes, handles, the queue, the streams, every PNG's chunks and pixels",
-    "[.][hle][lle][compare][pngenc]")
+    "[hle][lle][compare][pngenc]")
 {
     const Setup s = setup();
     run(s, "cellPngEnc against Sony's libpngenc", [&](bool sony) { return half(s, sony); },

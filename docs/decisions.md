@@ -10363,3 +10363,11 @@ differ from zlib 1.2.3's for the same pixels and texts (notes in the comparison,
 Tests: tests/hle/test_pngenc_compare.cpp (0 of 1,834 against Sony's; PSPOCKET_COMPARE_SELF=1 agrees with itself);
 tests/hle/test_imgenc.cpp updated to Sony's answers (the queues and Reset's skips, the refusals, FATAL for a keyword to
 tidy, the memory of a text, 1.2.8's chunk order, sCAL's and gAMA's bytes, a buffer too small).
+
+## D-913 · 2026-10-11 · cellPngEnc no longer firmware-first (part 2)
+
+cellPngEnc matches Sony's libpngenc call for call (part 1: 0 of 1,834 observations differ, every answer, both queues,
+each stream's information and every PNG's chunks and pixels), so its firmware-first marker goes (D-563): where the
+system software is installed, a game importing cellPngEnc now gets pspocket's, not libpngenc.sprx. Its comparison
+(test_pngenc_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware and skips without it; the name
+check and test_imgenc.cpp check the library is pspocket's and unmarked.
