@@ -1,6 +1,6 @@
 // cellKey2char: keyboard key codes to the characters they type (libkey2char), pspocket's own (D-565, D-914).
 // Read from Sony's libkey2char.sprx (fw 4.92, the reference, D-046) and compared with it running on pspocket
-// (tests/hle/test_key2char_compare.cpp); RPCS3's rpcs3/Emu/Cell/Modules/cellKey2char.cpp has the five names, the error
+// (tests/hle/test_key2char_compare.cpp; no longer firmware-first, D-914); RPCS3's rpcs3/Emu/Cell/Modules/cellKey2char.cpp has the five names, the error
 // codes and the 128-byte handle, and converts nothing.
 //
 // The handle the game owns holds all of libkey2char's state:
@@ -1180,7 +1180,6 @@ void register_cellKey2char(Registry& r)
         PS_HLE_FUNC(0x28893D81, cellKey2char_28893D81),
         PS_HLE_FUNC(0xEAE114F6, cellKey2char_EAE114F6),
     });
-    r.firmware_first(kModule);
 }
 
 } // namespace pspocket::hle

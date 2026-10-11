@@ -10420,3 +10420,10 @@ layouts for 101, 106 and German only (letters, digits and a few keys elsewhere).
 with Sony's libio is the next step for typed text.
 Tests: tests/hle/test_key2char.cpp rewritten for libkey2char's answers (8 cases), test_key2char_compare.cpp widened;
 compare_util.hpp's Side reaches an export by its NID.
+
+## D-914 · 2026-10-11 · cellKey2char is no longer firmware-first (part 4)
+
+cellKey2char matches Sony's libkey2char over its comparison (part 3: 74,278 observations, 0 differences), so its
+firmware-first mark goes (D-563): a game gets pspocket's cellKey2char with the system software installed or not. The
+comparison loses its [.] and joins the gate (under a second; it skips without the firmware), its name check requiring
+the library unmarked, as test_key2char.cpp does.

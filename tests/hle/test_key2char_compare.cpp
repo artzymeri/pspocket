@@ -5,7 +5,8 @@
 // three modes, with shift, caps lock, num lock and the others; Korean, Japanese and dead-key typing in sequences;
 // and the module's nine other exports (its Hangul automaton's functions, known by NID) on an automaton of the test's.
 // Where *charCode points is a line of its own, written when it changes. charNum and processed are never NULL (the
-// module writes them unchecked). No game data; skipped without the firmware (compare_util.hpp).
+// module writes them unchecked). No game data; skipped without the firmware (compare_util.hpp). In the gate since
+// D-914.
 
 #include <catch_amalgamated.hpp>
 
@@ -376,11 +377,12 @@ Observed half(const Setup& s, bool sony_half)
 
 } // namespace
 
-TEST_CASE("cellKey2char's comparison calls Sony's exports by their names; pspocket's library, firmware first",
+TEST_CASE("cellKey2char's comparison calls Sony's exports by their names; pspocket's library, its own (D-914)",
     "[hle][key2char]")
 {
     check_names("cellKey2char", {"cellKey2CharOpen", "cellKey2CharClose", "cellKey2CharGetChar", "cellKey2CharSetMode",
-                                    "cellKey2CharSetArrangement"});
+                                    "cellKey2CharSetArrangement"},
+        /*marked=*/false);
     // The nine known only by their NIDs.
     for (const u32 nid : {0x83E91458u, 0xAE4B34E6u, 0xE5D1F9B0u, 0x291ADBA5u, 0x1B5F6EFCu, 0x51667234u, 0x7F8E6F3Eu,
              0x28893D81u, 0xEAE114F6u}) {
@@ -391,7 +393,7 @@ TEST_CASE("cellKey2char's comparison calls Sony's exports by their names; pspock
 }
 
 TEST_CASE("cellKey2char against Sony's libkey2char: answers, the handle, every key in every arrangement and mode",
-    "[.][hle][lle][compare][key2char]")
+    "[hle][lle][compare][key2char]")
 {
     const Setup s = setup();
     run(s, "cellKey2char against Sony's libkey2char", [&](bool sony) { return half(s, sony); },

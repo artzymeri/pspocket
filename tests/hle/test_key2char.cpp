@@ -75,7 +75,7 @@ struct Env {
 
 } // namespace
 
-TEST_CASE("cellKey2char: the five functions and the nine known by NID, firmware first", "[hle][key2char]")
+TEST_CASE("cellKey2char: the five functions and the nine known by NID, pspocket's own (D-914)", "[hle][key2char]")
 {
     for (const std::string_view name : {"cellKey2CharOpen", "cellKey2CharClose", "cellKey2CharGetChar",
              "cellKey2CharSetMode", "cellKey2CharSetArrangement"}) {
@@ -87,7 +87,7 @@ TEST_CASE("cellKey2char: the five functions and the nine known by NID, firmware 
     for (const u32 nid : {0x83E91458u, 0xAE4B34E6u, 0xE5D1F9B0u, 0x291ADBA5u, 0x1B5F6EFCu, 0x51667234u, 0x7F8E6F3Eu,
              0x28893D81u, 0xEAE114F6u})
         CHECK(hle::registry().find("cellKey2char", nid) != nullptr);
-    CHECK(hle::registry().is_firmware_first("cellKey2char"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellKey2char"));
 }
 
 TEST_CASE("cellKey2char: open and close; the mode and the arrangement and their checks", "[hle][key2char]")
