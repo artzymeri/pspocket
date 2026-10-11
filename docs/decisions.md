@@ -11312,3 +11312,182 @@ Tests: test_devices.cpp "[remoteplay]": the status; the peer's information and t
 untouched; the volume 1.0, then each one set, a null pointer, one that is not guest memory (the regression); the
 settings and Break; a second process starting again at 1.0. test_sysutil_misc.cpp's check of the default volume passes
 unchanged.
+
+## D-670 · 2026-10-11 · cellNetCtl's game-internal forms and the game update's Init, Term and CheckAbort, pspocket's own
+
+Eleven of the functions answered as RPCS3's stubs (D-182) in libnetctl, a library pspocket always serves (D-175), made
+pspocket's own (runtime/hle/src/cellNetCtl.cpp), each unverified (D-594: libnetctl.sprx is always native, so the
+marker only records that no Sony module was compared). RPCS3 registers all eleven as todos with no arguments
+(rpcs3/Emu/Cell/Modules/cellNetCtl.cpp) and nothing public describes them.
+- **The game-internal forms** (cellNetCtl*GameInt) are read as libnetctl's interface for a network a game drives
+  itself: four have public forms, and Scan, GetScanInfo, Connect and Disconnect have none (a wireless LAN scanned and
+  joined, as the PSP's ad hoc control does). They answer as the public forms do for pspocket's offline network
+  (D-024). Each is NOT_INITIALIZED before cellNetCtlInit and after Term (the library's one Init); then those with
+  known pointers check them (null or not guest memory: INVALID_ADDR, the latter logged with the call site):
+  - GetStateGameInt(s32* state): Disconnected (0).
+  - GetInfoGameInt(code, CellNetCtlInfo* info): cellNetCtlGetInfo's answer, from one body for both: the Ethernet
+    address FF:FF:FF:FF:FF:FF only (RPCS3's np_handler before it discovers one), every other code NOT_CONNECTED.
+  - AddHandlerGameInt(handler, arg, s32* hid) and DelHandlerGameInt(hid): four handler slots, IDs 0 to 3 (the public
+    DelHandler's check, RPCS3: an ID above 3 is INVALID_ID), the lowest free one's ID written to *hid as the SDK's
+    AddHandler writes its ID; a fifth is HANDLER_MAX. DelHandler of an ID outside 0 to 3 (a negative one too) is
+    INVALID_ID, of a free slot ID_NOT_FOUND. The handlers are kept and never called: the interface never changes
+    state. cellNetCtlTerm forgets them. (The public AddHandler, RPCS3's todo, writes no ID and keeps nothing; it is
+    left as games run on it.)
+  - ConnectGameInt: NOT_CONNECTED at once, no link being able to come up (cellNetAoiStart's answer, D-635), rather
+    than RPCS3's CELL_OK, which would leave a game waiting for a connection. DisconnectGameInt: CELL_OK, the
+    interface being disconnected as asked. ScanGameInt: CELL_OK, nothing found; GetScanInfoGameInt: CELL_OK, nothing
+    written. Their arguments are not known, so these four log their argument registers (r3 to r5) and read none: a
+    count or a list written through a pointer guessed wrong would land in the game's data.
+  - Each function's first four calls are logged at info, later ones at debug (GetState may be polled).
+- **The game update** (CELL_GAMEUPDATE_ERROR_*, RPCS3 cellNetCtl.h): cellGameUpdateInit once, ALREADY_INITIALIZED
+  until cellGameUpdateTerm; Term without Init is NOT_INITIALIZED. A check (StartAsync, StartWithoutDialogAsync and
+  their Ex forms) is in progress from its start until its callback is called (at the next cellSysutilCheckCallback);
+  cellGameUpdateCheckAbort, after Init, aborts those in progress: their callbacks hear
+  CELL_GAMEUPDATE_RESULT_STATUS_ABORTED (6) instead of NO_UPDATE, the Ex forms' result too. With none in progress
+  (none started, or answered already) it is NOT_START (0x8002cc08); a finish (FinishAsync) is not a check. The checks
+  themselves still need no Init (RPCS3's, which games run on today); only CheckAbort asks for it.
+To check on the Mac, against libnetctl.sprx: the GameInt signatures (whether GetState, GetInfo, AddHandler and
+DelHandler take the public forms' arguments; what Connect, Scan and GetScanInfo take and write), whether they need
+cellNetCtlInit or an Init of their own, the handler limit and IDs (and whether the public AddHandler writes its ID),
+what Connect answers with no link (at once, or through a handler's ERROR event with which error), what a scan that
+finds nothing writes; cellGameUpdateInit's arguments, whether the checks need Init, whether Term during a check is
+BUSY, CheckAbort's answer with no check and what an aborted callback hears.
+Tests: test_misc_hle.cpp "[netctl-gameint]" (every form before Init and after Term, the state, the information, the
+pointers, four handlers and a fifth, deletion and reuse, Connect, Disconnect, the scan, no handler called, Term
+forgetting them), "[gameupdate]" (Init and Term twice, an abort before the answer in the plain and Ex forms, a finish
+not aborted, none after the answer).
+
+## D-671 · 2026-10-11 · Background downloads and the access point mode: none, and never on (cellBGDLUtility, cellSysutilAp)
+
+Six of RPCS3's stubs in two sysutil libraries pspocket always serves, made pspocket's own
+(runtime/hle/src/sysutil_misc.cpp), unverified (D-594; libsysutil_* modules are always native).
+- **cellBGDLUtility** (libsysutil_bgdl; RPCS3 rpcs3/Emu/Cell/Modules/cellBgdl.cpp/.h: CellBGDLInfo, the modes, the
+  error codes, four todos answering CELL_OK). The system downloads a game's PSN content (an add-on, a demo) in the
+  background while the game runs, and the game reads how far each download has come. There is no PSN here (D-139), so
+  nothing is ever downloading:
+  - GetInfo(const char* content_id, CellBGDLInfo* info, s32 num) and GetInfo2 (a service ID): 0, RPCS3's CELL_OK read
+    as the number of entries filled, and nothing written. The ID is read for the log only and may be null (RPCS3 takes
+    one; refusing it could fail a game asking after all its downloads); one that runs into memory that is not guest
+    memory is CELL_BGDL_UTIL_ERROR_PARAM (logged). num below 0 is PARAM; the num entries (24 bytes each) must be guest
+    memory (PARAM, logged), and num 0 needs no buffer.
+  - SetMode(mode) keeps AUTO (0) or ALWAYS_ALLOW (1), another is PARAM; GetMode(mode*) writes it, AUTO at first (a
+    null pointer or one that is not guest memory: PARAM).
+  - GetInfo, GetInfo2 and GetMode may be polled (a progress bar): each's first four calls at info, then debug.
+- **cellSysutilAp's On and Off** (RPCS3 rpcs3/Emu/Cell/Modules/cellSysutilAp.cpp: CellSysutilApParam and the error
+  codes; On and Off todos answering CELL_OK). The access point mode makes the console's wireless LAN an access point,
+  bridged to its wired LAN, for PSPs. pspocket's console has neither (an iPhone has no Ethernet and cannot be made an
+  access point) and no network (D-024), so the mode never comes on:
+  - On(const CellSysutilApParam* pParam, container): pParam null, or its 124 bytes not guest memory (logged), is
+    INVALID_VALUE (0x8002cd02); otherwise NETIF_NO_CABLE (0x8002cd15: the wired LAN the mode bridges to is not
+    connected), its type, wlanFlag, title ID and SSID logged (the WPA key never). RPCS3's CELL_OK would leave a game
+    waiting for PSPs that cannot join. The container is not checked: what On does with it is not known.
+  - Off: CELL_OK, the mode being off as asked. A PS3 may answer NOT_INITIALIZED (0x8002cd03) to an Off without an On;
+    a game's cleanup would then meet an error where it meets CELL_OK today, so RPCS3's answer is kept.
+  - GetRequiredMemSize is unchanged (RPCS3's 1 MB).
+To check on the Mac, against libsysutil_bgdl.sprx and libsysutil_ap.sprx: whether GetInfo answers a count or CELL_OK,
+and what it writes when nothing downloads (an entry in state ERROR, or nothing); whether a null ID is taken; num's and
+the buffer's checks; the default mode. CellSysutilApParam's checks (type, wlanFlag, the strings) and their order; what
+On answers with no cable, or with the network disabled (NETIF_DISABLED?); whether it shows a dialog in its container;
+what Off answers when the mode is not on.
+Tests: test_sysutil_misc.cpp "[bgdl]" (the mode, the IDs, the buffer's checks, an entry past guest memory, nothing
+written), "[sysutil-ap]" (On's checks and answer, its parameters untouched, Off).
+
+## D-672 · 2026-10-11 · The auth dialog's Abort and Close; cellGameExec's games: this one game, nothing booted or deleted
+
+Six more of RPCS3's stubs in runtime/hle/src/sysutil_misc.cpp made pspocket's own, unverified (D-594).
+- **cellAuthDialogUtility** (RPCS3 rpcs3/Emu/Cell/Modules/cellAuthDialog.cpp). Open's check is RPCS3's (a zero
+  argument is ARG1_IS_ZERO, 0x8002d202, its answers unchanged); Abort and Close were todos, RPCS3 noting from the
+  module that their first check fails with 0x8002d203 ("not init cond?"). Now Open with a non-zero argument opens the
+  dialog, which stays open until Close (no UI answers it, D-183); a second Open while it is open is RPCS3's CELL_OK
+  and still one dialog. Abort and Close of a dialog that is not open (never opened, refused, closed) answer
+  0x8002d203, read as "not open". Abort of the open dialog is CELL_OK and leaves it open for Close, as the other
+  sysutil dialogs' aborts leave their unload to the game (a game aborting and then closing gets CELL_OK twice). Close
+  is CELL_OK and closes it; its argument (RPCS3: "arg1", not known) is logged, not read.
+- **cellGameExec** (RPCS3 rpcs3/Emu/Cell/Modules/cellGameExec.cpp: the signatures; GetList, DeleteGame, ExecGame and
+  GetExitGameInfo todos answering CELL_OK): PlayStation Home's library for booting other games, listing and deleting
+  them, and reading what a game it booted left when it ended. pspocket runs the one game it was built for (on iOS each
+  game is an app of its own, D-036). What is installed is read from its /dev_hdd0 as cellGame reads it:
+  /dev_hdd0/game/<dirName>/PARAM.SFO of an HDD game's category (RPCS3 psf::is_cat_hdd; game data is no game); the
+  disc is in the drive when the game booted from it or /dev_bdvd holds PS3_GAME/PARAM.SFO.
+  - A directory name is 1 to 31 characters of [A-Z0-9_-] not starting with '_', ending within CELL_GAME_DIRNAME_SIZE
+    (32) bytes (RPCS3's sysutil_check_name_string, which cellGameDeleteGameData applies), else CELL_GAME_ERROR_PARAM
+    (logged when not guest memory). The name goes into a host path, so nothing else is let through.
+  - ExecGame(type, dirName, options, memContainer, execData, userData): HOME (4) is NOAPP (Home is gone, as its paths
+    answer); DISC (1) with no disc, and HDD (2) naming no installed game, are NOTFOUND; one that is there (this game
+    too) is NOTSUPPORTED (0x8002cb21), logged: pspocket boots no other program from a running one. Another type is
+    PARAM. RPCS3's CELL_OK would leave a game waiting for an exit that never comes.
+  - DeleteGame(dirName, memContainer): an installed game is not deleted (NOTSUPPORTED, logged): a PS3 asks the user
+    first, there is no dialog, and pspocket deletes no installation, this game's or another's. One not installed is
+    NOTFOUND.
+  - GetList(listBufNum, listBuf, u32* listNum, u32* getListNum, memContainer): both counts 0 and nothing in the
+    buffer: the list's entries are not known (RPCS3 names the buffer "unk"), so no game is listed, even where
+    /dev_hdd0 holds some (on iOS it holds this game alone). A count's pointer null or not guest memory: PARAM.
+  - GetExitGameInfo(u32* status, u32* type, char* dirName, u32* execData, u32* userData): no game was booted from this
+    one, so there is nothing to tell: RPCS3's CELL_OK with nothing written (what a status would say is not known), once
+    status, type and dirName are checked (null or not guest memory: PARAM). execData and userData may be null, as
+    cellGameGetBootGameInfo's execdata may.
+To check on the Mac, against libsysutil_authdialog.sprx and libsysutil_game_exec.sprx: what Open takes, whether a
+second Open is refused (0x8002d201?), what Abort does to the dialog and whether Close after it is CELL_OK, Close's
+argument; who may call cellGameExec (Home alone?), GetList's entries and whether this game and the disc are listed,
+DeleteGame's dialog and answers, ExecGame's checks and its answer for this game, GetExitGameInfo's answer when no game
+was booted from this one (an error, or a status saying so), and the arguments' order of all four.
+Tests: test_sysutil_misc.cpp "[authdialog]" (Abort and Close with no dialog, after a refused Open, after an abort,
+twice, one dialog for two Opens), "[gameexec]" (a synthetic /dev_hdd0 with this HDD game, another and game data: the
+list, deletion and booting of each, the names refused, the disc mounted and not, a disc game's own disc, the exit
+information's checks; nothing written, nothing deleted).
+
+## D-673 · 2026-10-11 · cellRtcAlarm: the system's RTC alarms kept, none rings; no argument read or written
+
+libsysutil_rtcalarm is an internal sysmodule (0xf032 in RPCS3's cellSysmodule.cpp; no public module ID loads it).
+RPCS3 registers its five names with no arguments (rpcs3/Emu/Cell/Modules/cellRtcAlarm.cpp: UNIMPLEMENTED_FUNC, CELL_OK
+each) and nothing public describes them. Read with lv2's system manager calls sys_sm_set_rtc_alarm and
+sys_sm_get_rtc_alarm (396 and 397, for the system only: pspocket's lv2 refuses them to a game, D-527), it is the
+application side of the console's wake-up alarm: an application registers a time at which the console leaves standby
+for it. pspocket's (runtime/hle/src/sysutil_misc.cpp), unverified (D-594; the module is always native):
+- pspocket's console has no standby (the app is the console, and nothing runs while it is closed), so no alarm ever
+  rings or runs.
+- Register keeps a registration under its first argument's low word (what names an alarm is not known: an ID, a time,
+  the address of a description), its argument registers r3 to r6 as given; the same first argument again replaces
+  it; at most 256 are kept, more are answered and not kept (logged). Unregister forgets the one kept under its first
+  argument, and answers CELL_OK when none is (logged): the keys being a guess, an error there could fail a cleanup
+  that works on a PS3. Notification (no alarm has rung), StopRunning (none runs) and GetStatus (the count kept, none
+  rung) have nothing to tell. Every answer is RPCS3's CELL_OK.
+- No argument is read or written: the layouts are not known, and a status written through a pointer guessed wrong
+  would land in the game's data. Each call logs its argument registers (each function's first four calls at info),
+  so a run shows what a game passes.
+To check on the Mac, against libsysutil_rtcalarm.sprx: the five signatures (whether Register takes a CellRtcTick or a
+CellRtcDateTime, an application's parameters, and answers an ID), the error codes, whether a game may load the module
+at all, what GetStatus and Notification write when no alarm has rung, what StopRunning stops, the registration limit.
+Tests: test_sysutil_misc.cpp "[rtcalarm]" (every call with pointers and with values that are no guest memory, a
+registration replaced, unregistered twice, 300 registrations and their unregistering; nothing written).
+
+## D-674 · 2026-10-11 · cellImeJpOpenExt, cellAudioOutUnregisterDevice and cellVideoOutGetResolutionAvailability2 on their neighbours
+
+The last three of this round's stubs, made on pspocket's own neighbouring functions, unverified (D-594; libsysutil_*
+modules are always native).
+- **cellImeJpOpenExt** (RPCS3: a todo with no arguments; runtime/hle/src/cellImeJp.cpp) as the newest Open, Open3
+  (RPCS3 cellImeJp.cpp, D-188): a non-zero memory container and a handle pointer (PARAM otherwise, logged when not
+  guest memory), the one IME of the process (ALREADY_OPEN while any Open's IME is open), RPCS3's handle 0xF0000000
+  written, the list of four CellImeJpAddDic pointers noted (null entries and those not guest memory skipped, logged).
+  What an extended form adds (r6 on) is not read. Should the third argument be one CellImeJpAddDic (Open2's form), its
+  path's first bytes read as four pointers are not guest memory and are skipped: dictionaries are only noted (RPCS3
+  has none), so the IME is the same either way.
+- **cellAudioOutUnregisterDevice(deviceNumber)** (RPCS3 cellAvconfExt.cpp: a todo answering CELL_OK;
+  runtime/hle/src/cellSysutil.cpp): cellAudioOutRegisterDevice still gives device 0 to every registration (RPCS3's
+  answer, unchanged) and now counts them; Unregister of device 0 while one is counted takes it, CELL_OK; any other
+  number, or device 0 with none counted, is CELL_AUDIO_OUT_ERROR_DEVICE_NOT_FOUND (0x8002b244).
+  cellAudioInUnregisterDevice is unchanged (CELL_OK for any number, as RPCS3's microphone thread unregisters).
+- **cellVideoOutGetResolutionAvailability2** (RPCS3: a todo with no arguments answering 0, which as this boolean answer
+  says "not available" to every mode): the public form's first three arguments (videoOut, resolutionId, aspect) and its
+  answer, from one body for both: 1 for the 720p display at 16:9 or auto on the primary output, 0 for any other mode
+  and on the secondary output, UNSUPPORTED_VIDEO_OUT for another output. What the second form adds (r6, r7) is logged,
+  not read.
+To check on the Mac: OpenExt's arguments and whether it opens the same IME; the device numbers RegisterDevice gives
+(pspocket: always 0) and Unregister's answers; GetResolutionAvailability2's arguments (a refresh rate? a 3D mode?) and
+whether its answer is the same boolean.
+Tests: test_imejp.cpp (OpenExt's checks, the list, one IME for every Open, a single dictionary and an unmapped list),
+test_sysutil.cpp "[avconf]" (registrations unregistered once each, other numbers; both availability forms over the
+same modes and outputs).
+The count (scripts/progress.py): 6,211 of 6,625 library functions pspocket's own before D-670 and 188 answered as
+RPCS3's stubs; after D-674, 6,242 and 157 (cellNetCtl 11, cellBGDLUtility 4, cellSysutilAp 2, cellAuthDialogUtility
+2, cellGameExec 4, cellRtcAlarm 5, cellImeJpUtility 1, cellSysutilAvconfExt 2: every one of these libraries' cells).
