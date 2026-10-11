@@ -750,7 +750,7 @@ void register_cellVpost(Registry& r)
         PS_HLE_FUNC(0x10EF39F6, cellVpostClose),
         PS_HLE_FUNC(0xABB8CC3D, cellVpostExec),
     });
-    r.firmware_first(kModule);
+    // Compared with libvpost and matching it, no longer firmware-first (D-913, D-563): games get pspocket's.
 }
 
 } // namespace pspocket::hle

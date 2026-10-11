@@ -12329,3 +12329,13 @@ byte mean, rounded up, of U[x + d] and D[x - d], d one of 0 (straight down), -1 
 - The chroma is averaged straight, the field's edge rows as before.
 cellVpostExec no longer logs that type 2 may differ. Test: test_vpost.cpp's edge-adaptive case (a tie between the
 diagonals, which the sum took the other way, and a mirrored edge). The comparison: 7 of 791 to 0.
+
+## D-913 · 2026-10-11 · cellVpost no longer firmware-first (part 13)
+
+cellVpost matches Sony's libvpost call for call (parts 4, 6, 7 and 9 to 12: 0 of 791 observations differ: every
+answer, the handle, the colour conversion in each matrix and range, the four scalers, windows, the eight exec types and
+the three interlace conversions, the bytes past a YUV picture and the picture information), so its firmware-first
+marker goes (D-563): where the system software is installed, a game importing cellVpost now gets pspocket's, not
+libvpost.sprx. Scaler types 2 and 3 read their filter tables from that installed libvpost.sprx (part 9); without it they
+fall back to bilinear, logged. Its comparison (test_vpost_compare.cpp) loses its [.]: it runs in the Mac's gate with the
+firmware and skips without it; the name check and test_vpost.cpp check the library is pspocket's and unmarked.

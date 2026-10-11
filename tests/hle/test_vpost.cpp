@@ -110,7 +110,7 @@ std::array<u8, 4> pixel(GuestThread& g, u32 w, u32 x, u32 y)
 
 } // namespace
 
-TEST_CASE("cellVpost: the five functions, firmware first", "[hle][vpost]")
+TEST_CASE("cellVpost: the five functions, pspocket's own (no longer firmware-first, D-913)", "[hle][vpost]")
 {
     for (const std::string_view name :
         {"cellVpostQueryAttr", "cellVpostOpen", "cellVpostOpenEx", "cellVpostClose", "cellVpostExec"}) {
@@ -119,7 +119,7 @@ TEST_CASE("cellVpost: the five functions, firmware first", "[hle][vpost]")
         REQUIRE(fn != nullptr);
         CHECK(fn->name == name);
     }
-    CHECK(hle::registry().is_firmware_first("cellVpost"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellVpost"));
 }
 
 TEST_CASE("cellVpost: QueryAttr's memory and checks; Open's, OpenEx's and Close's", "[hle][vpost]")

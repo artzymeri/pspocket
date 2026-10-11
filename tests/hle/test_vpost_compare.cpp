@@ -530,13 +530,15 @@ Observed half(const Setup& s, bool sony_half)
 
 } // namespace
 
-TEST_CASE("cellVpost's comparison calls Sony's exports by their names; pspocket's library, firmware first", "[hle][vpost]")
+TEST_CASE("cellVpost's comparison calls Sony's exports by their names; pspocket's library", "[hle][vpost]")
 {
-    check_names("cellVpost", {"cellVpostQueryAttr", "cellVpostOpen", "cellVpostOpenEx", "cellVpostClose", "cellVpostExec"});
+    check_names("cellVpost", {"cellVpostQueryAttr", "cellVpostOpen", "cellVpostOpenEx", "cellVpostClose", "cellVpostExec"},
+        /*marked=*/false);
 }
 
+// It matches (D-913): no longer hidden, it runs wherever the firmware is (the Mac's gate) and skips elsewhere.
 TEST_CASE("cellVpost against Sony's libvpost: sizes, handles, conversions, scaling, windows, picture information",
-    "[.][hle][lle][compare][vpost]")
+    "[hle][lle][compare][vpost]")
 {
     const Setup s = setup();
     run(s, "cellVpost against Sony's libvpost", [&](bool sony) { return half(s, sony); },
