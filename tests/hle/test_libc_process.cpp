@@ -241,7 +241,7 @@ TEST_CASE("sys_libc: _Printf and _Scanf through the caller's functions", "[hle][
     ps_write64(b, kA + 16, std::bit_cast<u64>(2.25));
     std::memset(b + kBuf, 0, 64);
     CHECK(i32(t.call("_Printf", copy, kBuf, kFmt, kA)) == 13);
-    CHECK(cstr(b, kBuf) == "-42-abc|  2.2");
+    CHECK(cstr(b, kBuf) == "-42-abc|  2.3"); // the SDK's printf rounds half up (D-905)
     // pfn(cursor, c, get): the next byte of a string (EOF at its NUL), or c pushed back.
     const u32 getc = c.add({0x80C30000u, 0x2C050000u, 0x41820028u, 0x88E60000u, 0x2C070000u, 0x41820014u,
         0x38C60001u, 0x90C30000u, 0x7CE33B78u, 0x4E800020u, 0x3860FFFFu, 0x4E800020u, 0x38C6FFFFu, 0x90C30000u,

@@ -20,9 +20,10 @@
 //   detach callbacks with liblv2 (_sys_spu_printf_initialize); spu_printf_attach_group/thread connect port 1;
 //   spu_printf_finalize destroys the queue, which ends the server. The arguments in LS: quadwords, the format's LS
 //   address in the first one's preferred word, then one argument per quadword in its preferred slot (word 0 for 32
-//   bits, doubleword 0 for 64), as the SPU ABI keeps variadic arguments.
-// - _Printf and _Scanf: Dinkumware's engines with the caller's output and input functions
-//   (pfn(arg, text, n) returning the next arg, NULL to stop; pfn(arg, c, get) getting or pushing back a character).
+//   bits, doubleword 0 for 64), as the SPU ABI keeps variadic arguments. The text is the SDK's SPU printf's
+//   (sys_libc_format.cpp, D-905).
+// - _Scanf: Dinkumware's engine with the caller's input function (pfn(arg, c, get) getting or pushing back a
+//   character). _Printf is in sys_libc_format.cpp (D-905).
 
 #include <algorithm>
 #include <array>
@@ -39,6 +40,7 @@
 #include "libc_format.hpp"
 #include "libc_guest.hpp"
 #include "libc_malloc.hpp"
+#include "libc_spu_printf.hpp"
 #include "prx.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/lv2/syscalls.hpp"
@@ -421,150 +423,6 @@ void tls_mutex_attr_init(u8* b, u32 a) { mutex_attr(b, a, "_TlsMtx"); }
 
 // ------------------------------------------------------------------------------------------------- SPU printf
 
-// The arguments of an SPU's printf in its local store (see the top).
-class SpuFormat final : public FormatSource {
-public:
-    // read(lsa, n, out): n bytes of LS; false when they cannot be read.
-    using Reader = std::function<bool(u32, u32, u8*)>;
-    SpuFormat(Reader read, u32 first) : read_(std::move(read)), next_(first) {}
-    u64 next() override { return word(true); }
-    u64 next_int(u32 bits) override { return bits > 32 ? word(false) : word(true); }
-    double next_double() override { return std::bit_cast<double>(word(false)); }
-    std::optional<std::string> string(u32 addr, u64 max) override
-    {
-        std::string s;
-        u8 chunk[16];
-        for (u32 a = addr & 0x3FFFF; s.size() < max;) {
-            const u32 at = a & ~15u;
-            if (!read_(at, 16, chunk)) return std::nullopt;
-            for (u32 i = a - at; i < 16 && s.size() < max; i++, a++) {
-                if (!chunk[i]) return s;
-                s += static_cast<char>(chunk[i]);
-            }
-            if (a >= 0x40000) return std::nullopt;
-        }
-        return s;
-    }
-    std::optional<std::u32string> wstring(u32 addr, u64 max) override
-    {
-        std::u32string s;
-        u8 w[4];
-        for (u32 a = addr & 0x3FFFC; s.size() < max; a += 4) {
-            if (a >= 0x40000 || !read_(a, 4, w)) return std::nullopt;
-            const u32 c = ps_read32(w, 0);
-            if (!c) return s;
-            s += static_cast<char32_t>(c);
-        }
-        return s;
-    }
-    bool store(u32, u64, u32) override { return false; } // %n into an SPU's memory is not written
-
-private:
-    u64 word(bool w32)
-    {
-        u8 q[8];
-        const u32 at = next_;
-        next_ += 16;
-        if (!read_(at, 8, q)) {
-            problems.push_back(std::format("the argument at LS {:#x} cannot be read", at));
-            return 0;
-        }
-        return w32 ? ps_read32(q, 0) : ps_read64(q, 0);
-    }
-    Reader read_;
-    u32 next_;
-};
-
-// The text of the printf whose arguments are at `arg` in the SPU thread's local store; nullopt when its format cannot
-// be read.
-std::optional<std::string> spu_text(PPUContext& ctx, const char* fn, SpuFormat::Reader read, u32 arg)
-{
-    u8 q[4];
-    if (!read(arg & 0x3FFF0, 4, q)) {
-        refuse(ctx, std::format("{}: the arguments at LS {:#x} cannot be read", fn, arg));
-        return std::nullopt;
-    }
-    SpuFormat src(read, (arg & 0x3FFF0) + 16);
-    const auto fmt = src.string(ps_read32(q, 0), kMaxString);
-    if (!fmt) {
-        refuse(ctx, std::format("{}: the format at LS {:#x} cannot be read", fn, ps_read32(q, 0)));
-        return std::nullopt;
-    }
-    FormatResult<char> r = format<char>(*fmt, src);
-    for (const std::string& p : src.problems) refuse(ctx, std::format("{}: {}", fn, p));
-    if (r.failed) return std::nullopt;
-    return std::move(r.text);
-}
-
-SpuFormat::Reader thread_reader(PPUContext& ctx, u32 spu)
-{
-    return [&ctx, spu](u32 lsa, u32 n, u8* out) {
-        lv2::PpuThread& t = thread_of(ctx);
-        StackVar v(ctx, t.kernel.base(), 8);
-        for (u32 i = 0; i < n; i += 8) {
-            const u32 k = std::min<u32>(8, n - i);
-            if (lv2::sys_spu_thread_read_ls(t, spu, lsa + i, v.addr(), k == 8 ? 8 : 4) != lv2::CELL_OK) return false;
-            const u64 value = ps_read64(t.kernel.base(), v.addr());
-            u8 bytes[8];
-            if (k == 8) ps_write64(bytes, 0, value);
-            else ps_write32(bytes, 0, static_cast<u32>(value));
-            std::memcpy(out + i, bytes, k);
-        }
-        return true;
-    };
-}
-
-// A raw SPU's local store is guest memory at 0xE0000000 + 0x100000 * id.
-SpuFormat::Reader raw_reader(PPUContext& ctx, u32 id)
-{
-    return [&ctx, id](u32 lsa, u32 n, u8* out) {
-        const u32 ea = 0xE0000000u + 0x100000u * id + (lsa & 0x3FFFF);
-        if (id >= 6 || !guest_range(thread_of(ctx), ea, n)) return false;
-        std::memcpy(out, gb(ctx) + ea, n);
-        return true;
-    };
-}
-
-s32 print_spu(PPUContext& ctx, const char* fn, SpuFormat::Reader read, u32 arg)
-{
-    const auto text = spu_text(ctx, fn, std::move(read), arg);
-    if (!text) return -1;
-    tty_out(ctx, *text);
-    return static_cast<s32>(text->size());
-}
-
-s32 sprint_spu(PPUContext& ctx, const char* fn, u32 buf, u64 size, SpuFormat::Reader read, u32 arg)
-{
-    const auto text = spu_text(ctx, fn, std::move(read), arg);
-    if (!text) return -1;
-    if (size) {
-        const usize k = std::min<u64>(text->size(), size - 1);
-        if (!range_ok(ctx, fn, buf, k + 1)) return -1;
-        std::memcpy(gb(ctx) + buf, text->data(), k);
-        gb(ctx)[buf + k] = 0;
-    }
-    return static_cast<s32>(text->size());
-}
-
-s32 spu_thread_printf_(PPUContext& ctx, u32 spu, u32 arg) { return print_spu(ctx, "spu_thread_printf", thread_reader(ctx, spu), arg); }
-s32 spu_thread_sprintf_(PPUContext& ctx, u32 buf, u32 spu, u32 arg)
-{
-    return sprint_spu(ctx, "spu_thread_sprintf", buf, ~u64{0}, thread_reader(ctx, spu), arg);
-}
-s32 spu_thread_snprintf_(PPUContext& ctx, u32 buf, u32 size, u32 spu, u32 arg)
-{
-    return sprint_spu(ctx, "spu_thread_snprintf", buf, size, thread_reader(ctx, spu), arg);
-}
-s32 raw_spu_printf_(PPUContext& ctx, u32 id, u32 arg) { return print_spu(ctx, "raw_spu_printf", raw_reader(ctx, id), arg); }
-s32 spu_raw_sprintf_(PPUContext& ctx, u32 buf, u32 id, u32 arg)
-{
-    return sprint_spu(ctx, "spu_raw_sprintf", buf, ~u64{0}, raw_reader(ctx, id), arg);
-}
-s32 spu_raw_snprintf_(PPUContext& ctx, u32 buf, u32 size, u32 id, u32 arg)
-{
-    return sprint_spu(ctx, "spu_raw_snprintf", buf, size, raw_reader(ctx, id), arg);
-}
-
 constexpr u32 kSpuPrintfPort = 1, kEventUser = 1;
 
 struct SpuPrintfState {
@@ -590,17 +448,13 @@ void _pspocket_spu_printf_server(PPUContext& ctx, u64 queue)
         }
         s32 r;
         if (handler) {
-            const auto text = spu_text(ctx, "spu_printf", thread_reader(ctx, spu), arg);
-            if (text) {
-                StackVar buf(ctx, gb(ctx), static_cast<u32>(text->size() + 1));
-                write_string(t, buf.addr(), *text);
-                call_guest(ctx, handler, {buf.addr()});
-                r = static_cast<s32>(text->size());
-            } else {
-                r = -1;
-            }
+            const PrintResult<char> text = spu_thread_print_text(ctx, spu, arg);
+            StackVar buf(ctx, gb(ctx), static_cast<u32>(text.text.size() + 1));
+            write_string(t, buf.addr(), text.text);
+            call_guest(ctx, handler, {buf.addr()});
+            r = text.count;
         } else {
-            r = print_spu(ctx, "spu_printf", thread_reader(ctx, spu), arg);
+            r = spu_thread_print_tty(ctx, spu, arg);
         }
         lv2::sys_spu_thread_write_spu_mb(t, spu, static_cast<u32>(r));
     }
@@ -729,61 +583,7 @@ s32 spu_printf_finalize_(PPUContext& ctx)
     return lv2::CELL_OK;
 }
 
-// ------------------------------------------------------------------------------------------------- _Printf, _Scanf
-
-// int _Printf(void *(*pfn)(void *, const char *, size_t), void *arg, const char *fmt, va_list ap): the text given to
-// pfn in pieces of up to 512 bytes (each call returns the next arg; NULL stops it: EOF).
-template <class C>
-s32 printf_through(PPUContext& ctx, const char* fn, u32 pfn, u32 arg, u32 fmt, u32 ap)
-{
-    VarArgs args = VarArgs::list(ctx, ap);
-    std::optional<std::basic_string<C>> f;
-    if constexpr (std::is_same_v<C, char>) f = read_string(thread_of(ctx), fmt);
-    else f = read_wstring(thread_of(ctx), fmt, kMaxString / 4);
-    if (!f) {
-        refuse(ctx, std::format("{}: the format at {:#x} runs out of guest memory", fn, fmt));
-        return -1;
-    }
-    class Src final : public FormatSource {
-    public:
-        Src(PPUContext& c, VarArgs& a) : ctx_(c), a_(a) {}
-        u64 next() override { return a_.next(); }
-        std::optional<std::string> string(u32 addr, u64 max) override { return read_string(thread_of(ctx_), addr, max); }
-        std::optional<std::u32string> wstring(u32 addr, u64 max) override
-        {
-            return read_wstring(thread_of(ctx_), addr, max);
-        }
-        bool store(u32 addr, u64 value, u32 bytes) override
-        {
-            if (!guest_range(thread_of(ctx_), addr, bytes)) return false;
-            for (u32 k = 0; k < bytes; k++) gb(ctx_)[addr + k] = static_cast<u8>(value >> (8 * (bytes - 1 - k)));
-            return true;
-        }
-
-    private:
-        PPUContext& ctx_;
-        VarArgs& a_;
-    } src(ctx, args);
-    FormatResult<C> r = format<C>(*f, src);
-    for (const std::string& p : src.problems) refuse(ctx, std::format("{}: {}", fn, p));
-    if (r.failed) return -1;
-    constexpr usize kPiece = 512;
-    const u32 unit = sizeof(C) == 1 ? 1 : 4;
-    for (usize at = 0; at < r.text.size(); at += kPiece) {
-        const usize n = std::min(kPiece, r.text.size() - at);
-        StackVar buf(ctx, gb(ctx), static_cast<u32>(n * unit + 4));
-        for (usize i = 0; i < n; i++) {
-            if constexpr (sizeof(C) == 1) gb(ctx)[buf.addr() + i] = static_cast<u8>(r.text[at + i]);
-            else ps_write32(gb(ctx), buf.addr() + 4 * static_cast<u32>(i), static_cast<u32>(r.text[at + i]));
-        }
-        arg = static_cast<u32>(call_guest(ctx, pfn, {arg, buf.addr(), n}));
-        if (!arg) return -1;
-    }
-    return static_cast<s32>(r.text.size());
-}
-
-s32 _Printf_(PPUContext& ctx, u32 pfn, u32 arg, u32 fmt, u32 ap) { return printf_through<char>(ctx, "_Printf", pfn, arg, fmt, ap); }
-s32 _WPrintf_(PPUContext& ctx, u32 pfn, u32 arg, u32 fmt, u32 ap) { return printf_through<char32_t>(ctx, "_WPrintf", pfn, arg, fmt, ap); }
+// ------------------------------------------------------------------------------------------------- _Scanf
 
 // int _Scanf(int (*pfn)(void *, int, int), void *arg, const char *fmt, va_list ap): pfn(arg, 0, 1) gets a character
 // (EOF at the end), pfn(arg, c, 0) pushes c back.
@@ -846,16 +646,14 @@ void register_sys_libc_process(Registry& r)
 {
     for (const std::string_view lib : {std::string_view("sys_libc"), std::string_view("sys_libm")}) {
         r.add(lib, {
-            LIBC(atexit), LIBC(_Atexit), LIBC(__cxa_atexit), LIBC(__call_functions_registered_with_atexit),
-            LIBC(exit), LIBC(_Exit), LIBC(abort), LIBC(exitspawn), LIBC(_Exitspawn), LIBC(_Assert),
-            LIBC(_Nonfatal_Assert), LIBC(_SCE_Assert), LIBC(_Mtxinit), LIBC(_Mtxdst), LIBC(_Mtxlock),
-            LIBC(_Mtxunlock), LIBC(_Initlocks), LIBC(_Clearlocks), LIBC(_Locksyslock), LIBC(_Unlocksyslock),
-            LIBC(_Once), LIBC(spu_thread_printf), LIBC(spu_thread_sprintf), LIBC(spu_thread_snprintf),
-            LIBC(raw_spu_printf), LIBC(spu_raw_sprintf), LIBC(spu_raw_snprintf), LIBC(spu_printf_initialize),
+            LIBC(atexit), LIBC(_Atexit), LIBC(__cxa_atexit), LIBC(__call_functions_registered_with_atexit), LIBC(exit),
+            LIBC(_Exit), LIBC(abort), LIBC(exitspawn), LIBC(_Exitspawn), LIBC(_Assert), LIBC(_Nonfatal_Assert),
+            LIBC(_SCE_Assert), LIBC(_Mtxinit), LIBC(_Mtxdst), LIBC(_Mtxlock), LIBC(_Mtxunlock), LIBC(_Initlocks),
+            LIBC(_Clearlocks), LIBC(_Locksyslock), LIBC(_Unlocksyslock), LIBC(_Once), LIBC(spu_printf_initialize),
             LIBC(spu_printf_finalize), LIBC(spu_printf_attach_group), LIBC(spu_printf_detach_group),
-            LIBC(spu_printf_attach_thread), LIBC(spu_printf_detach_thread), LIBC(_Printf), LIBC(_WPrintf),
-            LIBC(_Scanf), LIBC(_WScanf), LIBC(_Tlsalloc), LIBC(_Tlsfree), LIBC(_Tlsset), LIBC(_Tlsget),
-            LIBC(TlsGetValue), LIBC(TlsSetValue), LIBC(_Destroytls), LIBC(setjmp), LIBC(longjmp),
+            LIBC(spu_printf_attach_thread), LIBC(spu_printf_detach_thread), LIBC(_Scanf), LIBC(_WScanf),
+            LIBC(_Tlsalloc), LIBC(_Tlsfree), LIBC(_Tlsset), LIBC(_Tlsget), LIBC(TlsGetValue), LIBC(TlsSetValue),
+            LIBC(_Destroytls), LIBC(setjmp), LIBC(longjmp),
         });
     }
     // The server's body and the callbacks liblv2's sys_spu_printf_attach_* call: internal (linked when the game
