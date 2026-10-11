@@ -473,9 +473,148 @@ TEST_CASE("cellSysutilAvcExt: the transition after float arguments comes from th
     CHECK(a.call("cellSysutilAvcExtSetWindowSize", kNp, 0, 0, 5) == kInval);
 }
 
-TEST_CASE("AV chat: every stub RPCS3 left is pspocket's own, unverified (D-675, D-676)", "[hle][avc][avc2]")
+TEST_CASE("AV chat: every stub RPCS3 left is pspocket's own, unverified (D-675 to D-677)", "[hle][avc][avc2][avcext]")
 {
     CHECK(own_stubs("cellSysutilAvc2") == 16);
+    CHECK(own_stubs("cellSysutilAvcExt") == 14);
+}
+
+TEST_CASE("cellSysutilAvcExt: the panel is libsysutil's request, refused with no system software (D-677)",
+    "[hle][avc][avcext]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    u8* base = f.base();
+    write_callback(base);
+    constexpr u32 kReq = kData + 0x100;
+    const auto load = [&](u32 media) { return a.call("cellSysutilAvcLoadAsync", kOpd, 0x55, 0, media, 1, 1, kReq); };
+
+    // No AV chat: INVALID_STATUS, after the transition's check (NONE, -1, passes it, as libsysutil's export has it).
+    CHECK(a.call("cellSysutilAvcExtShowPanelEx", 0) == kInvalStatus);
+    CHECK(a.call("cellSysutilAvcExtHidePanelEx", 0xFFFFFFFF) == kInvalStatus);
+    CHECK(a.call("cellSysutilAvcExtShowPanelEx", 5) == kInval);
+    // A voice chat has no panel.
+    REQUIRE(load(1) == 0);
+    CHECK(a.call("cellSysutilAvcExtShowPanelEx", 0) == kInvalStatus);
+    REQUIRE(a.call("cellSysutilAvcUnloadAsync", kReq) == 0);
+    REQUIRE(take(a, base, 4).size() == 2); // loaded, unloaded
+    // A video chat's panel request goes to the system, which is not there: ERROR_UNKNOWN, as cellSysutilAvcShowPanel.
+    REQUIRE(load(2) == 0);
+    CHECK(a.call("cellSysutilAvcExtShowPanelEx", 0) == kUnknown);
+    CHECK(a.call("cellSysutilAvcExtShowPanelEx", 4) == kUnknown);
+    CHECK(a.call("cellSysutilAvcExtHidePanelEx", 0xFFFFFFFF) == kUnknown);
+    CHECK(a.call("cellSysutilAvcExtHidePanelEx", 7) == kInval);
+    CHECK(a.call("cellSysutilAvcShowPanel") == kUnknown);
+}
+
+TEST_CASE("cellSysutilAvcExt: each player's window kept as the game set it, name plates, chat mode and group, "
+          "detections with no device (D-677)",
+    "[hle][avc][avcext]")
+{
+    InterpretMisses interpret;
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    u8* base = f.base();
+    write_callback(base);
+    constexpr u32 kAlice = kData + 0x100, kAlice2 = kData + 0x140, kBob = kData + 0x180, kOut = kData + 0x200,
+                  kReq = kData + 0x240;
+    constexpr u64 kGarbage = 0xDEADBEEF; // what the caller left in the floats' registers
+    const auto np_id = [&](u32 at, std::string_view online_id, u8 fill) {
+        std::memset(base + at, fill, 36); // after the online ID's NUL: the term's padding, opt, reserved
+        std::memcpy(base + at, online_id.data(), online_id.size());
+        base[at + online_id.size()] = 0;
+    };
+    np_id(kAlice, "alice", 0);
+    np_id(kAlice2, "alice", 0x5A); // the same online ID, other bytes after it: the same player
+    np_id(kBob, "bob", 0);
+    const auto floats3 = [&](std::string_view fn, u32 player, double x, double y, double z, u64 transition) {
+        a.ctx.fpr[1] = x;
+        a.ctx.fpr[2] = y;
+        a.ctx.fpr[3] = z;
+        return a.call(fn, player, kGarbage, kGarbage, kGarbage, transition); // the transition in r7
+    };
+    const auto blank = [&] { std::memset(base + kOut, 0xAA, 16); };
+
+    // Nothing set yet: the getters write nothing.
+    blank();
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowPosition", kAlice, kOut, kOut + 4, kOut + 8) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowRotation", kAlice, kOut, kOut + 4, kOut + 8) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowSize", kAlice, kOut, kOut + 4) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowAlpha", kAlice, kOut) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowShowStatus", kAlice, kOut) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetNamePlateShowStatus", kOut) == 0);
+    CHECK(ps_read32(base, kOut) == 0xAAAAAAAAu);
+    CHECK(ps_read32(base, kOut + 8) == 0xAAAAAAAAu);
+
+    // Position and rotation, checked as SetWindowAlpha; the transition after the three floats from r7.
+    REQUIRE(floats3("cellSysutilAvcExtSetWindowPosition", kAlice, 0.25, -0.75, 2.0, 2) == 0);
+    REQUIRE(floats3("cellSysutilAvcExtSetWindowRotation", kBob, 10.0, 20.0, 30.0, 0) == 0);
+    CHECK(floats3("cellSysutilAvcExtSetWindowPosition", kAlice, 0, 0, 0, 5) == kInval);
+    CHECK(floats3("cellSysutilAvcExtSetWindowRotation", kBob, 0, 0, 0, 0xFFFFFFFF) == kInval);
+    CHECK(floats3("cellSysutilAvcExtSetWindowPosition", 0, 0, 0, 0, 0) == kInval);
+    CHECK(floats3("cellSysutilAvcExtSetWindowRotation", kUnmapped, 0, 0, 0, 0) == kInval); // RPCS3 reads nothing
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowPosition", kAlice2, kOut, kOut + 4, kOut + 8) == 0);
+    CHECK(float_at(base, kOut) == 0.25f);
+    CHECK(float_at(base, kOut + 4) == -0.75f);
+    CHECK(float_at(base, kOut + 8) == 2.0f);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowRotation", kBob, kOut, kOut + 4, kOut + 8) == 0);
+    CHECK(float_at(base, kOut) == 10.0f);
+    CHECK(float_at(base, kOut + 8) == 30.0f);
+    blank();
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowRotation", kAlice, kOut, kOut + 4, kOut + 8) == 0); // Alice's: none
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowPosition", kBob, kOut, kOut + 4, kOut + 8) == 0);
+    CHECK(ps_read32(base, kOut) == 0xAAAAAAAAu);
+
+    // Alpha, size and the show status as D-187's setters now keep them.
+    a.ctx.fpr[1] = 0.5;
+    REQUIRE(a.call("cellSysutilAvcExtSetWindowAlpha", kAlice, kGarbage, 1) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowAlpha", kAlice, kOut) == 0);
+    CHECK(float_at(base, kOut) == 0.5f);
+    a.ctx.fpr[1] = 320.0;
+    a.ctx.fpr[2] = 240.0;
+    REQUIRE(a.call("cellSysutilAvcExtSetWindowSize", kAlice, kGarbage, kGarbage, 0) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowSize", kAlice, kOut, kOut + 4) == 0);
+    CHECK(float_at(base, kOut) == 320.0f);
+    CHECK(float_at(base, kOut + 4) == 240.0f);
+    REQUIRE(a.call("cellSysutilAvcExtShowWindow", kAlice, 0) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowShowStatus", kAlice, kOut) == 0);
+    CHECK(base[kOut] == 1);
+    REQUIRE(a.call("cellSysutilAvcExtHideWindow", kAlice2, 0) == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowShowStatus", kAlice, kOut) == 0);
+    CHECK(base[kOut] == 0);
+    base[kOut] = 0xAA;
+    REQUIRE(a.call("cellSysutilAvcExtGetWindowShowStatus", kBob, kOut) == 0);
+    CHECK(base[kOut] == 0xAA);
+    REQUIRE(a.call("cellSysutilAvcExtSetWindowZorder", kBob, 3) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetWindowZorder", kUnmapped, 3) == kInval);
+    // Outputs that are not guest memory, once there is something to write.
+    CHECK(a.call("cellSysutilAvcExtGetWindowAlpha", kAlice, kUnmapped) == kInval);
+    CHECK(a.call("cellSysutilAvcExtGetWindowShowStatus", kAlice, kUnmapped) == kInval);
+    CHECK(a.call("cellSysutilAvcExtGetWindowPosition", kAlice, kOut, kOut + 4, 0) == kInval);
+    CHECK(a.call("cellSysutilAvcExtGetWindowPosition", kUnmapped, kOut, kOut + 4, kOut + 8) == kInval);
+
+    // The name plates, as the game last said.
+    REQUIRE(a.call("cellSysutilAvcExtSetHideNamePlate") == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetNamePlateShowStatus", kOut) == 0);
+    CHECK(base[kOut] == 0);
+    REQUIRE(a.call("cellSysutilAvcExtSetShowNamePlate") == 0);
+    REQUIRE(a.call("cellSysutilAvcExtGetNamePlateShowStatus", kOut) == 0);
+    CHECK(base[kOut] == 1);
+    CHECK(a.call("cellSysutilAvcExtGetNamePlateShowStatus", kUnmapped) == kInval);
+
+    // The chat mode and group; the detections, with the AV chat loaded: no device, so no event ever comes.
+    CHECK(a.call("cellSysutilAvcExtSetChatMode", 2) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetChatGroup") == 0);
+    REQUIRE(a.call("cellSysutilAvcLoadAsync", kOpd, 0x55, 0, 2, 1, 1, kReq) == 0);
+    for (const char* fn : {"cellSysutilAvcExtStartCameraDetection", "cellSysutilAvcExtStartMicDetection",
+             "cellSysutilAvcExtStartVoiceDetection", "cellSysutilAvcExtStopCameraDetection",
+             "cellSysutilAvcExtStopMicDetection", "cellSysutilAvcExtStopVoiceDetection",
+             "cellSysutilAvcExtStartVoiceDetection"}) {
+        INFO(fn);
+        CHECK(a.call(fn) == 0);
+    }
+    CHECK(take(a, base, 4) == std::vector<Entry>{{ps_read32(base, kReq), 1, 0, 0x55}}); // the load's only
 }
 
 TEST_CASE("cellSysutilAvc2: the video chat's windows and screen, the game's own (D-676)", "[hle][avc][avc2]")

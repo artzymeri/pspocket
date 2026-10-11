@@ -533,12 +533,24 @@ s32 cellSysutilAvcSetSpeakerVolumeLevel(PPUContext&, s32 level)
 
 // ------------------------------------------------------------------------------------- cellSysutilAvcExt
 
-// RPCS3 cellSysutilAvcExt.cpp: the AV chat's windows, panel and name plates. Nothing is shown, so the getters check
-// their pointers and write nothing (RPCS3's TODOs), the setters check the player and the transition (at most
-// EXPONENT, so NONE is refused too, as RPCS3) or the z-order; cellSysutilAvcExtLoadAsyncEx checks its option and loads
-// through cellSysutilAvcLoadAsync. Float arguments come in f1.. and each takes its general register's slot, so the
-// transition after them comes from the register after theirs (the PPC64 ELF ABI, D-503; RPCS3's binder skips no
-// register, and D-187 read the transition so, from r4: D-678). RPCS3's stubs here are answered from rpcs3_stubs.inc.
+// RPCS3 cellSysutilAvcExt.cpp: the AV chat's windows, panel and name plates. Nothing is drawn. The setters check the
+// player and the transition (at most EXPONENT, so NONE is refused too, as RPCS3) or the z-order, and keep what they set
+// for the player (D-677); the getters check their pointers and write what the game set (RPCS3's TODOs write nothing);
+// cellSysutilAvcExtLoadAsyncEx checks its option and loads through cellSysutilAvcLoadAsync. Float arguments come in
+// f1.. and each takes its general register's slot, so the transition after them comes from the register after theirs
+// (the PPC64 ELF ABI, D-503; RPCS3's binder skips no register, and D-187 read the transition so, from r4: D-678).
+//
+// The functions RPCS3 leaves as stubs are pspocket's own (D-677; unverified, D-594), as this library with no system
+// software behind it and no camera or microphone:
+// - The panel with a transition (ShowPanelEx, HidePanelEx) is libsysutil's export 0x44F288A7 (D-534: the AV chat
+//   panel's show state, which libsysutil exports for this library), as libsysutil's own cellSysutilAvcShowPanel and
+//   HidePanel send it: refused on pspocket's console, which has no system software to take the request.
+// - SetWindowPosition and SetWindowRotation as SetWindowAlpha (RPCS3's checks there), kept for the player.
+// - The name plates shown or hidden, the chat mode as given (its values are not known), and SetChatGroup (its arguments
+//   are not known: none is read) are kept; the camera, microphone and voice detections are switched on and off, and
+//   never detect anything (no camera, no microphone: no event is sent).
+// The AV chat's own state is not looked at (as D-187's neighbours do not; the panel's request does, in libsysutil).
+// What AvcExt keeps lasts while the process runs.
 constexpr std::string_view kAvcExtChan = "cellSysutilAvcExt";
 constexpr u32 CELL_AVC_ERROR_UNKNOWN = 0x8002b701;
 constexpr u32 CELL_SYSUTIL_AVC_TRANSITION_EXPONENT = 4, CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST = 2,
@@ -547,25 +559,118 @@ constexpr s32 CELL_SYSUTIL_AVC_OPTION_PARAM_VERSION = 100, kAvcOptionParamVersio
 // CellSysutilAvcOptionParam (12 bytes): be s32 avcOptionParamVersion, b8 sharingVideoBuffer at 4, be s32 maxPlayers
 // at 8.
 constexpr u32 kAvcOptionSize = 12;
+// SceNpId's online ID (handle.data, 16 characters): what NP IDs are told apart by (sceNpUtilCmpNpId).
+constexpr u32 kOnlineIdSize = 16;
+// libsysutil's export for the AV chat's panel with a transition (D-534).
+constexpr u32 kNidAvcPanelShowState = 0x44F288A7;
 
-// The getters: every pointer non-null, nothing written.
-s32 avc_ext_checked(std::string_view name, std::initializer_list<u32> ptrs)
+// A player's window as the game set it (D-677): each value once the game set it. Before that a getter would read the
+// system's own layout, which is not known here, so it writes nothing (as D-187's getters wrote nothing).
+struct AvcExtWindow {
+    std::vector<f32> position, rotation, size, alpha; // empty until set
+    std::optional<u8> shown;
+    std::optional<u32> zorder;
+};
+
+struct AvcExtState {
+    std::mutex mutex;
+    std::map<std::string, AvcExtWindow> windows; // by the player's online ID
+    std::optional<u8> name_plates;               // shown (1) or hidden (0), once the game said
+    std::optional<u32> chat_mode;
+    u32 chat_groups = 0; // SetChatGroup's calls
+    bool camera_detection = false, mic_detection = false, voice_detection = false;
+};
+
+// The player's online ID (up to its NUL); false, logged with the call site, when it is not guest memory (D-042).
+bool avc_ext_player(PPUContext& ctx, std::string_view call, u32 player_id, std::string& id)
+{
+    if (!guest_readable(thread_of(ctx), player_id, kOnlineIdSize)) {
+        log_call_site(ctx, guest_base(ctx), std::format("{}: the player's NP ID is not guest memory", call));
+        return false;
+    }
+    const char* p = reinterpret_cast<const char*>(guest_base(ctx) + player_id);
+    id.assign(p, strnlen(p, kOnlineIdSize));
+    return true;
+}
+
+// "name(a, b, ...)" for the log; `ok` false when one of them is null.
+std::string avc_ext_call(std::string_view name, const std::vector<u32>& ptrs, bool& ok)
 {
     std::string call = std::string(name) + "(";
-    bool ok = true;
+    ok = true;
     for (const u32 p : ptrs) {
         call += std::format("{}{:#x}", call.back() == '(' ? "" : ", ", p);
         ok = ok && p;
     }
-    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT), call + ")");
+    return call + ")";
 }
 
-// The window setters: a player and a transition up to EXPONENT.
-s32 avc_ext_window(std::string_view name, u32 player_id, u32 transition, const std::string& detail = {})
+// The getters with nothing to report: every pointer non-null, nothing written.
+s32 avc_ext_checked(std::string_view name, const std::vector<u32>& ptrs)
 {
-    const bool ok = player_id && transition <= CELL_SYSUTIL_AVC_TRANSITION_EXPONENT;
-    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT),
-        std::format("{}(player {:#x}{}, transition {:#x})", name, player_id, detail, transition));
+    bool ok = false;
+    const std::string call = avc_ext_call(name, ptrs, ok);
+    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+}
+
+// A window getter of floats (position, rotation, size, alpha): the player and every output non-null, then what the
+// game set for the player written, each output checked first (D-042), or nothing when the game set none.
+s32 avc_ext_get_floats(PPUContext& ctx, std::string_view name, u32 player_id, const std::vector<u32>& outs,
+    std::vector<f32> AvcExtWindow::* field)
+{
+    std::vector<u32> args{player_id};
+    args.insert(args.end(), outs.begin(), outs.end());
+    bool ok = false;
+    const std::string call = avc_ext_call(name, args, ok);
+    std::string id;
+    if (!ok || !avc_ext_player(ctx, call, player_id, id)) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    const auto w = s.windows.find(id);
+    if (w == s.windows.end() || (w->second.*field).empty()) {
+        return logged(kAvcExtChan, lv2::CELL_OK, call + ": not set by the game, nothing written");
+    }
+    const std::vector<f32>& values = w->second.*field;
+    for (const u32 out : outs) {
+        if (!guest_readable(thread_of(ctx), out, 4)) {
+            log_call_site(ctx, guest_base(ctx), std::format("{}: {:#x} is not guest memory", call, out));
+            return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+        }
+    }
+    for (usize i = 0; i < outs.size() && i < values.size(); i++) {
+        ps_write32(guest_base(ctx), outs[i], std::bit_cast<u32>(values[i]));
+    }
+    return logged(kAvcExtChan, lv2::CELL_OK, call);
+}
+
+// A byte the game set, written to `out` (checked first); nothing when it set none.
+s32 avc_ext_put_byte(PPUContext& ctx, const std::string& call, u32 out, std::optional<u8> value)
+{
+    if (!value) return logged(kAvcExtChan, lv2::CELL_OK, call + ": not set by the game, nothing written");
+    if (!guest_readable(thread_of(ctx), out, 1)) {
+        log_call_site(ctx, guest_base(ctx), std::format("{}: {:#x} is not guest memory", call, out));
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    ps_write8(guest_base(ctx), out, *value);
+    return logged(kAvcExtChan, lv2::CELL_OK, call + std::format(": {}", *value));
+}
+
+// The window setters: a player and a transition up to EXPONENT; then `apply` keeps what the call sets for the player.
+template <class Apply>
+s32 avc_ext_window(PPUContext& ctx, std::string_view name, u32 player_id, u32 transition, const std::string& detail,
+    Apply&& apply)
+{
+    const std::string call = std::format("{}(player {:#x}{}, transition {:#x})", name, player_id, detail, transition);
+    std::string id;
+    if (!player_id || transition > CELL_SYSUTIL_AVC_TRANSITION_EXPONENT || !avc_ext_player(ctx, call, player_id, id)) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    apply(s.windows[id]);
+    return logged(kAvcExtChan, lv2::CELL_OK, call + std::format(": {}'s window, nothing drawn", id));
 }
 
 // RPCS3 ensure()s the pointer ("Not actually checked") and writes nothing: here a null one is refused.
@@ -586,70 +691,209 @@ s32 cellSysutilAvcExtIsCameraAttached(PPUContext& ctx, u32 status)
     return avc_ext_attached(ctx, "cellSysutilAvcExtIsCameraAttached", status);
 }
 
-s32 cellSysutilAvcExtGetWindowPosition(PPUContext&, u32 player_id, u32 x, u32 y, u32 z)
+s32 cellSysutilAvcExtGetWindowPosition(PPUContext& ctx, u32 player_id, u32 x, u32 y, u32 z)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetWindowPosition", {player_id, x, y, z});
+    return avc_ext_get_floats(ctx, "cellSysutilAvcExtGetWindowPosition", player_id, {x, y, z}, &AvcExtWindow::position);
 }
 
-s32 cellSysutilAvcExtGetWindowSize(PPUContext&, u32 player_id, u32 x, u32 y)
+s32 cellSysutilAvcExtGetWindowSize(PPUContext& ctx, u32 player_id, u32 x, u32 y)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetWindowSize", {player_id, x, y});
+    return avc_ext_get_floats(ctx, "cellSysutilAvcExtGetWindowSize", player_id, {x, y}, &AvcExtWindow::size);
 }
 
-s32 cellSysutilAvcExtGetWindowShowStatus(PPUContext&, u32 player_id, u32 visible)
+s32 cellSysutilAvcExtGetWindowRotation(PPUContext& ctx, u32 player_id, u32 x, u32 y, u32 z)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetWindowShowStatus", {player_id, visible});
+    return avc_ext_get_floats(ctx, "cellSysutilAvcExtGetWindowRotation", player_id, {x, y, z}, &AvcExtWindow::rotation);
 }
 
-s32 cellSysutilAvcExtGetNamePlateShowStatus(PPUContext&, u32 visible)
+s32 cellSysutilAvcExtGetWindowAlpha(PPUContext& ctx, u32 player_id, u32 alpha)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetNamePlateShowStatus", {visible});
+    return avc_ext_get_floats(ctx, "cellSysutilAvcExtGetWindowAlpha", player_id, {alpha}, &AvcExtWindow::alpha);
 }
 
-s32 cellSysutilAvcExtGetWindowRotation(PPUContext&, u32 player_id, u32 x, u32 y, u32 z)
+// (player_id, b8* is_visible): shown or hidden as the game last said (ShowWindow, HideWindow).
+s32 cellSysutilAvcExtGetWindowShowStatus(PPUContext& ctx, u32 player_id, u32 visible)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetWindowRotation", {player_id, x, y, z});
+    bool ok = false;
+    const std::string call = avc_ext_call("cellSysutilAvcExtGetWindowShowStatus", {player_id, visible}, ok);
+    std::string id;
+    if (!ok || !avc_ext_player(ctx, call, player_id, id)) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    const auto w = s.windows.find(id);
+    return avc_ext_put_byte(ctx, call, visible, w != s.windows.end() ? w->second.shown : std::nullopt);
 }
 
-s32 cellSysutilAvcExtGetWindowAlpha(PPUContext&, u32 player_id, u32 alpha)
+// (b8* is_visible): the name plates as the game last said (SetShowNamePlate, SetHideNamePlate).
+s32 cellSysutilAvcExtGetNamePlateShowStatus(PPUContext& ctx, u32 visible)
 {
-    return avc_ext_checked("cellSysutilAvcExtGetWindowAlpha", {player_id, alpha});
+    bool ok = false;
+    const std::string call = avc_ext_call("cellSysutilAvcExtGetNamePlateShowStatus", {visible}, ok);
+    if (!ok) return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    return avc_ext_put_byte(ctx, call, visible, s.name_plates);
 }
 
+// No video comes, so there is no surface to point at: the pointers checked, nothing written.
 s32 cellSysutilAvcExtGetSurfacePointer(PPUContext&, u32 player_id, u32 surface, u32 size, u32 size_x, u32 size_y)
 {
     return avc_ext_checked("cellSysutilAvcExtGetSurfacePointer", {player_id, surface, size, size_x, size_y});
 }
 
 // (player_id, float alpha in f1, transition in r5: the float takes r4's slot).
-s32 cellSysutilAvcExtSetWindowAlpha(PPUContext&, u32 player_id, float alpha, u32 transition)
+s32 cellSysutilAvcExtSetWindowAlpha(PPUContext& ctx, u32 player_id, float alpha, u32 transition)
 {
-    return avc_ext_window("cellSysutilAvcExtSetWindowAlpha", player_id, transition, std::format(", alpha {}", alpha));
+    return avc_ext_window(ctx, "cellSysutilAvcExtSetWindowAlpha", player_id, transition,
+        std::format(", alpha {}", alpha), [&](AvcExtWindow& w) { w.alpha = {alpha}; });
 }
 
 // (player_id, float size_x in f1, float size_y in f2, transition in r6).
-s32 cellSysutilAvcExtSetWindowSize(PPUContext&, u32 player_id, float size_x, float size_y, u32 transition)
+s32 cellSysutilAvcExtSetWindowSize(PPUContext& ctx, u32 player_id, float size_x, float size_y, u32 transition)
 {
-    return avc_ext_window("cellSysutilAvcExtSetWindowSize", player_id, transition,
-        std::format(", {}x{}", size_x, size_y));
+    return avc_ext_window(ctx, "cellSysutilAvcExtSetWindowSize", player_id, transition,
+        std::format(", {}x{}", size_x, size_y), [&](AvcExtWindow& w) { w.size = {size_x, size_y}; });
 }
 
-s32 cellSysutilAvcExtShowWindow(PPUContext&, u32 player_id, u32 transition)
+// cellSysutilAvcExtSetWindowPosition(player_id, float x, float y, float z, transition in r7) and SetWindowRotation:
+// RPCS3's stubs, checked as SetWindowAlpha (D-677).
+s32 cellSysutilAvcExtSetWindowPosition(PPUContext& ctx, u32 player_id, float x, float y, float z, u32 transition)
 {
-    return avc_ext_window("cellSysutilAvcExtShowWindow", player_id, transition);
+    return avc_ext_window(ctx, "cellSysutilAvcExtSetWindowPosition", player_id, transition,
+        std::format(", {}, {}, {}", x, y, z), [&](AvcExtWindow& w) { w.position = {x, y, z}; });
 }
 
-s32 cellSysutilAvcExtHideWindow(PPUContext&, u32 player_id, u32 transition)
+s32 cellSysutilAvcExtSetWindowRotation(PPUContext& ctx, u32 player_id, float x, float y, float z, u32 transition)
 {
-    return avc_ext_window("cellSysutilAvcExtHideWindow", player_id, transition);
+    return avc_ext_window(ctx, "cellSysutilAvcExtSetWindowRotation", player_id, transition,
+        std::format(", {}, {}, {}", x, y, z), [&](AvcExtWindow& w) { w.rotation = {x, y, z}; });
 }
 
-s32 cellSysutilAvcExtSetWindowZorder(PPUContext&, u32 player_id, u32 zorder)
+s32 cellSysutilAvcExtShowWindow(PPUContext& ctx, u32 player_id, u32 transition)
 {
-    const bool ok = player_id && zorder >= CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST &&
-                    zorder <= CELL_SYSUTIL_AVC_ZORDER_BEHIND_MOST;
-    return logged(kAvcExtChan, ok ? lv2::CELL_OK : error(CELL_AVC_ERROR_INVALID_ARGUMENT),
-        std::format("cellSysutilAvcExtSetWindowZorder(player {:#x}, {})", player_id, zorder));
+    return avc_ext_window(ctx, "cellSysutilAvcExtShowWindow", player_id, transition, {},
+        [](AvcExtWindow& w) { w.shown = 1; });
+}
+
+s32 cellSysutilAvcExtHideWindow(PPUContext& ctx, u32 player_id, u32 transition)
+{
+    return avc_ext_window(ctx, "cellSysutilAvcExtHideWindow", player_id, transition, {},
+        [](AvcExtWindow& w) { w.shown = 0; });
+}
+
+s32 cellSysutilAvcExtSetWindowZorder(PPUContext& ctx, u32 player_id, u32 zorder)
+{
+    const std::string call = std::format("cellSysutilAvcExtSetWindowZorder(player {:#x}, {})", player_id, zorder);
+    std::string id;
+    if (!player_id || zorder < CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST || zorder > CELL_SYSUTIL_AVC_ZORDER_BEHIND_MOST ||
+        !avc_ext_player(ctx, call, player_id, id)) {
+        return logged(kAvcExtChan, error(CELL_AVC_ERROR_INVALID_ARGUMENT), call);
+    }
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    s.windows[id].zorder = zorder;
+    return logged(kAvcExtChan, lv2::CELL_OK, call);
+}
+
+// cellSysutilAvcExtShowPanelEx(transition) and HidePanelEx(transition): libsysutil's export 0x44F288A7 with the panel
+// shown or hidden (D-677), as libsysutil's cellSysutilAvcShowPanel and HidePanel send it with no transition (-1): a
+// transition past EXPONENT is INVALID_ARGUMENT (NONE, -1, passes), an AV chat not loaded for video INVALID_STATUS,
+// and the request itself, which pspocket's console has no system software to take, CELL_AVC_ERROR_UNKNOWN.
+s32 avc_ext_panel(PPUContext& ctx, std::string_view name, u32 transition, u8 show)
+{
+    const Function* f = registry().find("cellSysutil", kNidAvcPanelShowState);
+    if (!f) PS_FATAL(kAvcExtChan, "libsysutil's AV chat panel export (0x44F288A7) is not pspocket's");
+    ctx.gpr[3] = transition;
+    ctx.gpr[4] = show;
+    f->fn(ctx, guest_base(ctx));
+    return logged(kAvcExtChan, static_cast<s32>(static_cast<u32>(ctx.gpr[3])),
+        std::format("{}(transition {:#x}): libsysutil's panel request", name, transition));
+}
+
+s32 cellSysutilAvcExtShowPanelEx(PPUContext& ctx, u32 transition)
+{
+    return avc_ext_panel(ctx, "cellSysutilAvcExtShowPanelEx", transition, 1);
+}
+
+s32 cellSysutilAvcExtHidePanelEx(PPUContext& ctx, u32 transition)
+{
+    return avc_ext_panel(ctx, "cellSysutilAvcExtHidePanelEx", transition, 0);
+}
+
+// cellSysutilAvcExtSetShowNamePlate() and SetHideNamePlate(): the players' name plates shown or hidden (nothing drawn).
+s32 avc_ext_name_plates(std::string_view name, u8 shown)
+{
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    s.name_plates = shown;
+    return logged(kAvcExtChan, lv2::CELL_OK, std::format("{}()", name));
+}
+
+s32 cellSysutilAvcExtSetShowNamePlate(PPUContext&)
+{
+    return avc_ext_name_plates("cellSysutilAvcExtSetShowNamePlate", 1);
+}
+s32 cellSysutilAvcExtSetHideNamePlate(PPUContext&)
+{
+    return avc_ext_name_plates("cellSysutilAvcExtSetHideNamePlate", 0);
+}
+
+// cellSysutilAvcExtSetChatMode(mode): kept as given; its values are not known, so none is refused.
+s32 cellSysutilAvcExtSetChatMode(PPUContext&, u32 mode)
+{
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    s.chat_mode = mode;
+    return logged(kAvcExtChan, lv2::CELL_OK, std::format("cellSysutilAvcExtSetChatMode({:#x})", mode));
+}
+
+// cellSysutilAvcExtSetChatGroup(...): the players a chat group is made of, as the name says; RPCS3 registers it with no
+// arguments and nothing public describes them, so none is read (a wrong guess would read the game's data as players).
+// With nobody else in the chat there is nobody to group: counted and logged.
+s32 cellSysutilAvcExtSetChatGroup(PPUContext&)
+{
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    s.chat_groups++;
+    return logged(kAvcExtChan, lv2::CELL_OK,
+        std::format("cellSysutilAvcExtSetChatGroup(): its arguments are not known, none read (call {})", s.chat_groups));
+}
+
+// The detections of a camera or microphone attached and of the player's voice, switched on and off. No camera or
+// microphone is ever attached here, so nothing is detected and no event is sent.
+s32 avc_ext_detection(std::string_view name, bool AvcExtState::* which, bool on)
+{
+    AvcExtState& s = state<AvcExtState>();
+    std::lock_guard lock(s.mutex);
+    s.*which = on;
+    return logged(kAvcExtChan, lv2::CELL_OK, std::format("{}(){}", name, on ? ": nothing to detect here" : ""));
+}
+
+s32 cellSysutilAvcExtStartCameraDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStartCameraDetection", &AvcExtState::camera_detection, true);
+}
+s32 cellSysutilAvcExtStopCameraDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStopCameraDetection", &AvcExtState::camera_detection, false);
+}
+s32 cellSysutilAvcExtStartMicDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStartMicDetection", &AvcExtState::mic_detection, true);
+}
+s32 cellSysutilAvcExtStopMicDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStopMicDetection", &AvcExtState::mic_detection, false);
+}
+s32 cellSysutilAvcExtStartVoiceDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStartVoiceDetection", &AvcExtState::voice_detection, true);
+}
+s32 cellSysutilAvcExtStopVoiceDetection(PPUContext&)
+{
+    return avc_ext_detection("cellSysutilAvcExtStopVoiceDetection", &AvcExtState::voice_detection, false);
 }
 
 // RPCS3 cellSysutilAvcExtInitOptionParam(version, option): the version written, then 100, or 180 with 16 players;
@@ -1509,6 +1753,21 @@ void register_sysutil_misc(Registry& r)
         PS_HLE_FUNC(0xCBE0C10A, cellSysutilAvcExtGetSurfacePointer),
         PS_HLE_FUNC(0xD8685383, cellSysutilAvcExtInitOptionParam),
         PS_HLE_FUNC(0xE8B1C18D, cellSysutilAvcExtSetWindowZorder),
+        // RPCS3's stubs, pspocket's own without Sony's module to compare with (D-677; D-594).
+        PS_HLE_UNVERIFIED(0x683FE299, cellSysutilAvcExtHidePanelEx),
+        PS_HLE_UNVERIFIED(0x75F14D18, cellSysutilAvcExtSetChatGroup),
+        PS_HLE_UNVERIFIED(0x2FFF23F0, cellSysutilAvcExtSetChatMode),
+        PS_HLE_UNVERIFIED(0x22CA0929, cellSysutilAvcExtSetHideNamePlate),
+        PS_HLE_UNVERIFIED(0x5A763D0E, cellSysutilAvcExtSetShowNamePlate),
+        PS_HLE_UNVERIFIED(0x245FF230, cellSysutilAvcExtSetWindowPosition),
+        PS_HLE_UNVERIFIED(0x1B6E8CD2, cellSysutilAvcExtSetWindowRotation),
+        PS_HLE_UNVERIFIED(0x4466C0E2, cellSysutilAvcExtShowPanelEx),
+        PS_HLE_UNVERIFIED(0x29D5C6A4, cellSysutilAvcExtStartCameraDetection),
+        PS_HLE_UNVERIFIED(0x9E0FAFD3, cellSysutilAvcExtStartMicDetection),
+        PS_HLE_UNVERIFIED(0xC851A4C0, cellSysutilAvcExtStartVoiceDetection),
+        PS_HLE_UNVERIFIED(0x143F46A4, cellSysutilAvcExtStopCameraDetection),
+        PS_HLE_UNVERIFIED(0xCC131B91, cellSysutilAvcExtStopMicDetection),
+        PS_HLE_UNVERIFIED(0x5BA98E47, cellSysutilAvcExtStopVoiceDetection),
     });
     r.add("cellSubDisplay", {
         PS_HLE_FUNC(0xF9A7E8A5, cellSubDisplayInit),
