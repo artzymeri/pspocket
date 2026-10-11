@@ -10371,3 +10371,61 @@ each stream's information and every PNG's chunks and pixels), so its firmware-fi
 system software is installed, a game importing cellPngEnc now gets pspocket's, not libpngenc.sprx. Its comparison
 (test_pngenc_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware and skips without it; the name
 check and test_imgenc.cpp check the library is pspocket's and unmarked.
+
+## D-913 · 2026-10-11 · cellJpgEnc as Sony's libjpgenc answers and writes it (part 3)
+
+cellJpgEnc (D-616) was made without a Sony module, its structures inferred from libpngenc's; D-618's comparison had
+never run. Run against libjpgenc.sprx (firmware 4.92), 788 of 816 observations differed: most structures were wrong.
+Sony's module was read (its exports, its encoder thread, its libjpeg; nothing of it in the repository) and pspocket's
+library and encoder rewritten to do what it does. The comparison, rewritten on Sony's structures and widened (21
+configurations, every sampling and colour space, sizes 1x1 to 50x61 at both DCTs, qualities 0 to 100, restart
+intervals, a pitch past the row, extended parameters, the queues and Reset, buffers too small, files, every check, an
+SPU encoder), shows 14 of 3,751 observations differing, all in two features below.
+- **The structures** (Sony's): CellJpgEncConfig {maxWidth, maxHeight, encodeColorSpace (gray 1, RGB 2, YCbCr 3),
+  samplingFormat (4:4:4 0, 4:2:2 1, 4:2:0 2, 4:1:1 3, none 4), enableSpu (b8, +16), exParamList, exParamNum}: the JPEG's
+  colour space and sampling are the encoder's, not each picture's. CellJpgEncPicture {width, height, colorSpace,
+  pictureAddr, userData (u64, +16)} (rows of the picture's width); CellJpgEncPicture2 {width, height, pitchWidth,
+  colorSpace, pictureAddr, userData (u64, +24)} (EncodePicture2 is the pitch, not planes); CellJpgEncEncodeParam
+  {enableSpu (b8), restartInterval, dctMethod, compressionMode, compressionModeParam, exParamList, exParamNum}, each
+  extended parameter {marker, data, size}: a marker segment after SOI, its code the marker's low byte; the stream
+  information has the quality used at +28 before userData.
+- **QueryAttr**: sizes 1 to 65535, a colour space 1 to 3, sampling 4 exactly when not YCbCr, no extended parameters;
+  memSize 0x1B630 (0x388A0 with SPUs) + the width to 16 times 12 (gray), 30 (RGB, 4:4:4), 22 (4:2:2), 18 (4:1:1) or
+  33 (4:2:0), + 0x1780; cmdQueueDepth 4, versionUpper 0x270000, versionLower 4.
+- **Open** (and OpenEx): the handle is the work memory's first 128-byte boundary; too little memory, a PPU priority
+  past 0xBFF or an SPU priority past 0xFF is ARG; opening over memory already open makes a new encoder there.
+- **The queues** are libpngenc's (part 1): four commands (BUSY), the thread encoding while fewer than four streams wait,
+  eight streams; Reset (BUSY with five or more streams) turns the commands into STREAM_SKIP streams, skips the next
+  picture too and keeps the streams.
+- **EncodePicture's checks**: a picture within the encoder's size, a colour space the encoder takes (gray only into a
+  gray encoder; YCbCr not into an RGB one; RGB, RGBA and ARGB into any), a pitch of a row at least; enableSpu only on
+  an encoder opened for SPUs and only with the fast DCT; dctMethod 0 or 5; compressionMode 0 or 1; quality at most 100;
+  restartInterval at most 0xFFFF; each extended parameter's data given and its size 1 to 0xFFFD; location 0 or 1; the
+  size limit mode only into a buffer; a file needs its name; a buffer its address and limitSize of at least 0x1000 plus
+  the extended parameters' segments.
+- **The stream is libjpeg 6b's, byte for byte** (jpeg_encoder.cpp rewritten on its algorithms): no JFIF APP0 (pspocket
+  wrote one), jpeg_set_quality's tables (quality 0 is 1) forced to baseline, jccolor's fixed-point conversion (a YCbCr
+  picture taken as it is), jcsample's downsampling with its alternating bias, the last column and row repeated to the
+  iMCU, dummy blocks at the DC of the block before, jfdctflt in double with the two fused multiply-adds and the fused
+  quantisation libjpgenc's compiler made (QUALITY) or jfdctfst with its scaled divisors (FAST), jchuff's bit buffer,
+  restart markers and fill, and jcmarker's order (DQT, SOF0, DHT as the scan first uses each table, DRI, SOS). RGBA and
+  ARGB give the RGB picture's stream. A scratch harness compared 186 of Sony's streams: none differ.
+- **A buffer too small**: the stream is written until the buffer is full (to its end), then STREAM_OVERFLOW, streamSize
+  0, processedLine the rows written before the one whose data did not fit. A file that cannot be made is
+  STREAM_FILE_OPEN; the quality is reported in every stream's information.
+Still different, each logged once when a game uses it:
+- **The stream size limit mode** (6 observations): libjpgenc predicts the quality from a trial encoding of a corner of
+  the picture and tables of stream sizes by quality in its data (4 sampling groups, 3 activity rows, 101 qualities),
+  retrying lower up to three times; the tables are Sony's measurements, which pspocket does not carry. pspocket takes the
+  highest quality up to the one given whose stream fits (searched by halves): its streams fit as Sony's do, at a higher
+  quality (64x48 in 0x1000 bytes: Sony quality 69, pspocket 95).
+- **The SPU encoder** (8 observations): libjpgenc's SPU program converts, samples and transforms in its own arithmetic
+  (its first coefficients differ from libjpeg's) and pads the stream with two zero bytes after EOI (streamSize counts
+  them). pspocket encodes those pictures with libjpeg's FAST path: the same headers and tables, a picture within a
+  rounding of Sony's.
+cellJpgEnc stays firmware-first (D-563) while these differ.
+Tests: tests/hle/test_jpgenc_compare.cpp (PSPOCKET_COMPARE_SELF=1: 0 of 3,751; against Sony's: 14, the two features
+above); tests/hle/test_jpgenc.cpp rewritten for Sony's structures and answers (libjpeg 6b's tables and colours, the
+markers of every sampling at both DCTs read back by pspocket's decoder, the queues and Reset's skips, the overflow's
+rows, the size limit mode, files, every check). compare_util.hpp: PSPOCKET_COMPARE_DUMP=<dir> writes each half's data
+observations (the streams) to files for reading a difference.

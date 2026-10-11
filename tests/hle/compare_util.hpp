@@ -16,7 +16,8 @@
 //   comparison runs here. The halves must agree (one that does not repeat itself would show differences on the Mac
 //   that are not Sony's), and each test checks that pspocket's own values are sensible.
 // - Neither: skipped.
-// PSPOCKET_COMPARE_PRINT=1 also prints every observation of both halves (Sony's answers in full).
+// PSPOCKET_COMPARE_PRINT=1 also prints every observation of both halves (Sony's answers in full); with it,
+// PSPOCKET_COMPARE_DUMP=<directory> writes each half's data (pictures, streams) as files.
 // A half that makes no progress for a minute (a module stuck on something pspocket's lv2 lacks) says where it is on
 // stderr, every minute, so a hang on the Mac names its step; PSPOCKET_COMPARE_TRACE=1 prints every step as it is
 // written, so a crash (a module faulting) names its last.
@@ -30,10 +31,12 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <initializer_list>
 #include <map>
@@ -652,6 +655,22 @@ private:
         for (const Data& d : o.data) std::printf("[data] %s: %zu bytes\n", d.key.c_str(), d.bytes.size());
         for (const std::string& n : o.notes) std::printf("[note] %s\n", n.c_str());
         std::fflush(stdout);
+        // PSPOCKET_COMPARE_DUMP=<directory> (with PSPOCKET_COMPARE_PRINT): each half's data as files, to study a
+        // difference with other tools. Sony's outputs: keep the directory under inventory/ or a scratchpad, never in
+        // the repository (CLAUDE.md rule 1).
+        if (const char* dir = std::getenv("PSPOCKET_COMPARE_DUMP"); dir && *dir) {
+            const std::string base = std::string(dir) + "/" + (who == "pspocket" ? "ours" : "theirs");
+            std::filesystem::create_directories(base);
+            usize i = 0;
+            for (const Data& d : o.data) {
+                std::string name;
+                for (const char ch : d.key) name += std::isalnum(static_cast<unsigned char>(ch)) ? ch : '_';
+                std::FILE* f = std::fopen(std::format("{}/{:04}-{}.bin", base, i++, name.substr(0, 120)).c_str(), "wb");
+                if (!f) continue;
+                std::fwrite(d.bytes.data(), 1, d.bytes.size(), f);
+                std::fclose(f);
+            }
+        }
     }
 
     std::string title_;

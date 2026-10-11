@@ -1,50 +1,86 @@
 #pragma once
 
-// pspocket's baseline JPEG encoder for cellJpgEnc (D-615), written here from ITU-T T.81 (the JPEG standard: the
-// forward DCT of annex A.3.3, quantisation, the zigzag order of figure A.6, the Huffman coding of DC differences and
-// AC run/size pairs of annex F.1.2 with the code tables built as annex C builds them, the marker segments of annex B,
-// restart intervals) with its annex K tables (the example quantisation tables and the typical Huffman tables), and
-// ITU-T T.871 (JFIF: the APP0 segment, and YCbCr from RGB). No other encoder's code is copied or linked.
-// What it writes: SOI, a JFIF APP0 (version 1.01, no density, no thumbnail), DQT, SOF0 (8-bit samples), DHT, DRI when
-// there are restart markers, one interleaved scan of every component, EOI. A gray JPEG has one component (id 1);
-// a colour one Y, Cb and Cr (ids 1 to 3), the chroma at 1x1 and the luma at the sampling's factors. Edges are padded
-// by repeating the last column and row, chroma is subsampled as the mean of the luma samples it covers.
+// pspocket's baseline JPEG encoder for cellJpgEnc (D-615, D-913): the stream Sony's libjpgenc writes, which is IJG's
+// libjpeg 6b's (27-Mar-1998). Written here from libjpeg 6b's algorithms (the Independent JPEG Group's software, whose
+// licence lets its methods be used with this acknowledgment; no code of Sony's module) and ITU-T T.81 (annex K's tables):
+// - jpeg_set_defaults, jpeg_set_colorspace and jpeg_set_quality: gray (component 1), RGB (components 'R', 'G', 'B',
+//   all on table 0) or YCbCr (1, 2, 3; the chroma on table 1 and Huffman tables 1); annex K's quantisation tables
+//   scaled by libjpeg's quality curve, baseline (8-bit entries); annex K's Huffman tables.
+// - jccolor.c's conversions in 16-bit fixed point (RGB to YCbCr, RGB to gray), jcsample.c's downsampling (h2v1 and
+//   h2v2 with their alternating rounding bias, the general one for 4:1:1), jcprepct.c's edge expansion (the last column
+//   and row repeated), jccoefct.c's dummy blocks past the image (zero, the DC of the block before).
+// - jcdctmgr.c with jfdctfst.c (the fast integer DCT and its scaled divisors) or jfdctflt.c (the float DCT), as
+//   libjpgenc builds it: FAST_FLOAT double, the PPU's fused multiply-adds where its compiler made them (two in the
+//   transform, the quantisation's).
+// - jchuff.c's encoding (24-bit bit buffer, 0xFF stuffed, restart markers, the last byte filled with ones) and
+//   jcmarker.c's markers: SOI, (JFIF APP0 or Adobe APP14 when asked: libjpgenc asks neither), the application's markers
+//   (jpeg_write_marker), at the first row DQT for each table used, SOF0, DHT for each table as a component of the scan
+//   first uses it, DRI when there is a restart interval, SOS; EOI.
+// The stream goes to a sink a write at a time as libjpeg's destination manager gets it: a sink that refuses stops the
+// encoder there (libjpgenc's buffer full: the rows encoded before it count as done).
 
 #include <array>
+#include <functional>
 #include <vector>
 
 #include "pspocket/core/types.hpp"
 
 namespace pspocket::hle::jpeg {
 
-// A colour JPEG's chroma sampling: the luma's sampling factors (horizontal x vertical) against the chroma's 1x1.
-enum class Sampling { YCbCr444, YCbCr422, YCbCr420, YCbCr411 }; // 1x1, 2x1, 2x2, 4x1
+enum class Space : u8 { Gray = 1, RGB = 2, YCbCr = 3 };
+enum class Dct : u8 { Float, Fast }; // libjpgenc's QUALITY (JDCT_FLOAT) and FAST (JDCT_IFAST)
 
-// What to encode: each component's samples at the picture's full size, rows `width` bytes apart.
-struct Planes {
+struct Settings {
     u32 width = 0, height = 0;
-    int components = 1;        // 1: a gray JPEG (y only); 3: YCbCr
-    std::vector<u8> y, cb, cr; // width x height samples each (cb and cr for 3 components)
+    Space input = Space::RGB;    // the rows given: gray (a byte a pixel), RGB or YCbCr (three)
+    Space output = Space::YCbCr; // the JPEG's colour space
+    int h_samp = 2, v_samp = 2;  // a YCbCr JPEG's luma sampling factors (the chroma's are 1x1)
+    int quality = 75;            // jpeg_set_quality's (at most 0 is 1, past 100 is 100), forced to baseline
+    Dct dct = Dct::Float;
+    u32 restart_interval = 0; // MCUs between restart markers; 0: none
+    bool jfif = false, adobe = false;
 };
 
-struct EncodeSettings {
-    int quality = 75;                       // 1 to 100: annex K's tables scaled (as libjpeg scales them)
-    Sampling sampling = Sampling::YCbCr420; // a colour JPEG's
-    bool fast = false;                      // the DCT in single precision (cellJpgEnc's fast method), else double
-    u32 restart_interval = 0;               // MCUs between restart markers (a DRI segment); 0: none
+// Where the stream goes, a piece at a time; false: it takes no more (the encoder stops).
+using Sink = std::function<bool(const u8*, usize)>;
+
+class Encoder {
+public:
+    Encoder(const Settings& s, Sink sink);
+    ~Encoder();
+    Encoder(const Encoder&) = delete;
+    Encoder& operator=(const Encoder&) = delete;
+
+    // False when the settings cannot make a JPEG (a size of 0 or past 65535, a sampling libjpeg has not).
+    bool valid() const;
+    // jpeg_start_compress: SOI and the headers asked for.
+    bool start();
+    // jpeg_write_marker: a marker segment (0xFF, `code`, the length, the data), before the first row.
+    bool marker(u8 code, const u8* data, usize size);
+    // jpeg_write_scanlines with one row (width pixels of the input colour space); the frame and scan headers come with
+    // the first. Each row completing an iMCU row (or the image) is encoded with it.
+    bool write_row(const u8* row);
+    // jpeg_finish_compress: the last bits, EOI.
+    bool finish();
+    // The rows written (libjpeg's next_scanline).
+    u32 rows() const;
+    // A coefficient past baseline's range (libjpeg's JERR_BAD_DCT_COEF) stopped the encoder.
+    bool bad_coefficient() const;
+
+private:
+    struct Impl;
+    Impl* impl_;
 };
 
-// The JFIF stream of `planes`, or nothing when they cannot be one: a width or height of 0 or past 65535 (SOF's
-// 16-bit fields), a plane with fewer samples than width x height, a restart interval past 65535 (DRI's field).
-std::vector<u8> encode(const Planes& planes, const EncodeSettings& settings);
-
-// Annex K's example table for the luma (table K.1) or the chroma (K.2) scaled for `quality` (clamped to 1-100):
-// 5000 / quality percent below 50, 200 - 2 x quality from 50, each entry rounded and kept within 1-255 (baseline's
-// 8-bit tables). In natural order (row by row), not zigzag.
+// libjpeg 6b's table for `luma` (annex K table K.1, else K.2) at `quality` (jpeg_quality_scaling and
+// jpeg_add_quant_table with force_baseline), in natural order.
 std::array<u8, 64> quant_table(bool luma, int quality);
 
-// T.871 (section 7): Y, Cb and Cr from R, G and B, each rounded and kept within 0-255.
+// jccolor.c's conversions (16-bit fixed point, rounded as libjpeg rounds).
 void rgb_to_ycbcr(u8 r, u8 g, u8 b, u8& y, u8& cb, u8& cr);
 u8 rgb_to_y(u8 r, u8 g, u8 b);
+
+// A whole picture (rows `pitch` bytes apart) into a vector: the stream, or nothing when it cannot be one.
+std::vector<u8> encode(const Settings& s, const u8* pixels, usize pitch);
 
 } // namespace pspocket::hle::jpeg
