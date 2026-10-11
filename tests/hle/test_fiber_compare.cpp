@@ -1,13 +1,14 @@
-// cellFiber against Sony's libfiber (D-568, D-597): test_fiber.cpp's scripts (fiber_script.hpp: fibers and contexts
+// cellFiber against Sony's libfiber (D-597, D-914): test_fiber.cpp's scripts (fiber_script.hpp: fibers and contexts
 // running a guest routine that logs markers and the answers of the calls it makes) sent to pspocket's library and to
 // Sony's module, each scenario in a process of its own, the scripts calling the half's own exports. Compared: every
 // answer, the log (the order the fibers and contexts ran in, and what each call answered inside them), every output
-// word (statuses, causes, the context that switched, the scheduler, numWorker), and the attribute structures as the
-// initializers leave them (a game sets its fields over them). The schedulers', fibers', contexts' and worker controls'
-// own bytes are notes: the SDK keeps them opaque, pspocket keeps libfiber's state on the host (D-568), Sony's keeps it
-// there. Worker threads take fibers in an order of their own: only the joins' statuses are compared there. Not sent:
-// cellFiberPpuUtilWorkerControlConnectEventQueueToSpurs and DisconnectEventQueue (their arguments are not known). No
-// game data; skipped without the firmware (compare_util.hpp).
+// word (statuses, causes, the context that switched, the scheduler, numWorker), the attribute structures as the
+// initializers leave them (a game sets its fields over them) and the scheduler trace's records (their timebase left
+// out). The schedulers', fibers', contexts' and worker controls' own bytes are notes: both lay them out as libfiber does,
+// but they hold addresses of each half's own code (an entry stub, Sony's module's functions). Worker threads take fibers
+// in an order of their own: only the joins' statuses are compared there. Inputs a PS3 faults, hangs or aborts on with
+// Sony's module are not sent (each said where it would be). Every thread has its TLS block, where libfiber keeps its
+// per-thread state. No game data; skipped without the firmware (compare_util.hpp). In the gate since D-914.
 
 #include <catch_amalgamated.hpp>
 
@@ -719,7 +720,7 @@ constexpr Named kScenarios[] = {{"fibers by priority, yields, joins from the thr
 
 } // namespace
 
-TEST_CASE("cellFiber's comparison calls Sony's exports by their names; pspocket's library, firmware first",
+TEST_CASE("cellFiber's comparison calls Sony's exports by their names; pspocket's library, its own (D-914)",
     "[hle][fiber]")
 {
     check_names("cellFiber",
@@ -739,11 +740,12 @@ TEST_CASE("cellFiber's comparison calls Sony's exports by their names; pspocket'
             "cellFiberPpuUtilWorkerControlSetPollingMode", "cellFiberPpuUtilWorkerControlRunFibers",
             "cellFiberPpuUtilWorkerControlCreateFiber", "cellFiberPpuUtilWorkerControlWakeup",
             "cellFiberPpuUtilWorkerControlJoinFiber", "cellFiberPpuUtilWorkerControlShutdown",
-            "cellFiberPpuUtilWorkerControlFinalize"});
+            "cellFiberPpuUtilWorkerControlFinalize"},
+        /*marked=*/false);
 }
 
 TEST_CASE("cellFiber against Sony's libfiber: schedulers, fibers, contexts, worker controls, the checks",
-    "[.][hle][lle][compare][fiber]")
+    "[hle][lle][compare][fiber]")
 {
     const Setup s = setup();
     // PSPOCKET_COMPARE_ONLY=<text>: only the scenarios whose name has it.

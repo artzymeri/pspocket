@@ -114,7 +114,7 @@ struct Env {
 
 } // namespace
 
-TEST_CASE("cellFiber: the 47 functions, firmware first", "[hle][fiber]")
+TEST_CASE("cellFiber: the 47 functions, pspocket's own (no longer firmware-first, D-914)", "[hle][fiber]")
 {
     u32 n = 0;
     for (const hle::Function& fn : hle::registry().functions())
@@ -123,7 +123,7 @@ TEST_CASE("cellFiber: the 47 functions, firmware first", "[hle][fiber]")
             n++;
         }
     CHECK(n == 47);
-    CHECK(hle::registry().is_firmware_first("cellFiber"));
+    CHECK_FALSE(hle::registry().is_firmware_first("cellFiber"));
 }
 
 TEST_CASE("cellFiber: a scheduler runs its fibers by priority, each until it yields or ends; joins from the thread",

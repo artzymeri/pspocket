@@ -10369,3 +10369,11 @@ Tests: tests/hle/test_fiber.cpp rewritten for libfiber's answers (a TLS block pe
 export's descriptor as a game's stub makes it), 10 cases; test_fiber_compare.cpp's two new scenarios and its Self-mode
 checks of pspocket's own half. compare_util.hpp's PSPOCKET_COMPARE_TRACE now prints each line's value with its key;
 PSPOCKET_COMPARE_ONLY=<text> runs only the fiber scenarios whose name has it. The comparison takes under a second.
+
+## D-914 · 2026-10-11 · cellFiber is no longer firmware-first (part 2)
+
+cellFiber matches Sony's libfiber over its comparison (part 1: 435 observations in ten scenarios, 0 differences), so its
+firmware-first mark goes (D-563): a game gets pspocket's cellFiber whether the user's system software is installed or
+not, and the loader no longer gives the game libfiber.sprx for it. The comparison loses its [.] and joins the gate
+(test_hle with PSPOCKET_TEST_DEV_FLASH set; it skips without the firmware and takes under a second); its name check now
+requires the library not to be marked, as test_fiber.cpp does.

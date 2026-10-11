@@ -1,5 +1,6 @@
 // cellFiber: libfiber.sprx's 47 functions (fw 4.92) as pspocket's own, read from Sony's code (the reference, D-046)
-// and compared with it running on pspocket (tests/hle/test_fiber_compare.cpp, 0 differences: D-914). Written in
+// and compared with it running on pspocket (tests/hle/test_fiber_compare.cpp, 0 differences: D-914; no longer
+// firmware-first: a game gets this library, with the system software installed or not). Written in
 // D-537's session from libfiber; D-914 put it in place of D-568's model (guest fibers on host threads passing a baton,
 // made without Sony's module), which differed from libfiber in its checks, its joins, the worker control's states and
 // the attributes. RPCS3's rpcs3/Emu/Cell/Modules/cellFiber.cpp registers them as todo stubs; its cellFiber.h gives the
@@ -2492,7 +2493,6 @@ void register_cellFiber(Registry& r)
         PS_HLE_INTERNAL(0xE9A2B302, _pspocket_cellFiberPpuResumeSwitch),
         PS_HLE_INTERNAL(0x0DB9AD81, _pspocket_cellFiberPpuResumeReturnToThread),
     });
-    r.firmware_first(kModule);
 }
 
 } // namespace pspocket::hle
