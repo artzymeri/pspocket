@@ -9328,3 +9328,16 @@ from the SPU as they end, in whatever order the policy module finishes them, so 
 runs (class 7: head 0x110380 or 0x110000, two blocks free either way) and the test failed about one run in three with
 either PPU side. It now compares each free list as its count, wake-ups and waiters and the set of its blocks; six runs in
 a row agree.
+
+## D-911 · 2026-10-11 · The comparisons with Sony's modules on the Mac: what they show (part 1)
+
+D-597's comparisons (test_hle "[compare]"), written in a session without the firmware, ran on the Mac with the installed
+system software for the first time, after FFmpeg was rebuilt with every decoder (D-909). Of eleven: the codec cores'
+version queries agree; libmixer's two cannot run, firmware 4.92 shipping no module that exports libmixer (D-563 made it
+from RPCS3 for that reason), and now SKIP saying so (compare_util.hpp require_firmware_module); the others show
+differences or stop: cellVpost (500 of 536 observations: QueryAttr's attribute, the limits Open checks, Exec's
+picture information), cellPngEnc, cellVdec's MPEG-4 part 2, MVC and VC-1, while cellFiber, cellVdec's DivX 3.11 and
+cellKey2char stop with a fault in Sony's module running on pspocket (cellFiber's at its second
+cellFiberPpuInitializeScheduler). These libraries stay firmware-first (D-563): a game gets Sony's modules for them
+while the user's system software is installed, so none of this reaches a game; making pspocket's own match is the next
+work on them.
