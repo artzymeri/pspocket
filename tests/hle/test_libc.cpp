@@ -323,32 +323,51 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
     wput(b, kA, U"0x1p-2");
     t.call("wcstof", kA, 0);
     CHECK(t.ctx.fpr[1] == 0.25);
-    // The C locale's multibyte characters are bytes, each the wide character of its value.
-    b[kA] = 0xC0;
-    b[kA + 1] = 0;
-    CHECK(t.call("mbrtowc", kOut, kA, 4, 0) == 1);
-    CHECK(ps_read32(b, kOut) == 0xC0);
-    CHECK(t.call("mbrtowc", kOut, kA + 1, 4, 0) == 0);
+    // The C locale's multibyte characters are UTF-8 of up to three bytes, as the SDK's (D-906): é is C3 A9.
+    put(b, kA, "\xC3\xA9");
+    CHECK(t.call("mbrtowc", kOut, kA, 4, 0) == 2);
+    CHECK(ps_read32(b, kOut) == 0xE9);
+    CHECK(t.call("mbrtowc", kOut, kA + 2, 4, 0) == 0);
     CHECK(static_cast<u32>(t.call("mbrtowc", kOut, kA, 0, 0)) == 0xFFFFFFFEu); // (size_t)-2
-    CHECK(i32(t.call("mblen", kA, 1)) == 1);
+    const u32 state = kArr + 0x800;
+    std::memset(b + state, 0, 8);
+    CHECK(static_cast<u32>(t.call("mbrtowc", kOut, kA, 1, state)) == 0xFFFFFFFEu); // incomplete: kept in the state
+    CHECK(t.call("mbsinit", state) == 0);
+    CHECK(t.call("mbrtowc", kOut, kA + 1, 1, state) == 1);
+    CHECK(ps_read32(b, kOut) == 0xE9);
+    CHECK(t.call("mbsinit", state) == 1);
+    put(b, kB, "\x80");
+    CHECK(static_cast<u32>(t.call("mbrtowc", kOut, kB, 4, 0)) == 0xFFFFFFFFu);
+    CHECK(err() == 0x8001001Du); // EILSEQ
+    put(b, kB, "\xF0\x90\x80\x80"); // four bytes: no wide character of the SDK's
+    CHECK(static_cast<u32>(t.call("mbrtowc", kOut, kB, 4, 0)) == 0xFFFFFFFFu);
+    CHECK(i32(t.call("mblen", kA, 2)) == 2);
+    CHECK(i32(t.call("mblen", kA, 1)) == -1);
     CHECK(i32(t.call("mbtowc", 0, 0, 0)) == 0); // no shift states
-    CHECK(t.call("wcrtomb", kOut, 0xE9, 0) == 1);
-    CHECK(b[kOut] == 0xE9);
-    CHECK(static_cast<u32>(t.call("wcrtomb", kOut, 0x100, 0)) == 0xFFFFFFFFu);
+    CHECK(t.call("wcrtomb", kOut, 0xE9, 0) == 2);
+    CHECK(b[kOut] == 0xC3);
+    CHECK(b[kOut + 1] == 0xA9);
+    CHECK(t.call("wcrtomb", kOut, 0x20AC, 0) == 3);
+    CHECK(cstr(b, kOut).substr(0, 3) == "\xE2\x82\xAC");
+    CHECK(static_cast<u32>(t.call("wcrtomb", kOut, 0x10000, 0)) == 0xFFFFFFFFu);
     CHECK(err() == 0x8001001Du); // EILSEQ
     CHECK(i32(t.call("wctomb", kOut, 0x41)) == 1);
     CHECK(i32(t.call("btowc", static_cast<u64>(-1))) == -1);
-    CHECK(t.call("btowc", 0xFF) == 0xFF);
+    CHECK(t.call("btowc", 'A') == 'A');
+    CHECK(i32(t.call("btowc", 0xFF)) == -1);
+    CHECK(i32(t.call("btowc", 0xC3)) == -1);
     CHECK(i32(t.call("wctob", 0x100)) == -1);
+    CHECK(i32(t.call("wctob", 0xE9)) == -1); // two bytes
+    CHECK(i32(t.call("wctob", 'z')) == 'z');
     CHECK(t.call("mbsinit", 0) == 1);
-    put(b, kA, "h\xE9llo");
+    put(b, kA, "h\xC3\xA9llo");
     CHECK(t.call("mbstowcs", 0, kA, 0) == 5);
     CHECK(t.call("mbstowcs", kOut, kA, 16) == 5);
     CHECK(wstr(b, kOut) == U"héllo");
     // mbsrtowcs moves the source pointer past what it converted, or to NULL after the NUL.
     ps_write32(b, kArr, kA);
     CHECK(t.call("mbsrtowcs", kOut, kArr, 2, 0) == 2);
-    CHECK(ps_read32(b, kArr) == kA + 2);
+    CHECK(ps_read32(b, kArr) == kA + 3);
     CHECK(t.call("mbsrtowcs", kOut, kArr, 16, 0) == 3);
     CHECK(ps_read32(b, kArr) == 0);
     wput(b, kA, U"wide");
@@ -356,13 +375,16 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
     CHECK(cstr(b, kOut) == "wide");
     CHECK(t.call("wcstombs", 0, kA, 0) == 4);
     wput(b, kA, U"aĀ");
+    CHECK(t.call("wcstombs", kOut, kA, 16) == 3);
+    CHECK(cstr(b, kOut) == "a\xC4\x80");
+    wput(b, kA, U"a\U00010000");
     CHECK(static_cast<u32>(t.call("wcstombs", kOut, kA, 16)) == 0xFFFFFFFFu);
     ps_write32(b, kArr, kA);
     wput(b, kA, U"abc");
     CHECK(t.call("wcsrtombs", kOut, kArr, 2, 0) == 2);
     CHECK(ps_read32(b, kArr) == kA + 8);
-    CHECK(t.call("_Getmbcurmax") == 1);
-    // The classes are ASCII's; nothing past 127 is in one.
+    CHECK(t.call("_Getmbcurmax") == 3);
+    // The classes are ASCII's (the SDK's: DEL is no control); nothing past 127 is in one.
     for (u32 c = 0; c < 300; c++) {
         INFO(c);
         const bool ascii = c < 128;
@@ -370,7 +392,7 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
         CHECK((t.call("iswdigit", c) != 0) == (ascii && std::isdigit(static_cast<int>(c))));
         CHECK((t.call("iswspace", c) != 0) == (ascii && std::isspace(static_cast<int>(c))));
         CHECK((t.call("iswpunct", c) != 0) == (ascii && std::ispunct(static_cast<int>(c))));
-        CHECK((t.call("iswcntrl", c) != 0) == (ascii && std::iscntrl(static_cast<int>(c))));
+        CHECK((t.call("iswcntrl", c) != 0) == (ascii && std::iscntrl(static_cast<int>(c)) && c != 0x7F));
         CHECK((t.call("iswprint", c) != 0) == (ascii && std::isprint(static_cast<int>(c))));
         CHECK((t.call("iswblank", c) != 0) == (c == ' ' || c == '\t'));
         CHECK(t.call("towupper", c) == (c >= 'a' && c <= 'z' ? c - 32 : c));
@@ -384,12 +406,18 @@ TEST_CASE("sys_libc: wide numbers, multibyte conversions and wide classes", "[hl
     CHECK(t.call("wctype", kA) == 0);
     put(b, kA, "toupper");
     CHECK(t.call("towctrans", 'q', t.call("wctrans", kA)) == 'Q');
-    // Dinkumware's table of the class names, as wctype reads it.
+    // The SDK's table of the classes, as wctype reads it: {ranges, 0}, then {name, first range} in its order.
     const u32 tab = static_cast<u32>(t.call("_Getpwctytab"));
     REQUIRE(tab != 0);
-    CHECK(cstr(b, ps_read32(b, tab)) == "alnum");
-    CHECK(t.call("iswctype", 'A', ps_read32(b, tab + 4)) == 1); // the first entry's class
-    CHECK(t.call("iswctype", '!', ps_read32(b, tab + 4)) == 0);
+    CHECK(cstr(b, ps_read32(b, tab + 8)) == "alnum");
+    CHECK(cstr(b, ps_read32(b, tab + 8 * 12)) == "blank");
+    CHECK(ps_read32(b, tab + 8 * 13) == 0);
+    CHECK(t.call("iswctype", 'A', 1) == 1); // alnum
+    CHECK(t.call("iswctype", '!', 1) == 0);
+    put(b, kA, "blank");
+    CHECK(t.call("wctype", kA) == 12);
+    put(b, kA, "cntrl");
+    CHECK(t.call("wctype", kA) == 3);
 }
 
 TEST_CASE("sys_libc: malloc and its family on dlmalloc", "[hle][libc]")
@@ -576,24 +604,32 @@ TEST_CASE("sys_libc: the C locale and Dinkumware's conversion internals", "[hle]
     Fixture f;
     GuestThread t(f, 0, "ppu");
     u8* b = f.base();
+    // The SDK's setlocale knows "C" alone, whatever the category (D-906).
     CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 0, 0))) == "C");
-    put(b, kA, "");
+    put(b, kA, "C");
     CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 2, kA))) == "C");
-    put(b, kA, "fr_FR");
-    CHECK(t.call("setlocale", 0, kA) == 0);
-    CHECK(t.call("setlocale", 99, 0) == 0);
+    CHECK(cstr(b, static_cast<u32>(t.call("setlocale", 99, 0))) == "C");
+    for (const char* name : {"", "POSIX", "fr_FR", "C;collate:C", "c"}) {
+        INFO(name);
+        put(b, kA, name);
+        CHECK(t.call("setlocale", 0, kA) == 0);
+    }
     const u32 lc = static_cast<u32>(t.call("localeconv"));
     REQUIRE(lc != 0);
+    CHECK(lc == HleProcess::current()->link_variable("sys_libc", recomp::nid_of("_Locale")));
     CHECK(cstr(b, ps_read32(b, lc + 44)) == ".");
     CHECK(cstr(b, ps_read32(b, lc)).empty());
-    CHECK(b[lc + 28] == 0xFF); // CHAR_MAX of the PPU's unsigned char
-    CHECK(b[lc + 41] == 0xFF);
+    CHECK(b[lc + 28] == 0x7F); // CHAR_MAX of the SDK's library's signed char
+    CHECK(b[lc + 41] == 0x7F);
+    CHECK(cstr(b, ps_read32(b, lc + 64)) == "false");
+    CHECK(cstr(b, ps_read32(b, lc + 68)) == "true");
     // The class and case tables, entry 0 at the pointer, EOF before it.
     const u32 ct = static_cast<u32>(t.call("_Getpctype"));
     REQUIRE(ct != 0);
     CHECK((ps_read16(b, ct + 2 * 'a') & 0x10) != 0);   // _LO
     CHECK((ps_read16(b, ct + 2 * '7') & 0x20) != 0);   // _DI
-    CHECK((ps_read16(b, ct + 2 * '\t') & 0x400) != 0); // _XB: isblank
+    CHECK(ps_read16(b, ct + 2 * '\t') == 0x4C0); // _XB (isblank), _BB and _CN, as the SDK's table
+    CHECK(ps_read16(b, ct + 2 * '\n') == 0xC0);
     CHECK(ps_read16(b, ct - 2) == 0);                  // EOF
     CHECK(ps_read16(b, ct + 2 * 0xE9) == 0);
     const u32 lo = static_cast<u32>(t.call("_Getptolower"));

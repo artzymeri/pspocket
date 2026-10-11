@@ -9341,3 +9341,91 @@ cellKey2char stop with a fault in Sony's module running on pspocket (cellFiber's
 cellFiberPpuInitializeScheduler). These libraries stay firmware-first (D-563): a game gets Sony's modules for them
 while the user's system software is installed, so none of this reaches a game; making pspocket's own match is the next
 work on them.
+## D-906 · 2026-10-10 · sys_libc's locale and time as the SDK's C library has them
+
+The last 28 of sys_libc's (and sys_libm's) locale and time names are pspocket's own (runtime/hle/src/sys_libc_locale.cpp,
+the time ones in sys_libc_time.cpp, the shared layouts and conversion machine in libc_locale.hpp), and sys_libc's
+locale, time, multibyte and wide-class functions now give what the SDK's give. The reference is a game's statically
+linked copy of the SDK's library (Assassin's Creed's, BLES00158; addresses only in inventory/libc-ac/ac-libc-map.txt,
+nothing of it in the repository), read and called next to pspocket's (D-904's fixture).
+
+**What the SDK's library is.** Dinkumware's C99 library with the newer locale design: a locale is a `_Linfo` of 452
+bytes (name, next, collation and wide collation state tables, ctype/tolower/toupper, MB_CUR_MAX, multibyte and wide
+state tables, wide translation and class tables, an 80-byte `struct lconv`, a 21-pointer `_Tinfo`); `_Loctab` is its
+64 locale-file keywords {name, offset, kind} (kinds 0 grouping string ... 8 wide table); the four state tables are
+thread-local (here in the thread's block, which grew to 512 bytes); `_Times` is the current `_Tinfo`, whose name lists
+are delimited strings and whose ten format pointers share one four-field string. Sony's choices on top: setlocale knows
+"C" alone, `_Findloc` reads no file (so `_Getloc` finds "C" only), the time zone and summer time come from lv2.
+
+**The 28** (AC's address in the map where it has a copy):
+- `_Clocale` (variable, sys_libc): its name "C", the rest filled by `_Getcloc` (the current tables, MB_CUR_MAX 3,
+  `_Locale`, `_Times`; the translation table left out, as the SDK's). `_Locale`: the "C" lconv, the 14 chars 0x7F
+  (the SDK's char is signed), false/true "false"/"true", the rest "" but decimal_point ".". `_Loctab`: the 64 entries.
+  `_Times`: the "C" names.
+- In AC: `_Defloc` ("C"), `_Findloc` (NULL), `_Freeloc` (frees what a locale holds that "C" does not, by `_Loctab`'s
+  kinds; state tables by their "made" halfword), `_Getcloc`, `_Getgloballocale`/`_Setgloballocale` (the thread's
+  global locale pointer, now also sys_libstdcxx's: its locale::global and _Init keep the C++ _Locimp there, as the
+  SDK's C++ library does), `_Getloc` (the plain component of "name;category:name;...", overridden by the category's
+  own; looked up from `_Clocale`), `_Skip`, `_Getnloc` and `_Getlname` (pspocket's names for the two category-mask
+  helpers the SDK links beside setlocale and never calls: set pcats[1..6] (and [0] for all) from a name, -1 for a bad
+  mask or name, 1 changed / 0 not; build "name;category:name;..." into a malloc'd buffer), `_Getptimes` (&_Times),
+  `_CStrftime`, `_Gentime`.
+- No copy in AC (Dinkumware's design, Plauger's book for the C89 parts, adapted to the C99 `_Loctab`; their file syntax
+  pspocket's reading, nothing to compare with): `_Setloc(cat, p)` (Plauger's per-category copy for categories 1..6, 0
+  all: collation tables; ctype tables, MB_CUR_MAX (at most 8), multibyte/wide tables, wide tables; monetary; numeric
+  with false/true; time; messages no/yes), `_Readloc` (keyword lines, blank lines skipped, '\' continues, a table
+  line's '[' ends the keyword), `_Makeloc` (to the next LOCALE line), `_Makestab` ("ctype[lo:hi] sum",
+  "mbtowc[state, lo:hi] sum", copy-on-write tables, $@ the entry and $$ its value), `_Makewct` ("wctype name lo:hi
+  value ...", copying the "C" table's names), `_Locsum`/`_Locterm`/`_Locvar` (terms: numbers, 'c', $^ $a..$v $@ $$,
+  $0..$9 states, $A..$Z variables, F I O R preset to the state-table bits), `_Nnl` (strip a line's newline: 1 when
+  there was one); `_Getdst` and `_Isdst` (Plauger's rules over the locale's dst_rules or time_zone's fourth field; with
+  none, the "C" locale, lv2's summer flag); `_Wcsftime`/wcsftime (the AC build has neither, its wchar_t is 16 bits:
+  derived from `_CStrftime` with sys_libc's 32-bit wchar_t, conversions' text widened by the multibyte conversion).
+
+**What changed in sys_libc's own functions** (D-511, D-512, D-515 asserted other behaviour; their tests in
+test_libc.cpp changed to the SDK's):
+- setlocale: NULL or "C" answers "C" (the `_Clocale` name), anything else NULL, the category not looked at:
+  setlocale(LC_ALL, "") and "POSIX" are NULL now, setlocale(99, NULL) is "C". localeconv is `_Locale` (0x7F chars).
+- strftime is `_CStrftime` over `_Times`: Dinkumware's table-driven conversions with three-deep format expansion and
+  the format read as multibyte characters; an unknown conversion gives its letter and a NUL ("%q|" is 3 bytes "q\0|");
+  numbers clamped at 0 and cut to their width (year -5 is "0000", 12345 "2345"); %C is year/100+19; %z and %Z come from
+  the locale's time_zone only, empty in "C" (D-515 printed lv2's offset); the E modifier uses the era fields
+  ("+:offset:start:end:name:format"), O the alt_digits; %V/%G/%g count every year as 365 days (the SDK's leap test for
+  them can never pass), so 2020-12-30 and -31 are week 01 of 2021 (D-902's "%V at a year's start"); a buffer too small
+  answers 0 and keeps the pieces that fit. A locale whose formats expand into themselves stops with a log (the SDK's
+  loops for ever), and a modifier as the format's last character ends it (the SDK's reads past the string).
+- asctime is "%c\n" through the "C" _Tinfo into the thread's 26 bytes (wday 7 gives no day name, years cut to four
+  digits); gmtime, localtime and `_Ttotm` use Plauger's calendar (2100 a leap year: gmtime(4107542400) is 29 February
+  2100), negative fields before 1900, localtime = zone + summer offset with tm_isdst 1, `_Ttotm`'s non-zero isdst adds
+  the summer offset and is stored as given; `_Gettime` past the fields answers the NUL with length 0 (Plauger's 1);
+  time() answers -1 when lv2 fails. mktime (no copy) keeps D-515's meaning on the same calendar.
+- Multibyte: the "C" locale is UTF-8 of up to three bytes, MB_CUR_MAX 3 (`_Mbcurmax` 3), as the SDK's (its wchar_t
+  is 16 bits; with sys_libc's 32-bit one a wide character past 0xFFFF has no form, EILSEQ, and a four-byte lead is
+  EILSEQ); no overlong or surrogate checks; mbstate_t is {_Wchar, _Byte, _State} with a pending sequence kept;
+  `_Mbtowcx`/`_Wctombx` run Dinkumware's state-table machine when a locale has tables. btowc of a byte past 0x7F is
+  WEOF, wctob of é EOF; `_Getpmbstate` and its kin answer the thread's 64-byte state tables (D-512 had 8-byte states).
+- Wide classes: the SDK's table layout ({ranges, 0}, {name, first}, ..., {NULL, end}; ranges {lo, hi, value}), its
+  order (alnum 1, alpha, cntrl, digit, graph, lower, print, punct, space, upper, xdigit, blank 12), cntrl 0..0x1F (DEL
+  is not); `_Getpwctytab` answers the table. `_Wctrans` (no copy in AC) the same layout, tolower/toupper deltas.
+- The ctype table's \t..\r carry _BB as well as _CN (0x4C0, 0xC0), as the SDK's.
+- Collation in "C": strxfrm/wcsxfrm/`_Strxfrmx`/`_Wcsxfrmx` write as much of the string as fits (the SDK's leaves the
+  pieces); `_CStrxfrm(sout, size, save, tables)` and `_CWcsxfrm(sout, &src, size, ps, tables)` have the SDK's
+  signatures. Collation by a locale's state tables is not done (logged, code order): only a locale file's collate
+  lines could make them, which the SDK's setlocale never loads.
+- sys_libstdcxx: kCharMax 0x7F (the facets compare the lconv's "not available" with it).
+
+**How it was checked** (tests/hle/test_libc_locale_game.cpp, "[gamelibc]", 0 differences): strftime 99,286 calls (every
+conversion and modifier over 650 dates and odd fields, literal and multibyte formats, buffers 0..29); `_Gentime` and
+`_CStrftime` 876,688 calls over four _Tinfos (eras, alt digits, zones, self-referring formats); gmtime, localtime,
+asctime, ctime, `_Ttotm`, `_Daysto`, `_Gettime`, time 16,689 calls; locale objects, setlocale (11 categories × 16
+names), `_Getloc`, `_Getnloc`, `_Skip`, `_Findloc`, the global pointer, `_Getcloc`'s result 1,300; `_Mbtowc`,
+`_Wctomb` (all 65,536), `_Mbtowcx`/`_Wctombx` with state tables, `_Iswctype`, the class table 74,209; strcoll,
+strxfrm, `_CStrxfrm`, `_CWcsxfrm` 516. Not compared: formats whose first byte is no multibyte character (the SDK's
+then reuses whatever its stack held), `_Getlname` (it always frees or mallocs through the game's own allocator, which
+an unstarted executable lacks), the file functions (no copy). The game's _Once needs its lwmutex, which the test makes
+with the game's own start-up function. Firmware-free: tests/hle/test_libc_locale.cpp (strftime and the calendar, eras,
+wcsftime, `_Getdst`/`_Isdst`, the locale objects, a locale file read, made current with `_Setloc` and freed).
+
+Not done here: printf's %lc/%ls, scanf's wide conversions and the wide streams still convert bytes one to one (they are
+libc_format.hpp's and stdio's, D-905); sys_libstdcxx's codecvt<wchar_t, char> and ctype<wchar_t>::widen are bytes
+too, where the SDK's C++ library converts UTF-8 through the same machine (its do_widen gives WEOF past 0x7F).
