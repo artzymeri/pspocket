@@ -402,6 +402,10 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   scripts/build-ffmpeg.sh (macos, macos-tests, ios) for the new decoders. cellDmuxPamf's raw elementary stream core
   from RPCS3, unverified (D-624). Races found and fixed by a ThreadSanitizer pass over the day's libraries (D-650 to
   D-653): cellJpgEnc's and cellPngEnc's queue, a taskset 2's task IDs and event flag IDs.
+- Fixed (D-645, D-646): a damaged ATRAC3plus file whose fmt chunk counts fewer channels than its configuration made
+  cellAtrac overrun its PCM buffer into cellAdec's decoder state; the decoder's thread then outlived its close and
+  either spun or took the next decoder's commands (the rare test abort and the test run that stalled). Each core's
+  thread now ends once its context is not its own, and cellAtrac refuses such files and a RIFF length that wraps.
 Left (414, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
   and cellSail's playback (19, libsail), the codec
