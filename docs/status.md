@@ -314,7 +314,7 @@ its `cellSpurs.cpp` HLE is a partial, little-exercised reference: check new SPUR
 
 Every system library function is to be pspocket's own native code (D-500): the chart in the README at 100%, each
 library compared with Sony's own module in tests where the firmware has one. GTA V and Assassin's Creed already need no
-firmware module. Done so far (2026-10-11: 6,071 of 6,625, 91.6%):
+firmware module. Done so far (2026-10-11: 6,187 of 6,625, 93.4%):
 - **liblv2 (sysPrxForUser).** Its printf family is liblv2's own small formatter (D-501), its heaps and malloc are
   dlmalloc 2.8.3 as liblv2 builds it (D-502), and its process exit list, panic and syscall wrappers are pspocket's
   (D-501); each the same as liblv2 in tests/hle/test_lv2_compare.cpp.
@@ -392,7 +392,10 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   tone and by program, voices and their allocation, the request queue, a Standard MIDI File player, all through
   libsynth2's exports; the HD3 tone and program records are inferred (D-641: the first thing to check on the Mac).
   Both have comparisons with Sony's modules ready for the Mac ("[compare][rudp]", "[compare][snd3]").
-Left (554, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
+- sys_libc and sys_libm complete (D-904 to D-907, by the session on the Mac): Dinkumware's internals as the SDK's C
+  library has them, compared with the copies two games link into themselves: the SPU accessors and printf helpers,
+  printf's and scanf's engines, number parsing, the locale objects, multibyte conversions, collation and time.
+Left (438, 2026-10-11). What each part needs (a session without the firmware could not make these faithfully):
 - Sony's module, read or compared on the Mac (firmware_compare.hpp): cellSailRec (58)
   and cellSail's playback (19, libsail), the codec
   cores' modules (libsvc1d, libsmvd2/4, libsjvtd, libavcdec, libmvcdec past their versions, libdivx*, libvdec's 6, and
@@ -402,9 +405,6 @@ Left (554, 2026-10-11). What each part needs (a session without the firmware cou
   module management's six).
 - The 188 functions answered as RPCS3's stubs, in libraries pspocket always serves: their arguments and answers from
   the libraries' modules.
-- sys_libc and sys_libm's internals (260: Dinkumware's formatter, scanner and locale internals, the SPU printf
-  helpers' read and write families): no firmware module has them; their arguments are to be read in a game's own copy
-  of the C library.
 - To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
   cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
   (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,
