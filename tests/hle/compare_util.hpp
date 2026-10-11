@@ -77,6 +77,14 @@ inline void trace(const std::string& what)
     std::fflush(stderr);
 }
 
+// PSPOCKET_COMPARE_ONLY=<text>: a comparison that supports it runs only its steps whose name contains the text (for
+// looking at one case; a run so narrowed is not a comparison's verdict).
+inline bool selected(std::string_view step)
+{
+    const char* only = std::getenv("PSPOCKET_COMPARE_ONLY");
+    return !only || !*only || step.find(only) != std::string_view::npos;
+}
+
 // How this run compares; SKIPs the test without the firmware and without PSPOCKET_COMPARE_SELF.
 inline Setup setup()
 {
@@ -662,13 +670,39 @@ private:
     std::map<std::string, std::pair<usize, usize>> groups_; // group -> (compared, differ)
 };
 
+// PSPOCKET_COMPARE_DUMP=<directory>: each half's observations written there for reading off line, the lines to
+// <directory>/<half>.txt and each data observation to <directory>/<half>/<n>.bin (listed in the .txt). What Sony's half
+// writes is derived from the firmware: the directory belongs in a scratch area or inventory/, never the repository.
+inline void dump(const Observed& o, const std::string& half)
+{
+    const char* dir = std::getenv("PSPOCKET_COMPARE_DUMP");
+    if (!dir || !*dir) return;
+    const std::string base = std::string(dir) + "/" + half;
+    const std::string mk = "mkdir -p '" + base + "'";
+    if (std::system(mk.c_str()) != 0) return;
+    if (std::FILE* f = std::fopen((base + ".txt").c_str(), "w")) {
+        for (const Line& l : o.lines) std::fprintf(f, "%s -> %s\n", l.key.c_str(), l.value.c_str());
+        for (usize i = 0; i < o.data.size(); i++) {
+            std::fprintf(f, "[data %zu] %s: %zu bytes\n", i, o.data[i].key.c_str(), o.data[i].bytes.size());
+            if (std::FILE* d = std::fopen(std::format("{}/{}.bin", base, i).c_str(), "wb")) {
+                std::fwrite(o.data[i].bytes.data(), 1, o.data[i].bytes.size(), d);
+                std::fclose(d);
+            }
+        }
+        for (const std::string& n : o.notes) std::fprintf(f, "[note] %s\n", n.c_str());
+        std::fclose(f);
+    }
+}
+
 // The usual shape: both halves run by `half(sony_half)`, compared, reported; `sane` checks pspocket's own half in Self
 // mode. Returns pspocket's observations.
 template <class HalfFn, class SaneFn>
 Observed run(const Setup& s, const std::string& title, HalfFn half, SaneFn sane)
 {
     Observed ours = half(false);
+    dump(ours, "pspocket");
     const Observed theirs = half(true);
+    dump(theirs, s.mode == Mode::Firmware ? "sony" : "pspocket-again");
     Report report(title, s);
     report.compare(ours, theirs, s.mode == Mode::Firmware ? "Sony" : "pspocket (again)");
     if (s.mode == Mode::Self) sane(ours);

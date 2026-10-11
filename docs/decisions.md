@@ -10319,3 +10319,41 @@ from an integer, so double precision floors them alike on every host.
 Tests: 21 Note2Pitch and 14 Pitch2Note values of libsd's arithmetic; every note from 12 to 83 at every fine step near
 4096 * 2^(offset / 12) (within 1 + 0.06%), rising, and back through Pitch2Note within 5 fine steps (1 from the centre
 up). To compare on the Mac: the comparison's 2,350 answers against Sony's.
+
+## D-912 · 2026-10-11 · cellVdec's new codecs against Sony's libvdec (part 1): the comparisons as a game decodes
+
+D-597's comparison of cellVdec's DivX 3.11, MPEG-4 part 2, VC-1 and MVC with Sony's libvdec 4.92 (D-911: DivX 3.11
+crashed, the others differed) is reworked so that what it compares is what a game sees, and widened.
+
+- **Why DivX 3.11 "crashed".** Two things, neither an engine fault. Its five decodes each waited 60 s for AUDONEs that
+  never came: Sony's DivX 3.11 core has two frame buffers and holds the third access unit back while the game holds a
+  picture, and the old test took its pictures only after EndSeq. Then OpenEx without CellVdecDivxSpecificInfo2: libvdec
+  reads the frame size from address 4 there (its pointer to the information is a register that is only set when the
+  information is given, and is 0 otherwise), which faults on a PS3 as it does here. That case is no longer sent; a game
+  always gives the information.
+- **A decoder's life as a game lives it** (test_vdec_codecs_compare.cpp decode()): each access unit's AUDONE awaited, then
+  the pictures announced by then taken at once (GetPicItem, GetPicture); hold() decodes without taking pictures until an
+  access unit is held back, then takes one picture at a time (how many pictures each core holds); items_ahead() takes
+  items ahead of their pictures and sets the frame rate inside the sequence. A callback due that does not come within
+  10 s is "none" (no 60 s waits).
+- **The decoder's memory**: 64 MB, so every decoder gets what QueryAttrEx asks for (Sony's libvdec refuses less than its
+  codec's part, part 2), filled with 0xA5 before each OpenEx so the bytes a decoder leaves unwritten show (the
+  information blocks and items have many).
+- **Widened**: QueryAttrEx over every level of each codec with and without codec specific information (picture sizes,
+  buffer counts, deblocking, the refusals); OpenEx with the codec's part and one byte less; DivX and MPEG-4 told their
+  size, an 80x48 stream (not a multiple of 32 lines), DivX with three buffers held; VC-1 told its size and held; MVC's
+  sizes for every level. Each picture's frame buffer is read with its core's own layout (part 2).
+- **A damaged stream**: DivX 3.11 written at 96x64 and told 128x96 decodes into garbage in both decoders; its pictures and
+  which of them a decoder reports damaged (the item's status, the information's error word, the PICOUT's data) are
+  notes, the rest compared.
+- **MVC through DecodeAuEx2 is not sent**: Sony's libvdec hands libmvcdec the picture information's address from 0x10
+  bytes past where it keeps it (the caller's r26 saved in its frame), and writes the information there when the picture
+  comes: on a PS3 wherever the game's r26 points; here a fault at 0x15c. Nothing to compare. The H.264 base view decode
+  D-597 added to read MVC against goes too (MVC never decodes through DecodeAu, part 2); H.264 is compared in
+  test_vdec.cpp (D-196).
+- **compare_util.hpp**: PSPOCKET_COMPARE_DUMP=<dir> writes each half's observations (lines, and each data block as a
+  file) for reading off line, Sony's into a scratch directory only; PSPOCKET_COMPARE_ONLY=<text> runs only the steps of
+  a comparison whose names contain it (one case at a time).
+
+Tests: the four comparisons (hidden, [compare][vdec]); with PSPOCKET_COMPARE_SELF=1 both halves agree and the sanity
+checks hold the values Sony's module gave.
