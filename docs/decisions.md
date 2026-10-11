@@ -11099,3 +11099,76 @@ filter's attributes (no specific information); a PAMF filter read as a raw one r
 stream's four units notified with RPCS3's arguments (no timestamps, no specific information) and released; flush,
 disable, close. tests/hle/test_lle.cpp: an import of the raw table, a game's or a module's, goes to libdmuxpamf where it
 is installed and to pspocket's table where not; an import of the PAMF table stays on the host either way.
+
+## D-645 · 2026-10-11 · The cellAtrac fuzzing's abort and stall: a decoder thread whose context the game overwrote
+
+The cellAtrac fuzzing target (D-603, D-605) aborted at its fixture's end about once in ten runs on a busy machine
+("shutdown: 1 guest thread(s) still running", twice, then "kernel destroyed while guest threads still run guest code"),
+and a loaded ctest stalled in test_hle for 30 minutes until its timeout. Pinned to one core (taskset -c 0) the target
+failed 7 runs in 9: 2 such aborts and 5 stalls (the stall taken apart: the test's thread in cellAdecClose's join).
+ThreadSanitizer, run by another helper, reported the same case: realign's copy against the ATRAC3plus decoder thread's
+reads, and that thread's cellAtrac callback against the next file's SetDataAndGetMemSize. One cause:
+- **What happened.** Three of the default seed's inputs (plain #86, looped #133, odd chunk #142) are AT3+ files whose
+  fmt chunk says one channel and whose ATRAC3plus configuration says two. cellAtrac sizes a frame's PCM in its work
+  memory from the fmt (8 KB, libatrac3plus's sizes, D-532); cellAdec's realign copies the whole frame the decoder made
+  (16 KB, by the configuration, libatxdec's, D-198). The PCM ran over cellAdec's context and the core's after it (zeros:
+  the frames are silent). cellAdecClose then refused the context (its first word no longer its address: ARG, as Sony's
+  libadec), so cellAtracDeleteDecoder never stopped or joined the decoder's thread. Coming back to its queue after the
+  overwrite (on a loaded machine the game's thread, woken by the PCMOUT callback, got there first), that thread read
+  mutex and condition IDs of 0: a lock and a wait that failed at once, round and round at a core's full speed, which the
+  kernel cannot stop (it stops a thread in a syscall or a wait, and an HLE function's lv2 calls that fail at once are
+  neither): the shutdown waited 5 s twice, then the fatal. Or the next file's decoder opened in the same memory, the old
+  thread read its new IDs and took its commands, its close among them, and cellAdecClose's join waited for a thread
+  that never heard it: the stall. The close path itself was right: each core's close stops its thread and joins it
+  before it returns (RPCS3 cellAdec.cpp, as libadec), and a game closing a decoder while its last frame decodes waits
+  for that frame.
+- **The decoder threads (adec_atracx.cpp, adec_ffmpeg.cpp, adec_lpcm.cpp).** The thread of each of pspocket's cores
+  (ATRAC3plus, the cores on FFmpeg, LPCM) checks that its context is still its own each time it takes its queue (after
+  the lock, so a context replaced in between is seen), its semaphore (LPCM), run_thread and its output: the context's
+  thread ID names it, and the call just made on the context's mutexes, conditions or semaphore succeeded. When not, it
+  logs an error ("its context is no longer its own") and ends, releasing what it holds. So it neither goes round
+  failing calls nor takes another decoder's commands: the path that blocked for ever is gone with the one that aborted.
+  A thread asleep on its own condition when the context goes stays asleep, as on a PS3, until the process ends (the
+  kernel's shutdown wakes and unwinds it). ATRAC3plus's and the FFmpeg cores' open clear the whole context first;
+  LPCM's now clears the thread ID first, so an earlier thread still in that memory never finds itself named while the
+  new objects are made.
+  Deviations: LLE's threads ignore these calls' failures (LPCM notes them in error_occurred), RPCS3 ensure()s each and
+  stops the emulator; the thread ID check is pspocket's own.
+- **cellAtrac (cellAtrac.cpp).** The overrun is stopped where it starts: SetDataAndGetMemSize answers UNKNOWN_FORMAT for
+  an ATRAC3plus configuration of more channels than the fmt chunk's (each frame would run past the work memory's PCM,
+  the core's memory, whose cellAdec type is chosen from the fmt's, and the game's buffer, sized from GetChannel) and for
+  an fmt of more than the 8 channels ATRAC3plus carries (a partial frame's samples, read at the fmt's stride, came from
+  up to 2 MB past the PCM). Fewer channels fit and are taken as before. libatrac3plus, as read, checks neither: a PS3
+  would overwrite the decoder's memory the same way. To compare on the Mac with such a file. With the default seed the
+  fuzzing now refuses those files, and no close is refused.
+- **A game** meets the overwrite only with such a damaged file or a bug of its own (memory used again after a close that
+  failed); it then loses that decoder, as on a PS3, and goes on.
+- **The other media libraries' end calls.** cellVdec and cellDmux's PAMF core keep their decoder's and demuxer's state
+  on the host (the commands, the queues, the lv2 objects' IDs), so an overwrite of the game's memory cannot take their
+  threads' queues, and cellVdecClose and cellDmuxClose (the core's join_thread) join their threads. cellPamf,
+  cellJpgDec and cellPngDec (their SPU paths decode on the calling thread here) and cellVpost have no threads.
+  cellAtracMulti closes through cellAdec, but its ATRAC3 multichannel type is served only by the firmware's core
+  (pspocket has none of its own), whose thread is Sony's code making syscalls the kernel stops; its shuffled frame
+  buffer holds 4,352 bytes a track, and a file whose frames are larger per channel would write past it as libatrac3multi
+  would (not fuzzed, left).
+Tests: test_adec_context.cpp, on the LPCM, ATRAC3plus and MP3 (FFmpeg) cores, without load: the game's callback, on the
+decoder's own thread, overwrites the context at PCMOUT with zeros and with a pattern (the thread ends; cellAdecClose
+refuses the context), and holds the thread at PCMOUT while another decoder opens in the same memory (the first thread
+ends; the second decodes, gives its PCM and closes, its thread joined). Before: the reported abort (zeros, and LPCM's
+pattern), the fatal "command type" (the pattern taken for a command), a first thread that never ends (the stall).
+test_atrac.cpp: the channel refusals. The fuzzing target pinned to one core: 50 runs with the default seed after the
+threads' fix, none failed; after the whole of it 20 with the default seed and 16 with other seeds and four times the
+inputs (one of them needed D-646), none failed. The whole test_hle three times on the loaded machine with two busy
+loops more: 75 to 79 s each, no stall, only libm's known signed zeros failing.
+
+## D-646 · 2026-10-11 · cellAtrac's header reader: a length that wraps the reader back is refused
+
+The cellAtrac fuzzing with another seed and four times the inputs (PSPOCKET_FUZZ_SEED=7919 PSPOCKET_FUZZ_ITERS=4) hung
+in SetDataAndGetMemSize on its input 44.1 kHz #852: a chunk of 0xFFFFFF00 bytes after a run of empty ones. The reader's
+check that a chunk ends within the bytes read is a 32-bit sum, which a length near 4 GB wraps: the check passed and the
+next chunk was 256 bytes back, so the reader went round the same chunks for ever (and the same sum let a fmt chunk near
+the end be read past the bytes). The check is now made without the sum, and a RIFF form other than WAVE whose length
+takes the reader back to its header (or before it) is refused: READSIZE_IS_TOO_SMALL both. libatrac3plus's reader, as
+read, makes the same sums; nothing else changes. cellAtracMulti reads its headers with the same reader. Test
+(test_atrac.cpp): a 12-byte RIFF that points back at itself, a chunk that does, empty chunks and one that goes back to
+them (the old reader went round for ever on all three), a fmt chunk whose length only wraps: each refused.
