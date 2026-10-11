@@ -536,8 +536,9 @@ s32 cellSysutilAvcSetSpeakerVolumeLevel(PPUContext&, s32 level)
 // RPCS3 cellSysutilAvcExt.cpp: the AV chat's windows, panel and name plates. Nothing is shown, so the getters check
 // their pointers and write nothing (RPCS3's TODOs), the setters check the player and the transition (at most
 // EXPONENT, so NONE is refused too, as RPCS3) or the z-order; cellSysutilAvcExtLoadAsyncEx checks its option and loads
-// through cellSysutilAvcLoadAsync. Float arguments come in f1.. and take no general register (RPCS3's binder). RPCS3's
-// stubs here are answered from rpcs3_stubs.inc.
+// through cellSysutilAvcLoadAsync. Float arguments come in f1.. and each takes its general register's slot, so the
+// transition after them comes from the register after theirs (the PPC64 ELF ABI, D-503; RPCS3's binder skips no
+// register, and D-187 read the transition so, from r4: D-678). RPCS3's stubs here are answered from rpcs3_stubs.inc.
 constexpr std::string_view kAvcExtChan = "cellSysutilAvcExt";
 constexpr u32 CELL_AVC_ERROR_UNKNOWN = 0x8002b701;
 constexpr u32 CELL_SYSUTIL_AVC_TRANSITION_EXPONENT = 4, CELL_SYSUTIL_AVC_ZORDER_FORWARD_MOST = 2,
@@ -620,18 +621,17 @@ s32 cellSysutilAvcExtGetSurfacePointer(PPUContext&, u32 player_id, u32 surface, 
     return avc_ext_checked("cellSysutilAvcExtGetSurfacePointer", {player_id, surface, size, size_x, size_y});
 }
 
-// (player_id, float alpha in f1, transition).
-s32 cellSysutilAvcExtSetWindowAlpha(PPUContext& ctx, u32 player_id, u32 transition)
+// (player_id, float alpha in f1, transition in r5: the float takes r4's slot).
+s32 cellSysutilAvcExtSetWindowAlpha(PPUContext&, u32 player_id, float alpha, u32 transition)
 {
-    return avc_ext_window("cellSysutilAvcExtSetWindowAlpha", player_id, transition,
-        std::format(", alpha {}", ctx.fpr[1]));
+    return avc_ext_window("cellSysutilAvcExtSetWindowAlpha", player_id, transition, std::format(", alpha {}", alpha));
 }
 
-// (player_id, float size_x in f1, float size_y in f2, transition).
-s32 cellSysutilAvcExtSetWindowSize(PPUContext& ctx, u32 player_id, u32 transition)
+// (player_id, float size_x in f1, float size_y in f2, transition in r6).
+s32 cellSysutilAvcExtSetWindowSize(PPUContext&, u32 player_id, float size_x, float size_y, u32 transition)
 {
     return avc_ext_window("cellSysutilAvcExtSetWindowSize", player_id, transition,
-        std::format(", {}x{}", ctx.fpr[1], ctx.fpr[2]));
+        std::format(", {}x{}", size_x, size_y));
 }
 
 s32 cellSysutilAvcExtShowWindow(PPUContext&, u32 player_id, u32 transition)

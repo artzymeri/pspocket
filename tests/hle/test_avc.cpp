@@ -385,13 +385,14 @@ TEST_CASE("cellSysutilAvcExt: windows checked, nothing shown; options; LoadAsync
     CHECK(a.call("cellSysutilAvcExtGetSurfacePointer", kNp, kOut, kOut, kOut, 0) == kInval);
     CHECK(a.call("cellSysutilAvcExtGetSurfacePointer", kNp, kOut, kOut, kOut, kOut) == 0);
 
-    // Setters: a player and a transition up to EXPONENT (NONE, 0xFFFFFFFF, is refused as in RPCS3); a z-order.
+    // Setters: a player and a transition up to EXPONENT (NONE, 0xFFFFFFFF, is refused as in RPCS3); a z-order. The
+    // transition after the floats comes from the register after their slots (D-678): r5 after one, r6 after two.
     a.ctx.fpr[1] = 0.5;
-    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 4) == 0);
-    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 5) == kInval);
-    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 0xFFFFFFFF) == kInval);
-    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", 0, 0) == kInval);
-    CHECK(a.call("cellSysutilAvcExtSetWindowSize", kNp, 0) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 0, 4) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 0, 5) == kInval);
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 0, 0xFFFFFFFF) == kInval);
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", 0, 0, 0) == kInval);
+    CHECK(a.call("cellSysutilAvcExtSetWindowSize", kNp, 0, 0, 0) == 0);
     CHECK(a.call("cellSysutilAvcExtShowWindow", kNp, 1) == 0);
     CHECK(a.call("cellSysutilAvcExtHideWindow", 0, 1) == kInval);
     CHECK(a.call("cellSysutilAvcExtSetWindowZorder", kNp, 1) == kInval);
@@ -453,6 +454,24 @@ usize own_stubs(std::string_view module)
 }
 
 } // namespace
+
+// D-678, a regression: the transition after SetWindowAlpha's and SetWindowSize's floats was read from r4, the first
+// float's slot (RPCS3's binder), where the caller leaves whatever r4 held: a good transition was refused by what was
+// there, a bad one taken. It comes from r5 after one float, r6 after two.
+TEST_CASE("cellSysutilAvcExt: the transition after float arguments comes from the register after their slots (D-678)",
+    "[hle][avc][avcext]")
+{
+    Fixture f;
+    GuestThread a(f, 0, "a");
+    constexpr u32 kNp = kData + 0x200;
+    a.ctx.fpr[1] = 0.75;
+    a.ctx.fpr[2] = 0.5;
+    constexpr u64 kGarbage = 0xDEADBEEF; // r4, r5: what the caller left in the floats' slots
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, kGarbage, 1) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetWindowAlpha", kNp, 0, 5) == kInval);
+    CHECK(a.call("cellSysutilAvcExtSetWindowSize", kNp, kGarbage, kGarbage, 3) == 0);
+    CHECK(a.call("cellSysutilAvcExtSetWindowSize", kNp, 0, 0, 5) == kInval);
+}
 
 TEST_CASE("AV chat: every stub RPCS3 left is pspocket's own, unverified (D-675, D-676)", "[hle][avc][avc2]")
 {
