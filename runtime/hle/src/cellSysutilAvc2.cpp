@@ -698,7 +698,7 @@ s32 cellSysutilAvc2SetWindowString(PPUContext& ctx, u32 member_id, u32 string)
     return finish(string && text.terminated ? lv2::CELL_OK : error(CELL_AVC2_ERROR_INVALID_ARGUMENT), call);
 }
 
-// The calls RPCS3 only checks (attributes, window geometry and strings, streaming).
+// The calls RPCS3 only checks (the attributes, a window's string).
 s32 cellSysutilAvc2GetAttribute(PPUContext&, u32 attr) { return checked("cellSysutilAvc2GetAttribute", {attr}); }
 s32 cellSysutilAvc2SetAttribute(PPUContext&, u32 attr) { return checked("cellSysutilAvc2SetAttribute", {attr}); }
 s32 cellSysutilAvc2GetWindowAttribute(PPUContext&, u32, u32 attr)
