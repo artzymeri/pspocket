@@ -288,7 +288,8 @@ struct Instance {
 
 // A CellSpursTaskset2's own tasks (cellSpursCreateTask2, D-626), by the taskset's address: the IDs of those created and
 // not yet joined (a task that exited keeps its ID until cellSpursJoinTask2 takes its exit code, so a task created in
-// between cannot take it) and those a JoinTask2 waits for. Bit 127 - id, as the taskset's bit sets.
+// between cannot take it) and those a JoinTask2 waits for. Bit 127 - id, as the taskset's bit sets. Read and changed
+// under SpursHost::mutex only, which a CellSpursTaskset2's task creation holds across its claim of an ID (D-652).
 struct Task2Ids {
     u128 unjoined = 0, joining = 0;
 };

@@ -2666,33 +2666,39 @@ s32 create_task(PPUContext& ctx, std::string_view what, u32 taskset, u32 task_id
     if (second) {
         if (const s32 rc = task_readable(ctx, what, "taskset", taskset, kTaskset2Size); rc != lv2::CELL_OK) return rc;
     }
-    u128 unjoined = 0;
-    if (second) {
-        SpursHost& h = host();
-        std::lock_guard lock(h.mutex);
-        if (const auto it = h.task2.find(taskset); it != h.task2.end()) unjoined = it->second.unjoined;
-    }
 
+    // The lowest ID free in `enabled`, those of `unjoined` passed by.
     u32 id = CELL_SPURS_MAX_TASK;
-    reservation_op(base, taskset, [&id, unjoined](u8* line) {
-        id = CELL_SPURS_MAX_TASK;
-        for (u32 w = 0; w < 4; w++) {
-            const u32 enabled = ps_read32(line, ts_off::enabled + 4 * w);
-            const u32 taken = enabled | static_cast<u32>(unjoined >> (96 - 32 * w));
-            if (taken == 0xFFFFFFFF) continue;
-            const u32 bit = static_cast<u32>(std::countl_one(taken));
-            id = 32 * w + bit;
-            ps_write32(line, ts_off::enabled + 4 * w, enabled | (0x80000000u >> bit));
-            return true;
-        }
-        return false;
-    });
-    if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_AGAIN);
-    if (x.task2) {
+    const auto claim = [&](u128 unjoined) {
+        reservation_op(base, taskset, [&id, unjoined](u8* line) {
+            id = CELL_SPURS_MAX_TASK;
+            for (u32 w = 0; w < 4; w++) {
+                const u32 enabled = ps_read32(line, ts_off::enabled + 4 * w);
+                const u32 taken = enabled | static_cast<u32>(unjoined >> (96 - 32 * w));
+                if (taken == 0xFFFFFFFF) continue;
+                const u32 bit = static_cast<u32>(std::countl_one(taken));
+                id = 32 * w + bit;
+                ps_write32(line, ts_off::enabled + 4 * w, enabled | (0x80000000u >> bit));
+                return true;
+            }
+            return false;
+        });
+    };
+    if (second || x.task2) {
+        // In a CellSpursTaskset2 the claim passes by the IDs of its own tasks not yet joined as they are while it is
+        // made, and a Task2 task's ID is recorded before anyone else claims (D-652): all under the host's lock. With
+        // the IDs read under the lock before the claim and recorded under it again after, a task created, run and
+        // ended by other threads in between left its ID free in `enabled` and missing from the copy: the claim took
+        // it while its exit code waited to be joined, and the join got the new task's code.
         SpursHost& h = host();
         std::lock_guard lock(h.mutex);
-        h.task2[taskset].unjoined |= u128{1} << (127 - id);
+        const auto it = h.task2.find(taskset);
+        claim(it != h.task2.end() ? it->second.unjoined : 0);
+        if (x.task2 && id < CELL_SPURS_MAX_TASK) h.task2[taskset].unjoined |= u128{1} << (127 - id);
+    } else {
+        claim(0);
     }
+    if (id >= CELL_SPURS_MAX_TASK) return error(CELL_SPURS_TASK_ERROR_AGAIN);
 
     const u32 info = taskset + ts_off::task_info + id * ts_off::task_info_stride;
     ps_write64(base, info + ts_off::ti_elf, s.elf | x.elf_flags);
@@ -3105,8 +3111,14 @@ s32 join_task2(PPUContext& ctx, std::string_view fn, u32 taskset, u32 id, u32 ex
     ps_res_acquire(base, slot, line);
     const u32 code = ps_read32(line, slot & (PS_RES_LINE_SIZE - 1));
     {
+        // The ID free again and no longer being joined in one step (D-652): a task created with it the moment it is
+        // free can be joined at once, not found still being joined (BUSY).
         std::lock_guard lock(h.mutex);
-        if (const auto it = h.task2.find(taskset); it != h.task2.end()) it->second.unjoined &= ~bit;
+        if (const auto it = h.task2.find(taskset); it != h.task2.end()) {
+            it->second.unjoined &= ~bit;
+            if (block) it->second.joining &= ~bit;
+        }
+        joining.active = false;
     }
     if (exit_code) ps_write32(base, exit_code, code);
     PS_LOG_DEBUG(kChan, "{}(taskset {:#x}, task {}): exit code {:#x}", fn, taskset, id, code);

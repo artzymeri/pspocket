@@ -6,6 +6,7 @@
 
 #include "hle_test_util.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -459,6 +460,107 @@ TEST_CASE("CellSpursTaskset2: a task that exited keeps its ID until it is joined
         CHECK(ps_read32(s.b, kExit) == 0x100 + n);
     }
     CHECK(s.a.call("cellSpursTryJoinTask2", kTs2, 69, kExit) == code(TASK | kSrch));
+}
+
+TEST_CASE("CellSpursTaskset2: tasks created on four threads and joined on four others at once, each join with its own "
+          "task's exit code (D-650, D-652)", "[hle][spurs][spurs-task2]")
+{
+    constexpr u32 kCreators = 4, kJoiners = 4, kEach = 50, kBacklog = 24;
+    constexpr u32 kScratch = kData + 0x60000; // a thread's argument (16 bytes), task ID and exit code, 0x40 apart
+    Task2Fixture s;
+    // Each task exits at once with the code in its argument's second word.
+    Program p;
+    p.emit(as::ila(1, 0x3FFD0));
+    p.emit(as::rotqbyi(20, 3, 4));
+    p.exit_with_register(20);
+    write_task_elf(s.b, kElf, p);
+    s.run();
+
+    struct Created {
+        u32 id, value;
+    };
+    std::mutex mutex;
+    std::vector<Created> backlog; // created, not yet taken by a joiner
+    std::atomic<u32> created{0}, joined{0}, wrong{0}, creators_done{0};
+    std::vector<std::thread> threads;
+    for (u32 c = 0; c < kCreators; c++) {
+        threads.emplace_back([&, c] {
+            GuestThread g(s.f, 1 + c, "creator");
+            const u32 arg = kScratch + 0x40 * c, id_out = arg + 0x10;
+            for (u32 n = 0; n < kEach;) {
+                bool behind = false; // the joiners: let them catch up
+                {
+                    std::lock_guard lock(mutex);
+                    behind = backlog.size() >= kBacklog;
+                }
+                if (behind) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                const u32 value = 0x10000 * (c + 1) + n;
+                std::memset(s.b + arg, 0, 16);
+                ps_write32(s.b, arg + 4, value);
+                const u64 r = g.call("cellSpursCreateTask2", kTs2, id_out, kElf, arg, 0);
+                if (r == code(TASK | kAgain)) { // every ID taken for now
+                    std::this_thread::yield();
+                    continue;
+                }
+                THREAD_CHECK(r == 0);
+                if (r != 0) {
+                    wrong++;
+                    break;
+                }
+                std::lock_guard lock(mutex);
+                backlog.push_back({ps_read32(s.b, id_out), value});
+                created++;
+                n++;
+            }
+            creators_done++;
+        });
+    }
+    for (u32 j = 0; j < kJoiners; j++) {
+        threads.emplace_back([&, j] {
+            GuestThread g(s.f, 1 + kCreators + j, "joiner");
+            const u32 exit_out = kScratch + 0x40 * (kCreators + j) + 0x20;
+            for (u32 n = 0;; n++) {
+                Created task{};
+                {
+                    std::lock_guard lock(mutex);
+                    if (backlog.empty()) {
+                        if (creators_done.load() == kCreators) return;
+                    } else {
+                        task = backlog.front();
+                        backlog.erase(backlog.begin());
+                    }
+                }
+                if (!task.value) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                // JoinTask2 waits; TryJoinTask2 is BUSY until the task has exited.
+                u64 r = 0;
+                if (n % 2) {
+                    r = g.call("cellSpursJoinTask2", kTs2, task.id, exit_out);
+                } else {
+                    while ((r = g.call("cellSpursTryJoinTask2", kTs2, task.id, exit_out)) == code(TASK | kBusy))
+                        std::this_thread::yield();
+                }
+                if (r != 0 || ps_read32(s.b, exit_out) != task.value) wrong++;
+                joined++;
+            }
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    CHECK(created == kCreators * kEach);
+    CHECK(joined == kCreators * kEach);
+    CHECK(wrong == 0);
+    // Every ID free again: the next task is task 0.
+    std::memset(s.b + kArg, 0, 16);
+    ps_write32(s.b, kArg + 4, 0x77);
+    REQUIRE(s.a.call("cellSpursCreateTask2", kTs2, kId, kElf, kArg, 0) == 0);
+    CHECK(ps_read32(s.b, kId) == 0);
+    REQUIRE(s.a.call("cellSpursJoinTask2", kTs2, 0, kExit) == 0);
+    CHECK(ps_read32(s.b, kExit) == 0x77);
 }
 
 TEST_CASE("cellSpursCreateTask2WithBinInfo: the ELF, context size and LS pattern from the bin info, the context in "
