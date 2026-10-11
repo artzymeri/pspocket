@@ -1,34 +1,36 @@
-// cellVpost: the video post-processor (libvpost), pspocket's own (D-564). It scales a decoded YUV 4:2:0 picture and
-// converts it to RGBA for the game to draw, as games do with the pictures cellVdec gives them.
-// Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellVpost.cpp and cellVpost.h: the structures, the error codes, the handles
-// (idm IDs from 1), QueryAttr's answers, the picture information Exec writes, the input layout (the Y plane, then U,
-// then V, each with its width's stride) and RPCS3's output (RGBA bytes, the alpha outAlpha, scaled with libswscale's
-// bilinear filter). No Sony module was at hand to compare with: the library is firmware-first (D-563).
-// Beyond RPCS3, which leaves them out:
-// - the input's colour matrix (BT.601 or BT.709) and quantisation range (full, or broadcast: Y 16-235, C 16-240)
-//   convert it, where libswscale's default is BT.601 broadcast whatever the game asks;
-// - the windows: inWindow is the part of the input scaled, outWindow where it goes in the output; a window with no
-//   width or height is the whole picture, one past the picture's edge is cut to it; output pixels outside outWindow
-//   are left as they were;
-// - outPicFmt YUV420_PLANAR gives the scaled planes, without conversion;
-// - the chroma position: type A has a chroma sample at every second luma column (MPEG-2's), type B between two
-//   (MPEG-1's); vertically both are between two lines;
-// - the scaler is a tent filter as wide as the scaling (bilinear interpolation when enlarging, an average of what each
-//   output pixel covers when reducing), libswscale's bilinear; the other scaler types and the interlace conversions
-//   are done the same way, the picture always taken as a whole frame (as RPCS3), and logged once;
-// - the arguments are checked as the error codes name them: null pointers, a configuration with formats libvpost has
-//   not, sizes past the configuration's maxima, buffers outside guest memory.
-// Exec runs on the calling thread; nothing is written to the work memory the game gives Open.
+// cellVpost: the video post-processor (libvpost), pspocket's own (D-564), made to answer and convert as Sony's libvpost
+// does (D-913, compared call for call with libvpost.sprx, tests/hle/test_vpost_compare.cpp). RPCS3's
+// (rpcs3/Emu/Cell/Modules/cellVpost.cpp/.h) gave the structures and the error codes.
+//
+// What libvpost is: a PPU wrapper over four SPURS task stages (input, interlace conversion, scaler, colour conversion),
+// run one after another for each Exec through two frame buffers in the game's work memory. Here the same work is done on
+// the calling thread, with libvpost's checks, answers and arithmetic (each found by running Sony's module on chosen
+// pictures; nothing of it in the repository):
+// - QueryAttr: inMaxWidth and outMaxWidth even, 32 to 1920; the heights even, 32 to 1088; depths 8 bits, the input
+//   YUV 4:2:0 planar, the output RGBA (0) or YUV 4:2:0 planar (1), both reserved words 0. memSize: twice the larger
+//   frame (a frame: the width to 16 times the height, plus two chroma planes of half the width to 16 times half the
+//   height plus one) plus 0x9FE5; delay 0, versions 0x40000 and 0x05060606.
+// - Open makes the handle at the work memory's first 128-byte boundary (its first word itself, which Exec and Close
+//   check); a PPU priority past 0xBFF, an SPU priority outside 16 to 255, SPUs other than one or less memory than
+//   QueryAttr's is O_ARG_RSRC_INVALID. OpenEx takes a SPURS instance, eight priorities of 0 to 15 (not all 0) and a
+//   maximum contention of 1.
+// - Exec: the input 128-byte aligned (the Y plane, then U, then V, each its width's stride), the control parameters
+//   within the handle's sizes and libvpost's ranges (windows inside their pictures, even, at least 32 square), the output
+//   128-byte aligned. The output is the whole picture: the input window scaled into the output window, black (Y 0 or 16,
+//   chroma 128) around it.
+// - The scaler (when a window or the size changes): see scale_plane.
+// - The colour conversion: per output pixel the chroma of its 2x2 block (type A), or between two chroma columns averaged
+//   as bytes (type B), then libvpost's fixed point (coefficients in 1/8192 of the chroma, the luma in 1/16384, a sum in
+//   2^-20 rounded down); out of range clamped; the alpha outAlpha.
 
 #include <algorithm>
-#include <cmath>
+#include <array>
 #include <cstring>
 #include <mutex>
 #include <string_view>
 #include <vector>
 
 #include "guest.hpp"
-#include "idm.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -48,8 +50,8 @@ enum : u32 {
     CELL_VPOST_ERROR_O_ARG_CFG_NULL = 0x80610440,
     CELL_VPOST_ERROR_O_ARG_CFG_INVALID = 0x80610441,
     CELL_VPOST_ERROR_O_ARG_RSRC_NULL = 0x80610442,
+    CELL_VPOST_ERROR_O_ARG_RSRC_INVALID = 0x80610443,
     CELL_VPOST_ERROR_O_ARG_HDL_NULL = 0x80610444,
-    CELL_VPOST_ERROR_O_FATAL_CREATEMON_FAIL = 0x80610461,
     CELL_VPOST_ERROR_C_ARG_HDL_NULL = 0x80610470,
     CELL_VPOST_ERROR_C_ARG_HDL_INVALID = 0x80610471,
     CELL_VPOST_ERROR_E_ARG_HDL_NULL = 0x806104A0,
@@ -64,39 +66,49 @@ enum : u32 {
 };
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
-// The enumerations' values.
-constexpr s32 kDepth8 = 0, kInYuv420Planar = 0, kOutRgbaIlv = 0, kOutYuv420Planar = 1;
-constexpr s32 kStructPfrm = 0, kStructIfrm = 1, kStructItop = 2, kStructIbtm = 3;
-constexpr s32 kScanP = 0, kScanI = 1;
-constexpr s32 kChromaTypeA = 0;
-constexpr s32 kRangeFull = 0;
-constexpr s32 kMatrixBt709 = 1;
-
-// RPCS3's QueryAttr answers.
-constexpr u32 kMemSize = 4 * 1024 * 1024, kVerUpper = 0x260000, kVerLower = 0x280000;
+constexpr u32 kOutRgba = 0, kOutYuv = 1;
+constexpr u32 kHandleWords = 0x4080; // libvpost's second handle word (the size of its control block)
 
 // CellVpostCfgParam {inMaxWidth, inMaxHeight, inDepth, inPicFmt, outMaxWidth, outMaxHeight, outDepth, outPicFmt,
 // reserved1, reserved2}.
 struct Config {
-    u32 in_max_w = 0, in_max_h = 0, out_max_w = 0, out_max_h = 0;
-    s32 out_fmt = 0;
+    std::array<u32, 10> w{};
+    u32 in_w() const { return w[0]; }
+    u32 in_h() const { return w[1]; }
+    u32 out_w() const { return w[4]; }
+    u32 out_h() const { return w[5]; }
+    u32 out_fmt() const { return w[7]; }
 };
 
-struct Instance {
-    Config cfg;
-};
+Config read_config(u8* base, u32 at)
+{
+    Config c;
+    for (u32 i = 0; i < 10; i++) c.w[i] = ps_read32(base, at + 4 * i);
+    return c;
+}
 
-struct State {
-    std::mutex mutex;
-    IdTable<Instance, 1, 1023> instances;
-    bool exec_type_logged = false, scaler_logged = false, window_logged = false;
-};
+bool width_ok(u32 v) { return v - 32 <= 1920 - 32 && !(v & 1); }
+bool height_ok(u32 v) { return v - 32 <= 1088 - 32 && !(v & 1); }
 
-State& state() { return HleProcess::current()->state<State>(); }
+bool config_ok(const Config& c)
+{
+    return width_ok(c.w[0]) && height_ok(c.w[1]) && c.w[2] == 0 && c.w[3] == 0 && width_ok(c.w[4]) &&
+           height_ok(c.w[5]) && c.w[6] == 0 && c.w[7] <= 1 && c.w[8] == 0 && c.w[9] == 0;
+}
 
-u8* gb(PPUContext& ctx) { return guest_base(ctx); }
+// A YUV 4:2:0 frame as libvpost keeps one in its work memory.
+u32 frame_size(u32 w, u32 h)
+{
+    const u32 y = ((w + 15) & ~15u) * h;
+    const u32 c = ((((w + 1) >> 1) + 15) & ~15u) * ((h + 2) >> 1);
+    return (y + 2 * c) & ~15u;
+}
 
-// Whether [addr, addr + size) is committed guest memory, page by page.
+u32 mem_size(const Config& c)
+{
+    return 2 * std::max(frame_size(c.in_w(), c.in_h()), frame_size(c.out_w(), c.out_h())) + 0x9FE5;
+}
+
 bool in_guest(PPUContext& ctx, u32 addr, u64 size)
 {
     if (!addr || u64{addr} + size > 0x100000000ull) return false;
@@ -107,340 +119,322 @@ bool in_guest(PPUContext& ctx, u32 addr, u64 size)
     return true;
 }
 
-// The configuration at cfg, or false when libvpost has nothing of what it asks for.
-bool read_config(u8* base, u32 cfg, Config& out)
-{
-    const s32 in_depth = static_cast<s32>(ps_read32(base, cfg + 8));
-    const s32 in_fmt = static_cast<s32>(ps_read32(base, cfg + 12));
-    const s32 out_depth = static_cast<s32>(ps_read32(base, cfg + 24));
-    out.in_max_w = ps_read32(base, cfg);
-    out.in_max_h = ps_read32(base, cfg + 4);
-    out.out_max_w = ps_read32(base, cfg + 16);
-    out.out_max_h = ps_read32(base, cfg + 20);
-    out.out_fmt = static_cast<s32>(ps_read32(base, cfg + 28));
-    return in_depth == kDepth8 && in_fmt == kInYuv420Planar && out_depth == kDepth8 &&
-           (out.out_fmt == kOutRgbaIlv || out.out_fmt == kOutYuv420Planar) && out.in_max_w && out.in_max_h &&
-           out.out_max_w && out.out_max_h;
-}
+// A handle: libvpost's control block, its first word its own address.
+bool is_handle(PPUContext& ctx, u32 h) { return in_guest(ctx, h, 0x80) && ps_read32(guest_base(ctx), h) == h; }
 
-// ------------------------------------------------------------------------------------------------- scaling
+// ------------------------------------------------------------------------------------------------- the pictures
 
-// For each output sample, the input samples it is made of and their weights: a tent filter centred where the output
-// sample's centre falls in the input, as wide as an output sample (at least one input sample). `first` and `count`
-// are the input samples the window holds; `centre(o)` maps output sample o to input coordinates.
-struct Taps {
-    std::vector<u32> start, count;
-    std::vector<f32> weight; // max_taps a sample
-    u32 max_taps = 0;
+struct Plane {
+    u32 w = 0, h = 0;
+    std::vector<u8> px;
+    u8& at(u32 x, u32 y) { return px[static_cast<usize>(y) * w + x]; }
+    u8 at(u32 x, u32 y) const { return px[static_cast<usize>(y) * w + x]; }
 };
 
-template <class Centre>
-void make_taps(Taps& t, u32 out_count, f32 step, u32 first, u32 count, Centre centre)
-{
-    const f32 radius = std::max(1.0f, step);
-    t.max_taps = static_cast<u32>(std::ceil(2.0f * radius)) + 1;
-    t.start.assign(out_count, 0);
-    t.count.assign(out_count, 0);
-    t.weight.assign(static_cast<usize>(out_count) * t.max_taps, 0.0f);
-    const s64 lo = first, hi = s64{first} + count - 1;
-    std::vector<std::pair<s64, f32>> w;
-    for (u32 o = 0; o < out_count; o++) {
-        const f32 c = centre(o);
-        const s64 k0 = static_cast<s64>(std::floor(c - radius)) + 1, k1 = static_cast<s64>(std::ceil(c + radius)) - 1;
-        // Taps past the window's edge fold onto its edge sample.
-        f32 sum = 0.0f;
-        w.clear();
-        for (s64 k = k0; k <= k1; k++) {
-            const f32 wk = 1.0f - std::fabs(static_cast<f32>(k) - c) / radius;
-            if (wk <= 0.0f) continue;
-            w.emplace_back(std::clamp(k, lo, hi), wk);
-            sum += wk;
-        }
-        if (w.empty()) w.emplace_back(std::clamp(static_cast<s64>(std::lround(c)), lo, hi), sum = 1.0f);
-        std::sort(w.begin(), w.end());
-        const s64 s0 = w.front().first;
-        const u32 n = static_cast<u32>(w.back().first - s0 + 1);
-        t.start[o] = static_cast<u32>(s0);
-        t.count[o] = std::min(n, t.max_taps);
-        f32* dst = &t.weight[static_cast<usize>(o) * t.max_taps];
-        for (const auto& [k, wk] : w) {
-            const s64 i = k - s0;
-            if (i < t.max_taps) dst[i] += wk / sum;
-        }
-    }
-}
-
-// One plane's window scaled: in (stride `stride`) through the horizontal taps, then the vertical ones, into out
-// (out_w x out_h floats, 0-255).
-void scale_plane(const u8* in, u32 stride, const Taps& h, const Taps& v, u32 out_w, u32 out_h, std::vector<f32>& tmp,
-    std::vector<f32>& out)
-{
-    u32 row_lo = ~0u, row_hi = 0;
-    for (u32 y = 0; y < out_h; y++) {
-        row_lo = std::min(row_lo, v.start[y]);
-        row_hi = std::max(row_hi, v.start[y] + v.count[y]);
-    }
-    const u32 rows = row_hi - row_lo;
-    tmp.resize(static_cast<usize>(rows) * out_w);
-    for (u32 r = 0; r < rows; r++) {
-        const u8* src = in + static_cast<usize>(row_lo + r) * stride;
-        f32* dst = &tmp[static_cast<usize>(r) * out_w];
-        for (u32 x = 0; x < out_w; x++) {
-            const f32* w = &h.weight[static_cast<usize>(x) * h.max_taps];
-            const u8* s = src + h.start[x];
-            f32 acc = 0.0f;
-            for (u32 k = 0; k < h.count[x]; k++) acc += w[k] * static_cast<f32>(s[k]);
-            dst[x] = acc;
-        }
-    }
-    out.resize(static_cast<usize>(out_w) * out_h);
-    for (u32 y = 0; y < out_h; y++) {
-        const f32* w = &v.weight[static_cast<usize>(y) * v.max_taps];
-        f32* dst = &out[static_cast<usize>(y) * out_w];
-        std::fill(dst, dst + out_w, 0.0f);
-        for (u32 k = 0; k < v.count[y]; k++) {
-            const f32* src = &tmp[static_cast<usize>(v.start[y] + k - row_lo) * out_w];
-            for (u32 x = 0; x < out_w; x++) dst[x] += w[k] * src[x];
-        }
-    }
-}
-
-u8 to_byte(f32 v) { return static_cast<u8>(std::lround(std::clamp(v, 0.0f, 255.0f))); }
+struct Picture {
+    Plane y, u, v;
+};
 
 struct Window {
     u32 x = 0, y = 0, w = 0, h = 0;
 };
 
-// A window as Exec uses it: the whole picture when it has no size, cut to the picture.
-Window fit(Window w, u32 width, u32 height, bool& adjusted)
+// The bilinear scaler (type 0): vertically first, then horizontally, each output a weighted sum of the two samples
+// about its position (weights in 1/256, the sum rounded down; a row past the window's bottom is the picture's, past the
+// picture's its last; a column past the window's right edge its last).
+// Vertical positions are in 1/65536 of a row (the step rounded down), each row's its own. Horizontal ones are in 1/256,
+// sixteen output columns at a time as libvpost writes them (from a multiple of 16 in the output picture): each lane of
+// the first sixteen a step (in 1/256) from the window's first column, each later sixteen 16 steps on (in 1/65536,
+// rounded down to 1/256). A chroma plane is sited between its luma samples (type A horizontally, both types
+// vertically): its positions start (step - 1) / 4 on
+// (rounded down); a negative start for a window at a multiple of 16 in the output is 0.
+void scale_plane(const Plane& in_plane, const Window& iw_given, const Window& ow, bool chroma, u32 chroma_type, Plane& out)
 {
-    if (!w.w || !w.h) return {0, 0, width, height};
-    Window f = w;
-    f.x = std::min(f.x, width - 1);
-    f.y = std::min(f.y, height - 1);
-    f.w = std::min(f.w, width - f.x);
-    f.h = std::min(f.h, height - f.y);
-    adjusted = adjusted || f.x != w.x || f.y != w.y || f.w != w.w || f.h != w.h;
-    return f;
+    // Past a halving horizontally, every second column of the window is taken first.
+    Plane halved;
+    Window iw = iw_given;
+    const Plane* src = &in_plane;
+    if (iw.w > 2 * ow.w) {
+        halved = {iw.w / 2, in_plane.h, std::vector<u8>(static_cast<usize>(iw.w / 2) * in_plane.h)};
+        for (u32 y = 0; y < in_plane.h; y++)
+            for (u32 x = 0; x < iw.w / 2; x++) halved.at(x, y) = in_plane.at(iw.x + 2 * x, y);
+        iw = {0, iw.y, iw.w / 2, iw.h};
+        src = &halved;
+    }
+    const Plane& in = *src;
+    const u32 step_v = static_cast<u32>((u64{iw.h} << 16) / ow.h), step_h = static_cast<u32>((u64{iw.w} << 16) / ow.w);
+    const s32 off_v = chroma ? (static_cast<s32>(step_v) - 0x10000) >> 2 : 0;
+    const s32 off_h = chroma && chroma_type == 0 ? (static_cast<s32>(step_h) - 0x10000) >> 10 : 0;
+    const u32 cols = iw.w;
+    Plane tmp{cols, ow.h, std::vector<u8>(static_cast<usize>(cols) * ow.h)};
+    for (u32 y = 0; y < ow.h; y++) {
+        const u32 pos = static_cast<u32>(std::max<s64>(s64{y} * step_v + off_v, 0));
+        const u32 i = pos >> 16, f = (pos >> 8) & 0xFF;
+        const u32 r0 = std::min(iw.y + i, in.h - 1), r1 = std::min(iw.y + i + 1, in.h - 1);
+        for (u32 x = 0; x < cols; x++)
+            tmp.at(x, y) = static_cast<u8>((in.at(iw.x + x, r0) * (256 - f) + in.at(iw.x + x, r1) * f) >> 8);
+    }
+    out.w = ow.w;
+    out.h = ow.h;
+    out.px.assign(static_cast<usize>(ow.w) * ow.h, 0);
+    const s32 block = static_cast<s32>((u64{step_h} * 16) >> 8), step8 = static_cast<s32>(step_h >> 8);
+    const u32 first = ow.x & 15;
+    std::array<s32, 16> lane{};
+    for (u32 k = 0; k < 16; k++) lane[k] = off_h + (static_cast<s32>(k) - static_cast<s32>(first)) * step8;
+    if (first == 0 && lane[0] < 0) lane[0] = 0;
+    for (u32 x = 0; x < ow.w; x++) {
+        const u32 a = ow.x + x;
+        const s32 p = static_cast<s32>((a >> 4) - (ow.x >> 4)) * block + lane[a & 15];
+        const u32 pos = static_cast<u32>(std::max(p, 0));
+        const u32 i = pos >> 8, f = pos & 0xFF;
+        const u32 c0 = std::min(i, cols - 1), c1 = std::min(i + 1, cols - 1);
+        for (u32 y = 0; y < ow.h; y++)
+            out.at(x, y) = static_cast<u8>((tmp.at(c0, y) * (256 - f) + tmp.at(c1, y) * f) >> 8);
+    }
 }
+
+// libvpost's colour conversion: (A * Y + Cu * (U - 128) + Cv * (V - 128) + B) >> 20 for each of R, G, B.
+struct Matrix {
+    s64 a, b;          // the luma's weight and the sum's constant (the luma's offset and the rounding in it)
+    s64 rv, gu, gv, bu; // the chroma's weights
+};
+
+Matrix matrix_of(u32 matrix, u32 range)
+{
+    // In 1/2^20: the luma 2^20 (full range) or 64 * 19076 (broadcast, from 16); the chroma 128 * libvpost's 1/8192.
+    const bool broadcast = range == 1;
+    const s64 a = broadcast ? 64 * 19076 : 1 << 20;
+    const s64 b = broadcast ? 523264 - 16 * a : 1 << 19;
+    if (matrix == 1) {
+        if (broadcast) return {a, b, 128 * 14690, 128 * -1746, 128 * -4378, 128 * 17322};
+        return {a, b, 128 * 12900, 128 * -1534, 128 * -3834, 128 * 15201};
+    }
+    if (broadcast) return {a, b, 128 * 13078, 128 * -3204, 128 * -6658, 128 * 16520};
+    return {a, b, 128 * 11485, 128 * -2818, 128 * -5850, 128 * 14516};
+}
+
+u8 clamp_byte(s64 v) { return static_cast<u8>(std::clamp<s64>(v, 0, 255)); }
 
 // ------------------------------------------------------------------------------------------------- the calls
 
 // cellVpostQueryAttr(cfgParam, attr): CellVpostAttr {memSize, delay (u8), vpostVerUpper (+8), vpostVerLower (+12)}.
 s32 cellVpostQueryAttr(PPUContext& ctx, u32 cfg, u32 attr)
 {
-    u8* base = gb(ctx);
+    u8* base = guest_base(ctx);
     if (!cfg) return error(CELL_VPOST_ERROR_Q_ARG_CFG_NULL);
-    if (!attr) return error(CELL_VPOST_ERROR_Q_ARG_ATTR_NULL);
-    if (!in_guest(ctx, cfg, 40) || !in_guest(ctx, attr, 16)) {
-        log_call_site(ctx, base, "cellVpostQueryAttr: a parameter is not in guest memory");
-        return error(cfg && !in_guest(ctx, cfg, 40) ? CELL_VPOST_ERROR_Q_ARG_CFG_INVALID
-                                                     : CELL_VPOST_ERROR_Q_ARG_ATTR_NULL);
-    }
-    Config c;
-    if (!read_config(base, cfg, c)) return error(CELL_VPOST_ERROR_Q_ARG_CFG_INVALID);
-    ps_write32(base, attr, kMemSize);
+    if (!in_guest(ctx, cfg, 40)) return error(CELL_VPOST_ERROR_Q_ARG_CFG_INVALID);
+    const Config c = read_config(base, cfg);
+    if (!config_ok(c)) return error(CELL_VPOST_ERROR_Q_ARG_CFG_INVALID);
+    if (!attr || !in_guest(ctx, attr, 16)) return error(CELL_VPOST_ERROR_Q_ARG_ATTR_NULL);
+    ps_write32(base, attr, mem_size(c));
     ps_write8(base, attr + 4, 0);
-    ps_write32(base, attr + 8, kVerUpper);
-    ps_write32(base, attr + 12, kVerLower);
+    ps_write32(base, attr + 8, 0x40000);
+    ps_write32(base, attr + 12, 0x05060606);
     return lv2::CELL_OK;
 }
 
-// cellVpostOpen and OpenEx (cfgParam, resource, handle *): the resource (memory, threads, SPUs or a SPURS instance)
-// is only checked for being there.
-s32 open(PPUContext& ctx, u32 cfg, u32 resource, u32 handle, u32 resource_size, const char* name)
+// The handle made in the work memory: its own address, the block's size, the configuration (+0x24) and the
+// resource's memory (+0x4C, +0x50), as libvpost lays them out.
+u32 make_handle(u8* base, u32 cfg, u32 mem, u32 size)
 {
-    u8* base = gb(ctx);
-    if (!cfg) return error(CELL_VPOST_ERROR_O_ARG_CFG_NULL);
-    Config c;
-    if (!in_guest(ctx, cfg, 40) || !read_config(base, cfg, c)) return error(CELL_VPOST_ERROR_O_ARG_CFG_INVALID);
-    if (!resource || !in_guest(ctx, resource, resource_size)) return error(CELL_VPOST_ERROR_O_ARG_RSRC_NULL);
-    if (!handle || !in_guest(ctx, handle, 4)) return error(CELL_VPOST_ERROR_O_ARG_HDL_NULL);
-    State& s = state();
-    std::lock_guard lock(s.mutex);
-    const u32 id = s.instances.make(Instance{c});
-    if (!id) return error(CELL_VPOST_ERROR_O_FATAL_CREATEMON_FAIL);
-    ps_write32(base, handle, id);
-    PS_LOG_INFO(kChan, "{}: handle {}, in up to {}x{}, out up to {}x{} {}", name, id, c.in_max_w, c.in_max_h,
-        c.out_max_w, c.out_max_h, c.out_fmt == kOutRgbaIlv ? "RGBA" : "YUV420 planar");
-    return lv2::CELL_OK;
+    const u32 h = (mem + 0x7F) & ~0x7Fu;
+    ps_write32(base, h, h);
+    ps_write32(base, h + 4, kHandleWords);
+    for (u32 i = 0; i < 10; i++) ps_write32(base, h + 0x24 + 4 * i, ps_read32(base, cfg + 4 * i));
+    ps_write32(base, h + 0x4C, mem);
+    ps_write32(base, h + 0x50, size);
+    return h;
 }
 
+// cellVpostOpen(cfgParam, CellVpostResource {memAddr, memSize, ppuThreadPriority, ppuThreadStackSize,
+// spuThreadPriority, numOfSpus}, handle *).
 s32 cellVpostOpen(PPUContext& ctx, u32 cfg, u32 resource, u32 handle)
 {
-    return open(ctx, cfg, resource, handle, 24, "cellVpostOpen");
-}
-
-s32 cellVpostOpenEx(PPUContext& ctx, u32 cfg, u32 resource, u32 handle)
-{
-    return open(ctx, cfg, resource, handle, 24, "cellVpostOpenEx");
-}
-
-s32 cellVpostClose(PPUContext&, u32 handle)
-{
-    if (!handle) return error(CELL_VPOST_ERROR_C_ARG_HDL_NULL);
-    State& s = state();
-    std::lock_guard lock(s.mutex);
-    if (!s.instances.remove(handle)) return error(CELL_VPOST_ERROR_C_ARG_HDL_INVALID);
+    u8* base = guest_base(ctx);
+    if (!cfg) return error(CELL_VPOST_ERROR_O_ARG_CFG_NULL);
+    if (!in_guest(ctx, cfg, 40) || !config_ok(read_config(base, cfg))) return error(CELL_VPOST_ERROR_O_ARG_CFG_INVALID);
+    if (!resource || !in_guest(ctx, resource, 24)) return error(CELL_VPOST_ERROR_O_ARG_RSRC_NULL);
+    const u32 mem = ps_read32(base, resource), size = ps_read32(base, resource + 4);
+    const u32 ppu = ps_read32(base, resource + 8), spu = ps_read32(base, resource + 16);
+    const u32 spus = ps_read32(base, resource + 20);
+    const Config c = read_config(base, cfg);
+    if (!mem || ppu >= 0xC00 || spu - 16 >= 0xF0 || spus != 1 || size < mem_size(c) || !in_guest(ctx, mem, size))
+        return error(CELL_VPOST_ERROR_O_ARG_RSRC_INVALID);
+    if (!handle || !in_guest(ctx, handle, 4)) return error(CELL_VPOST_ERROR_O_ARG_HDL_NULL);
+    const u32 h = make_handle(base, cfg, mem, size);
+    ps_write32(base, handle, h);
+    PS_LOG_INFO(kChan, "cellVpostOpen: handle {:#x}, in up to {}x{}, out up to {}x{} {}", h, c.in_w(), c.in_h(),
+        c.out_w(), c.out_h(), c.out_fmt() == kOutRgba ? "RGBA" : "YUV420 planar");
     return lv2::CELL_OK;
 }
 
+// cellVpostOpenEx(cfgParam, CellVpostResourceEx {memAddr, memSize, spurs, priority[8] (u8), maxContention}, handle *).
+s32 cellVpostOpenEx(PPUContext& ctx, u32 cfg, u32 resource, u32 handle)
+{
+    u8* base = guest_base(ctx);
+    if (!cfg) return error(CELL_VPOST_ERROR_O_ARG_CFG_NULL);
+    if (!in_guest(ctx, cfg, 40) || !config_ok(read_config(base, cfg))) return error(CELL_VPOST_ERROR_O_ARG_CFG_INVALID);
+    if (!resource || !in_guest(ctx, resource, 24)) return error(CELL_VPOST_ERROR_O_ARG_RSRC_NULL);
+    const u32 mem = ps_read32(base, resource), size = ps_read32(base, resource + 4);
+    const u32 spurs = ps_read32(base, resource + 8), contention = ps_read32(base, resource + 20);
+    bool any = false, bad = false;
+    for (u32 i = 0; i < 8; i++) {
+        const u8 p = ps_read8(base, resource + 12 + i);
+        any = any || p != 0;
+        bad = bad || p > 15;
+    }
+    const Config c = read_config(base, cfg);
+    if (!mem || !spurs || bad || !any || contention != 1 || size < mem_size(c) || !in_guest(ctx, mem, size))
+        return error(CELL_VPOST_ERROR_O_ARG_RSRC_INVALID);
+    if (!handle || !in_guest(ctx, handle, 4)) return error(CELL_VPOST_ERROR_O_ARG_HDL_NULL);
+    const u32 h = make_handle(base, cfg, mem, size);
+    ps_write32(base, handle, h);
+    PS_LOG_INFO(kChan, "cellVpostOpenEx: handle {:#x} (SPURS {:#x}: pspocket converts on the caller's thread)", h, spurs);
+    return lv2::CELL_OK;
+}
+
+s32 cellVpostClose(PPUContext& ctx, u32 handle)
+{
+    if (!handle) return error(CELL_VPOST_ERROR_C_ARG_HDL_NULL);
+    if (!is_handle(ctx, handle)) return error(CELL_VPOST_ERROR_C_ARG_HDL_INVALID);
+    u8* base = guest_base(ctx);
+    ps_write32(base, handle, 0);
+    ps_write32(base, handle + 4, 0);
+    ps_write32(base, handle + 0x20, 0x7FFFFFFF);
+    return lv2::CELL_OK;
+}
+
+// A window inside its picture: even, at least 32 square.
+bool window_ok(const Window& w, u32 width, u32 height)
+{
+    return w.x < width && w.y < height && w.w >= 32 && w.h >= 32 && !(w.x & 1) && !(w.y & 1) && !(w.w & 1) &&
+           !(w.h & 1) && w.x + w.w <= width && w.y + w.h <= height;
+}
+
+struct State {
+    std::mutex mutex;
+    bool exec_type_logged = false, scaler_logged = false;
+};
+
+State& state() { return HleProcess::current()->state<State>(); }
+
 // cellVpostExec(handle, inPicBuff, ctrlParam, outPicBuff, picInfo). CellVpostCtrlParam: execType, scalerType,
-// ipcType, inWidth (+12), inHeight, inChromaPosType (+20), inQuantRange, inColorMatrix, inWindow {x, y, width, height}
-// (+32), outWidth (+48), outHeight, outWindow (+56), outAlpha (u8, +72), userData (u64, +80).
+// ipcType, inWidth, inHeight, inChromaPosType, inQuantRange, inColorMatrix, inWindow {x, y, width, height}, outWidth,
+// outHeight, outWindow, outAlpha (u8, +72), userData (u64, +80), reserved1, reserved2 (+88, +92).
 s32 cellVpostExec(PPUContext& ctx, u32 handle, u32 in_pic, u32 ctrl, u32 out_pic, u32 info)
 {
-    u8* base = gb(ctx);
+    u8* base = guest_base(ctx);
     if (!handle) return error(CELL_VPOST_ERROR_E_ARG_HDL_NULL);
-    State& s = state();
-    Config c;
-    {
-        std::lock_guard lock(s.mutex);
-        const Instance* inst = s.instances.find(handle);
-        if (!inst) return error(CELL_VPOST_ERROR_E_ARG_HDL_INVALID);
-        c = inst->cfg;
-    }
+    if (!is_handle(ctx, handle)) return error(CELL_VPOST_ERROR_E_ARG_HDL_INVALID);
     if (!in_pic) return error(CELL_VPOST_ERROR_E_ARG_INPICBUF_NULL);
+    if (in_pic & 0x7F) return error(CELL_VPOST_ERROR_E_ARG_INPICBUF_INVALID);
     if (!ctrl) return error(CELL_VPOST_ERROR_E_ARG_CTRL_NULL);
-    if (!out_pic) return error(CELL_VPOST_ERROR_E_ARG_OUTPICBUF_NULL);
-    if (!info) return error(CELL_VPOST_ERROR_E_ARG_PICINFO_NULL);
     if (!in_guest(ctx, ctrl, 96)) return error(CELL_VPOST_ERROR_E_ARG_CTRL_INVALID);
-    if (!in_guest(ctx, info, 88)) return error(CELL_VPOST_ERROR_E_ARG_PICINFO_NULL);
-
-    const s32 exec_type = static_cast<s32>(ps_read32(base, ctrl)), scaler = static_cast<s32>(ps_read32(base, ctrl + 4));
-    const u32 w = ps_read32(base, ctrl + 12), h = ps_read32(base, ctrl + 16);
-    const s32 chroma_pos = static_cast<s32>(ps_read32(base, ctrl + 20));
-    const s32 range = static_cast<s32>(ps_read32(base, ctrl + 24));
-    const s32 matrix = static_cast<s32>(ps_read32(base, ctrl + 28));
-    const Window in_win_asked{ps_read32(base, ctrl + 32), ps_read32(base, ctrl + 36), ps_read32(base, ctrl + 40),
-        ps_read32(base, ctrl + 44)};
-    const u32 ow = ps_read32(base, ctrl + 48), oh = ps_read32(base, ctrl + 52);
-    const Window out_win_asked{ps_read32(base, ctrl + 56), ps_read32(base, ctrl + 60), ps_read32(base, ctrl + 64),
-        ps_read32(base, ctrl + 68)};
-    const u8 alpha = ps_read8(base, ctrl + 72);
-    const u64 user_data = ps_read64(base, ctrl + 80);
-    if (!w || !h || w > c.in_max_w || h > c.in_max_h || !ow || !oh || ow > c.out_max_w || oh > c.out_max_h ||
-        exec_type < 0 || exec_type > 7) {
-        PS_LOG_WARN(kChan, "cellVpostExec: in {}x{}, out {}x{}, exec type {}: not within the handle's {}x{} and {}x{}",
-            w, h, ow, oh, exec_type, c.in_max_w, c.in_max_h, c.out_max_w, c.out_max_h);
+    const Config c = read_config(base, handle + 0x24);
+    std::array<u32, 24> p{};
+    for (u32 i = 0; i < 24; i++) p[i] = ps_read32(base, ctrl + 4 * i);
+    const u32 exec_type = p[0], scaler = p[1], ipc = p[2], in_w = p[3], in_h = p[4], chroma = p[5], range = p[6],
+              matrix = p[7], out_w = p[12], out_h = p[13];
+    const Window iw{p[8], p[9], p[10], p[11]}, ow{p[14], p[15], p[16], p[17]};
+    if (exec_type >= 8 || scaler >= 4 || ipc >= 3 || !width_ok(in_w) || !height_ok(in_h) || chroma >= 2 ||
+        range >= 2 || matrix >= 2 || !window_ok(iw, in_w, in_h) || !width_ok(out_w) || !height_ok(out_h) ||
+        !window_ok(ow, out_w, out_h) || in_w > c.in_w() || in_h > c.in_h() || out_w > c.out_w() || out_h > c.out_h() ||
+        p[22] != 0 || p[23] != 0)
+        return error(CELL_VPOST_ERROR_E_ARG_CTRL_INVALID);
+    if (!out_pic) return error(CELL_VPOST_ERROR_E_ARG_OUTPICBUF_NULL);
+    if (out_pic & 0x7F) return error(CELL_VPOST_ERROR_E_ARG_OUTPICBUF_INVALID);
+    if (!info) return error(CELL_VPOST_ERROR_E_ARG_PICINFO_NULL);
+    const u32 fmt = c.out_fmt();
+    const u64 in_size = u64{in_w} * in_h + 2 * (u64{in_w / 2} * (in_h / 2));
+    const u64 out_size = fmt == kOutRgba ? u64{out_w} * out_h * 4 : u64{out_w} * out_h + 2 * (u64{out_w / 2} * (out_h / 2));
+    if (!in_guest(ctx, in_pic, in_size) || !in_guest(ctx, out_pic, out_size) || !in_guest(ctx, info, 88)) {
+        log_call_site(ctx, base, "cellVpostExec: a picture is not in guest memory");
         return error(CELL_VPOST_ERROR_E_ARG_CTRL_INVALID);
     }
-    const u64 in_size = u64{w} * h + 2 * (u64{w / 2} * (h / 2));
-    const u64 out_size = c.out_fmt == kOutRgbaIlv ? u64{ow} * oh * 4 : u64{ow} * oh + 2 * (u64{ow / 2} * (oh / 2));
-    if (!in_guest(ctx, in_pic, in_size)) return error(CELL_VPOST_ERROR_E_ARG_INPICBUF_INVALID);
-    if (!in_guest(ctx, out_pic, out_size)) return error(CELL_VPOST_ERROR_E_ARG_OUTPICBUF_INVALID);
     {
+        State& s = state();
         std::lock_guard lock(s.mutex);
         if (exec_type != 0 && !s.exec_type_logged) {
             s.exec_type_logged = true;
-            PS_LOG_INFO(kChan, "cellVpostExec: exec type {} (fields): the picture is taken as a whole frame",
+            PS_LOG_WARN(kChan, "cellVpostExec: exec type {} (fields): converted as a frame, not as libvpost's interlace "
+                               "conversion (D-913)",
                 exec_type);
         }
         if (scaler != 0 && !s.scaler_logged) {
             s.scaler_logged = true;
-            PS_LOG_INFO(kChan, "cellVpostExec: scaler type {}: scaled with the bilinear one", scaler);
+            PS_LOG_WARN(kChan, "cellVpostExec: scaler type {}: scaled with libvpost's bilinear one, not its own (D-913)",
+                scaler);
         }
     }
 
-    // The picture information: what was asked, the structures from the exec type.
-    static constexpr s32 kInStruct[8] = {kStructPfrm, kStructPfrm, kStructPfrm, kStructItop, kStructIbtm, kStructIfrm,
-        kStructItop, kStructIbtm};
-    static constexpr s32 kOutStruct[8] = {kStructPfrm, kStructItop, kStructIbtm, kStructPfrm, kStructPfrm, kStructIfrm,
-        kStructItop, kStructIbtm};
-    const s32 in_struct = kInStruct[exec_type], out_struct = kOutStruct[exec_type];
-    const s32 fields[] = {static_cast<s32>(w), static_cast<s32>(h), kDepth8, in_struct == kStructPfrm ? kScanP : kScanI,
-        kInYuv420Planar, chroma_pos, in_struct, range, matrix, static_cast<s32>(ow), static_cast<s32>(oh), kDepth8,
-        out_struct == kStructPfrm ? kScanP : kScanI, c.out_fmt, chroma_pos, out_struct, range, matrix};
-    for (u32 i = 0; i < std::size(fields); i++) ps_write32(base, info + 4 * i, static_cast<u32>(fields[i]));
-    ps_write64(base, info + 72, user_data);
+    // The input planes.
+    Picture in;
+    in.y = {in_w, in_h, std::vector<u8>(base + in_pic, base + in_pic + static_cast<usize>(in_w) * in_h)};
+    const u32 cw = in_w / 2, ch = in_h / 2;
+    const u8* u_at = base + in_pic + static_cast<usize>(in_w) * in_h;
+    in.u = {cw, ch, std::vector<u8>(u_at, u_at + static_cast<usize>(cw) * ch)};
+    in.v = {cw, ch, std::vector<u8>(u_at + static_cast<usize>(cw) * ch, u_at + 2 * static_cast<usize>(cw) * ch)};
+
+    // The output's planes: black around the window, the input's window scaled into it.
+    const bool same = iw.x == 0 && iw.y == 0 && ow.x == 0 && ow.y == 0 && iw.w == in_w && iw.h == in_h && ow.w == out_w &&
+                      ow.h == out_h && iw.w == ow.w && iw.h == ow.h;
+    Picture out;
+    if (same) {
+        out = in;
+    } else {
+        const u8 black = range == 1 ? 16 : 0;
+        out.y = {out_w, out_h, std::vector<u8>(static_cast<usize>(out_w) * out_h, black)};
+        out.u = {out_w / 2, out_h / 2, std::vector<u8>(static_cast<usize>(out_w / 2) * (out_h / 2), 128)};
+        out.v = out.u;
+        Plane scaled;
+        scale_plane(in.y, iw, ow, false, chroma, scaled);
+        for (u32 y = 0; y < ow.h; y++)
+            std::memcpy(&out.y.at(ow.x, ow.y + y), &scaled.at(0, y), ow.w);
+        const Window ciw{iw.x / 2, iw.y / 2, iw.w / 2, iw.h / 2}, cow{ow.x / 2, ow.y / 2, ow.w / 2, ow.h / 2};
+        for (auto [src, dst] : {std::pair{&in.u, &out.u}, std::pair{&in.v, &out.v}}) {
+            scale_plane(*src, ciw, cow, true, chroma, scaled);
+            for (u32 y = 0; y < cow.h; y++)
+                std::memcpy(&dst->at(cow.x, cow.y + y), &scaled.at(0, y), cow.w);
+        }
+    }
+
+    u8* o = base + out_pic;
+    if (fmt == kOutYuv) {
+        std::memcpy(o, out.y.px.data(), out.y.px.size());
+        std::memcpy(o + out.y.px.size(), out.u.px.data(), out.u.px.size());
+        std::memcpy(o + out.y.px.size() + out.u.px.size(), out.v.px.data(), out.v.px.size());
+    } else {
+        const Matrix m = matrix_of(matrix, range);
+        const u8 alpha = ps_read8(base, ctrl + 72);
+        const u32 ocw = out_w / 2;
+        for (u32 y = 0; y < out_h; y++)
+            for (u32 x = 0; x < out_w; x++) {
+                const u32 cx = x / 2, cy = y / 2;
+                s64 u = out.u.at(cx, cy), v = out.v.at(cx, cy);
+                if (chroma == 1 && (x & 1)) {
+                    const u32 nx = std::min(cx + 1, ocw - 1);
+                    u = (u + out.u.at(nx, cy) + 1) >> 1;
+                    v = (v + out.v.at(nx, cy) + 1) >> 1;
+                }
+                const s64 yy = m.a * out.y.at(x, y) + m.b;
+                u8* px = o + (static_cast<usize>(y) * out_w + x) * 4;
+                px[0] = clamp_byte((yy + m.rv * (v - 128)) >> 20);
+                px[1] = clamp_byte((yy + m.gu * (u - 128) + m.gv * (v - 128)) >> 20);
+                px[2] = clamp_byte((yy + m.bu * (u - 128)) >> 20);
+                px[3] = alpha;
+            }
+    }
+
+    // The picture information: what was asked and what the exec type makes of it.
+    static constexpr u32 kInScan[8] = {0, 0, 0, 1, 1, 1, 1, 1}, kInStruct[8] = {0, 0, 0, 2, 3, 1, 2, 3};
+    static constexpr u32 kOutScan[8] = {0, 1, 1, 0, 0, 1, 1, 1}, kOutStruct[8] = {0, 2, 3, 0, 0, 1, 2, 3};
+    const u32 words[18] = {in_w, in_h, c.w[2], kInScan[exec_type], c.w[3], chroma, kInStruct[exec_type], range, matrix,
+        out_w, out_h, c.w[6], kOutScan[exec_type], fmt, chroma, kOutStruct[exec_type], fmt == kOutRgba ? 0 : range,
+        matrix};
+    for (u32 i = 0; i < 18; i++) ps_write32(base, info + 4 * i, words[i]);
+    ps_write64(base, info + 72, ps_read64(base, ctrl + 80));
     ps_write32(base, info + 80, 0);
     ps_write32(base, info + 84, 0);
-
-    bool adjusted = false;
-    const Window iw = fit(in_win_asked, w, h, adjusted), owin = fit(out_win_asked, ow, oh, adjusted);
-    if (adjusted) {
-        std::lock_guard lock(s.mutex);
-        if (!s.window_logged) {
-            s.window_logged = true;
-            PS_LOG_WARN(kChan, "cellVpostExec: a window past its picture ({}x{} at {},{} of {}x{}; {}x{} at {},{} of "
-                               "{}x{}) is cut to it",
-                in_win_asked.w, in_win_asked.h, in_win_asked.x, in_win_asked.y, w, h, out_win_asked.w,
-                out_win_asked.h, out_win_asked.x, out_win_asked.y, ow, oh);
-        }
-    }
-
-    // Luma: output pixel o's centre in the input window; chroma: the same point in chroma samples (type A: a chroma
-    // sample at every second luma column; B, and vertically: between two).
-    const f32 sx = static_cast<f32>(iw.w) / static_cast<f32>(owin.w);
-    const f32 sy = static_cast<f32>(iw.h) / static_cast<f32>(owin.h);
-    const f32 hsite = chroma_pos == kChromaTypeA ? 0.0f : 0.5f;
-    const u8* y_plane = base + in_pic;
-    const u8* u_plane = y_plane + static_cast<usize>(w) * h;
-    const u8* v_plane = u_plane + static_cast<usize>(w / 2) * (h / 2);
-    const u32 cw = std::max(1u, w / 2), ch = std::max(1u, h / 2);
-    const u32 cx0 = std::min(iw.x / 2, cw - 1), cy0 = std::min(iw.y / 2, ch - 1);
-    const u32 cx1 = std::clamp((iw.x + iw.w + 1) / 2, cx0 + 1, cw);
-    const u32 cy1 = std::clamp((iw.y + iw.h + 1) / 2, cy0 + 1, ch);
-
-    thread_local Taps lh, lv, chh, chv;
-    thread_local std::vector<f32> tmp, py, pu, pv;
-    const bool yuv_out = c.out_fmt == kOutYuv420Planar;
-    const auto luma_x = [&](f32 out_x) { return static_cast<f32>(iw.x) + (out_x + 0.5f) * sx - 0.5f; };
-    const auto luma_y = [&](f32 out_y) { return static_cast<f32>(iw.y) + (out_y + 0.5f) * sy - 0.5f; };
-    make_taps(lh, owin.w, sx, iw.x, iw.w, [&](u32 o) { return luma_x(static_cast<f32>(o)); });
-    make_taps(lv, owin.h, sy, iw.y, iw.h, [&](u32 o) { return luma_y(static_cast<f32>(o)); });
-    // The chroma wanted: at every output pixel for RGBA; for YUV, the output's own chroma samples, sited as the
-    // input's (output luma column 2p, or 2p + 0.5 for type B; row 2p + 0.5).
-    const u32 cow = yuv_out ? std::max(1u, owin.w / 2) : owin.w, coh = yuv_out ? std::max(1u, owin.h / 2) : owin.h;
-    make_taps(chh, cow, yuv_out ? sx : sx / 2.0f, cx0, cx1 - cx0, [&](u32 o) {
-        const f32 out_x = yuv_out ? 2.0f * static_cast<f32>(o) + hsite : static_cast<f32>(o);
-        return (luma_x(out_x) - hsite) / 2.0f;
-    });
-    make_taps(chv, coh, yuv_out ? sy : sy / 2.0f, cy0, cy1 - cy0, [&](u32 o) {
-        const f32 out_y = yuv_out ? 2.0f * static_cast<f32>(o) + 0.5f : static_cast<f32>(o);
-        return (luma_y(out_y) - 0.5f) / 2.0f;
-    });
-    scale_plane(y_plane, w, lh, lv, owin.w, owin.h, tmp, py);
-    scale_plane(u_plane, w / 2, chh, chv, cow, coh, tmp, pu);
-    scale_plane(v_plane, w / 2, chh, chv, cow, coh, tmp, pv);
-
-    u8* out = base + out_pic;
-    if (yuv_out) {
-        u8* oy = out;
-        u8* ou = oy + static_cast<usize>(ow) * oh;
-        u8* ov = ou + static_cast<usize>(ow / 2) * (oh / 2);
-        for (u32 y = 0; y < owin.h; y++)
-            for (u32 x = 0; x < owin.w; x++)
-                oy[static_cast<usize>(owin.y + y) * ow + owin.x + x] = to_byte(py[static_cast<usize>(y) * owin.w + x]);
-        const u32 ox = owin.x / 2, oy0 = owin.y / 2;
-        for (u32 y = 0; y < coh && oy0 + y < oh / 2; y++) {
-            for (u32 x = 0; x < cow && ox + x < ow / 2; x++) {
-                const usize at = static_cast<usize>(oy0 + y) * (ow / 2) + ox + x;
-                ou[at] = to_byte(pu[static_cast<usize>(y) * cow + x]);
-                ov[at] = to_byte(pv[static_cast<usize>(y) * cow + x]);
-            }
-        }
-        return lv2::CELL_OK;
-    }
-
-    // YCbCr to RGB: Kr and Kb of the matrix; broadcast range expands Y from 16-235 and C from 16-240.
-    const f32 kr = matrix == kMatrixBt709 ? 0.2126f : 0.299f, kb = matrix == kMatrixBt709 ? 0.0722f : 0.114f;
-    const f32 kg = 1.0f - kr - kb;
-    const bool full = range == kRangeFull;
-    const f32 ys = full ? 1.0f : 255.0f / 219.0f, yo = full ? 0.0f : 16.0f, cs = full ? 1.0f : 255.0f / 224.0f;
-    const f32 rv = 2.0f * (1.0f - kr) * cs, bu = 2.0f * (1.0f - kb) * cs;
-    const f32 gu = 2.0f * kb * (1.0f - kb) / kg * cs, gv = 2.0f * kr * (1.0f - kr) / kg * cs;
-    for (u32 y = 0; y < owin.h; y++) {
-        u8* row = out + (static_cast<usize>(owin.y + y) * ow + owin.x) * 4;
-        const usize at = static_cast<usize>(y) * owin.w;
-        for (u32 x = 0; x < owin.w; x++) {
-            const f32 lum = (py[at + x] - yo) * ys, cb = pu[at + x] - 128.0f, cr = pv[at + x] - 128.0f;
-            row[4 * x + 0] = to_byte(lum + rv * cr);
-            row[4 * x + 1] = to_byte(lum - gu * cb - gv * cr);
-            row[4 * x + 2] = to_byte(lum + bu * cb);
-            row[4 * x + 3] = alpha;
-        }
-    }
     return lv2::CELL_OK;
 }
 

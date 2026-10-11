@@ -10429,3 +10429,48 @@ above); tests/hle/test_jpgenc.cpp rewritten for Sony's structures and answers (l
 markers of every sampling at both DCTs read back by pspocket's decoder, the queues and Reset's skips, the overflow's
 rows, the size limit mode, files, every check). compare_util.hpp: PSPOCKET_COMPARE_DUMP=<dir> writes each half's data
 observations (the streams) to files for reading a difference.
+
+## D-913 · 2026-10-11 · cellVpost as Sony's libvpost answers and converts (part 4)
+
+cellVpost (D-564) was RPCS3's: its attributes, idm handles and a float conversion and scaler of pspocket's own. The
+comparison with libvpost.sprx (firmware 4.92) showed 374 of 536 observations differing, and most of its pictures were
+ones libvpost refuses (sizes under 32, unaligned buffers, empty windows). Sony's module was read (its PPU wrapper over
+four SPURS task stages: input, interlace conversion, scaler, colour conversion) and run on chosen pictures (thousands of
+probes: flat colours over the whole YUV cube, impulses, noise, every window placement); nothing of it in the repository.
+pspocket's library is rewritten to do what it does. The comparison, rewritten on what libvpost takes and widened (25
+configurations, every resource field at its limits, OpenEx's checks, flat colours, noise and ramps in both matrices,
+ranges and chroma sitings, 13 scalings by each scaler type, windows, every exec and interpolation type, every check, YUV
+output) now shows 88 of 791 observations differing, in the features listed last.
+- **QueryAttr**: inMaxWidth and outMaxWidth even, 32 to 1920, the heights even, 32 to 1088, depths 8 bits, the input YUV
+  4:2:0 planar, the output RGBA or YUV 4:2:0 planar, both reserved words 0 (else Q_ARG_CFG_INVALID). memSize is twice
+  the larger frame (the width to 16 times the height plus two chroma planes of half the width to 16 times half the height
+  plus one) plus 0x9FE5 (RPCS3: 4 MB); delay 0; versions 0x40000 and 0x05060606.
+- **Open** makes the handle in the work memory, at its first 128-byte boundary, its first word its own address (Exec and
+  Close check it: a pointer that is no handle is HDL_INVALID). O_ARG_RSRC_INVALID for no memory, less than QueryAttr's, a
+  PPU priority past 0xBFF, an SPU priority outside 16 to 255 or SPUs other than one (the stack is not checked). OpenEx
+  takes {memAddr, memSize, spurs, priority[8], maxContention}: a SPURS instance, priorities 0 to 15 not all 0, a
+  maximum contention of 1. Close clears the handle.
+- **Exec's checks**, in libvpost's order: the handle, the input (given, 128-byte aligned: INPICBUF_INVALID), the
+  control parameters (CTRL_INVALID: exec type to 7, scaler type to 3, interpolation type to 2, the sizes as QueryAttr's
+  and within the handle's, chroma siting, range and matrix 0 or 1, both windows inside their pictures, even and at least
+  32 square, both reserved words 0), the output (128-byte aligned: OUTPICBUF_INVALID), the picture information.
+- **The output** is the whole picture: the input window scaled into the output window, black around it (Y 0, or 16 in
+  broadcast range; chroma 128). The picture information takes libvpost's tables for the exec type's scans and
+  structures; an RGBA output's range is 0.
+- **The colour conversion** is libvpost's fixed point, found exactly from all 2^24 colours' slices: R, G, B = (A * Y +
+  Cu (U - 128) + Cv (V - 128) + B) >> 20, clamped; full range A = 2^20 and B = 2^19; broadcast A = 64 * 19076 on Y - 16
+  and B = 523264; the chroma weights 128 times BT.601's 11485, -2818, -5850, 14516 (broadcast 13078, -3204, -6658,
+  16520) or BT.709's 12900, -1534, -3834, 15201 (broadcast 14690, -1746, -4378, 17322). Each pixel's chroma: its 2x2
+  block's (siting type A), or for odd columns the byte average, rounded up, of its sample and the next (type B).
+- **The scaler type 0** is libvpost's bilinear: vertically first, then horizontally; weights in 1/256, each sum rounded
+  down; vertical positions in 1/65536 per row; horizontal ones in 1/256, sixteen output columns at a time from a
+  multiple of 16 in the output picture (each sixteen 16 steps of 1/65536 on, rounded down to 1/256, its columns a 1/256
+  step apart); a row past the window's bottom is the picture's, a column past its right edge its last; chroma planes
+  sited (step - 1) / 4 on (horizontally for type A only); past a halving horizontally, every second column first.
+Still different, each logged once when a game uses it: scaler types 1 to 3 (libvpost's sharpening and 4-tap and 8x4-tap
+filters, the last from tables of coefficients in its data), exec types 1 to 6 (its field and frame conversions; types 0
+and 7 match), a horizontal reduction past a half, a chroma window not at a multiple of 16 enlarged, and the bytes
+libvpost writes past a YUV output whose chroma planes have an odd size. cellVpost stays firmware-first (D-563) while
+these differ.
+Tests: tests/hle/test_vpost_compare.cpp (PSPOCKET_COMPARE_SELF=1 agrees with itself); tests/hle/test_vpost.cpp rewritten
+for libvpost's answers (its memory, handle, checks, conversion, sitings, scaler positions, windows, information).
