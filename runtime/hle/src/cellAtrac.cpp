@@ -983,6 +983,13 @@ s32 cellAtracSetDataAndGetMemSize_impl(PPUContext& ctx, const Layout& L, u32 h, 
         b[h + p + 0x18] = 0;
         a.w32(p + 0x14, 0x84);
         if (r >= 5) return a.e(CELL_ATRAC_ERROR_ILLEGAL_SAMPLING_RATE);
+        // pspocket's (D-645): a configuration of more channels than the fmt chunk's is refused. Each decoded frame
+        // would run past the memory sized from the fmt's: the frame's PCM in the work memory (onto cellAdec's context,
+        // whose close is then refused and whose thread goes on), the core's memory (its cellAdec type is chosen from
+        // the fmt's), the game's buffer (GetChannel answers the fmt's). So is an fmt of more than the 8 channels
+        // ATRAC3plus carries: a partial frame's samples, read at the fmt's stride, would come from past the PCM.
+        // libatrac3plus, as read, checks neither.
+        if (ch > 8 || (cfg > 4 ? cfg + 1 : cfg) > ch) return a.e(CELL_ATRAC_ERROR_UNKNOWN_FORMAT);
     }
     if (const u32 e = set_stream(a, buffer, read, buffer_size, info); e) return a.e(e);
     ps_write32(b, mem_size, 0);
