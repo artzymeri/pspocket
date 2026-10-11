@@ -567,6 +567,76 @@ TEST_CASE("cellJpgEnc: the queues, Reset's skipped streams, a buffer too small, 
     CHECK(g.call("cellJpgEncClose", h) == 0);
 }
 
+TEST_CASE("cellJpgEnc: on the SPUs, libjpgenc's SPU encoder's arithmetic and its output buffer (D-913)",
+    "[hle][jpgenc]")
+{
+    Fixture f;
+    GuestThread g(f, 0, "game");
+    u8* b = f.base();
+    write_config(b, 64, 64, YCBCR, S420, true);
+    ps_write32(b, kRsrc, kWork);
+    ps_write32(b, kRsrc + 4, needed(64, YCBCR, S420, true));
+    ps_write32(b, kRsrc + 8, 1000);
+    ps_write32(b, kRsrc + 12, 200);
+    REQUIRE(g.call("cellJpgEncOpen", kCfg, kRsrc, kHandle) == 0);
+    const u32 h = ps_read32(b, kHandle);
+    const auto stream = [&](u32 size) { return std::vector<u8>(b + kStream, b + kStream + size); };
+    // RGB (0, 0, 250): Y 28 in libjpeg's fixed point, 29 in the SPU program's single precision.
+    for (u32 i = 0; i < 16 * 16; i++) {
+        b[kPixels + 3 * i] = 0;
+        b[kPixels + 3 * i + 1] = 0;
+        b[kPixels + 3 * i + 2] = 250;
+    }
+    REQUIRE(encode(g, h, {16, 16, RGB}, {100, FAST, 0, 0, 0, true}) == 0);
+    Info i = stream_info(g, h);
+    REQUIRE(i.state == 0);
+    // The stream counts two bytes past EOI, what the SPU's buffer held there: zeros at first.
+    std::vector<u8> first = stream(i.size);
+    REQUIRE(first.size() > 4);
+    CHECK(first[first.size() - 4] == 0xFF);
+    CHECK(first[first.size() - 3] == 0xD9);
+    CHECK(first[first.size() - 2] == 0);
+    CHECK(first[first.size() - 1] == 0);
+    Decoded d = read_jpeg(std::vector<u8>(first.begin(), first.end() - 2), jpeg::ColorSpace::Gray);
+    REQUIRE(d.ok);
+    CHECK(d.pixels[0] == 29);
+    REQUIRE(encode(g, h, {16, 16, RGB}, {100, FAST}) == 0); // the same encoder, on the PPU
+    i = stream_info(g, h);
+    d = read_jpeg(stream(i.size), jpeg::ColorSpace::Gray);
+    REQUIRE(d.ok);
+    CHECK(d.pixels[0] == 28);
+    // A longer picture (noise past the SPU buffer's first 4094 bytes) ends at EOI; a shorter one after it ends with the
+    // bytes the longer one left in the buffer.
+    u32 seed = 1;
+    for (u32 k = 0; k < 64 * 48 * 3; k++) {
+        seed = seed * 1103515245u + 12345u;
+        b[kPixels + k] = static_cast<u8>(seed >> 16);
+    }
+    REQUIRE(encode(g, h, {64, 48, RGB}, {100, FAST, 0, 0, 0, true}) == 0);
+    i = stream_info(g, h);
+    REQUIRE(i.state == 0);
+    REQUIRE(i.size > 4096);
+    const std::vector<u8> longer = stream(i.size);
+    CHECK(longer[longer.size() - 2] == 0xFF);
+    CHECK(longer[longer.size() - 1] == 0xD9);
+    for (u32 k = 0; k < 16 * 16 * 3; k++) b[kPixels + k] = static_cast<u8>(k % 3 == 2 ? 250 : 0);
+    REQUIRE(encode(g, h, {16, 16, RGB}, {90, FAST, 0, 0, 0, true}) == 0);
+    i = stream_info(g, h);
+    REQUIRE(i.state == 0);
+    const std::vector<u8> after = stream(i.size);
+    const usize n = after.size() - 2; // past the first 4094 bytes the buffer starts again: the longer one's 4094 + n
+    CHECK(after[n] == longer[4094 + n]);
+    CHECK(after[n + 1] == longer[4095 + n]);
+    // The SPU sends 4096 bytes at a time only while the buffer has room past them: in 0x1000 bytes nothing goes, and
+    // the stream overflows with every row encoded.
+    REQUIRE(encode(g, h, {16, 16, RGB}, {90, FAST, 0, 0, 0, true}, 0x1000) == 0);
+    i = stream_info(g, h);
+    CHECK(i.state == kOverflow);
+    CHECK(i.size == 0);
+    CHECK(i.lines == 16);
+    CHECK(g.call("cellJpgEncClose", h) == 0);
+}
+
 TEST_CASE("cellJpgEnc: to a file on /dev_hdd0, and one that cannot be made", "[hle][jpgenc]")
 {
     namespace fs = std::filesystem;

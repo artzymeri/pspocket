@@ -12339,3 +12339,33 @@ marker goes (D-563): where the system software is installed, a game importing ce
 libvpost.sprx. Scaler types 2 and 3 read their filter tables from that installed libvpost.sprx (part 9); without it they
 fall back to bilinear, logged. Its comparison (test_vpost_compare.cpp) loses its [.]: it runs in the Mac's gate with the
 firmware and skips without it; the name check and test_vpost.cpp check the library is pspocket's and unmarked.
+
+## D-913 · 2026-10-11 · cellJpgEnc's SPU encoder, from libjpgenc's SPU program (part 14)
+
+A picture on the SPUs (enableSpu, the fast DCT) is no longer libjpeg's FAST on the PPU: libjpgenc's SPU program was
+read (its colour conversion, DCT and quantisation evaluated with symbolic inputs in scratch; nothing of it in the
+repository) and its behaviour checked byte for byte against libjpgenc.sprx on 360 pictures (sizes, qualities, restart
+intervals, every sampling, RGB, RGBA, ARGB and YCbCr input, gray and RGB encoders, buffers too small, the size limit):
+- jpeg::Dct::Spu (jpeg_encoder.cpp). RGB to YCbCr in single precision: each channel fa(fma(R, kR, fm(G, kG)), fma(B,
+  kB, offset)) truncated to a byte, the weights the decimal ones (0.299, 0.587, 0.114; -0.16874, -0.33126, 0.5; 0.5,
+  -0.41869, -0.08131) truncated to floats, the offsets a half plus 150 units of 2^-24 and 128.5 less 7 of 2^-16 (12,157
+  of the 16.7 million colours get a Y one above libjpeg's). Downsampling, edges below, dummy blocks and the Huffman
+  coding are libjpeg's. The DCT: an 8-point transform factored by tangents (tan pi/8, tan pi/16, tan 3pi/16 and
+  cos pi/4 as six-decimal floats), columns then rows; quantisation: each coefficient fma'd with its multiplier and
+  16384.5, truncated, less 16384; the multipliers the AA&N scale products over 8 (to six decimals) over the table
+  entry, from the SPU's reciprocal estimate (frest, fi) and one Newton step. All in the SPU's single precision as
+  pspocket models it (pspocket/spu/fp.h: results truncated toward zero, denormals zero), done exactly in doubles
+  (TwoSum), with RPCS3's frest table and fi model through pspocket/spu/fp.h.
+- Past the picture's right edge the SPU program's row buffers hold whatever its local store held (it converts them
+  whole): undefined, here black (a zero pixel converted), what Sony's gives with a fresh local store away from its
+  scratch bytes. Pictures a whole number of MCUs wide (16 columns at 4:2:0, 32 at 4:1:1) are exact.
+- Its output (cellJpgEnc.cpp, SpuRing): the stream goes through a 4096-byte buffer in local store, its first 4094
+  bytes, then 4096 at a time from the buffer's start; each piece is sent only while the game's buffer has more than
+  4096 bytes from the piece's start, else the stream overflows there (the rows done before; at the last piece every
+  row). A stream that fits the first piece with two bytes more is followed by two bytes past EOI, counted in
+  streamSize: what the buffer held there (zeros at first, then earlier streams', the size limit's trial and tries
+  included).
+The comparison's SPU pictures are now 32x17 (and 64x48 past 4094 bytes, a buffer of 0x1000, a shorter stream after
+a longer one): its 33-wide picture showed only the undefined columns. The comparison: 6 of 3,751 to 0 of 3,792.
+Test: test_jpgenc.cpp's SPU case (Y 29 against libjpeg's 28 for RGB 0,0,250; the bytes past EOI, zeros, then a longer
+stream's; no bytes past a long stream; a buffer of 0x1000 overflowing with every row).

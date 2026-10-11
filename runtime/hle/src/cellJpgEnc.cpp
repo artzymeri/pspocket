@@ -20,7 +20,9 @@
 // parameter {marker, data, size}, a marker segment written after the stream's SOI (its marker code the low byte);
 // CellJpgEncOutputParam {location (FILE 0, BUFFER 1), streamFileName, streamAddr, limitSize}; CellJpgEncStreamInfo
 // {state, location, streamFileName, streamAddr, limitSize, streamSize, processedLine, quality, userData (u64, +32)}.
-// The stream is jpeg_encoder.cpp's (libjpeg 6b, without JFIF or Adobe markers, as libjpgenc's).
+// The stream is jpeg_encoder.cpp's (libjpeg 6b, without JFIF or Adobe markers, as libjpgenc's); a picture on the SPUs
+// (the fast DCT) is libjpgenc's SPU encoder's (jpeg::Dct::Spu: its own arithmetic) sent as its SPU program sends it
+// (SpuRing below: the two bytes past a short stream's EOI, and pieces of 4096 bytes).
 
 #include <algorithm>
 #include <array>
@@ -28,6 +30,7 @@
 #include <optional>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -139,6 +142,23 @@ Result result_of(const Command& c, s32 state)
     return r;
 }
 
+// libjpgenc's SPU encoder writes each stream through a 4096-byte buffer in its local store (its first 4094 bytes, then
+// from the buffer's start again), and a stream that fits its first piece with two bytes more ends with those two past
+// EOI: what that buffer held there (zeros at first, then earlier streams' bytes).
+constexpr u64 kSpuFirstPiece = 4094, kSpuPiece = 4096;
+using SpuRing = std::array<u8, kSpuPiece>;
+
+usize ring_slot(u64 at) { return static_cast<usize>(at < kSpuFirstPiece ? at : (at - kSpuFirstPiece) % kSpuPiece); }
+
+// Bytes of an SPU stream from `at` on, into the ring as the SPU writes them.
+void into_ring(SpuRing* ring, u64 at, const u8* p, usize n)
+{
+    for (usize i = 0; ring && i < n; i++) (*ring)[ring_slot(at + i)] = p[i];
+}
+
+// The two bytes past an SPU stream of `n` bytes.
+std::array<u8, 2> ring_tail(const SpuRing& ring, u64 n) { return {ring[ring_slot(n)], ring[ring_slot(n + 1)]}; }
+
 struct Encoder {
     Config cfg;
     std::deque<Command> commands; // waiting to be encoded (four at most)
@@ -148,6 +168,7 @@ struct Encoder {
     bool in_flight = false;       // the first command is being encoded (it keeps its place until its stream is queued)
     bool reset_pending = false;   // a Reset came while it was: the others are skipped once its stream is queued
     u64 generation = 0, resets = 0;
+    std::shared_ptr<SpuRing> ring = std::make_shared<SpuRing>(); // the SPU encoder's output buffer (its streams' bytes)
 };
 
 // libjpgenc's stream size tables (the size limit mode's), read at the first size-limited picture.
@@ -160,7 +181,7 @@ struct State {
     std::mutex mutex;
     std::map<u32, Encoder> encoders; // by handle
     u64 opens = 0;
-    bool spu_logged = false, limit_logged = false;
+    bool limit_logged = false;
     SizeTables tables;
 };
 
@@ -196,17 +217,34 @@ u32 pixel_bytes(u32 space, u32 encoder)
 
 // The stream to the game's buffer (libjpeg's destination: bytes until the buffer is full, then the encoder stops) or
 // collected for a file.
+// libjpgenc's SPU encoder sends its stream from its 4096-byte buffer (SpuRing) in pieces: its first 4094 bytes, then
+// 4096 at a time, each sent only while the game's buffer has room for more than 4096 bytes from the piece's start.
+u64 spu_piece_start(u64 at) { return at < kSpuFirstPiece ? 0 : at - (at - kSpuFirstPiece) % kSpuPiece; }
+
 struct Output {
     PPUContext& ctx;
     bool to_buffer = false;
     u32 addr = 0, limit = 0;
     std::vector<u8> bytes;
     u64 written = 0;
+    bool spu = false;         // from libjpgenc's SPU encoder (to a buffer: its pieces)
+    SpuRing* ring = nullptr; // the SPU encoder's buffer the stream goes through
+
+    bool spu_piece_fits(u64 start) const { return start + kSpuPiece < limit; }
 
     bool write(const u8* p, usize n)
     {
+        if (spu) into_ring(ring, written, p, n);
         if (!to_buffer) {
             bytes.insert(bytes.end(), p, p + n);
+            written += n;
+            return true;
+        }
+        if (spu) { // a piece filled and not sent stops the encoder there; the game's buffer limits only the pieces
+            for (u64 end = kSpuFirstPiece; end <= written + n; end += kSpuPiece)
+                if (end > written && !spu_piece_fits(spu_piece_start(end - 1))) return false;
+            const u64 take = written < limit ? std::min<u64>(limit - written, n) : 0;
+            std::memcpy(gb(ctx) + addr + written, p, take);
             written += n;
             return true;
         }
@@ -266,7 +304,7 @@ jpeg::Settings settings_of(const Config& cfg, const Command& c, u32 quality)
     s.h_samp = cfg.space == YCBCR ? kH[cfg.sampling & 3] : 1;
     s.v_samp = cfg.space == YCBCR ? kV[cfg.sampling & 3] : 1;
     s.quality = static_cast<int>(quality);
-    s.dct = c.dct == DCT_FAST ? jpeg::Dct::Fast : jpeg::Dct::Float;
+    s.dct = c.dct != DCT_FAST ? jpeg::Dct::Float : c.spu ? jpeg::Dct::Spu : jpeg::Dct::Fast;
     s.restart_interval = c.restart;
     return s;
 }
@@ -315,8 +353,16 @@ Failure encode_once(PPUContext& ctx, const Config& cfg, const Command& c, u32 qu
 {
     u8* base = gb(ctx);
     const Pixels px{base + c.addr, c.width, c.height, c.pitch, c.space};
-    return encode_pixels(base, settings_of(cfg, c, quality), &c, px, [&](const u8* p, usize n) { return out.write(p, n); },
-        lines);
+    out.spu = c.spu;
+    const Failure f = encode_pixels(base, settings_of(cfg, c, quality), &c, px,
+        [&](const u8* p, usize n) { return out.write(p, n); }, lines);
+    // The SPU's last piece goes when the picture is done: not sent, the stream overflows with every row encoded.
+    if (f == Failure::None && c.spu && out.to_buffer && out.written &&
+        !out.spu_piece_fits(spu_piece_start(out.written - 1))) {
+        lines = c.height;
+        return Failure::Overflow;
+    }
+    return f;
 }
 
 // ------------------------------------------------------------------------------------------------- the size limit
@@ -433,7 +479,7 @@ void stopped_at(u32& w, u32& h, u32& size, u32 lines)
 }
 
 // The trial encoding's activity, or nothing when it failed otherwise than by filling its buffer.
-std::optional<u32> trial_activity(PPUContext& ctx, const Config& cfg, const Command& c)
+std::optional<u32> trial_activity(PPUContext& ctx, const Config& cfg, const Command& c, SpuRing* ring)
 {
     u8* base = gb(ctx);
     const u32 spp = c.space == GRAYSCALE ? 1 : 3;
@@ -458,13 +504,14 @@ std::optional<u32> trial_activity(PPUContext& ctx, const Config& cfg, const Comm
     jpeg::Settings st = settings_of(cfg, c, 75);
     st.width = cw;
     st.height = ch;
-    st.dct = jpeg::Dct::Fast;
+    st.dct = c.spu ? jpeg::Dct::Spu : jpeg::Dct::Fast;
     constexpr u32 kTrialBuffer = 0x4000;
     u64 written = 0;
     u32 lines = 0;
     const Pixels px{crop.data(), cw, ch, cw * bpp, c.space};
     const Failure f = encode_pixels(base, st, nullptr, px,
-        [&](const u8*, usize n) {
+        [&](const u8* p, usize n) {
+            if (c.spu) into_ring(ring, written, p, n);
             written = std::min<u64>(written + n, kTrialBuffer);
             return written < kTrialBuffer;
         },
@@ -488,14 +535,15 @@ u32 extra_bytes(u8* base, const Command& c)
 }
 
 // A size-limited picture (to a buffer), as libjpgenc's thread encodes it.
-Result encode_size_limited(PPUContext& ctx, const Config& cfg, const Command& c, const SizeTables& st, Result r)
+Result encode_size_limited(
+    PPUContext& ctx, const Config& cfg, const Command& c, const SizeTables& st, Result r, SpuRing* ring)
 {
     u8* base = gb(ctx);
     const auto& t = st.t[group_of(cfg)];
     const u32 pixels = c.width * c.height, spp = c.space == GRAYSCALE ? 1 : 3, samples = spp * pixels;
     u32 step = pixels <= 4999 ? 4 : pixels <= 9999 ? 3 : pixels <= 39999 ? 2 : 1;
     const u32 bump = pixels <= 4999 ? 3 : pixels <= 39999 ? 2 : 1;
-    const std::optional<u32> measured = trial_activity(ctx, cfg, c);
+    const std::optional<u32> measured = trial_activity(ctx, cfg, c, ring);
     if (!measured) {
         r.state = error(CELL_JPGENC_ERROR_FATAL);
         return r;
@@ -533,6 +581,7 @@ Result encode_size_limited(PPUContext& ctx, const Config& cfg, const Command& c,
 
     for (u32 attempt = 1;; attempt++) {
         Output out{ctx, true, c.stream, c.limit, {}, 0};
+        out.ring = ring;
         u32 lines = 0;
         const Failure f = encode_once(ctx, cfg, c, q, out, lines);
         r.quality = q;
@@ -562,8 +611,17 @@ Result encode_size_limited(PPUContext& ctx, const Config& cfg, const Command& c,
     }
 }
 
-// One command encoded, as libjpgenc's thread does it.
-Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c)
+// A whole SPU stream in a buffer (`size` bytes at `addr`, room for `limit`): its two bytes past the end from the ring,
+// as far as the buffer has room.
+void spu_tail_to_buffer(PPUContext& ctx, const SpuRing& ring, u32 addr, u32 limit, u32& size)
+{
+    if (size + 2 > kSpuPiece) return; // a stream past its first piece ends at EOI
+    const std::array<u8, 2> tail = ring_tail(ring, size);
+    for (u32 i = 0; i < 2 && size < limit; i++) ps_write8(gb(ctx), addr + size++, tail[i]);
+}
+
+// One command encoded, as libjpgenc's thread does it (`ring`: the encoder's SPU output buffer).
+Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c, SpuRing& ring)
 {
     Result r = result_of(c, 0);
     u32 fd = 0;
@@ -571,20 +629,17 @@ Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c)
         r.state = error(CELL_JPGENC_ERROR_STREAM_FILE_OPEN);
         return r;
     }
-    if (c.spu) {
-        std::lock_guard lock(s.mutex);
-        if (!s.spu_logged) {
-            s.spu_logged = true;
-            PS_LOG_WARN(kChan, "cellJpgEncEncodePicture: encoded on the PPU's libjpeg (libjpgenc's SPU encoder rounds "
-                               "otherwise: its streams differ, D-913)");
-        }
-    }
     Output out{ctx, c.location == LOCATION_BUFFER, c.stream, c.limit, {}, 0};
+    out.ring = &ring;
     u32 lines = 0, quality = c.quality;
     Failure failed = Failure::None;
     if (c.mode == STREAM_SIZE_LIMIT) {
         const SizeTables& st = size_tables(s);
-        if (st.ok) return encode_size_limited(ctx, cfg, c, st, r);
+        if (st.ok) {
+            r = encode_size_limited(ctx, cfg, c, st, r, &ring);
+            if (c.spu && r.state == 0 && r.size) spu_tail_to_buffer(ctx, ring, c.stream, c.limit, r.size);
+            return r;
+        }
         {
             std::lock_guard lock(s.mutex);
             if (!s.limit_logged) {
@@ -604,6 +659,19 @@ Result encode(PPUContext& ctx, State& s, const Config& cfg, const Command& c)
         quality = lo;
     }
     failed = encode_once(ctx, cfg, c, quality, out, lines);
+    if (c.spu && failed == Failure::None) {
+        if (c.location == LOCATION_FILE) {
+            const std::array<u8, 2> tail = ring_tail(ring, out.bytes.size());
+            if (out.bytes.size() + 2 <= kSpuPiece) {
+                out.bytes.insert(out.bytes.end(), tail.begin(), tail.end());
+                out.written += 2;
+            }
+        } else {
+            u32 size = static_cast<u32>(out.written);
+            spu_tail_to_buffer(ctx, ring, c.stream, c.limit, size);
+            out.written = size;
+        }
+    }
     if (c.location == LOCATION_FILE) {
         const bool ok = write_file(ctx, fd, out.bytes);
         if (failed == Failure::None && !ok) failed = Failure::Fatal;
@@ -636,6 +704,7 @@ void pump(PPUContext& ctx, State& s, u32 handle)
 {
     u64 generation = 0;
     Config cfg;
+    std::shared_ptr<SpuRing> ring;
     {
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
@@ -643,6 +712,7 @@ void pump(PPUContext& ctx, State& s, u32 handle)
         e->second.pumping = true;
         generation = e->second.generation;
         cfg = e->second.cfg;
+        ring = e->second.ring;
     }
     for (;;) {
         Command c;
@@ -661,7 +731,7 @@ void pump(PPUContext& ctx, State& s, u32 handle)
             skip = enc.skip_next;
             enc.skip_next = false;
         }
-        const Result r = skip ? result_of(c, error(CELL_JPGENC_ERROR_STREAM_SKIP)) : encode(ctx, s, cfg, c);
+        const Result r = skip ? result_of(c, error(CELL_JPGENC_ERROR_STREAM_SKIP)) : encode(ctx, s, cfg, c, *ring);
         std::lock_guard lock(s.mutex);
         const auto e = s.encoders.find(handle);
         if (e == s.encoders.end() || e->second.generation != generation) return;

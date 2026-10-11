@@ -583,12 +583,25 @@ Observed half(const Setup& s, bool sony_half)
     h.r("cellJpgEncClose", {e}, "Close again");
     h.r("cellJpgEncWaitForInput", {e, 0}, "WaitForInput after Close");
 
-    // With the SPUs: an encoder opened for them, pictures encoded on them (the fast DCT only).
+    // With the SPUs: an encoder opened for them, pictures encoded on them (the fast DCT only). Those pictures are a
+    // whole number of 16-column blocks wide: libjpgenc's SPU encoder converts its row buffers whole, and past a
+    // picture's last column they hold whatever its local store held before (nothing defined to compare, D-913).
     const u32 spu = h.open("an SPU encoder", slot++, 64, 64, YCBCR, S420, true);
     if (spu) {
+        put_picture(b, 32, 17, RGB, 96, 5);
+        h.one("RGB 32x17 on the SPUs", spu, {32, 17, RGB}, {85, FAST, 0, 0, 0, true});
+        h.one("RGB 32x17 on the SPUs, restart interval 2", spu, {32, 17, RGB}, {85, FAST, 2, 0, 0, true});
+        put_picture(b, 64, 48, RGB, 192, 6);
+        h.one("RGB 64x48 on the SPUs at quality 100 (past the SPU's first 4094 bytes)", spu, {64, 48, RGB},
+            {100, FAST, 0, 0, 0, true});
+        if (h.encode("RGB 64x48 on the SPUs to a buffer of 0x1000 bytes", spu, {64, 48, RGB}, {100, FAST, 0, 0, 0, true},
+                0, 0x1000) == 0) {
+            h.wait_output("RGB 64x48 on the SPUs to a buffer of 0x1000 bytes", spu, true);
+            h.stream_info("RGB 64x48 on the SPUs to a buffer of 0x1000 bytes", spu);
+        }
+        put_picture(b, 32, 17, RGB, 96, 5);
+        h.one("RGB 32x17 on the SPUs again (the bytes past EOI)", spu, {32, 17, RGB}, {60, FAST, 0, 0, 0, true});
         put_picture(b, 33, 17, RGB, 99, 5);
-        h.one("RGB 33x17 on the SPUs", spu, {33, 17, RGB}, {85, FAST, 0, 0, 0, true});
-        h.one("RGB 33x17 on the SPUs, restart interval 2", spu, {33, 17, RGB}, {85, FAST, 2, 0, 0, true});
         h.one("RGB 33x17 with the SPUs' encoder, on the PPU", spu, {33, 17, RGB}, {85, FAST});
         h.one("RGB 33x17 on the SPUs, the accurate DCT", spu, {33, 17, RGB}, {85, QUALITY, 0, 0, 0, true});
         h.r("cellJpgEncClose", {spu}, "Close of the SPU encoder");

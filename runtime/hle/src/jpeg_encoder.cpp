@@ -5,8 +5,12 @@
 #include "jpeg_encoder.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
+
+#include "pspocket/spu/fp.h"
 
 // The float DCT must keep the PPU's operations as they are: fused multiply-adds only where they are written below.
 #pragma clang fp contract(off)
@@ -174,6 +178,111 @@ void fdct_float(double* d)
     }
 }
 
+// ---- libjpgenc's SPU encoder (Dct::Spu), read from its SPU program ----
+// Single precision as the SPU computes it, in pspocket's model of it (pspocket/spu/fp.h, the one the SPU programs run
+// on): each result the exact one truncated toward zero to 24 bits, results below 2^-126 zero; a product with a zero
+// operand +0 and a multiply-add with one its addend. The exact sum comes from TwoSum: s + err.
+float spu_round(double s, double err)
+{
+    float f = static_cast<float>(s);
+    const double fd = static_cast<double>(f);
+    if (std::fabs(fd) > std::fabs(s) || (fd == s && err != 0 && (err < 0) != (s < 0))) f = std::nextafter(f, 0.0f);
+    return std::fabs(f) < FLT_MIN ? 0.0f : f;
+}
+float spu_sum(double a, double b)
+{
+    const double s = a + b, bb = s - a, err = (a - (s - bb)) + (b - bb);
+    return spu_round(s, err);
+}
+float spu_fa(float a, float b) { return spu_sum(static_cast<double>(a), static_cast<double>(b)); }
+float spu_fs(float a, float b) { return spu_sum(static_cast<double>(a), -static_cast<double>(b)); }
+float spu_fm(float a, float b)
+{
+    return a == 0 || b == 0 ? 0.0f : spu_round(static_cast<double>(a) * static_cast<double>(b), 0);
+}
+float spu_fma(float a, float b, float c)
+{
+    return a == 0 || b == 0 ? c : spu_sum(static_cast<double>(a) * static_cast<double>(b), static_cast<double>(c));
+}
+float spu_fms(float a, float b, float c) { return spu_fma(a, b, -c); }
+float spu_fnms(float a, float b, float c) { return spu_fma(-a, b, c); }
+// A double truncated to single precision (the SPU program's colour weights are the decimal ones truncated).
+float spu_float(double v) { return spu_round(v, 0); }
+
+// frest and fi: the SPU's reciprocal estimate and its interpolation (RPCS3's table and fixed-point model,
+// rpcs3/Emu/Cell/SPUThread.cpp and SPULLVMRecompiler.cpp "spu_fi", as pspocket/spu/fp.h has them).
+float spu_frest(float x)
+{
+    const u32 u = std::bit_cast<u32>(x);
+    return std::bit_cast<float>(ps_spu_frest_fraction_lut[(u >> 18) & 0x1F] | ps_spu_frest_exponent_lut[(u >> 23) & 0xFF] |
+        (u & 0x80000000u));
+}
+float spu_fi(float a, float b)
+{
+    const u32 ua = std::bit_cast<u32>(a), ub = std::bit_cast<u32>(b);
+    const u32 base = (ub & 0x007FFC00u) << 9, ymul = (ub & 0x3FFu) * (ua & 0x7FFFFu);
+    const bool adjust = ymul > base;
+    const u32 bnew = (base - ymul) >> (adjust ? 8 : 9);
+    const u32 expo = (ub & 0xFF800000u) - (adjust ? 0x00800000u : 0);
+    return std::bit_cast<float>(expo | (bnew & 0x007FFFFFu));
+}
+
+// The quantisation's multipliers: each entry's DCT scale over the table's entry, the reciprocal from the estimate and
+// one Newton step. The scales are the AA&N factors' products over 8 to six decimals, as libjpgenc's program has them.
+std::array<float, 64> spu_multipliers(const std::array<u8, 64>& q)
+{
+    static constexpr double kS[8] = {1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 1.175875602, 1.306562965,
+        1.387039845};
+    std::array<float, 64> m{};
+    for (int i = 0; i < 64; i++) {
+        const float c = static_cast<float>(std::round(kS[i / 8] * kS[i % 8] / 8 * 1e6) / 1e6);
+        const float qf = static_cast<float>(q[static_cast<usize>(i)]);
+        const float r = spu_fi(qf, spu_frest(qf));
+        const float t = spu_fm(c, r);
+        m[static_cast<usize>(i)] = spu_fma(spu_fnms(t, qf, c), r, t);
+    }
+    return m;
+}
+
+// The SPU program's 8-point DCT, factored by tangents (outputs in natural order, each scaled as the multipliers expect).
+void spu_dct8(float* p, int step)
+{
+    constexpr float t1 = 0.414214f, t2 = 0.198912f, t3 = 0.668179f, c4 = 0.707107f;
+    const float x0 = p[0], x1 = p[step], x2 = p[2 * step], x3 = p[3 * step], x4 = p[4 * step], x5 = p[5 * step],
+                x6 = p[6 * step], x7 = p[7 * step];
+    const float s07 = spu_fa(x0, x7), s34 = spu_fa(x3, x4), s16 = spu_fa(x1, x6), s25 = spu_fa(x2, x5);
+    const float e0 = spu_fs(s07, s34), e1 = spu_fs(s16, s25);
+    const float d16 = spu_fs(x1, x6), d25 = spu_fs(x2, x5), d07 = spu_fs(x0, x7), d34 = spu_fs(x3, x4);
+    const float sum = spu_fa(d16, d25), diff = spu_fs(d16, d25);
+    const float a = spu_fma(sum, c4, d07), b = spu_fma(diff, c4, d34);
+    const float c = spu_fma(diff, -c4, d34), d = spu_fma(sum, -c4, d07);
+    const float f0 = spu_fa(s07, s34), f1 = spu_fa(s16, s25);
+    p[0] = spu_fa(f0, f1);
+    p[step] = spu_fma(b, t2, a);
+    p[2 * step] = spu_fma(e1, t1, e0);
+    p[3 * step] = spu_fma(c, -t3, d);
+    p[4 * step] = spu_fs(f0, f1);
+    p[5 * step] = spu_fma(d, t3, c);
+    p[6 * step] = spu_fms(e0, t1, e1);
+    p[7 * step] = spu_fms(a, t2, b);
+}
+
+// libjpgenc's SPU colour conversion: each channel the sum of two truncated products-and-sums, truncated to a byte (at
+// most 255, at least 0), with a half and 128 and a half as the program has them (a little over and under).
+void spu_rgb_to_ycbcr(u8 r, u8 g, u8 b, u8& y, u8& cb, u8& cr)
+{
+    static const float kR[3] = {spu_float(0.299), spu_float(-0.16874), 0.5f};
+    static const float kG[3] = {spu_float(0.587), spu_float(-0.33126), spu_float(-0.41869)};
+    static const float kB[3] = {spu_float(0.114), 0.5f, spu_float(-0.08131)};
+    static const float kOff[3] = {static_cast<float>(0.5 + 150.0 / 16777216.0), static_cast<float>(128.5 - 7.0 / 65536.0),
+        static_cast<float>(128.5 - 7.0 / 65536.0)};
+    u8* out[3] = {&y, &cb, &cr};
+    for (int k = 0; k < 3; k++) {
+        const float v = spu_fa(spu_fma(r, kR[k], spu_fm(g, kG[k])), spu_fma(b, kB[k], kOff[k]));
+        *out[k] = static_cast<u8>(v <= 0 ? 0 : v >= 255 ? 255 : static_cast<int>(v));
+    }
+}
+
 int clamp_quality(int q) { return std::clamp(q, 1, 100); }
 
 } // namespace
@@ -225,6 +334,8 @@ struct Encoder::Impl {
     std::array<std::array<u8, 64>, 2> quant{};
     std::array<int, 64> fast_div[2]{};
     std::array<double, 64> float_div[2]{};
+    std::array<float, 64> spu_mul[2]{};
+    std::array<u8, 3> spu_blank{}; // a zero pixel of the input in each component (Dct::Spu's right edge)
     CodeTable dc_codes[2], ac_codes[2];
     u32 mcus_per_row = 0, total_imcu_rows = 0, imcu_row = 0;
     u32 rows_done = 0, group_rows = 0, groups = 0;
@@ -273,12 +384,15 @@ struct Encoder::Impl {
                 float_div[t][i] =
                     1.0 / (static_cast<double>(quant[t][i]) * kAanScaleFactor[i / 8] * kAanScaleFactor[i % 8] * 8.0);
             }
+            if (s.dct == Dct::Spu) spu_mul[t] = spu_multipliers(quant[t]);
         }
         dc_codes[0] = codes_of(kDcLuma);
         ac_codes[0] = codes_of(kAcLuma);
         dc_codes[1] = codes_of(kDcChroma);
         ac_codes[1] = codes_of(kAcChroma);
         group.assign(comps.size(), std::vector<u8>(static_cast<usize>(max_v) * s.width));
+        if (s.output == Space::YCbCr && s.input == Space::RGB)
+            spu_rgb_to_ycbcr(0, 0, 0, spu_blank[0], spu_blank[1], spu_blank[2]);
         restarts_to_go = s.restart_interval;
         ok = true;
     }
@@ -381,10 +495,11 @@ struct Encoder::Impl {
         byte(0);
     }
 
-    // jcsample.c's expand_right_edge: a row's last sample repeated to `to` columns.
-    static void expand(u8* row, u32 from, u32 to)
+    // jcsample.c's expand_right_edge: a row's last sample repeated to `to` columns. libjpgenc's SPU encoder converts its
+    // row buffers whole: past the picture they are black (a zero pixel converted: `blank`).
+    void expand(u8* row, u32 from, u32 to, u8 blank) const
     {
-        if (to > from) std::memset(row + from, row[from - 1], to - from);
+        if (to > from) std::memset(row + from, s.dct == Dct::Spu ? blank : row[from - 1], to - from);
     }
 
     // One row group (max_v rows, the image's last repeated past its bottom) into each component's iMCU rows: jcsample.c.
@@ -398,7 +513,7 @@ struct Encoder::Impl {
             for (int r = 0; r < max_v; r++) {
                 u8* dst = in.data() + static_cast<usize>(r) * out_cols * hx;
                 std::memcpy(dst, group[ci].data() + static_cast<usize>(r) * s.width, s.width);
-                expand(dst, s.width, out_cols * hx);
+                expand(dst, s.width, out_cols * hx, spu_blank[ci]);
             }
             const usize stride = static_cast<usize>(out_cols) * hx;
             for (int orow = 0; orow < c.v; orow++) {
@@ -439,7 +554,16 @@ struct Encoder::Impl {
     {
         const u32 cols = c.width_in_blocks * 8;
         const u8* p = c.rows.data() + static_cast<usize>(row0) * cols + col0;
-        if (s.dct == Dct::Fast) {
+        if (s.dct == Dct::Spu) {
+            // Columns, then rows; each coefficient times its multiplier plus 16384.5, truncated, less 16384.
+            float w[64];
+            for (int r = 0; r < 8; r++)
+                for (int x = 0; x < 8; x++) w[r * 8 + x] = static_cast<float>(p[r * cols + x] - 128);
+            for (int x = 0; x < 8; x++) spu_dct8(w + x, 8);
+            for (int r = 0; r < 8; r++) spu_dct8(w + r * 8, 1);
+            for (int i = 0; i < 64; i++)
+                coef[i] = static_cast<int>(spu_fma(w[i], spu_mul[c.quant][static_cast<usize>(i)], 16384.5f)) - 16384;
+        } else if (s.dct == Dct::Fast) {
             int w[64];
             for (int r = 0; r < 8; r++)
                 for (int x = 0; x < 8; x++) w[r * 8 + x] = p[r * cols + x] - 128;
@@ -631,7 +755,8 @@ bool Encoder::write_row(const u8* row)
         if (m.s.output == Space::Gray) {
             m.group[0][at + x] = m.s.input == Space::RGB ? rgb_to_y(p[0], p[1], p[2]) : p[0];
         } else if (m.s.output == Space::YCbCr && m.s.input == Space::RGB) {
-            rgb_to_ycbcr(p[0], p[1], p[2], m.group[0][at + x], m.group[1][at + x], m.group[2][at + x]);
+            (m.s.dct == Dct::Spu ? spu_rgb_to_ycbcr : rgb_to_ycbcr)(p[0], p[1], p[2], m.group[0][at + x],
+                m.group[1][at + x], m.group[2][at + x]);
         } else {
             for (int c = 0; c < 3; c++) m.group[static_cast<usize>(c)][at + x] = p[c];
         }

@@ -12,6 +12,10 @@
 // - jcdctmgr.c with jfdctfst.c (the fast integer DCT and its scaled divisors) or jfdctflt.c (the float DCT), as
 //   libjpgenc builds it: FAST_FLOAT double, the PPU's fused multiply-adds where its compiler made them (two in the
 //   transform, the quantisation's).
+// - libjpgenc's SPU encoder (Dct::Spu), read from its SPU program: RGB to YCbCr in single-precision floats, a DCT
+//   factored by tangents, quantisation by reciprocals refined from the SPU's estimate, all in the SPU's single
+//   precision (results truncated, pspocket/spu/fp.h); past the picture's right edge black (the SPU's row buffers hold
+//   only the picture's columns: what lies past them is whatever its local store held, here as when it held zeros).
 // - jchuff.c's encoding (24-bit bit buffer, 0xFF stuffed, restart markers, the last byte filled with ones) and
 //   jcmarker.c's markers: SOI, (JFIF APP0 or Adobe APP14 when asked: libjpgenc asks neither), the application's markers
 //   (jpeg_write_marker), at the first row DQT for each table used, SOF0, DHT for each table as a component of the scan
@@ -28,7 +32,9 @@
 namespace pspocket::hle::jpeg {
 
 enum class Space : u8 { Gray = 1, RGB = 2, YCbCr = 3 };
-enum class Dct : u8 { Float, Fast }; // libjpgenc's QUALITY (JDCT_FLOAT) and FAST (JDCT_IFAST)
+// libjpgenc's QUALITY (JDCT_FLOAT) and FAST (JDCT_IFAST) on the PPU; Spu: FAST on the SPUs, libjpgenc's SPU encoder
+// (its colour conversion, DCT and quantisation in the SPU's single precision; see jpeg_encoder.cpp).
+enum class Dct : u8 { Float, Fast, Spu };
 
 struct Settings {
     u32 width = 0, height = 0;
