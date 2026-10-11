@@ -231,3 +231,46 @@ TEST_CASE("cellAtrac against libatrac3plus: every answer, output and handle byte
     CHECK(count("cellAtracDecode -> 0x80610332") >= 1); // a stream that ran dry
     compare_logs(ours, script(f.base(), theirs));
 }
+
+namespace {
+
+constexpr u32 CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL = 0x80610313;
+
+// cellAtracSetDataAndGetMemSize over `file`, read whole into a buffer of 0x20000 bytes.
+u32 set_data(GuestThread& t, u8* b, const std::vector<u8>& file)
+{
+    std::memset(b + kHandle, 0, 0x200);
+    std::memcpy(b + kBuffer, file.data(), file.size());
+    return static_cast<u32>(
+        t.call("cellAtracSetDataAndGetMemSize", kHandle, kBuffer, static_cast<u32>(file.size()), 0x20000, kOut));
+}
+
+} // namespace
+
+// Header lengths that the reader's 32-bit sums wrap round to a header or chunk already read (D-646): refused, where the
+// reader read the same headers again for ever (the cellAtrac fuzzing with another seed: a chunk of 0xFFFFFF00 bytes).
+TEST_CASE("cellAtrac: a header length that wraps the reader back is refused, not read for ever (D-646)", "[hle][atrac]")
+{
+    Fixture f;
+    REQUIRE(f.hle->link_internal_functions({"cellAdec", "cellAtrac"}));
+    GuestThread t(f, 0, "ppu");
+    u8* b = f.base();
+    // A RIFF form that is not WAVE, 12 bytes, whose length takes the reader back to its own start.
+    CHECK(set_data(t, b, {'R', 'I', 'F', 'F', 0xF8, 0xFF, 0xFF, 0xFF, 'A', 'V', 'I', ' '}) ==
+          CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    // After the fmt chunk (it ends at 72): a chunk whose length takes the reader back to its own start; two empty
+    // chunks and one that goes back to the first of them.
+    const auto inserted = [](const std::vector<u8>& chunks) {
+        std::vector<u8> file = at3p_file({});
+        file.insert(file.begin() + 72, chunks.begin(), chunks.end());
+        return file;
+    };
+    CHECK(set_data(t, b, inserted({'L', 'O', 'O', 'P', 0xF8, 0xFF, 0xFF, 0xFF})) ==
+          CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    CHECK(set_data(t, b, inserted({'J', 'U', 'N', 'K', 0, 0, 0, 0, 'J', 'U', 'N', 'K', 0, 0, 0, 0, 'B', 'A', 'C', 'K',
+                             0xE8, 0xFF, 0xFF, 0xFF})) == CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+    // A fmt chunk whose length runs past the bytes only through the wrap: refused before it is read.
+    std::vector<u8> fmt = at3p_file({});
+    for (u32 i = 16; i < 20; i++) fmt[i] = i == 16 ? 0xF0 : 0xFF;
+    CHECK(set_data(t, b, fmt) == CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL);
+}

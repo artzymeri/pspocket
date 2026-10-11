@@ -717,12 +717,14 @@ u32 parse_header(const u8* p, u32 size, u8* info, bool multi = false)
     if (size <= 0xB) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
     u32 at = 0;
     const auto rd = [&](u32 n) { return le(p, at, size, n); };
-    for (;;) {
+    for (u32 riff = 0;; riff = at) {
         if (rd(4) != 0x46464952) return CELL_ATRAC_ERROR_UNKNOWN_FORMAT; // RIFF
         const u32 len = rd(4);
         if (rd(4) == 0x45564157) break; // WAVE
         at += ((len - 4) & 1) + (len - 4);
-        if (size < at || size < at + 0xC) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
+        // pspocket's (D-646): a length the 32-bit sum wraps back to this header, or before it, is refused;
+        // libatrac3plus's reader read the same headers again for ever.
+        if (at <= riff || size < at || size < at + 0xC) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
     }
     if (at + 8 >= size) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
     static constexpr u8 kGuid[16] = {0xE9, 0x23, 0xAA, 0xBF, 0xCB, 0x58, 0x44, 0x71,
@@ -733,7 +735,10 @@ u32 parse_header(const u8* p, u32 size, u8* info, bool multi = false)
         const u32 id = rd(4);
         const u32 len = rd(4);
         u32 left = len + (len & 1);
-        if (size < at + left && id != 0x61746164) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
+        // A chunk past the bytes read. Checked without the 32-bit sum (pspocket's, D-646): libatrac3plus's wraps for
+        // a length near 4 GB, which then took the reader back to a chunk before (read again for ever) or let a fmt
+        // chunk be read past the bytes.
+        if (left > size - at && id != 0x61746164) return CELL_ATRAC_ERROR_READSIZE_IS_TOO_SMALL;
         if (id == 0x61746164) { // data
             put32(0x3C, left);
             put32(0x34, at);
