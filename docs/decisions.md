@@ -12521,3 +12521,47 @@ With the comparisons that now match Sony's modules out of hiding (D-912 to D-916
 installed runs about six minutes (cellRudp's comparison alone about 110 s), past the 300 s ctest limit scripts/gate.sh
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
+
+## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
+
+sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole
+library (239 functions) is; libsysutil_np.sprx is always served natively (D-175).
+
+**The product category functions** were RPCS3's TODOs (infos pointing at the category, counts never written, dval 0).
+They are now Sony's libsysutil_np 4.92, read from it and compared with it (tests/hle/test_np_commerce_compare.cpp:
+11,971 calls on each side over random store data, every answer as an offset and every byte of the data and the
+category, info and price objects the same): the twelve getters that were stubs (GetCurrencyCode, GetCategoryId,
+Name, Description, ImageURL, GetSkuId, GetProductId, ProductName, SkuName, SkuDescription, SkuImageURL, SkuUserData:
+the record's address plus the field's offset) and the ten around them. The data (version 1): be32 version, be32
+status, the currency at +8 (its three letters, be32 decimals at +12), the category record at +16 (760 bytes), the
+child category count at +776, the children from +780 (760 each), then the SKU count and the SKUs (1,004 each). An
+info is {category, record} and writing one NUL-terminates its record's strings in the data (a currency at +3; a
+category at +55, +247, +631, +759; a SKU at +55, +103, +295, +359, +743, +871, +999). InitProductCategory keeps the
+data and size first, then checks the version (else INVALID_GPC_PROTOCOL_VERSION, 0x8002942A), the status (a browse
+server error 0x80029600 | status, 0x80029600 past 255) and the currency, and sets dval to 10 to the decimals' power
+in 32 bits (0 for none; Sony's multiplies that many times, squared here). GetChildProductSkuInfo checks only that a
+SKU's first four bytes lie in the data, as Sony's does. GetSkuPrice splits the price at +1000 by dval. Sony's checks
+no pointer; one that is not guest memory is refused here with a log.
+
+**The requests to the system software's NP service** (_sceNpSysutilClientMalloc/Free, _sce_np_sysutil_send_packet,
+_send_packet_sub, _send_empty_packet, _recv_packet, _recv_packet_fixedmem, _recv_packet_fixedmem_sub,
+_cxml_prepare_doc, _cxml_set_npid, sce_np_matching_set_matching2_running, sceNpDrmExecuteGamePurchase): Sony's sibling
+modules build their requests with them; pspocket serves those itself, so a game reaches them only by importing them.
+Each does what libsysutil_np does, over pspocket's cxml and packet functions (D-534), called as Sony's module calls its
+imports: a document's tables from a FixedMemory instance, its magic and root element; Document::Write through a
+PacketWriter on channel 0 (1 for _sub) under the request number; a reply read into the receive buffer (or the
+FixedMemory instance, 0x6000 bytes) until done (a reply larger than the buffer is read away and answered 0x8002B006),
+made a document and its "result" returned when negative; an NP ID as an element with a "handle" child (its "data" the
+online ID) and "opt" and "reserved" files. The client heap is Sony's: _sys_heap_create_heap("SceNpSysutilClientHeap",
+pool size, 0x80000000, {8, pool}) over the game's NP pool, with the 0x18000-byte receive buffer from it, made at first
+use while NP is up (Sony's sceNpInit makes them) and deleted by sceNpTerm; before sceNpInit the heap is 0 and liblv2
+says "invalid heap area 0x0", as with Sony's. matching2_running keeps a byte the older matching library checks (with
+matching 2's own state) before refusing with UTILITY_UNAVAILABLE. sceNpDrmExecuteGamePurchase is SCE_NP_DRM_ERROR_INTERNAL
+before sceNpInit, then Sony's "drmrequest" (magic NPDR, reqtype 2, an empty reqarg) as request 268 between
+cellSysutilPacketBegin and End; pspocket's console has no system software, so its channels are closed and the call
+answers the channel's 0x8002B007 as Sony's code does on it: no store opens (its purchase mutex, which serialises
+nothing here, is left out). These eleven are unverified (D-594): comparing them needs Sony's sceNpInit's whole set-up.
+
+Tests: test_np_commerce_compare.cpp (with the firmware); test_np.cpp: the product category test now checks Sony's
+behaviour, and a new case covers the client heap before, during and after NP, the closed channel's answer and the
+matching 2 flag (its low byte).
