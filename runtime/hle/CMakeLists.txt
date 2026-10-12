@@ -163,6 +163,7 @@ add_library(pspocket_hle STATIC
     src/cellPrintUtility.cpp
     src/cellPesmUtility.cpp
     src/cellGamePs1Emu.cpp
+    src/cellDtcpIpUtility.cpp
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp

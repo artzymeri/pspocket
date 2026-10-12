@@ -271,5 +271,10 @@ s32 with_request(PPUContext& ctx, std::string_view module, std::string_view what
 void register_print(Registry& r);
 void register_pesm(Registry& r);
 void register_game_ps1emu(Registry& r);
+void register_dtcp(Registry& r);
+
+// For the comparisons: cellDtcpIpUtility's data block (its lwmutex and shared memory pointer among it, at the offsets of
+// libsysutil_dtcp_ip's data from 0x87E0), made at first use.
+u32 dtcp_data();
 
 } // namespace pspocket::hle::sysutil::sub
