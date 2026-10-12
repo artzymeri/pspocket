@@ -13705,3 +13705,11 @@ three words holding each half's function addresses masked), the slots and pipeli
 lv2 calls and the file libmp4 wrote byte for byte (the mvhd, tkhd and mdhd boxes' creation and modification times, the
 wall clock's, masked): 0 of 157, 113, 99 and 259 observations differ. With the MP4 composer every one of cellSailRec's
 58 functions and libsail_rec's internal paths are pspocket's own; nothing stops the process for a later part.
+
+## D-931 · 2026-10-12 · A test's temporary directory is removed only by the process that made it
+
+D-924 gave each test process its own temporary directory, removed when the process ends. A comparison's two halves run
+in forked children of the test process; they inherit the directory and its removal, and the first half to end removed
+it while the other half (or the parent) still used it: the gate after merging the agents' cellSail and cellSailRec
+parts aborted cellPngEnc's comparison (SIGABRT in its file output, std::filesystem throwing on the missing directory).
+tests/own_temp_dir.cpp now records the process that made the directory and removes it only from that process.
