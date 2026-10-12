@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6355 of 6625 pspocket&#x27;s own (95.9%), 45 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6365 of 6625 pspocket&#x27;s own (96.1%), 35 answered as RPCS3</text>
 <g><title>sys_libc: 1119 own, 0 answered as RPCS3, 0 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -6489,22 +6489,22 @@
 <rect x="785.5" y="307.0" width="5.8" height="6.4" fill="#9be9a8"/>
 <rect x="792.0" y="307.0" width="5.8" height="6.4" fill="#9be9a8"/>
 </g>
-<g><title>cellPrintUtility: 4 own, 10 answered as RPCS3, 0 not yet, of 14</title>
+<g><title>cellPrintUtility: 14 own, 0 answered as RPCS3, 0 not yet, of 14</title>
 <rect x="805.8" y="284.9" width="25.9" height="30.2" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="806.8" y="285.9" width="7.4" height="5.0" fill="#2da44e"/>
 <rect x="814.8" y="285.9" width="7.4" height="5.0" fill="#2da44e"/>
 <rect x="822.7" y="285.9" width="7.4" height="5.0" fill="#2da44e"/>
 <rect x="806.8" y="291.5" width="7.4" height="5.0" fill="#2da44e"/>
-<rect x="814.8" y="291.5" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="822.7" y="291.5" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="806.8" y="297.1" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="814.8" y="297.1" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="822.7" y="297.1" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="806.8" y="302.8" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="814.8" y="302.8" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="822.7" y="302.8" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="806.8" y="308.4" width="7.4" height="5.0" fill="#9be9a8"/>
-<rect x="814.8" y="308.4" width="7.4" height="5.0" fill="#9be9a8"/>
+<rect x="814.8" y="291.5" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="822.7" y="291.5" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="806.8" y="297.1" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="814.8" y="297.1" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="822.7" y="297.1" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="806.8" y="302.8" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="814.8" y="302.8" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="822.7" y="302.8" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="806.8" y="308.4" width="7.4" height="5.0" fill="#2da44e"/>
+<rect x="814.8" y="308.4" width="7.4" height="5.0" fill="#2da44e"/>
 </g>
 <g><title>cellDtcpIpUtility: 0 own, 13 answered as RPCS3, 0 not yet, of 13</title>
 <rect x="831.7" y="284.9" width="24.0" height="30.2" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
