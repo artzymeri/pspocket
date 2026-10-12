@@ -1111,6 +1111,40 @@ Element util_find_child(PPUContext& ctx, const Element& parent, std::string_view
     return find_child(m, parent, Text::of(name), nullptr, nullptr);
 }
 
+bool util_check_name(PPUContext& ctx, const Element& e, std::string_view name)
+{
+    Mem m(ctx);
+    return same(m, element_name(m, e), Text::of(name));
+}
+
+s32 util_get_float(PPUContext& ctx, const Element& e, std::string_view name, u32& out_bits)
+{
+    Mem m(ctx);
+    return get_value(m, e, Text::of(name), [&](const Attribute& a) {
+        u32 v1 = 0, v2 = 0;
+        const s32 r = attr_get(m, a, 2, v1, v2);
+        if (r == 0) out_bits = v1;
+        return r;
+    });
+}
+
+s32 util_get_string_host(PPUContext& ctx, const Element& e, std::string_view name, u32& out_str, u32& out_len)
+{
+    Mem m(ctx);
+    return get_value(m, e, Text::of(name), [&](const Attribute& a) -> s32 {
+        if (!a.doc) return err(CXML_ERROR_NO_DOCUMENT);
+        const u32 node = attr_node(m, a);
+        if (m.r32(node + 4) != 3) return err(CXML_ERROR_TYPE);
+        const u32 s = string_at(m, a.doc, m.r32(node + 8));
+        out_str = s;
+        if (!s) return err(CXML_ERROR_NO_DOCUMENT);
+        const u32 len = m.r32(node + 12);
+        if (m.r8(s + len)) return err(CXML_ERROR_BAD_TABLE);
+        out_len = len;
+        return 0;
+    });
+}
+
 u32 fixed_memory_begin(PPUContext& ctx, s32 n)
 {
     if (n != 0 && n != 1) {

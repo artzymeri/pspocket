@@ -282,6 +282,12 @@ s32 util_get_file(PPUContext& ctx, const Element& e, std::string_view name, File
 u32 file_address(PPUContext& ctx, const File& f);
 // The first child named `name` (and, when `attr` is given, whose ID attribute `attr` is `value`); {0, -1} for none.
 Element util_find_child(PPUContext& ctx, const Element& parent, std::string_view name);
+// For libsysutil's sub-libraries (D-925): cxmlutil::CheckElementName (an element of no document has no name, which
+// libsysutil reads at address 0: a Fault), GetFloat (the float's bits) and GetString with its outputs on the host (the
+// string's address is given whenever the attribute is a string, as libsysutil writes it first).
+bool util_check_name(PPUContext& ctx, const Element& e, std::string_view name);
+s32 util_get_float(PPUContext& ctx, const Element& e, std::string_view name, u32& out_bits);
+s32 util_get_string_host(PPUContext& ctx, const Element& e, std::string_view name, u32& out_str, u32& out_len);
 
 // ---- sysutil_cxmlutil (cellSysutilCxml.cpp).
 

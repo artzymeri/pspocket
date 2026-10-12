@@ -12633,3 +12633,38 @@ its SYN on librudp's real-time timer through the next clients' connections, and 
 datagram with a client's own depended on the machine's load (19 of 2,652 observations then, the status counters after it
 one datagram apart). The refused client now ends once its refusal is seen; three runs under the same load agree with
 Sony's module (0 of 2,648).
+
+## D-925 · 2026-10-12 · cellPrintUtility's ten from libsysutil_print, with a system side to test them
+
+Clone a's part of the sysutil sub-modules (its D-541, read from Sony's libsysutil_*.sprx, 4.92) brought to main for
+printing; its other modules there (BGDL, RtcAlarm, GameExec, RemotePlay) stay main's own (D-669..D-673). The ten
+functions RPCS3 left stubs now do what libsysutil_print does, through pspocket's libsysutil (D-534):
+runtime/hle/src/cellPrintUtility.cpp, over runtime/hle/src/sysutil_sub.hpp (a request's packet, FixedMemory, cxml
+document, send and reply read as the module's code does them, each step in its order; a fault where Sony's would read a
+bad pointer logs the call site, answers CELL_EFAULT and gives back what the request took).
+
+- **Channel 0, packet 0x11C, "PRIN".** The module keeps one callback, which its loads and configuration set and the
+  system's event 0x121 calls once through the dispatcher cellSysutilPrintInit registers (pspocket's: an internal
+  function, cellPrintUtility_PrintEvent); cellSysutilPrintShutdown unregisters it, clearing the callback when that
+  succeeds. Each request checks cellSysutilPacketBegin's answer, prints its failures through liblv2's printf ("doc.Write
+  failed 0x%x", "packet read error 0x%x.", "not enough receive buffer.", "get result failed 0x%x", "error from server.
+  (error=0x%x)") and clears the callback when it succeeds: cellPrintStartJob (a page count above 0 and color format 0,
+  else INVALID_PARAM before any request), EndJob, CancelJob, StartPage, EndPage, GetStatus (the file "p_status" copied
+  only when it is 44 bytes; any other size answers 0 with nothing copied and the callback kept), GetPrintableArea (its
+  first pointer checked as 64 bits).
+- **cellPrintSendBand works on channel 1:** the size sent is zeroed first, the document sent, then the band as the same
+  packet's raw data (once the system has read the document), and the reply's "p_send_size" written.
+- **LoadAsync, LoadAsync2, OpenConfig, UnloadAsync** stay as they were (sysutil_misc.cpp, their callbacks answered at
+  once); they keep no callback in the module's state.
+- **On pspocket's console** the channels are closed: every request answers 0x8002b007 and gives the channel back
+  (tests/hle/test_sysutil_more.cpp, "cellPrintUtility on pspocket's console", no firmware needed).
+- **Compared** with Sony's module through tests/hle/sysutil_sub_compare.hpp, `[sysutil]`: one fresh process calls the
+  module's exports, one pspocket's; after every call the answer, the script's memory, libsysutil's globals and
+  FixedMemory, the channels' shared memory, the lv2 calls of the script's thread and the requests the system side read.
+  The system side lays out a channel's ring as the system software does; a thread of the test's answers each request
+  with a queued reply (cxml documents built on the host) when the script's thread waits for it, and reads a packet out of
+  the ring for a writer waiting for room (SendBand's band behind its document); any other wait closes the channel.
+  56 calls, 891 lv2 calls, 33 requests answered (the dispatcher registered and unregistered, liblv2's printf output
+  among the lv2 calls): 0 differences.
+- **Outside the module's file:** sysutil_cxml.hpp and cellSysutilCxml.cpp (cxmlutil's CheckElementName, GetFloat and
+  GetString with host outputs), sysutil_more.cpp (the registration).
