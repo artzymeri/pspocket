@@ -13850,3 +13850,65 @@ Compared (tests/hle/test_fs_utility_init.cpp, the comparison in the gate with th
 in a game's process, the TTY's text included: 0 differ. sysutil_sub_compare.hpp now records each step's TTY lines (a
 script asks for them to be compared), compares the path arguments of the file system's calls by their text, knows the
 storage and mount calls' arguments, and PSPOCKET_TEST_DUMP=2 prints pspocket's run beside Sony's.
+
+## D-932 · 2026-10-12 · The CELP libraries pspocket's own (part 1: cellCelpEnc, the 16 kHz encoder)
+
+libcelpenc (cellCelpEnc, ten functions) is MPEG-4 CELP's wideband coder (ISO/IEC 14496-3 subpart 3: 16 kHz, regular
+pulse excitation, configurations 0 to 3 at 14400, 16000, 18667 and 22533 bit/s): a PPU library driving an SPU program.
+pspocket's (runtime/hle/src/cellCelpEnc.cpp) answers as the library does and does the SPU program's work on the host,
+bit for bit (celp_rpe_enc.cpp, with celp_math.cpp, celp_tables.cpp and celp_spu_fp.hpp shared with the other CELP
+libraries).
+
+What Sony's library does, and pspocket's with it:
+- QueryAttr: workMemSize 0xA600, versions 0x04000000 and 0x100. NULL: ARG.
+- Open: the resource copied (the game's is left alone); start not 0, PPU priority at most 0xBFF, SPU priority at most
+  0xFF, the handle (the start's next 128-byte boundary) and its 0x7D80 bytes within the memory; then the handle's state,
+  frame size and access unit size words zeroed, and only then 0x2800 bytes more wanted (ARG, the words zeroed already);
+  a SPURS instance of one SPU, a task set, two SPURS queues and the task made. OpenEx and OpenExt (one function in
+  libcelpenc): the game's SPURS (not 0) and maxContention 1 to 8, and they change the game's resource: its size less
+  the handle's memory and alignment, its start past the handle's memory (before the last check).
+- The state word (+0): open 1, started 2, a frame sent 3, its answer taken 4. Start (from 1 or 2; 2 ends first): RPE 1,
+  16 kHz 2, configuration up to 3, word size up to 1 (16-bit little-endian 0, float 1), else ARG, then the state
+  (SEQ); a frame is 160 samples in configuration 1 and 240 in the others (its bytes at +0x28, written before the end);
+  the SPU program sets its encoder up and answers with the header, 28 bytes, copied to outBuff (outSize 0 without
+  one). EncodeFrame: the state (2) first, then its pointer, the frame's address and its size, exactly a frame; the
+  frame copied into the handle and sent. WaitForOutput (only in 3) takes the answer; GetAu (auItem first, then state 4)
+  writes auItem {outBuffer, size} and copies the access unit (size 0 without a buffer); End (from 2 to 4) takes an
+  answer still waiting; Close from any open state, SEQ when closed.
+- The header: ".mp4", 0, 0x4003, 1, the sampling rate, the bit rate, a frame's bits twice (216, 160, 280, 338), 32 bits
+  of 0, 2, 6, then 14496-3's CelpHeader (RPE, 16 kHz, no fine rate control, the configuration), padded to a byte.
+- The first two access units are empty (the encoder looks two frames ahead); the others 27, 20, 35 or 43 bytes. Float
+  samples are scaled by 32767 on the SPU, in its single precision.
+
+The SPU program is the reference encoder (ISO/IEC 14496-5: Philips's phi_*.c, Matsushita's pan_*.c; DIN-DKE's copy of
+the reference software in external/usac-refsoft, never in the repository) compiled for the SPU, its loops vectorised.
+pspocket's encoder does its arithmetic: the SPU's single precision (truncation, denormals zero; pspocket's SPU model),
+every sum in the program's order and grouping (four lanes, vectors of four summed three at a time), its divisions
+(frest, fi and a Newton step), the SDK's cosf4 and acosf4, double precision where the program uses it. Where the SPU
+program differs from the reference software:
+- The input is not high-pass filtered.
+- The LSP root search starts its next interval differently; the LSP quantiser keeps four first-stage candidates and
+  compares in its own order; the LPC analysis accumulates in blocks of 16 samples.
+- The adaptive codebook's energy table gets only its newest row each subframe (the reference recomputes every row in a
+  frame's middle subframe); it has a row for each subframe's length of the codebook (6, 6, 8, 10).
+- The lag preselection compares each row's 16 values as a tournament for 40-sample subframes, in order for shorter.
+- For 30-sample subframes a candidate's filtered vector has two values more (the codebook's next samples after a full
+  convolution, the previous candidate's after the end correction), whose squares count in its energy, and the end
+  correction leaves values 24 to 27 the previous candidate's.
+- The fixed codebook fixes its Np-4 largest pulses only when more than Np-3 pulses are not zero (the reference: at
+  least Np-4).
+- The first-order fit's parameter is the previous frame's first reflection coefficient times 0.8, in double precision.
+
+Not reproduced: no SPURS instance, task set or queue is made (their errors cannot happen); the SPU program's own state
+(+0x2100 in the handle) is kept on the host; float samples of exponent 255 (on the SPU, numbers past FLT_MAX) are
+outside pspocket's SPU model.
+
+Compared (tests/hle/test_celp_compare.cpp, the user's firmware 4.92): QueryAttr; Open's, OpenEx's and OpenExt's checks,
+the handles and the resources they change; every call in every state; Start's eight headers; 332 frames of ten kinds
+of synthetic audio (speech-like, sines, a chirp, noise, a square wave, impulses, noise in a sample's last bits, a
+constant, gated speech, silence) in each configuration and word size, every access unit byte for byte: 0 of 1925
+observations differ. Before that, in a scratch harness running Sony's SPU program's functions under pspocket's SPU
+interpreter (inventory/, never in the repository), every intermediate of the encoder (the LPC analysis and its LSPs,
+the quantiser, each subframe's targets, energies, lag candidates, searches and states) for every subframe of 30 to 60
+frames in each configuration: 0 differences. Without the firmware, test_celp_compare.cpp encodes speech through the
+library and decodes it with pspocket's CELP decoder (part 2): about 6 dB SNR in each configuration.
