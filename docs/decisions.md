@@ -13494,3 +13494,17 @@ of the first CellFsStat's ctime). Both runs share one tree of host files: the fi
 file's ctime to the host's clock, which the second run's first cellFsStat then reads, so the two first stats agree
 only when no second boundary falls between the tree's making and the first run's change. The two stats' ctimes (the
 host's clock, not libfs's doing) are no longer compared; their other fields still are. Alone it agreed every time.
+
+## D-929 · 2026-10-12 · cellGamePs1Emu's one function: the PS1 emulator's pad rumble request
+
+libsysutil_game_ps1emu.sprx (4.92, sys/internal) exports one function nothing names, 0x61CE2BCD; RPCS3 does not know
+it. Read from the module: a request "setPadRumble" with "elmMode" (0 or 1, else 0x8002CB07 before any request) on
+libsysutil's channel 1, packet 0x129, magic "GPS1", in FixedMemory 1. Each step's failure is the answer (the element,
+the attribute, the write: on pspocket's console the closed channel's 0x8002b007, D-534; the reply's read); the reply
+is made a document from FixedMemory's whole 0x6000 bytes and its "elmResult" read through the request's element (the
+module keeps it: the reply's tree at the same offset, the root, whose name is not looked at). pspocket's,
+runtime/hle/src/cellGamePs1Emu.cpp, makes the same calls through sysutil_sub.hpp (D-925), its libsysutil calls answered
+as the exports answer them (as_export, D-926). Compared with Sony's module (tests/hle/test_sysutil_more.cpp): the
+closed channel, the mode's check, a system answering with results, another root, no result, a result that is a string,
+no reply, a truncated one: 13 calls, 209 lv2 calls, 6 requests answered, 0 differences. The module's start and stop do
+nothing a game sees.
