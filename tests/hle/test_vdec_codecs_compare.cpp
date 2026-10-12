@@ -596,6 +596,20 @@ Observed mpeg4(const Setup& s, bool sony_half)
     for (const u32 codec : {CODEC_DIVX, CODEC_MPEG4})
         decode(r, std::format("{} 96x64 with a colour description", codec == CODEC_DIVX ? "DivX" : "MPEG-4"),
             stream(codec, codec == CODEC_DIVX ? 10 : 0, coloured), 96, 64, Rule::within(1));
+    if (s.ours_on_firmware) {
+        // The cores under Sony's libvdec only (D-920): B pictures, which libsmvd4 does not decode (their frame buffers
+        // as they were); libsmvd4's interlaced pictures (in error, undecoded) and quarter sample motion (taken as half
+        // sample motion).
+        const std::vector<std::vector<u8>> with_b =
+            encode(AV_CODEC_ID_MPEG4, 96, 64, 7, 6, [](AVCodecContext* av) { av->max_b_frames = 2; });
+        const std::vector<std::vector<u8>> qpel =
+            encode(AV_CODEC_ID_MPEG4, 96, 64, 4, 4, [](AVCodecContext* av) { av->flags |= AV_CODEC_FLAG_QPEL; });
+        for (const u32 codec : {CODEC_DIVX, CODEC_MPEG4})
+            decode(r, std::format("{} 96x64 with B pictures", codec == CODEC_DIVX ? "DivX" : "MPEG-4"),
+                stream(codec, codec == CODEC_DIVX ? 10 : 0, with_b), 96, 64, Rule::within(1));
+        decode(r, "MPEG-4 96x64 interlaced", stream(CODEC_MPEG4, 0, interlaced), 96, 64, Rule::within(1));
+        decode(r, "MPEG-4 96x64 quarter samples", stream(CODEC_MPEG4, 0, qpel), 96, 64, Rule::within(1));
+    }
     return std::move(r.o);
 }
 
@@ -799,11 +813,12 @@ TEST_CASE("The DivX 3.11 core under Sony's libvdec: pspocket's against Sony's", 
     run(s, "libdivx311dec under Sony's libvdec", [&](bool sony) { return divx311(s, sony); }, [](const Observed&) {});
 }
 
-TEST_CASE("The DivX core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+TEST_CASE("The DivX and MPEG-4 cores under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
 {
     if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP(kNoDivx);
     const Setup s = cores_setup();
-    run(s, "libdivxdec under Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); }, [](const Observed&) {});
+    run(s, "libdivxdec and libsmvd4 under Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); },
+        [](const Observed&) {});
 }
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX and as MPEG-4",

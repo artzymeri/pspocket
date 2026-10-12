@@ -5,21 +5,31 @@
 // answer and output structure, the frame buffers' places (as offsets into the core's memory) and their contents (the
 // IDCT may round one step apart, as D-912 accepts for DivX and MPEG-4; VC-1 exactly), the pictures' order and the
 // errors. The cores' own memory (their state, SPU tasks' areas) is opaque: not compared. Skipped without the firmware
-// (compare_util.hpp) and without FFmpeg's encoders. No game data. libdivx311dec and libdivxdec so far.
+// (compare_util.hpp) and without FFmpeg's encoders. No game data. libdivx311dec, libdivxdec and libsmvd4 so far.
 
 #include <catch_amalgamated.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "compare_util.hpp"
 #include "vdec_streams.hpp"
+
+#if PSPOCKET_HAVE_FFMPEG
+extern "C" {
+#include <libavutil/opt.h>
+}
+#endif
 
 using namespace pspocket;
 using namespace pspocket::hle::test;
@@ -452,6 +462,178 @@ std::vector<u8> with_fixed_vop_rate(const std::vector<u8>& packet, u32 increment
     return out;
 }
 
+// The first packet of FFmpeg's stream with VBV parameters in its video object layer (FFmpeg's encoder writes none):
+// bit rate 0x12345 (halves 0x2 and 0x2345), buffer size 0x1A3 (0x34 and 3), occupancy 0x5678 (0x0 and 0x5678).
+std::vector<u8> with_vbv(const std::vector<u8>& packet)
+{
+    const usize at = start_code_at(packet, 0x20);
+    REQUIRE(at < packet.size());
+    const usize next = start_code_at(packet, 0xB2, at + 4) < packet.size() ? start_code_at(packet, 0xB2, at + 4)
+                                                                           : start_code_at(packet, 0xB6, at + 4);
+    const std::vector<u8> vol(packet.begin() + static_cast<std::ptrdiff_t>(at + 4),
+        packet.begin() + static_cast<std::ptrdiff_t>(next));
+    BitReader r{vol};
+    BitWriter w;
+    const auto copy = [&](u32 n) { w.put(r.bits(n), n); };
+    copy(1 + 8);
+    const u32 ident = r.bits(1);
+    w.put(ident, 1);
+    if (ident) copy(4 + 3);
+    const u32 aspect = r.bits(4);
+    w.put(aspect, 4);
+    if (aspect == 15) copy(16);
+    const u32 control = r.bits(1);
+    REQUIRE(control == 1);
+    w.put(1, 1);
+    copy(3); // chroma_format, low_delay
+    REQUIRE(r.bits(1) == 0);
+    w.put(1, 1); // vbv_parameters
+    w.put(0x2, 15);
+    w.put(1, 1);
+    w.put(0x2345, 15);
+    w.put(1, 1);
+    w.put(0x34, 15);
+    w.put(1, 1);
+    w.put(3, 3);
+    w.put(0, 11);
+    w.put(1, 1);
+    w.put(0x5678, 15);
+    w.put(1, 1);
+    // The rest without its stuffing (a 0, then 1s to the byte), stuffed again.
+    usize end = vol.size() * 8;
+    while (end > 0 && ((vol[(end - 1) / 8] >> (7 - (end - 1) % 8)) & 1)) end--;
+    end--;
+    while (r.pos < end) w.put(r.bits(1), 1);
+    w.put(0, 1);
+    while (w.n % 8) w.put(1, 1);
+    std::vector<u8> out(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(at + 4));
+    out.insert(out.end(), w.out.begin(), w.out.end());
+    out.insert(out.end(), packet.begin() + static_cast<std::ptrdiff_t>(next), packet.end());
+    return out;
+}
+
+// The first packet with its video object layer rewritten without its layer identifier and control parameters (as
+// FFmpeg's FF_BUG_MS writes it), the bits after them as they were.
+std::vector<u8> with_plain_vol(const std::vector<u8>& packet)
+{
+    const usize at = start_code_at(packet, 0x20);
+    REQUIRE(at < packet.size());
+    const usize next = start_code_at(packet, 0xB2, at + 4) < packet.size() ? start_code_at(packet, 0xB2, at + 4)
+                                                                           : start_code_at(packet, 0xB6, at + 4);
+    const std::vector<u8> vol(packet.begin() + static_cast<std::ptrdiff_t>(at + 4),
+        packet.begin() + static_cast<std::ptrdiff_t>(next));
+    BitReader r{vol};
+    BitWriter w;
+    const auto copy = [&](u32 n) { w.put(r.bits(n), n); };
+    copy(1 + 8);
+    REQUIRE(r.bits(1) == 1);
+    r.bits(4 + 3);
+    w.put(0, 1); // is_object_layer_identifier
+    const u32 aspect = r.bits(4);
+    w.put(aspect, 4);
+    if (aspect == 15) copy(16);
+    REQUIRE(r.bits(1) == 1);
+    r.bits(3);
+    REQUIRE(r.bits(1) == 0);
+    w.put(0, 1); // vol_control_parameters
+    usize end = vol.size() * 8;
+    while (end > 0 && ((vol[(end - 1) / 8] >> (7 - (end - 1) % 8)) & 1)) end--;
+    end--;
+    while (r.pos < end) w.put(r.bits(1), 1);
+    w.put(0, 1);
+    while (w.n % 8) w.put(1, 1);
+    std::vector<u8> out(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(at + 4));
+    out.insert(out.end(), w.out.begin(), w.out.end());
+    out.insert(out.end(), packet.begin() + static_cast<std::ptrdiff_t>(next), packet.end());
+    return out;
+}
+
+// A video object layer's fields as make_vol writes them (FFmpeg's stream's coding fields: 25 ticks a second, 96x64,
+// progressive, OBMC off, 8 bits, H.263 quantisation, no estimation, no resync markers, no partitions, no scalability).
+struct VolFields {
+    u32 random_access = 0, type = 1, ident = 1, verid = 1, priority = 1, aspect = 1, par_w = 0, par_h = 0;
+    u32 control = 1, chroma = 1, low_delay = 1, vbv = 0;
+    u32 width = 96, height = 64;
+};
+
+// The first packet with its visual object header and video object layer replaced: the visual object's identifier
+// (`vo_ident`, verid 1 and priority 1 when present) and a layer written from `f`.
+std::vector<u8> with_vol(const std::vector<u8>& packet, const VolFields& f, u32 vo_ident = 1)
+{
+    const usize vo = start_code_at(packet, 0xB5), vo_start = start_code_at(packet, 0x00, vo + 4);
+    const usize at = start_code_at(packet, 0x20);
+    REQUIRE((vo < packet.size() && vo_start < packet.size() && at < packet.size()));
+    const usize next = start_code_at(packet, 0xB2, at + 4) < packet.size() ? start_code_at(packet, 0xB2, at + 4)
+                                                                           : start_code_at(packet, 0xB6, at + 4);
+    BitWriter o;
+    o.put(vo_ident, 1);
+    if (vo_ident) {
+        o.put(1, 4);
+        o.put(1, 3);
+    }
+    o.put(1, 4); // video object
+    o.put(0, 1); // no video signal type
+    o.put(0, 1);
+    while (o.n % 8) o.put(1, 1);
+    BitWriter w;
+    w.put(f.random_access, 1);
+    w.put(f.type, 8);
+    w.put(f.ident, 1);
+    if (f.ident) {
+        w.put(f.verid, 4);
+        w.put(f.priority, 3);
+    }
+    w.put(f.aspect, 4);
+    if (f.aspect == 15) {
+        w.put(f.par_w, 8);
+        w.put(f.par_h, 8);
+    }
+    w.put(f.control, 1);
+    if (f.control) {
+        w.put(f.chroma, 2);
+        w.put(f.low_delay, 1);
+        w.put(f.vbv, 1);
+        if (f.vbv) {
+            for (const auto& [v, n] : {std::pair{1u, 15u}, {1u, 1u}, {2u, 15u}, {1u, 1u}, {3u, 15u}, {1u, 1u}, {4u, 3u},
+                     {5u, 11u}, {1u, 1u}, {6u, 15u}, {1u, 1u}})
+                w.put(v, n);
+        }
+    }
+    const u32 verid = f.ident ? f.verid : 1;
+    w.put(0, 2);  // rectangular
+    w.put(1, 1);
+    w.put(25, 16);
+    w.put(1, 1);
+    w.put(0, 1);  // no fixed VOP rate
+    w.put(1, 1);
+    w.put(f.width, 13);
+    w.put(1, 1);
+    w.put(f.height, 13);
+    w.put(1, 1);
+    w.put(0, 1);  // progressive
+    w.put(1, 1);  // obmc_disable
+    w.put(0, verid == 1 ? 1 : 2); // sprite_enable
+    w.put(0, 1);  // not_8_bit
+    w.put(0, 1);  // quant_type
+    if (verid != 1) w.put(0, 1); // quarter_sample
+    w.put(1, 1);  // complexity_estimation_disable
+    w.put(1, 1);  // resync_marker_disable
+    w.put(0, 1);  // data_partitioned
+    if (verid != 1) {
+        w.put(0, 1); // newpred_enable
+        w.put(0, 1); // reduced_resolution_vop_enable
+    }
+    w.put(0, 1); // scalability
+    w.put(0, 1);
+    while (w.n % 8) w.put(1, 1);
+    std::vector<u8> out(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(vo + 4));
+    out.insert(out.end(), o.out.begin(), o.out.end());
+    out.insert(out.end(), packet.begin() + static_cast<std::ptrdiff_t>(vo_start), packet.begin() + static_cast<std::ptrdiff_t>(at + 4));
+    out.insert(out.end(), w.out.begin(), w.out.end());
+    out.insert(out.end(), packet.begin() + static_cast<std::ptrdiff_t>(next), packet.end());
+    return out;
+}
+
 // The first packet with its visual object header replaced by one with a video signal type and colour description.
 std::vector<u8> with_colour(const std::vector<u8>& packet, u8 primaries, u8 transfer, u8 matrix)
 {
@@ -870,6 +1052,721 @@ Observed divx(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// ------------------------------------------------------------------------------------------------- MPEG-4
+
+// The MPEG-4 calls' other arguments: SetAuxData's 16 bytes, GetSideInfoPic's and GetAuxData's two outputs and count,
+// GetSideInfoSeq's output.
+constexpr u32 kAux = kArg + 0x200, kSide = kArg + 0x300, kAuxOut = kArg + 0x380, kSeq = kArg + 0x400,
+              kCount = kArg + 0x480;
+
+// smvd4CreateInstance2's parameters: the type (4: the memory for a level, 5: for a size, words 8 and 9), word 1 and the
+// taskset (word 7).
+void smvd4_param(u8* b, u32 type, u32 taskset, u32 w = 0, u32 h = 0, u32 word1 = 0)
+{
+    std::memset(b + kParam, 0, 0x28);
+    ps_write32(b, kParam + 0x00, type);
+    ps_write32(b, kParam + 0x04, word1);
+    ps_write32(b, kParam + 0x1C, taskset);
+    ps_write32(b, kParam + 0x20, w);
+    ps_write32(b, kParam + 0x24, h);
+}
+
+// libsmvd4's frame buffer (strips with 16 lines and samples of edge; the luma's lines to 32 for the allocation).
+u32 smvd4_frame_bytes(u32 w, u32 h) { return (((h + 31) & ~31u) + 32) * (((w + 15) & ~15u) + 32) * 3 / 2 + 0x80; }
+
+// The VOP an access unit begins with, for the test's bookkeeping: its type (I 0, P 1, B 2, S 3; none 4) and whether it
+// is coded (the test's streams have 25 ticks a second: 5 bits of time increment).
+struct VopKind {
+    u32 type = 4;
+    bool coded = true;
+};
+VopKind vop_kind(const std::vector<u8>& au)
+{
+    const usize at = start_code_at(au, 0xB6);
+    if (at + 4 >= au.size()) return {};
+    BitReader br{au, (at + 4) * 8};
+    VopKind k;
+    k.type = br.bits(2);
+    while (br.bits(1)) {
+    }
+    br.bits(1 + 5 + 1);
+    k.coded = br.bits(1) != 0;
+    return k;
+}
+
+struct Smvd4 {
+    Run& r;
+    u32 handle = 0, width = 0, height = 0;
+    u32 taken = 0;
+    u32 at = kStream;
+    // Pictures pspocket does not reproduce (each is a note, its frame's sum): a VOP damaged on purpose (FFmpeg conceals
+    // what is missing otherwise than Sony's program) and the P pictures after it, until the next I picture. A picture
+    // whose frame Sony's program does not write (B, not coded, interlaced) is a note when its slot's frame was one.
+    bool broken = false;
+    bool interlaced = false; // the stream's VOPs are not decoded (an interlaced layer)
+    std::set<u32> broken_users{};
+    std::set<u32> stale_users{};
+    std::map<u32, bool> broken_slot{}; // by the picture's luma address
+    std::deque<u32> pending{};         // the users of the pictures decoded and not taken, in decoding order
+    // A P picture with no anchor is predicted from the third slot's frame; decoded into that slot itself, Sony's
+    // program overwrites its reference as it decodes, so a few samples come out up to 2 steps off pspocket's (which
+    // predicts from the whole old frame), and so do the pictures predicted from it: those compare within 2 steps.
+    bool no_anchor = true, chain_approx = false;
+    std::set<u32> anchorless_users{};
+    std::map<u32, bool> approx_slot{};
+    u32 slot2_luma() const { return kMem + 0x14A80 + 2 * smvd4_frame_bytes(width, height) + (height + 48) * 16; }
+
+    std::string w(u32 v) { return std::format("{:#x}", v); }
+
+    // The core's own state after a call, as a note (opaque, not compared): its sequence information, its words, its
+    // picture queue and the pictures' information.
+    void note_state(const std::string& key)
+    {
+        if (!handle || !env_on("PSPOCKET_CORE_STATE")) return;
+        u8* b = r.b;
+        r.o.note(key + ": seq " + compare::hex(b + handle + 0x80, 0x34));
+        r.o.note(key + ": words " + compare::hex(b + handle + 0x100, 0x6C));
+        r.o.note(key + ": queue " + compare::hex(b + handle + 0x680, 4) + " " + compare::hex(b + handle + 0x700, 4) +
+                 " " + compare::hex(b + handle + 0x780, 0x10));
+        const u32 entries = ps_read32(b, handle + 0x600);
+        if (entries >= kMem && entries < kMem + kMemSize) {
+            std::string e;
+            for (u32 k = 0; k < 8; k++) e += compare::hex(b + entries + k * 0x80, 8) + " ";
+            r.o.note(key + ": entries " + e + compare::hex(b + entries + 0x400, 8));
+        }
+        for (u32 k = 0; k < 3; k++)
+            r.o.note(std::format("{}: picture {} ", key, k) + compare::hex(b + handle + 0x280 + k * 0x100, 0x90));
+    }
+
+    // Each picture the core holds: GetNumPicture, then GetPicture (its nine words, the addresses as offsets), its side
+    // information and auxiliary data, its frame buffer; ReleasePicture after each when `release`.
+    void take(const std::string& when, bool release, u32 limit = ~0u)
+    {
+        u8* b = r.b;
+        ps_write32(b, kOut, 0xEEEEEEEE);
+        r.r("smvd4GetNumPicture", {handle, kOut}, when + ": GetNumPicture");
+        r.o.line(when + ": pictures", w(ps_read32(b, kOut)));
+        for (u32 k = 0; k < limit; k++) {
+            std::memset(b + kPic, 0xEE, 0x30);
+            const std::string key = std::format("{}: picture {}", when, taken);
+            r.r("smvd4GetPicture", {handle, kPic}, key + ": GetPicture");
+            if (ps_read32(b, kPic + 12) == 0xEEEEEEEE) return; // none
+            taken++;
+            const u32 luma = ps_read32(b, kPic), cb = ps_read32(b, kPic + 4), cr = ps_read32(b, kPic + 8);
+            r.o.line(key + ": luma", in_core(luma));
+            r.o.line(key + ": Cb", in_core(cb));
+            r.o.line(key + ": Cr", in_core(cr));
+            std::vector<u8> words(b + kPic, b + kPic + 0x30);
+            std::memset(words.data(), 0, 12);
+            r.o.line(key + ": the picture", compare::hex(words));
+            std::memset(b + kSide, 0xEE, 0x40);
+            ps_write32(b, kCount, 0xEEEEEEEE);
+            r.r("smvd4GetSideInfoPic", {handle, kCount, kSide, kSide + 0x20}, key + ": GetSideInfoPic");
+            r.o.line(key + ": side information", w(ps_read32(b, kCount)) + " " + compare::hex(b + kSide, 0x40));
+            std::memset(b + kAuxOut, 0xEE, 0x20);
+            ps_write32(b, kCount, 0xEEEEEEEE);
+            r.r("smvd4GetAuxData", {handle, kCount, kAuxOut, kAuxOut + 0x10}, key + ": GetAuxData");
+            r.o.line(key + ": auxiliary data", w(ps_read32(b, kCount)) + " " + compare::hex(b + kAuxOut, 0x20));
+            // The picture's frame, laid out for its own size in its slot.
+            const u32 pw = ps_read32(b, kPic + 16), ph = ps_read32(b, kPic + 20);
+            const u32 lines = ((ph + 15) & ~15u) + 32;
+            const u32 frame = luma - (lines * 16 + 16 * 16), bytes = smvd4_frame_bytes(pw, ph) - 0x80;
+            u32 user = ~0u;
+            if (!pending.empty()) {
+                user = pending.front();
+                pending.pop_front();
+            }
+            bool note = broken_users.contains(user);
+            bool approx = false;
+            if (stale_users.contains(user)) {
+                note = broken_slot[luma];
+                approx = approx_slot[luma];
+            } else {
+                broken_slot[luma] = note;
+                if (anchorless_users.contains(user)) approx = luma == slot2_luma() || approx_slot[slot2_luma()];
+                else approx = chain_approx;
+                approx_slot[luma] = approx;
+                chain_approx = approx;
+            }
+            if (luma >= kMem && frame >= kMem && frame + bytes <= kMem + kMemSize && pw <= 1920 && ph <= 1088) {
+                if (note) {
+                    u32 sum = 0;
+                    for (u32 i = 0; i < bytes; i++) sum += b[frame + i];
+                    r.o.note(std::format("{}: its frame buffer's sum {:#x} (not reproduced)", key, sum));
+                    if (env_on("PSPOCKET_CORE_STATE"))
+                        r.o.bytes(key + ": its frame buffer (a probe's)", b + frame, bytes);
+                } else {
+                    r.o.bytes(key + ": its frame buffer", b + frame, bytes, Rule::within(approx ? 2 : 1));
+                }
+            }
+            if (release) r.r("smvd4ReleasePicture", {handle}, key + ": ReleasePicture");
+        }
+    }
+
+    // SetAuxData (16 bytes of the caller's), then DecodePicture(handle, au {address, size, a word}, out). `damaged`:
+    // the access unit's VOP is damaged on purpose (its picture not reproduced).
+    u64 decode(const std::string& key, const std::vector<u8>& au, u32 user, bool aux = true, bool damaged = false)
+    {
+        u8* b = r.b;
+        if (at + au.size() > kStream + 0x80000) at = kStream;
+        std::memcpy(b + at, au.data(), au.size());
+        if (aux) {
+            for (u32 k = 0; k < 4; k++) ps_write32(b, kAux + 4 * k, (0x1000 << k) + user);
+            r.r("smvd4SetAuxData", {handle, kAux}, key + ": SetAuxData");
+        }
+        ps_write32(b, kAu + 0, at);
+        ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
+        ps_write32(b, kAu + 8, 0x5000 + user);
+        at = (at + static_cast<u32>(au.size()) + 15) & ~15u;
+        ps_write32(b, kStatus, 0xEEEEEEEE);
+        u64 v = 0;
+        if (interlaced) {
+            // Bit 2 of an interlaced P VOP's warning comes from its macroblocks in Sony's program (not reproduced):
+            // compared without it, the answer itself a note.
+            const std::optional<u64> got = r.side.call("smvd4DecodePicture", {handle, kAu, kStatus});
+            v = got ? *got : ~u64{0};
+            r.o.line(key + " (bit 2 aside)", got ? answer(static_cast<u32>(v) & ~4u) : std::string("(not exported)"));
+            r.o.note(key + ": " + answer(v));
+        } else {
+            v = r.r("smvd4DecodePicture", {handle, kAu, kStatus}, key);
+        }
+        r.o.line(key + ": out", w(ps_read32(b, kStatus)));
+        flag(key);
+        note_state(key);
+        // The test's bookkeeping: whether a picture came out, and whether pspocket reproduces its frame.
+        const u32 a = static_cast<u32>(v);
+        if (a == 0 || (a >= 0x80615100 && a < 0x80615110)) {
+            const VopKind k = vop_kind(au);
+            pending.push_back(user);
+            if (interlaced || !k.coded || k.type >= 2) {
+                stale_users.insert(user);
+            } else if (k.type == 0) {
+                broken = damaged;
+                if (damaged) broken_users.insert(user);
+                no_anchor = false;
+            } else if (k.type == 1) {
+                if (broken || damaged) {
+                    broken = true;
+                    broken_users.insert(user);
+                }
+                if (no_anchor) anchorless_users.insert(user);
+                no_anchor = false;
+            }
+        }
+        return v;
+    }
+
+    void flag(const std::string& key)
+    {
+        ps_write32(r.b, kOut, 0xEEEEEEEE);
+        r.r("smvd4GetExistenceFlag", {handle, kOut}, key + ": GetExistenceFlag");
+        r.o.line(key + ": the flag", w(ps_read32(r.b, kOut)));
+    }
+
+    void seq(const std::string& key)
+    {
+        std::memset(r.b + kSeq, 0xEE, 0x40);
+        r.r("smvd4GetSideInfoSeq", {handle, kSeq}, key + ": GetSideInfoSeq");
+        r.o.line(key + ": the sequence", compare::hex(r.b + kSeq, 0x40));
+    }
+
+    // Initialize, CancelDecode and FlushPicture, with the test's bookkeeping.
+    u64 init(const std::string& key)
+    {
+        broken = false;
+        no_anchor = true;
+        pending.clear();
+        return r.r("smvd4Initialize", {handle}, key);
+    }
+    u64 cancel(const std::string& key)
+    {
+        broken = false;
+        no_anchor = true;
+        pending.clear();
+        return r.r("smvd4CancelDecode", {handle}, key);
+    }
+    u64 flush(const std::string& key)
+    {
+        no_anchor = true;
+        const u64 v = r.r("smvd4FlushPicture", {handle}, key);
+        note_state(key);
+        return v;
+    }
+
+    // A whole stream, each picture taken and released as soon as there is one; then the flush.
+    void stream(const std::string& what, const std::vector<std::vector<u8>>& aus, u32 user0)
+    {
+        for (usize i = 0; i < aus.size(); i++) {
+            decode(std::format("{}: DecodePicture {}", what, i), aus[i], user0 + static_cast<u32>(i));
+            take(std::format("{}: after DecodePicture {}", what, i), true);
+        }
+        flush(what + ": FlushPicture");
+        take(what + ": after FlushPicture", true);
+    }
+};
+
+Observed smvd4(const Setup& s, bool sony_half)
+{
+    Run r(s, sony_half, "libsmvd4");
+    u8* b = r.b;
+    make_spurs(r);
+    Smvd4 d{r};
+    // The memory queries: each level's largest picture, and sizes within them.
+    for (u32 level = 0; level <= 8; level++) {
+        ps_write32(b, kOut, 0xEEEEEEEE);
+        r.r("smvd4GetMemorySize", {kOut, level}, std::format("GetMemorySize level {}", level));
+        r.o.line(std::format("GetMemorySize level {}: the size", level), d.w(ps_read32(b, kOut)));
+    }
+    r.r("smvd4GetMemorySize", {0, 1}, "GetMemorySize with no output");
+    for (const auto& [level, wd, ht] : {std::tuple{1u, 96u, 64u}, {1u, 176u, 144u}, {1u, 177u, 144u}, {1u, 176u, 145u},
+             {0u, 720u, 576u}, {6u, 16u, 16u}, {1u, 0u, 64u}, {1u, 96u, 0u}, {7u, 96u, 64u}, {5u, 640u, 480u},
+             {5u, 0xFFFFFFFFu, 64u}}) {
+        smvd4_param(b, 5, 0, wd, ht);
+        ps_write32(b, kOut, 0xEEEEEEEE);
+        const std::string key = std::format("GetMemorySize2 level {} {}x{}", level, wd, ht);
+        r.r("smvd4GetMemorySize2", {kOut, level, kParam}, key);
+        r.o.line(key + ": the size", d.w(ps_read32(b, kOut)));
+    }
+    smvd4_param(b, 4, 0, 96, 64);
+    ps_write32(b, kOut, 0xEEEEEEEE);
+    r.r("smvd4GetMemorySize2", {kOut, 1, kParam}, "GetMemorySize2 type 4");
+    r.o.line("GetMemorySize2 type 4: the size", d.w(ps_read32(b, kOut)));
+    r.r("smvd4GetMemorySize2", {kOut, 1, 0}, "GetMemorySize2 with no parameters");
+    r.r("smvd4GetMemorySize2", {0, 1, kParam}, "GetMemorySize2 with no output");
+    ps_write32(b, kOut, 0xEEEEEEEE);
+    r.r("smvd4GetVersionNumber", {kOut}, "GetVersionNumber");
+    r.o.line("GetVersionNumber: the version", d.w(ps_read32(b, kOut)));
+
+    const std::vector<std::vector<u8>> plain = encode(AV_CODEC_ID_MPEG4, 96, 64, 10, 4);
+    smvd4_param(b, 5, kTs, 96, 64);
+    ps_write32(b, kOut, 0);
+    r.r("smvd4GetMemorySize2", {kOut, 1, kParam}, "GetMemorySize2 for the decoder");
+    const u32 need = ps_read32(b, kOut);
+    // CreateInstance2's refusals.
+    std::memset(b + kMem, 0xA5, need + 0x1000);
+    r.r("smvd4CreateInstance2", {0, need, 1, kParam}, "CreateInstance2 with no memory");
+    r.r("smvd4CreateInstance2", {kMem + 0x40, need, 1, kParam}, "CreateInstance2 with memory not aligned");
+    r.r("smvd4CreateInstance2", {kMem, need, 1, 0}, "CreateInstance2 with no parameters");
+    for (const u32 type : {0u, 1u, 2u, 3u, 6u}) {
+        smvd4_param(b, type, kTs, 96, 64);
+        r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, std::format("CreateInstance2 type {}", type));
+    }
+    smvd4_param(b, 5, 0, 96, 64);
+    r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "CreateInstance2 with no taskset");
+    std::memset(b + kData + 0x7000, 0, 0x1000);
+    smvd4_param(b, 5, kData + 0x7000, 96, 64);
+    r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "CreateInstance2 with a taskset that is none");
+    smvd4_param(b, 5, kTs, 96, 64);
+    r.r("smvd4CreateInstance2", {kMem, need - 1, 1, kParam}, "CreateInstance2 with one byte less");
+    r.r("smvd4CreateInstance2", {kMem, need, 7, kParam}, "CreateInstance2 level 7");
+    smvd4_param(b, 5, kTs, 200, 64);
+    r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "CreateInstance2 200x64 level 1");
+    smvd4_param(b, 4, kTs, 96, 64);
+    r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "CreateInstance2 type 4 level 1 with too little");
+    // The decoder.
+    smvd4_param(b, 5, kTs, 96, 64);
+    std::memset(b + kMem, 0xA5, need + 0x1000);
+    d.width = 96;
+    d.height = 64;
+    if (r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "CreateInstance2") == 0) {
+        d.handle = kMem;
+        d.note_state("CreateInstance2");
+        d.flag("after CreateInstance2");
+        d.seq("after CreateInstance2");
+        r.r("smvd4GetPicture", {d.handle, kPic}, "GetPicture before Initialize");
+        r.r("smvd4ReleasePicture", {d.handle}, "ReleasePicture before Initialize");
+        d.init("Initialize");
+        d.note_state("Initialize");
+        d.flag("after Initialize");
+        d.seq("after Initialize");
+        d.stream("plain", plain, 10);
+        d.flag("after the stream");
+        d.seq("after the stream");
+        // Pictures held: how many access units the core takes before it has no frame buffer.
+        d.init("Initialize for holding");
+        for (usize i = 0; i < 5; i++)
+            d.decode(std::format("held: DecodePicture {}", i), plain[i], 100 + static_cast<u32>(i));
+        d.take("held", false, 1);
+        r.r("smvd4ReleasePicture", {d.handle}, "held: ReleasePicture");
+        d.decode("held: DecodePicture again", plain[3], 110);
+        d.take("held, then", true);
+        r.r("smvd4ReleasePicture", {d.handle}, "held: ReleasePicture once too many");
+        // Discontinue and CancelDecode in a stream.
+        d.init("Initialize 2");
+        d.decode("Discontinue: DecodePicture 0", plain[0], 200);
+        d.decode("Discontinue: DecodePicture 1", plain[1], 201);
+        r.r("smvd4Discontinue", {d.handle}, "Discontinue");
+        d.note_state("Discontinue");
+        d.take("after Discontinue", true);
+        d.decode("Discontinue: DecodePicture 2", plain[2], 202);
+        d.take("after Discontinue: DecodePicture 2", true);
+        d.decode("CancelDecode: DecodePicture 3", plain[3], 203);
+        d.cancel("CancelDecode");
+        d.note_state("CancelDecode");
+        d.take("after CancelDecode", true);
+        d.decode("CancelDecode: DecodePicture 4", plain[4], 204);
+        d.take("after CancelDecode: DecodePicture 4", true);
+        d.decode("a P picture after CancelDecode", plain[5], 205);
+        d.take("after a P picture after CancelDecode", true);
+        // The checks.
+        d.init("Initialize 3");
+        d.decode("a P picture first", plain[1], 300);
+        d.take("a P picture first", true);
+        d.decode("without SetAuxData", plain[0], 301, false);
+        d.take("without SetAuxData", true);
+        r.r("smvd4SetAuxData", {d.handle, 0}, "SetAuxData with no data");
+        r.r("smvd4DecodePicture", {d.handle, 0, kStatus}, "DecodePicture with no access unit");
+        r.r("smvd4DecodePicture", {d.handle, kAu, 0}, "DecodePicture with no output");
+        ps_write32(b, kAu + 4, 0);
+        r.r("smvd4DecodePicture", {d.handle, kAu, kStatus}, "DecodePicture with size 0");
+        d.take("after size 0", true);
+        r.r("smvd4GetNumPicture", {d.handle, 0}, "GetNumPicture with no output");
+        r.r("smvd4GetPicture", {d.handle, 0}, "GetPicture with no output");
+        r.r("smvd4GetSideInfoPic", {d.handle, kCount, kSide, 0}, "GetSideInfoPic with no second output");
+        r.r("smvd4GetAuxData", {d.handle, kCount, kAuxOut, 0}, "GetAuxData with no second output");
+        r.r("smvd4GetSideInfoSeq", {d.handle, 0}, "GetSideInfoSeq with no output");
+        r.r("smvd4GetExistenceFlag", {d.handle, 0}, "GetExistenceFlag with no output");
+        // Streams of other kinds, each after Initialize.
+        const auto variant = [&](const std::string& what, const std::vector<std::vector<u8>>& aus, u32 user0) {
+            if (!selected(what)) return;
+            d.init(what + ": Initialize");
+            for (usize i = 0; i < aus.size(); i++)
+                r.o.note(std::format("{}: access unit {}: {} bytes", what, i, aus[i].size()));
+            d.stream(what, aus, user0);
+            d.flag(what);
+            d.seq(what);
+        };
+        const auto enc = [](int w, int h, int frames, int gop, std::function<void(AVCodecContext*)> setup = {}) {
+            return encode(AV_CODEC_ID_MPEG4, w, h, frames, gop, setup);
+        };
+        const auto flags = [](int f) { return [f](AVCodecContext* av) { av->flags |= f; }; };
+        const auto option = [](const char* name, const char* value) {
+            return [name, value](AVCodecContext* av) { av_opt_set(av->priv_data, name, value, 0); };
+        };
+        const int kInterlaced = AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
+        // The start codes' ids and random_accessible_vol.
+        {
+            std::vector<std::vector<u8>> aus = plain;
+            for (auto& au : aus) {
+                const usize vo = start_code_at(au, 0x00);
+                if (vo < au.size()) au[vo + 3] = 0x01;
+                const usize vol = start_code_at(au, 0x20);
+                if (vol < au.size()) {
+                    au[vol + 3] = 0x21;
+                    au[vol + 4] |= 0x80;
+                }
+            }
+            variant("ids", aus, 1000);
+        }
+        variant("SAR 64:45", enc(96, 64, 3, 4, [](AVCodecContext* av) { av->sample_aspect_ratio = {64, 45}; }), 1100);
+        {
+            std::vector<std::vector<u8>> aus = enc(96, 64, 3, 4);
+            aus[0] = with_fixed_vop_rate(aus[0], 1);
+            variant("a fixed VOP rate", aus, 1200);
+        }
+        {
+            std::vector<std::vector<u8>> aus = enc(96, 64, 3, 4);
+            aus[0] = with_colour(aus[0], 5, 6, 7);
+            variant("colour", aus, 1300);
+        }
+        variant("30 pictures", enc(96, 64, 30, 12), 1400);
+        variant("closed GOP", enc(96, 64, 6, 3, [](AVCodecContext* av) { av->flags |= AV_CODEC_FLAG_CLOSED_GOP;
+            av_opt_set_int(av->priv_data, "sc_threshold", 1000000000, 0);
+        }), 1500);
+        variant("one VOL", enc(96, 64, 6, 3, [](AVCodecContext* av) {
+            av->strict_std_compliance = FF_COMPLIANCE_VERY_STRICT;
+        }), 1600);
+        variant("MPEG quantisation", enc(96, 64, 4, 4, option("mpeg_quant", "1")), 1700);
+        variant("resync markers", enc(96, 64, 4, 4, option("ps", "60")), 1800);
+        variant("data partitioning", enc(96, 64, 4, 4, [](AVCodecContext* av) {
+            av_opt_set(av->priv_data, "ps", "60", 0);
+            av_opt_set(av->priv_data, "data_partitioning", "1", 0);
+        }), 1900);
+        // A layer refused (MPEG quantisation) of another size than the one before: what the sequence information
+        // keeps.
+        variant("80x48 with MPEG quantisation", enc(80, 48, 2, 4, option("mpeg_quant", "1")), 1750);
+        variant("4MV", enc(96, 64, 4, 4, [](AVCodecContext* av) { av->flags |= AV_CODEC_FLAG_4MV; }), 2000);
+        variant("AC prediction", enc(96, 64, 4, 4, flags(AV_CODEC_FLAG_AC_PRED)), 2100);
+        d.interlaced = true;
+        variant("interlaced", enc(96, 64, 4, 4, flags(kInterlaced)), 2200);
+        variant("interlaced, longer", enc(96, 64, 12, 12, flags(kInterlaced)), 2250);
+        d.interlaced = false;
+        variant("quarter samples", enc(96, 64, 4, 4, flags(AV_CODEC_FLAG_QPEL)), 2300);
+        variant("B pictures", enc(96, 64, 7, 6, [](AVCodecContext* av) { av->max_b_frames = 2; }), 2400);
+        variant("80x48", enc(80, 48, 4, 4), 2500);
+        {
+            // N-VOPs, two VOPs in one access unit, headers alone, a VOP in two halves, bytes that are no stream.
+            const std::vector<u8> nv = n_vop(5, 1);
+            const usize vop = start_code_at(plain[0], 0xB6);
+            const std::vector<u8> headers(plain[0].begin(), plain[0].begin() + static_cast<std::ptrdiff_t>(vop));
+            const std::vector<u8> ivop(plain[0].begin() + static_cast<std::ptrdiff_t>(vop), plain[0].end());
+            const auto half = plain[1].begin() + static_cast<std::ptrdiff_t>(plain[1].size() / 2);
+            const std::vector<u8> first(plain[1].begin(), half);
+            const std::vector<u8> second(half, plain[1].end());
+            std::vector<u8> two = plain[1];
+            two.insert(two.end(), plain[2].begin(), plain[2].end());
+            std::vector<u8> junk(40);
+            for (usize i = 0; i < junk.size(); i++) junk[i] = static_cast<u8>(i * 37 + 11);
+            variant("an N-VOP", {plain[0], nv, plain[1]}, 2600);
+            variant("two VOPs in one", {plain[0], two, plain[3]}, 2700);
+            variant("headers alone", {headers, ivop, plain[1]}, 2800);
+            if (selected("a VOP in halves")) {
+                d.init("a VOP in halves: Initialize");
+                d.decode("a VOP in halves: DecodePicture 0", plain[0], 2900);
+                d.take("a VOP in halves: after DecodePicture 0", true);
+                d.decode("a VOP in halves: DecodePicture 1", first, 2901, true, true);
+                d.take("a VOP in halves: after DecodePicture 1", true);
+                d.decode("a VOP in halves: DecodePicture 2", second, 2902);
+                d.take("a VOP in halves: after DecodePicture 2", true);
+                d.decode("a VOP in halves: DecodePicture 3", plain[2], 2903);
+                d.take("a VOP in halves: after DecodePicture 3", true);
+                d.flush("a VOP in halves: FlushPicture");
+                d.take("a VOP in halves: after FlushPicture", true);
+                d.flag("a VOP in halves");
+                d.seq("a VOP in halves");
+            }
+            variant("bytes that are no stream", {junk, plain[0], junk, plain[1]}, 3000);
+            // An I picture without its GOV header; a GOV a second in; a broken link; a picture larger than the
+            // instance's; damaged bits.
+            {
+                std::vector<std::vector<u8>> aus = plain;
+                for (const usize k : {usize{4}, usize{8}}) {
+                    const usize at_gov = start_code_at(aus[k], 0xB3), at_vop = start_code_at(aus[k], 0xB6);
+                    if (at_gov < at_vop && at_vop < aus[k].size())
+                        aus[k].erase(aus[k].begin() + static_cast<std::ptrdiff_t>(at_gov),
+                            aus[k].begin() + static_cast<std::ptrdiff_t>(at_vop));
+                }
+                variant("I without GOV", aus, 3200);
+            }
+            variant("a GOV a second in", enc(96, 64, 27, 25), 3300);
+            {
+                std::vector<std::vector<u8>> aus = plain;
+                const usize gov = start_code_at(aus[4], 0xB3);
+                if (gov + 6 < aus[4].size()) aus[4][gov + 6] |= 0x10; // broken_link (after closed_gov)
+                variant("a broken link", aus, 3400);
+            }
+            {
+                std::vector<std::vector<u8>> aus = plain;
+                for (usize i = 12; i < 20 && i < aus[1].size(); i++) aus[1][i] ^= 0x5A;
+                for (usize i = 30; i < 60 && i < aus[0].size(); i++) aus[0][i] ^= 0xA5;
+                variant("damaged", {aus[0], aus[1], plain[2]}, 3600);
+            }
+            // How long Discontinue's mark lasts; a P picture right after CancelDecode; P pictures with no anchor
+            // decoded into the second and the third slot.
+            if (selected("discontinuity")) {
+                d.init("discontinuity: Initialize");
+                d.decode("discontinuity: DecodePicture 0", plain[0], 3110);
+                d.decode("discontinuity: DecodePicture 1", plain[1], 3111);
+                d.take("discontinuity: the first two", true);
+                r.r("smvd4Discontinue", {d.handle}, "discontinuity: Discontinue");
+                for (usize i = 2; i < 7; i++) {
+                    d.decode(std::format("discontinuity: DecodePicture {}", i), plain[i], 3110 + static_cast<u32>(i));
+                    d.take(std::format("discontinuity: after DecodePicture {}", i), true);
+                }
+            }
+            if (selected("cancelled")) {
+                d.init("cancelled: Initialize");
+                d.decode("cancelled: DecodePicture 0", plain[0], 3120);
+                d.decode("cancelled: DecodePicture 1", plain[1], 3121);
+                d.cancel("cancelled: CancelDecode");
+                d.decode("cancelled: a P picture", plain[2], 3122);
+                d.take("cancelled: a P picture", true);
+                d.decode("cancelled: an I picture", plain[4], 3123);
+                d.take("cancelled: an I picture", true);
+            }
+            if (selected("no anchor")) {
+                d.init("no anchor, slot 1: Initialize");
+                d.decode("no anchor, slot 1: an I picture", plain[0], 3130);
+                d.flush("no anchor, slot 1: FlushPicture");
+                d.decode("no anchor, slot 1: a P picture", plain[1], 3131);
+                d.take("no anchor, slot 1", true);
+                d.init("no anchor, slot 2: Initialize");
+                d.decode("no anchor, slot 2: an I picture", plain[0], 3140);
+                d.decode("no anchor, slot 2: a P picture", plain[1], 3141);
+                d.flush("no anchor, slot 2: FlushPicture");
+                d.decode("no anchor, slot 2: another P picture", plain[2], 3142);
+                d.take("no anchor, slot 2", true);
+            }
+            if (selected("after FlushPicture")) {
+                d.init("after FlushPicture: Initialize");
+                d.decode("after FlushPicture: DecodePicture 0", plain[0], 3100);
+                d.decode("after FlushPicture: DecodePicture 1", plain[1], 3101);
+                d.take("after FlushPicture: the first two", true);
+                d.flush("after FlushPicture: FlushPicture");
+                d.take("after FlushPicture: the flush", true);
+                d.decode("after FlushPicture: a P picture", plain[2], 3102);
+                d.take("after FlushPicture: a P picture", true);
+                d.flush("after FlushPicture: FlushPicture 2");
+                d.flush("after FlushPicture: FlushPicture 3");
+                d.decode("after FlushPicture: an I picture", plain[4], 3103);
+                d.take("after FlushPicture: an I picture", true);
+                d.flag("after FlushPicture");
+            }
+        }
+        // The GOV's time code in hours and minutes; VBV parameters; a layer without its identifier and control
+        // parameters (FFmpeg's FF_BUG_MS).
+        {
+            std::vector<std::vector<u8>> aus = plain;
+            const usize gov = start_code_at(aus[4], 0xB3);
+            if (gov + 6 < aus[4].size()) {
+                // hours 1, minutes 2, marker, seconds 3, closed_gov 0, broken_link 0, then stuffing.
+                BitWriter tw;
+                tw.put(1, 5);
+                tw.put(2, 6);
+                tw.put(1, 1);
+                tw.put(3, 6);
+                tw.put(0, 2);
+                tw.put(0, 1);
+                while (tw.n % 8) tw.put(1, 1);
+                std::copy(tw.out.begin(), tw.out.end(), aus[4].begin() + static_cast<std::ptrdiff_t>(gov + 4));
+            }
+            variant("a GOV at 1:02:03", aus, 3700);
+        }
+        {
+            std::vector<std::vector<u8>> aus = plain;
+            aus[0] = with_vbv(aus[0]);
+            variant("VBV parameters", aus, 3900);
+        }
+        {
+            std::vector<std::vector<u8>> aus = plain;
+            aus[0] = with_plain_vol(aus[0]);
+            variant("no layer identifier or control parameters", aus, 3800);
+        }
+        // Layers written whole: identifiers and control parameters of other values (each stream after the one before:
+        // the fields a layer leaves out keep what?).
+        {
+            const auto layer = [&](const std::string& what, const VolFields& f, u32 vo_ident, u32 user0) {
+                std::vector<std::vector<u8>> aus(plain.begin(), plain.begin() + 2);
+                aus[0] = with_vol(aus[0], f, vo_ident);
+                variant(what, aus, user0);
+            };
+            VolFields a;
+            a.verid = 2;
+            a.priority = 3;
+            layer("layer a: no VO identifier, verid 2, priority 3", a, 0, 3810);
+            VolFields e0;
+            e0.ident = 0;
+            layer("layer e: no identifier after verid 2", e0, 1, 3815);
+            VolFields bb;
+            bb.random_access = 1;
+            bb.type = 5;
+            bb.low_delay = 0;
+            bb.chroma = 1;
+            bb.vbv = 1;
+            layer("layer b: random access, type 5, low delay 0, VBV", bb, 1, 3820);
+            VolFields c;
+            c.ident = 0;
+            c.control = 0;
+            c.aspect = 2;
+            layer("layer c: no identifier, no control parameters", c, 1, 3830);
+            VolFields e4;
+            e4.priority = 7;
+            e4.verid = 4;
+            e4.chroma = 2;
+            layer("layer d: priority 7, verid 4, chroma format 2", e4, 1, 3840);
+        }
+        // A layer larger than the instance's: a fatal error; what the decoder answers after it.
+        if (selected("larger than the instance")) {
+            variant("larger than the instance", enc(176, 144, 3, 4), 3500);
+            d.init("after the fatal error: Initialize");
+            d.decode("after the fatal error: DecodePicture", plain[0], 3510);
+            d.take("after the fatal error", true);
+            r.r("smvd4Discontinue", {d.handle}, "after the fatal error: Discontinue");
+            r.r("smvd4CancelDecode", {d.handle}, "after the fatal error: CancelDecode");
+            d.flush("after the fatal error: FlushPicture");
+            d.flag("after the fatal error");
+            d.seq("after the fatal error");
+        }
+        r.r("smvd4ReleaseInstance", {d.handle}, "ReleaseInstance");
+        d.flag("after ReleaseInstance");
+    }
+    // Fresh instances: the existence flag and the GOV's fields from the start; layers of other sizes than the
+    // instance's (larger ones are fatal errors).
+    if (selected("fresh")) {
+        const std::vector<u8> nothing(16, 0x33);
+        const usize vop = start_code_at(plain[0], 0xB6), gov = start_code_at(plain[0], 0xB3);
+        const std::vector<u8> headers(plain[0].begin(), plain[0].begin() + static_cast<std::ptrdiff_t>(gov));
+        std::vector<u8> no_gov = plain[0];
+        no_gov.erase(no_gov.begin() + static_cast<std::ptrdiff_t>(gov),
+            no_gov.begin() + static_cast<std::ptrdiff_t>(vop));
+        smvd4_param(b, 5, kTs, 96, 64);
+        std::memset(b + kMem, 0xA5, need + 0x1000);
+        if (r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, "fresh: CreateInstance2") == 0) {
+            Smvd4 f{r};
+            f.handle = kMem;
+            f.width = 96;
+            f.height = 64;
+            f.init("fresh: Initialize");
+            const std::vector<std::vector<u8>> mq = encode(AV_CODEC_ID_MPEG4, 96, 64, 1, 4, [](AVCodecContext* av) {
+                av_opt_set(av->priv_data, "mpeg_quant", "1", 0);
+            });
+            f.decode("fresh: a layer with MPEG quantisation", mq[0], 4999);
+            f.take("fresh: a layer with MPEG quantisation", true);
+            f.decode("fresh: a P picture", plain[1], 5000);
+            f.take("fresh: a P picture", true);
+            f.decode("fresh: headers", headers, 5001);
+            f.take("fresh: headers", true);
+            f.decode("fresh: an I picture without GOV", no_gov, 5002);
+            f.take("fresh: an I picture without GOV", true);
+            f.decode("fresh: an I picture", plain[0], 5003);
+            f.take("fresh: an I picture", true);
+            f.init("fresh: Initialize again");
+            f.flag("fresh: after Initialize again");
+            f.decode("fresh: again, an I picture without GOV", no_gov, 5004);
+            f.take("fresh: again, an I picture without GOV", true);
+            r.r("smvd4ReleaseInstance", {f.handle}, "fresh: ReleaseInstance");
+        }
+        for (const auto& [wd, ht] :
+            {std::pair{112, 48}, {64, 80}, {96, 64}, {80, 64}, {96, 96}, {48, 128}, {32, 144}}) {
+            const std::string key = std::format("fresh {}x{}", wd, ht);
+            std::memset(b + kMem, 0xA5, need + 0x1000);
+            if (r.r("smvd4CreateInstance2", {kMem, need, 1, kParam}, key + ": CreateInstance2") != 0) continue;
+            Smvd4 f{r};
+            f.handle = kMem;
+            f.width = static_cast<u32>(wd);
+            f.height = static_cast<u32>(ht);
+            f.init(key + ": Initialize");
+            const std::vector<std::vector<u8>> aus = encode(AV_CODEC_ID_MPEG4, wd, ht, 2, 4);
+            f.decode(key + ": DecodePicture 0", aus[0], 5100);
+            f.take(key + ": 0", true);
+            f.decode(key + ": DecodePicture 1", aus[1], 5101);
+            f.take(key + ": 1", true);
+            f.seq(key);
+            r.r("smvd4ReleaseInstance", {f.handle}, key + ": ReleaseInstance");
+        }
+    }
+    // An instance for a level (type 4, level 1: 176x144), on fresh memory: no GOV yet, junk first.
+    smvd4_param(b, 4, kTs);
+    ps_write32(b, kOut, 0);
+    r.r("smvd4GetMemorySize", {kOut, 1}, "GetMemorySize for the level 1 decoder");
+    const u32 need4 = ps_read32(b, kOut);
+    std::memset(b + kMem, 0xA5, need4 + 0x1000);
+    if (selected("level 1") && r.r("smvd4CreateInstance2", {kMem, need4, 1, kParam}, "level 1: CreateInstance2") == 0) {
+        Smvd4 e{r};
+        e.handle = kMem;
+        e.width = 176;
+        e.height = 144;
+        e.init("level 1: Initialize");
+        std::vector<u8> junk(16, 0x33);
+        e.decode("level 1: junk", junk, 4000);
+        e.seq("level 1: after junk");
+        std::vector<std::vector<u8>> aus = encode(AV_CODEC_ID_MPEG4, 176, 144, 4, 4);
+        for (auto& au : aus) {
+            const usize at_gov = start_code_at(au, 0xB3), at_vop = start_code_at(au, 0xB6);
+            if (at_gov < at_vop && at_vop < au.size())
+                au.erase(au.begin() + static_cast<std::ptrdiff_t>(at_gov),
+                    au.begin() + static_cast<std::ptrdiff_t>(at_vop));
+        }
+        e.stream("level 1: no GOV", aus, 4100);
+        e.seq("level 1");
+        e.stream("level 1: 96x64", plain, 4200);
+        r.r("smvd4ReleaseInstance", {e.handle}, "level 1: ReleaseInstance");
+    }
+    r.r("smvd4ReleaseInstance", {0}, "ReleaseInstance with no instance");
+    end_spurs(r);
+    return std::move(r.o);
+}
+
 } // namespace
 
 TEST_CASE("The DivX 3.11 core (libdivx311dec): pspocket's own, answering as Sony's did (D-920)", "[hle][vdec-cores]")
@@ -954,6 +1851,52 @@ TEST_CASE("The DivX core (libdivxdec) against Sony's", "[.][hle][lle][compare][v
     run(s, "libdivxdec against Sony's", [&](bool sony) { return divx(s, sony); }, [](const Observed&) {});
 }
 
+TEST_CASE("The MPEG-4 core (libsmvd4): pspocket's own, answering as Sony's did (D-920)", "[hle][vdec-cores]")
+{
+    if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP("this FFmpeg has no mpeg4 encoder (build-ffmpeg.sh)");
+    check_names("libsmvd4", {"smvd4GetMemorySize", "smvd4GetMemorySize2", "smvd4CreateInstance2",
+                                "smvd4ReleaseInstance", "smvd4Initialize", "smvd4DecodePicture", "smvd4FlushPicture",
+                                "smvd4Discontinue", "smvd4CancelDecode", "smvd4GetPicture", "smvd4GetNumPicture",
+                                "smvd4ReleasePicture", "smvd4GetSideInfoPic", "smvd4GetAuxData", "smvd4GetSideInfoSeq",
+                                "smvd4GetExistenceFlag", "smvd4SetAuxData", "smvd4GetVersionNumber"},
+        false);
+    Setup s;
+    s.mode = Mode::Self;
+    const Observed o = smvd4(s, false);
+    // Sony's answers (test_vdec_cores_compare.cpp's comparison, firmware 4.92).
+    CHECK(o.value("GetMemorySize level 1: the size") == "0x44480");
+    CHECK(o.value("GetMemorySize2 level 1 96x64: the size") == "0x23900");
+    CHECK(o.value("GetMemorySize2 level 1 177x144") == "0x80615142");
+    CHECK(o.value("CreateInstance2 type 0") == "0x80615142");
+    CHECK(o.value("CreateInstance2 with one byte less") == "0x80615181");
+    CHECK(o.value("CreateInstance2 level 7") == "0x80615180");
+    CHECK(o.value("CreateInstance2 with a taskset that is none") == "0x80410902");
+    CHECK(o.value("after CreateInstance2: the flag") == "0xa5a5a5a5"); // never written before an access unit
+    CHECK(o.value("plain: DecodePicture 0: out") == "0x17a");
+    CHECK(o.value("plain: after DecodePicture 0: picture 0: luma") == "the core's memory +0x15180");
+    CHECK(o.value("plain: after DecodePicture 1: picture 1: luma") == "the core's memory +0x19a00");
+    CHECK(o.value("plain: after DecodePicture 0: picture 0: the picture") ==
+        "hex:000000000000000000000000400000040000006000000040000000600000003000000000eeeeeeeeeeeeeeeeeeeeeeee");
+    CHECK(o.value("plain: after DecodePicture 1: picture 1: side information")
+              .starts_with("0x1 hex:0101a5a50000000000000101000000000000000000010101000000a500020100ee"));
+    CHECK(o.value("plain: after FlushPicture: GetNumPicture") == "0x80615122");
+    CHECK(o.value("after the stream: the sequence")
+              .starts_with("hex:010020000101010101000001010100ee00000000000000000000000000ee001900ee00000060004000"));
+    CHECK(o.value("held: DecodePicture 3") == "0x80615121"); // three frame buffers, none free
+    CHECK(o.value("a P picture first") == "0x80615120");     // no video object layer since Initialize
+    CHECK(o.value("after Discontinue: DecodePicture 2: picture 16: GetPicture") == "0x8061511b");
+    CHECK(o.value("larger than the instance: DecodePicture 0") == "0x80615181");
+    CHECK(o.value("after the fatal error: Initialize") == "0x80615180");
+    const Data* first = o.find_data("plain: after DecodePicture 0: picture 0: its frame buffer");
+    REQUIRE(first);
+    CHECK(first->bytes[0x700] == 30); // the picture's first sample, after a strip and 16 lines of edge
+}
 
+TEST_CASE("The MPEG-4 core (libsmvd4) against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP("this FFmpeg has no mpeg4 encoder (build-ffmpeg.sh)");
+    const Setup s = setup();
+    run(s, "libsmvd4 against Sony's", [&](bool sony) { return smvd4(s, sony); }, [](const Observed&) {});
+}
 
 #endif

@@ -1,4 +1,5 @@
-// The video codec cores' version queries (D-575): RPCS3's answers, the ARG errors, firmware first. No game data.
+// The video codec cores' version queries (D-575): RPCS3's answers, the ARG errors, firmware first (but the cores
+// pspocket has whole, D-920). No game data.
 
 #include "hle_test_util.hpp"
 
@@ -45,8 +46,10 @@ TEST_CASE("Codec cores: versions and characteristics as RPCS3 has them, firmware
     CHECK(g.call("avcDecQueryCharacteristics", 0) == r3_of_code(0x80615201));
     CHECK(g.call("mvcDecQueryCharacteristics", kNotGuest) == r3_of_code(0x80615901));
 
-    for (const char* library : {"libavcdec", "libmvcdec", "libsjvtd", "libsmvd2", "libsmvd4", "libsvc1d"}) {
+    // The cores whose decoding calls are not pspocket's own yet; libsmvd4's are (D-920).
+    for (const char* library : {"libavcdec", "libmvcdec", "libsjvtd", "libsmvd2", "libsvc1d"}) {
         INFO(library);
         CHECK(hle::registry().is_firmware_first(library));
     }
+    CHECK_FALSE(hle::registry().is_firmware_first("libsmvd4"));
 }

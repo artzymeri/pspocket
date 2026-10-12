@@ -40,15 +40,19 @@ public:
 
 #if PSPOCKET_HAVE_FFMPEG
     // Opens FFmpeg's decoder `id` (the frame size for the codecs whose stream has none, DivX 3.11's; else 0), with
-    // `extradata` as its configuration (VC-1's sequence header and entry point) and `idct` its IDCT (FF_IDCT_*, 0
-    // FFmpeg's choice). False when there is none or it refuses (the caller logs).
-    bool open(AVCodecID id, u32 width = 0, u32 height = 0, const std::vector<u8>& extradata = {}, int idct = 0)
+    // `extradata` as its configuration (VC-1's sequence header and entry point), `idct` its IDCT (FF_IDCT_*, 0
+    // FFmpeg's choice) and `flags` more of its AV_CODEC_FLAG_*s. False when there is none or it refuses (the caller
+    // logs).
+    bool open(AVCodecID id, u32 width = 0, u32 height = 0, const std::vector<u8>& extradata = {}, int idct = 0,
+        int flags = 0)
     {
         close();
         const AVCodec* dec = avcodec_find_decoder(id);
         if (!dec) return false;
         av_ = avcodec_alloc_context3(dec);
-        av_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+        av_->opaque = this;
+        av_->get_buffer2 = get_buffer;
+        av_->flags |= AV_CODEC_FLAG_COPY_OPAQUE | flags;
         av_->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
         av_->thread_count = 1; // each picture out as soon as FFmpeg has it
         if (idct) av_->idct_algo = idct;
@@ -82,6 +86,7 @@ public:
     {
 #if PSPOCKET_HAVE_FFMPEG
         avcodec_free_context(&av_);
+        av_frame_free(&last_);
 #endif
     }
 
@@ -126,11 +131,82 @@ public:
     {
 #if PSPOCKET_HAVE_FFMPEG
         if (av_) avcodec_flush_buffers(av_);
+        if (last_) av_frame_unref(last_);
+#endif
+    }
+
+    // FFmpeg's error concealment (FF_EC_*, its default FF_EC_GUESS_MVS | FF_EC_DEBLOCK) for what it decodes next.
+    void concealment([[maybe_unused]] int ec)
+    {
+#if PSPOCKET_HAVE_FFMPEG
+        if (av_) av_->error_concealment = ec;
+#endif
+    }
+
+    // The next picture FFmpeg decodes starts as these planes (planar 4:2:0, no padding, w x h) instead of whatever its
+    // buffer held: what it does not decode (macroblocks missing from a damaged access unit, with error concealment off)
+    // keeps them, as a core whose SPU program leaves a frame buffer's samples it does not decode (D-920).
+    void prefill(u32 w, u32 h, std::vector<u8> y, std::vector<u8> u, std::vector<u8> v)
+    {
+        prefill_w_ = w;
+        prefill_h_ = h;
+        prefill_y_ = std::move(y);
+        prefill_u_ = std::move(u);
+        prefill_v_ = std::move(v);
+    }
+
+    // Keeps the last picture FFmpeg gave (a reference to its buffer), so that rewrite_last() can change it: for a core
+    // whose SPU program predicts a P picture from a frame buffer's contents, whatever they hold (D-920). Only for
+    // decoders that give each picture as soon as it is decoded and predict the next from it (MPEG-4 part 2 with
+    // AV_CODEC_FLAG_LOW_DELAY, B pictures never given): FFmpeg's reference is then that picture's buffer.
+    void keep_last(bool on) { keep_last_ = on; }
+
+    // The last picture's planes (planar 4:2:0, no padding, w x h) rewritten, so that FFmpeg predicts the next P picture
+    // from these. FFmpeg holds the buffer as its reference and never writes it again; writing it through the picture it
+    // gave is outside its API's contract, which is why only the decoders above use it. False when no picture of that
+    // size and format is kept.
+    bool rewrite_last(u32 w, u32 h, const u8* y, const u8* u, const u8* v)
+    {
+#if PSPOCKET_HAVE_FFMPEG
+        if (!last_ || !last_->data[0] || last_->width != static_cast<int>(w) || last_->height != static_cast<int>(h))
+            return false;
+        if (last_->format != AV_PIX_FMT_YUV420P && last_->format != AV_PIX_FMT_YUVJ420P) return false;
+        for (u32 r = 0; r < h; r++)
+            std::memcpy(last_->data[0] + r * static_cast<u32>(last_->linesize[0]), y + r * w, w);
+        for (u32 r = 0; r < h / 2; r++) {
+            std::memcpy(last_->data[1] + r * static_cast<u32>(last_->linesize[1]), u + r * (w / 2), w / 2);
+            std::memcpy(last_->data[2] + r * static_cast<u32>(last_->linesize[2]), v + r * (w / 2), w / 2);
+        }
+        return true;
+#else
+        (void)w, (void)h, (void)y, (void)u, (void)v;
+        return false;
 #endif
     }
 
 private:
 #if PSPOCKET_HAVE_FFMPEG
+    // FFmpeg's buffers, the next one filled as prefill() asked.
+    static int get_buffer(AVCodecContext* av, AVFrame* f, int flags)
+    {
+        const int r = avcodec_default_get_buffer2(av, f, flags);
+        auto* self = static_cast<FfDecoder*>(av->opaque);
+        if (r < 0 || !self || !self->prefill_w_) return r;
+        const u32 w = self->prefill_w_, h = self->prefill_h_;
+        self->prefill_w_ = 0;
+        if ((f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) || f->width < static_cast<int>(w) ||
+            f->height < static_cast<int>(h) || self->prefill_y_.size() < w * h)
+            return r;
+        for (u32 row = 0; row < h; row++)
+            std::memcpy(f->data[0] + row * static_cast<u32>(f->linesize[0]), self->prefill_y_.data() + row * w, w);
+        const u32 cw = w / 2;
+        for (u32 row = 0; row < h / 2; row++) {
+            std::memcpy(f->data[1] + row * static_cast<u32>(f->linesize[1]), self->prefill_u_.data() + row * cw, cw);
+            std::memcpy(f->data[2] + row * static_cast<u32>(f->linesize[2]), self->prefill_v_.data() + row * cw, cw);
+        }
+        return r;
+    }
+
     void receive(std::deque<DecodedPicture>& out)
     {
         AVFrame* f = av_frame_alloc();
@@ -143,13 +219,22 @@ private:
             p.damaged = f->decode_error_flags != 0 || (f->flags & AV_FRAME_FLAG_CORRUPT) != 0;
             p.au = static_cast<u64>(reinterpret_cast<uintptr_t>(f->opaque));
             if (vdec_hw::planes(f, p.width, p.height, p.y, p.u, p.v)) out.push_back(std::move(p));
+            if (keep_last_) {
+                if (!last_) last_ = av_frame_alloc();
+                av_frame_unref(last_);
+                if (av_frame_ref(last_, f) < 0) av_frame_unref(last_);
+            }
             av_frame_unref(f);
         }
         av_frame_free(&f);
     }
 
     AVCodecContext* av_ = nullptr;
+    AVFrame* last_ = nullptr;
 #endif
+    bool keep_last_ = false;
+    u32 prefill_w_ = 0, prefill_h_ = 0;
+    std::vector<u8> prefill_y_, prefill_u_, prefill_v_;
 };
 
 } // namespace pspocket::hle::vdec

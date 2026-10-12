@@ -8,6 +8,8 @@
 // - libdivx311dec (DivX 3.11): divx311Dec*: QueryAttr, Open, Close, DecodeAu, GetNumOfPictures, GetPicture,
 //   ReleasePicture, FlushPicture, Reset.
 // - libdivxdec (DivX, MPEG-4 part 2 with B pictures and DivX's packed bitstream): divxDec*, the same nine.
+// - libsmvd4 (MPEG-4 part 2, Simple profile): vdec_smvd4.cpp, over the s-cores' framework (vdec_score.hpp); registered
+//   from here.
 //
 // Nothing here is Sony's code or data (CLAUDE.md rule 1): the behaviour is written from what the modules do.
 
@@ -27,6 +29,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
+#include "vdec_core_common.hpp"
 #include "vdec_ffmpeg.hpp"
 #include "vdec_layout.hpp"
 
@@ -34,24 +37,9 @@ namespace pspocket::hle {
 namespace {
 
 constexpr std::string_view kChan = "vdecCores";
-constexpr s32 error(u32 code) { return static_cast<s32>(code); }
-
-bool writable(PPUContext& ctx, u32 addr, u32 size) { return addr && guest_readable(thread_of(ctx), addr, size); }
-
-// Another HLE library's function called as the core module calls its import (cellSpurs), on this thread.
-u64 call_import(PPUContext& ctx, std::string_view module, u32 nid, std::initializer_list<u64> args)
-{
-    const Function* f = registry().find(module, nid);
-    if (!f) PS_FATAL(kChan, "{}'s function {:#010x} is not pspocket's own", module, nid);
-    u64 saved[8];
-    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
-    u32 i = 0;
-    for (const u64 a : args) ctx.gpr[3 + i++] = a;
-    f->fn(ctx, guest_base(ctx));
-    const u64 r = ctx.gpr[3];
-    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
-    return r;
-}
+using vdec_core::call_import;
+using vdec_core::error;
+using vdec_core::writable;
 
 // What Sony's cores check of the taskset they are given (their SPU tasks' home): its SPURS instance, and that
 // instance's information; an error of cellSpurs's is the core's answer.
@@ -1535,6 +1523,7 @@ s32 divxDecFlushPicture(PPUContext& ctx, u32 handle)
 
 void register_vdec_cores(Registry& r)
 {
+    vdec_core::register_smvd4(r);
     r.add("libdivx311dec", {
         PS_HLE_FUNC(0xA1521D39, divx311DecQueryAttr),
         PS_HLE_FUNC(0xBD6092C4, divx311DecOpen),
