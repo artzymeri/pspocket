@@ -117,12 +117,21 @@ constexpr u32 kState = 0, kPath = 8, kPathLen = 0x42C, kType = 0x438, kDefaults 
 }
 
 // The feeders (0x200 bytes, the game's): the stream's side at +0 (eleven of libsail_rec's own callbacks, their
-// argument the feeder, the recorder at +0x34, the index at +0x30, the state at +0x40), the game's callbacks at +0xC0
-// (audio) or +0xD0 (video) and their argument at +0xEC or +0xFC.
+// argument the feeder at +0x2C, the index at +0x30, the recorder at +0x34, the pipeline and the slot at +0x38 and
+// +0x3C, the state at +0x40, the session's result at +0x44, the frames to drain at +0x48, the frames the game has out
+// at +0x50 and the pipeline holds at +0x54, the step's handle at +0x58, the recording's start and end times and the
+// last frame's at +0x60, +0x68, +0x70, the session at +0x78), the diagnostic handlers, the format kept (+0xA8 audio,
+// 0x18 bytes; +0xB0 video, 0x20), the game's callbacks at +0xC0 (audio) or +0xD0 (video) and their argument at +0xEC
+// or +0xFC.
 namespace fd {
-constexpr u32 kIndex = 0x30, kRecorder = 0x34, kState = 0x40, kAudioDiag = 0x98, kAudioDiagArg = 0x9C,
-              kVideoDiag = 0xA0, kVideoDiagArg = 0xA4, kAudioFuncs = 0xC0, kAudioArg = 0xEC, kVideoFuncs = 0xD0,
-              kVideoArg = 0xFC, kSize = 0x200;
+constexpr u32 kArgument = 0x2C, kIndex = 0x30, kRecorder = 0x34, kPipeline = 0x38, kSlot = 0x3C, kState = 0x40,
+              kResult = 0x44, kDrain = 0x48, kFrames = 0x50, kHeld = 0x54, kHandle = 0x58, kStart = 0x60, kEnd = 0x68,
+              kLast = 0x70, kSession = 0x78, kAudioDiag = 0x98, kAudioDiagArg = 0x9C, kVideoDiag = 0xA0,
+              kVideoDiagArg = 0xA4, kAudioFormat = 0xA8, kVideoFormat = 0xB0, kAudioFuncs = 0xC0, kAudioArg = 0xEC,
+              kVideoFuncs = 0xD0, kVideoArg = 0xFC, kSize = 0x200;
+// libsail_rec's own callbacks (the stream's side's table at +0), each in front of the game's of the same index.
+constexpr u32 kMakeup = 0, kCleanup = 1, kOpen = 2, kClose = 3, kStartCall = 4, kStop = 5, kCancel = 6, kFormat = 7,
+              kCheckout = 8, kCheckin = 9, kClear = 10;
 }
 
 // The game's composer (0x140 bytes): the recorder at +0, the game's 17 callbacks at +4, their argument at +0x48,
@@ -304,25 +313,54 @@ u64 composer_notify_completed(PPUContext& ctx, u64 composer, s32 result);
 s32 mp4_composer_attach(PPUContext& ctx, u32 rec);
 void mp4_composer_destroy(PPUContext& ctx, u32 rec, u32 mp4);
 
-// The feeders' stream side (cellSailRecFeed.cpp): each step on the feeder `f` ends with a completion for `handle`.
-void feeder_audio_open(PPUContext& ctx, u32 f, u32 pipeline, u32 slot, u32 format, u64 handle);
-void feeder_video_open(PPUContext& ctx, u32 f, u32 pipeline, u32 slot, u32 format, u64 handle);
-void feeder_audio_start(PPUContext& ctx, u32 f, u32 session, u64 start, u64 end, u64 handle);
-void feeder_video_start(PPUContext& ctx, u32 f, u32 session, u64 start, u64 end, u64 handle);
-void feeder_audio_stop(PPUContext& ctx, u32 f, u32 flag, u64 end, u64 handle);
-void feeder_video_stop(PPUContext& ctx, u32 f, u32 flag, u64 end, u64 handle);
-void feeder_audio_close(PPUContext& ctx, u32 f, u64 handle);
-void feeder_video_close(PPUContext& ctx, u32 f, u64 handle);
+// The feeders (cellSailRecFeed.cpp): the stream's side of feeder `f` through libsail_rec's own table (makeup and
+// cleanup at Boot and the end, Cancel's cancel); each step ends with a completion for `handle`. `video`: a video
+// feeder (its notifications' codes and diagnostic handler).
+// The name of libsail_rec's own callback `i` (an internal function) for an audio or video feeder.
+std::string_view feeder_call_name(bool video, u32 i);
+s32 feeder_makeup(PPUContext& ctx, u32 f, u32 rec, u32 index);
+s32 feeder_cleanup(PPUContext& ctx, u32 f);
+void feeder_cancel(PPUContext& ctx, u32 f);
+void feeder_open(PPUContext& ctx, u32 f, u32 pipeline, u32 slot, u32 format, u64 handle, bool video);
+void feeder_start(PPUContext& ctx, u32 f, u32 session, u64 start, u64 end, u64 handle, bool video);
+void feeder_stop(PPUContext& ctx, u32 f, u32 flag, u64 end, u64 handle);
+void feeder_close(PPUContext& ctx, u32 f, u64 handle);
+// The format the feeder gives into `out` (its own callback 7).
+s32 feeder_format(PPUContext& ctx, u32 f, u32 out);
+// The game's call completed (messages 0xF, 0x19), frames out (0x10, 0x1A), whether frames wait, a frame taken for the
+// pipeline into `out` (-1: given straight back), a frame the pipeline gives back.
+void feeder_completed(PPUContext& ctx, u32 f, s32 result);
+void feeder_frames_out(PPUContext& ctx, u32 f, u32 n);
+bool feeder_has_frames(PPUContext& ctx, u32 f);
+s32 feeder_take(PPUContext& ctx, u32 f, u32 out, bool video);
+s32 feeder_release(PPUContext& ctx, u32 f, u32 frame);
 
-// The pipelines (cellSailRecAudio.cpp, cellSailRecVideo.cpp; `p` a slot's +0x50).
+// The pipelines (cellSailRecAudio.cpp, cellSailRecVideo.cpp; `p` a slot's +0x50): made at Boot (state 1) and taken
+// down at the end; each step ends with a completion for `handle`.
+void audio_pipeline_init(PPUContext& ctx, u32 p, u32 rec, u32 clock);
+void audio_pipeline_fini(PPUContext& ctx, u32 p);
 void audio_pipeline_start(PPUContext& ctx, u32 p, u64 handle);
 void audio_pipeline_stop(PPUContext& ctx, u32 p, u32 flag, u64 handle);
 void audio_pipeline_close(PPUContext& ctx, u32 p, u64 handle);
+void video_pipeline_init(PPUContext& ctx, u32 p, u32 rec, u32 clock);
+void video_pipeline_fini(PPUContext& ctx, u32 p);
 void video_pipeline_start(PPUContext& ctx, u32 p, u32 slot, u32 params, u64 handle);
 void video_pipeline_stop(PPUContext& ctx, u32 p, u32 flag, u64 handle);
 void video_pipeline_close(PPUContext& ctx, u32 p, u64 handle);
+// An audio stream configured once its feeder is open (the format it gives against the profile's), its pipeline opened
+// and the stream added to the composer (two steps for `handle`): 2, or the error.
+s32 audio_stream_open(PPUContext& ctx, u32 rec, u32 record, u64 handle);
+// The control thread's messages for the audio streams (0x10, 0x11, 0x14 to 0x18, 0x2B; `a` and `b` the message's
+// object and argument).
+void audio_message(PPUContext& ctx, u32 rec, u32 code, u32 a, u32 b);
 
-// The recorder's clock (+0x710 in mode 0): reset at each Start.
+// The recorder's clock (+0x710 in mode 0): reset at each Start; a stream's time `a` for the source's `b` (`c` its
+// timescale), under the clock's lwmutex: the first stream to tell it owns it, later times from it smoothed.
 void clock_reset(PPUContext& ctx, u32 clock);
+void clock_update(PPUContext& ctx, u32 clock, u32 owner, u64 a, u64 b, u64 c);
+
+// A copy of libsail_rec's data (`size` bytes at `vaddr` of the installed module) in guest memory, made once per process
+// (0 without the module, logged).
+u32 module_copy(PPUContext& ctx, u32 vaddr, u32 size);
 
 } // namespace pspocket::hle::sailrec

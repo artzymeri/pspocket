@@ -39,17 +39,6 @@ s32 post_from(PPUContext& ctx, std::string_view what, u32 rec, u32 code, u32 obj
 
 // ------------------------------------------------------------------------------------------------- feeders
 
-constexpr std::string_view kAudioFeederCalls[11] = {"_pspocket_cellSailRec_AudioMakeup",
-    "_pspocket_cellSailRec_AudioCleanup", "_pspocket_cellSailRec_AudioOpen", "_pspocket_cellSailRec_AudioStart",
-    "_pspocket_cellSailRec_AudioStop", "_pspocket_cellSailRec_AudioCancel", "_pspocket_cellSailRec_AudioCheckout",
-    "_pspocket_cellSailRec_AudioFormat", "_pspocket_cellSailRec_AudioGet", "_pspocket_cellSailRec_AudioRelease",
-    "_pspocket_cellSailRec_AudioClose"};
-constexpr std::string_view kVideoFeederCalls[11] = {"_pspocket_cellSailRec_VideoMakeup",
-    "_pspocket_cellSailRec_VideoCleanup", "_pspocket_cellSailRec_VideoOpen", "_pspocket_cellSailRec_VideoStart",
-    "_pspocket_cellSailRec_VideoStop", "_pspocket_cellSailRec_VideoCancel", "_pspocket_cellSailRec_VideoCheckout",
-    "_pspocket_cellSailRec_VideoFormat", "_pspocket_cellSailRec_VideoGet", "_pspocket_cellSailRec_VideoRelease",
-    "_pspocket_cellSailRec_VideoClose"};
-
 // cellSailFeederAudio/VideoInitialize(feeder, funcs, arg, attribute): the callbacks at +0x1C, +0x20, +0x24 and +0x28 are
 // required, the attribute must be NULL. The stream's side is cleared to 0xA0 (audio) or 0xA8 (video) bytes.
 s32 feeder_init(PPUContext& ctx, u32 f, u32 funcs, u32 arg, u32 attr, bool video)
@@ -61,7 +50,7 @@ s32 feeder_init(PPUContext& ctx, u32 f, u32 funcs, u32 arg, u32 attr, bool video
     std::memcpy(gb(ctx) + f + (video ? fd::kVideoFuncs : fd::kAudioFuncs), gb(ctx) + funcs, 0x2C);
     w32(ctx, f + (video ? fd::kVideoArg : fd::kAudioArg), arg);
     std::memset(gb(ctx) + f, 0, video ? 0xA8 : 0xA0);
-    for (u32 i = 0; i < 11; i++) w32(ctx, f + 4 * i, internal(video ? kVideoFeederCalls[i] : kAudioFeederCalls[i]));
+    for (u32 i = 0; i < 11; i++) w32(ctx, f + 4 * i, internal(feeder_call_name(video, i)));
     w32(ctx, f + 0x2C, f);
     return 0;
 }

@@ -66,10 +66,10 @@ void close_slot(PPUContext& ctx, u32 rec, u32 record, u64 parent, u32 slot, bool
     composer_remove(ctx, cs_of(rec), slot + (video ? vs::kComposerStream : as::kComposerStream), h, video);
     if (video) {
         video_pipeline_close(ctx, slot + vs::kPipeline, h);
-        feeder_video_close(ctx, r32(ctx, slot + vs::kFeeder), h);
+        feeder_close(ctx, r32(ctx, slot + vs::kFeeder), h);
     } else {
         audio_pipeline_close(ctx, slot + as::kPipeline, h);
-        feeder_audio_close(ctx, r32(ctx, slot + as::kFeeder), h);
+        feeder_close(ctx, r32(ctx, slot + as::kFeeder), h);
     }
     w32(ctx, record + 4, 3);
 }
@@ -112,7 +112,7 @@ void stop_all(PPUContext& ctx, u32 rec, u32 record, u32 flag, u64 parent)
         if (static_cast<u8>(r8(ctx, slot + as::kState) - 4) > 2) continue;
         steps += 2;
         w8(ctx, slot + as::kState, 7);
-        feeder_audio_stop(ctx, r32(ctx, slot + as::kFeeder), 1, 0, h);
+        feeder_stop(ctx, r32(ctx, slot + as::kFeeder), 1, 0, h);
         audio_pipeline_stop(ctx, slot + as::kPipeline, 1, h);
     }
     for (u32 i = 0, n = video_count(ctx, rec); i < n; i++) {
@@ -120,7 +120,7 @@ void stop_all(PPUContext& ctx, u32 rec, u32 record, u32 flag, u64 parent)
         if (static_cast<u8>(r8(ctx, slot + vs::kState) - 4) > 2) continue;
         steps += 2;
         w8(ctx, slot + vs::kState, 7);
-        feeder_video_stop(ctx, r32(ctx, slot + vs::kFeeder), 1, 0, h);
+        feeder_stop(ctx, r32(ctx, slot + vs::kFeeder), 1, 0, h);
         video_pipeline_stop(ctx, slot + vs::kPipeline, 1, h);
     }
     composer_stop(ctx, cs_of(rec), flag, h);
@@ -286,13 +286,13 @@ s32 _pspocket_cellSailRec_Started(PPUContext& ctx, u32 rec, u32 record, s32 stat
         const u32 slot = audio_slot(ctx, rec, i);
         if (r8(ctx, slot + as::kState) != 4) continue;
         steps++;
-        feeder_audio_start(ctx, r32(ctx, slot + as::kFeeder), session, start, end, h);
+        feeder_start(ctx, r32(ctx, slot + as::kFeeder), session, start, end, h, false);
     }
     for (u32 i = 0, n = video_count(ctx, rec); i < n; i++) {
         const u32 slot = video_slot(ctx, rec, i);
         if (r8(ctx, slot + vs::kState) != 4) continue;
         steps++;
-        feeder_video_start(ctx, r32(ctx, slot + vs::kFeeder), session, start, end, h);
+        feeder_start(ctx, r32(ctx, slot + vs::kFeeder), session, start, end, h, true);
     }
     return steps;
 }
@@ -338,6 +338,17 @@ s32 slot_opened(PPUContext& ctx, u32 rec, u32 record, s32 status, bool video)
 s32 _pspocket_cellSailRec_AudioSlotOpened(PPUContext& ctx, u32 rec, u32 record, s32 status)
 {
     return slot_opened(ctx, rec, record, status, false);
+}
+
+// An audio slot's feeder open: the stream configured, its pipeline opened and the stream added to the composer (the
+// slot opened after both); a failure here is an error event, then the slot closed again.
+s32 _pspocket_cellSailRec_AudioFeederOpened(PPUContext& ctx, u32 rec, u32 record, s32 status)
+{
+    if (status < 0) return slot_opened(ctx, rec, record, status, false);
+    const s32 r = audio_stream_open(ctx, rec, record, handle(record, "_pspocket_cellSailRec_AudioSlotOpened"));
+    if (r >= 0) return r;
+    error_event(ctx, rec, r);
+    return slot_opened(ctx, rec, record, r, false);
 }
 
 s32 _pspocket_cellSailRec_VideoSlotOpened(PPUContext& ctx, u32 rec, u32 record, s32 status)
@@ -407,8 +418,8 @@ s32 _pspocket_cellSailRec_ComposerOpened(PPUContext& ctx, u32 rec, u32 record, s
             w32(ctx, params + 0x14, codec);
             w8(ctx, format.addr(), coding);
         }
-        feeder_video_open(ctx, r32(ctx, slot + vs::kFeeder), slot + vs::kPipeline, slot, format.addr(),
-            handle(slot, "_pspocket_cellSailRec_VideoFeederOpened"));
+        feeder_open(ctx, r32(ctx, slot + vs::kFeeder), slot + vs::kPipeline, slot, format.addr(),
+            handle(slot, "_pspocket_cellSailRec_VideoFeederOpened"), true);
         first = 0;
         w32(ctx, slot + 4, 1);
     }
@@ -442,8 +453,8 @@ s32 _pspocket_cellSailRec_ComposerOpened(PPUContext& ctx, u32 rec, u32 record, s
             w8(ctx, format.addr(), coding);
             w32(ctx, format.addr() + 4, rate);
         }
-        feeder_audio_open(ctx, r32(ctx, slot + as::kFeeder), slot + as::kPipeline, slot, format.addr(),
-            handle(slot, "_pspocket_cellSailRec_AudioFeederOpened"));
+        feeder_open(ctx, r32(ctx, slot + as::kFeeder), slot + as::kPipeline, slot, format.addr(),
+            handle(slot, "_pspocket_cellSailRec_AudioFeederOpened"), false);
         steps++;
         first = 0;
         w32(ctx, slot + 4, 1);
@@ -755,7 +766,7 @@ void stop(PPUContext& ctx, u32 rec, u32 block, u32 record)
         w32(ctx, r + 0x10, slot);
         w32(ctx, r + 4, 1);
         w64(ctx, r + 8, 0);
-        feeder_audio_stop(ctx, r32(ctx, slot + as::kFeeder), 0, end, handle(r, "_pspocket_cellSailRec_AudioFeederStopped"));
+        feeder_stop(ctx, r32(ctx, slot + as::kFeeder), 0, end, handle(r, "_pspocket_cellSailRec_AudioFeederStopped"));
     }
     for (u32 i = 0, n = video_count(ctx, rec); i < n; i++) {
         const u32 slot = video_slot(ctx, rec, i);
@@ -767,7 +778,7 @@ void stop(PPUContext& ctx, u32 rec, u32 block, u32 record)
         w32(ctx, r, r32(ctx, r) | 2);
         w32(ctx, r + 4, 1);
         w64(ctx, r + 8, 0);
-        feeder_video_stop(ctx, r32(ctx, slot + vs::kFeeder), 0, end, handle(r, "_pspocket_cellSailRec_VideoFeederStopped"));
+        feeder_stop(ctx, r32(ctx, slot + vs::kFeeder), 0, end, handle(r, "_pspocket_cellSailRec_VideoFeederStopped"));
     }
 }
 
@@ -819,6 +830,7 @@ void register_stream(Registry& r)
         SAILREC_INTERNAL(_pspocket_cellSailRec_SlotClosedAudio),
         SAILREC_INTERNAL(_pspocket_cellSailRec_SlotClosedVideo),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AudioSlotOpened),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioFeederOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_VideoSlotOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AllClosed),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AllOpened),

@@ -24,6 +24,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
+#include "pspocket/ppu/fpu.h"
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle::sailrec {
@@ -72,65 +73,6 @@ void error_event(PPUContext& ctx, u32 rec, s32 err)
 
 namespace {
 
-// ------------------------------------------------------------------------------------------------- the feeders
-
-// A feeder's call through the table libsail_rec put at its +0 (its argument at +0x2C; the other registers passed on):
-// index 0 makeup, 1 cleanup, 6 the game's callback 6 (Cancel's); the table's entry 0 means none.
-s32 feeder_call(PPUContext& ctx, u32 f, u32 index)
-{
-    const u32 fn = r32(ctx, f + 4 * index);
-    if (!fn) return 0;
-    return static_cast<s32>(static_cast<u32>(call_guest(ctx, fn, {r32(ctx, f + 0x2C)})));
-}
-
-// The stream side's makeup (libsail_rec's): the recorder and the index kept, the state 1, the makeup called.
-s32 feeder_makeup(PPUContext& ctx, u32 f, u32 rec, u32 index)
-{
-    w32(ctx, f + fd::kRecorder, rec);
-    w32(ctx, f + fd::kIndex, index);
-    w32(ctx, f + fd::kState, 1);
-    return feeder_call(ctx, f, 0);
-}
-
-s32 feeder_cleanup(PPUContext& ctx, u32 f)
-{
-    w32(ctx, f + fd::kState, 0);
-    return feeder_call(ctx, f, 1);
-}
-
-// ------------------------------------------------------------------------------------------------- pipelines
-
-// The streams' pipelines as Boot makes them (state 1) and the end takes them down (only cleared from state 1).
-constexpr u32 kAudioPipeSize = 0x228, kAudioPipeState = 0x21C, kVideoPipeSize = 0x3C0, kVideoPipeState = 0x168;
-
-void audio_pipeline_init(PPUContext& ctx, u32 p, u32 rec, u32 clock)
-{
-    std::memset(gb(ctx) + p, 0, kAudioPipeSize);
-    w32(ctx, p + kAudioPipeState, 1);
-    w32(ctx, p, rec);
-    w32(ctx, p + 0xC, clock);
-}
-
-void audio_pipeline_fini(PPUContext& ctx, u32 p)
-{
-    if (r32(ctx, p + kAudioPipeState) > 1) later(ctx, "an audio pipeline's resources");
-    std::memset(gb(ctx) + p, 0, kAudioPipeSize);
-}
-
-void video_pipeline_init(PPUContext& ctx, u32 p, u32 rec, u32 clock)
-{
-    std::memset(gb(ctx) + p, 0, kVideoPipeSize);
-    w32(ctx, p + kVideoPipeState, 1);
-    w32(ctx, p, rec);
-    w32(ctx, p + 0xC, clock);
-}
-
-void video_pipeline_fini(PPUContext& ctx, u32 p)
-{
-    if (r32(ctx, p + kVideoPipeState) > 1) later(ctx, "a video pipeline's resources");
-    std::memset(gb(ctx) + p, 0, kVideoPipeSize);
-}
-
 // The recorder's clock (0x58 bytes, mode 0): its lwmutex "_saisr0" at +0x10.
 s32 clock_init(PPUContext& ctx, u32 c)
 {
@@ -154,6 +96,51 @@ void clock_reset(PPUContext& ctx, u32 c)
 {
     w32(ctx, c + 8, 0);
     w32(ctx, c + 4, 0);
+}
+
+// The clock (+4 the stream that set it, +8 its owner, +0x28 and +0x30 the source's and the stream's last times, +0x40
+// and +0x38 their first, +0x48 the timescale, +0x50 the times running the prediction was kept): the first stream to
+// tell it owns it; at each later time `a` of the owner's the source's time is predicted from the times so far (a step
+// `d` on from the last); `b` is taken when it lies within `d` of the prediction, else the prediction is kept, at most
+// three times running.
+void clock_update(PPUContext& ctx, u32 c, u32 owner, u64 a, u64 b, u64 timescale)
+{
+    if (lv2(ctx, "sys_lwmutex_lock", {c + 0x10, 0}) < 0) return;
+    const u32 held = r32(ctx, c + 8);
+    if (!held) {
+        w32(ctx, c + 8, owner);
+        w32(ctx, c + 4, owner);
+        w32(ctx, c + 0x50, 0);
+        w64(ctx, c + 0x30, a);
+        w64(ctx, c + 0x28, b);
+        w64(ctx, c + 0x48, timescale);
+        w64(ctx, c + 0x38, a);
+        w64(ctx, c + 0x40, b);
+    } else if (held == owner) {
+        const s64 last_a = static_cast<s64>(r64(ctx, c + 0x30)), span_a = last_a - static_cast<s64>(r64(ctx, c + 0x38));
+        const s64 last_b = static_cast<s64>(r64(ctx, c + 0x28));
+        bool take = span_a == 0;
+        s64 predicted = 0;
+        if (!take) {
+            const double step = static_cast<double>(static_cast<s64>(a) - last_a) *
+                                static_cast<double>(last_b - static_cast<s64>(r64(ctx, c + 0x40))) /
+                                static_cast<double>(span_a);
+            const s64 d = static_cast<s64>(ps_f64_bits(ps_ppu_fctid(step, PS_FPSCR_RN_ZERO)));
+            predicted = last_b + d;
+            const bool far = static_cast<s64>(b) + d <= predicted || d + predicted <= static_cast<s64>(b);
+            if (far) {
+                const u32 kept = r32(ctx, c + 0x50) + 1;
+                w32(ctx, c + 0x50, kept);
+                take = static_cast<s32>(kept) > 3;
+            } else {
+                take = true;
+            }
+            if (take) w32(ctx, c + 0x50, 0);
+        }
+        w64(ctx, c + 0x28, take ? b : static_cast<u64>(predicted));
+        w64(ctx, c + 0x30, a);
+    }
+    lv2(ctx, "sys_lwmutex_unlock", {c + 0x10});
 }
 
 namespace {
@@ -313,12 +300,16 @@ void message_loop(PPUContext& ctx, u32 rec)
         case 0xB: stop(ctx, rec, m2, m3); break;
         case 0xC: stop_flush(ctx, rec, m2, m3); break;
         case 0x2E: composer_session_error(ctx, rec, m3); break;
+        case 0xF: feeder_completed(ctx, m2, static_cast<s32>(m3)); break;
+        case 0x10: case 0x11: case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x2B:
+            audio_message(ctx, rec, code, m2, m3);
+            break;
         case 0xE:
-            // Cancel: each feeder's cancel call (the game's callback 6).
+            // Cancel: each feeder's cancel (the game's callback 6).
             for (u32 i = 0; i < r32(ctx, rec + rc::kAudioCount); i++)
-                feeder_call(ctx, r32(ctx, r32(ctx, rec + rc::kAudio) + i * rc::kAudioStride + as::kFeeder), 6);
+                feeder_cancel(ctx, r32(ctx, r32(ctx, rec + rc::kAudio) + i * rc::kAudioStride + as::kFeeder));
             for (u32 i = 0; i < r32(ctx, rec + rc::kVideoCount); i++)
-                feeder_call(ctx, r32(ctx, r32(ctx, rec + rc::kVideo) + i * rc::kVideoStride + vs::kFeeder), 6);
+                feeder_cancel(ctx, r32(ctx, r32(ctx, rec + rc::kVideo) + i * rc::kVideoStride + vs::kFeeder));
             break;
         case 0x30: {
             // Finalize: the stop record at +0x450 in use, the recorder no longer running, every event unsubscribed.
@@ -558,94 +549,6 @@ namespace {
 void _pspocket_cellSailRec_control(PPUContext& ctx, u64 rec) { control_thread(ctx, rec); }
 void _pspocket_cellSailRec_task(PPUContext& ctx, u64 rec) { task_thread(ctx, rec); }
 
-// ------------------------------------------------------------------------------------------------- feeder tables
-
-// libsail_rec's eleven callbacks in front of an audio feeder's (the game's at +0xC0, its argument at +0xEC) and a video
-// feeder's (+0xD0, +0xFC); each passes on the registers it does not set, as libsail_rec's do. 0 makeup and 1 cleanup
-// (0 without the game's), 2 open (the format kept at +0xA8, 0x18 bytes, or +0xB0, 0x20 bytes; the game's with the
-// format and 0), 3 start, 4 stop and 5 cancel (the game's with 0), each without the game's callback the call completed
-// at once (the diagnostic handler or the feeder's call-completed message); 6 the game's when it has one; 7 the format
-// (the game's with 0 and the place for it, or the one kept); 8 to 10 the game's always. Makeup, cleanup, the format and
-// 8 to 10 sign-extend the answer.
-template <bool Video>
-struct FeederTable {
-    static constexpr u32 kFuncs = Video ? fd::kVideoFuncs : fd::kAudioFuncs, kArg = Video ? fd::kVideoArg : fd::kAudioArg;
-    static constexpr u32 kFormat = Video ? 0xB0 : 0xA8, kFormatSize = Video ? 0x20 : 0x18;
-    static constexpr u32 kDiag = Video ? fd::kVideoDiag : fd::kAudioDiag;
-    static constexpr u32 kDiagArg = Video ? fd::kVideoDiagArg : fd::kAudioDiagArg;
-    static constexpr u32 kCompleted = Video ? 0x19 : 0xF;
-
-    static u64 sext(u64 v) { return static_cast<u64>(static_cast<s64>(static_cast<s32>(static_cast<u32>(v)))); }
-    static u32 game(PPUContext& ctx, u32 f, u32 i) { return r32(ctx, f + kFuncs + 4 * i); }
-    static u32 arg(PPUContext& ctx, u32 f) { return r32(ctx, f + kArg); }
-
-    // The call completed at once with 0 (libsail_rec's NotifyCallCompleted).
-    static u64 completed(PPUContext& ctx, u32 f)
-    {
-        if (const u32 diag = r32(ctx, f + kDiag)) return call_guest(ctx, diag, {r32(ctx, f + kDiagArg), 0, 0, 0});
-        return static_cast<u64>(static_cast<s64>(post(ctx, r32(ctx, f + fd::kRecorder), kCompleted, f, 0)));
-    }
-    static u64 makeup(PPUContext& ctx, u32 f)
-    {
-        const u32 fn = game(ctx, f, 0);
-        return fn ? sext(call_guest(ctx, fn, {arg(ctx, f)})) : 0;
-    }
-    static u64 cleanup(PPUContext& ctx, u32 f)
-    {
-        const u32 fn = game(ctx, f, 1);
-        return fn ? sext(call_guest(ctx, fn, {arg(ctx, f)})) : 0;
-    }
-    static u64 open(PPUContext& ctx, u32 f, u32 format)
-    {
-        std::memmove(gb(ctx) + f + kFormat, gb(ctx) + format, kFormatSize);
-        const u32 fn = game(ctx, f, 2);
-        return fn ? call_guest(ctx, fn, {arg(ctx, f), format, 0}) : completed(ctx, f);
-    }
-    static u64 with_zero(PPUContext& ctx, u32 f, u32 i)
-    {
-        const u32 fn = game(ctx, f, i);
-        return fn ? call_guest(ctx, fn, {arg(ctx, f), 0}) : completed(ctx, f);
-    }
-    static u64 six(PPUContext& ctx, u32 f)
-    {
-        const u32 fn = game(ctx, f, 6);
-        return fn ? call_guest(ctx, fn, {arg(ctx, f)}) : f;
-    }
-    static u64 format(PPUContext& ctx, u32 f, u32 out)
-    {
-        if (const u32 fn = game(ctx, f, 7)) return sext(call_guest(ctx, fn, {arg(ctx, f), 0, out}));
-        std::memmove(gb(ctx) + out, gb(ctx) + f + kFormat, kFormatSize);
-        return 0;
-    }
-    static u64 always(PPUContext& ctx, u32 f, u32 i) { return sext(call_guest(ctx, game(ctx, f, i), {arg(ctx, f)})); }
-};
-
-using AF = FeederTable<false>;
-using VF = FeederTable<true>;
-
-u64 _pspocket_cellSailRec_AudioMakeup(PPUContext& ctx, u32 f) { return AF::makeup(ctx, f); }
-u64 _pspocket_cellSailRec_AudioCleanup(PPUContext& ctx, u32 f) { return AF::cleanup(ctx, f); }
-u64 _pspocket_cellSailRec_AudioOpen(PPUContext& ctx, u32 f, u32 format) { return AF::open(ctx, f, format); }
-u64 _pspocket_cellSailRec_AudioStart(PPUContext& ctx, u32 f) { return AF::with_zero(ctx, f, 3); }
-u64 _pspocket_cellSailRec_AudioStop(PPUContext& ctx, u32 f) { return AF::with_zero(ctx, f, 4); }
-u64 _pspocket_cellSailRec_AudioCancel(PPUContext& ctx, u32 f) { return AF::with_zero(ctx, f, 5); }
-u64 _pspocket_cellSailRec_AudioCheckout(PPUContext& ctx, u32 f) { return AF::six(ctx, f); }
-u64 _pspocket_cellSailRec_AudioFormat(PPUContext& ctx, u32 f, u32, u32 out) { return AF::format(ctx, f, out); }
-u64 _pspocket_cellSailRec_AudioGet(PPUContext& ctx, u32 f) { return AF::always(ctx, f, 8); }
-u64 _pspocket_cellSailRec_AudioRelease(PPUContext& ctx, u32 f) { return AF::always(ctx, f, 9); }
-u64 _pspocket_cellSailRec_AudioClose(PPUContext& ctx, u32 f) { return AF::always(ctx, f, 10); }
-u64 _pspocket_cellSailRec_VideoMakeup(PPUContext& ctx, u32 f) { return VF::makeup(ctx, f); }
-u64 _pspocket_cellSailRec_VideoCleanup(PPUContext& ctx, u32 f) { return VF::cleanup(ctx, f); }
-u64 _pspocket_cellSailRec_VideoOpen(PPUContext& ctx, u32 f, u32 format) { return VF::open(ctx, f, format); }
-u64 _pspocket_cellSailRec_VideoStart(PPUContext& ctx, u32 f) { return VF::with_zero(ctx, f, 3); }
-u64 _pspocket_cellSailRec_VideoStop(PPUContext& ctx, u32 f) { return VF::with_zero(ctx, f, 4); }
-u64 _pspocket_cellSailRec_VideoCancel(PPUContext& ctx, u32 f) { return VF::with_zero(ctx, f, 5); }
-u64 _pspocket_cellSailRec_VideoCheckout(PPUContext& ctx, u32 f) { return VF::six(ctx, f); }
-u64 _pspocket_cellSailRec_VideoFormat(PPUContext& ctx, u32 f, u32, u32 out) { return VF::format(ctx, f, out); }
-u64 _pspocket_cellSailRec_VideoGet(PPUContext& ctx, u32 f) { return VF::always(ctx, f, 8); }
-u64 _pspocket_cellSailRec_VideoRelease(PPUContext& ctx, u32 f) { return VF::always(ctx, f, 9); }
-u64 _pspocket_cellSailRec_VideoClose(PPUContext& ctx, u32 f) { return VF::always(ctx, f, 10); }
-
 #define SAILREC_LATER(name, what) \
     s32 name(PPUContext& ctx) { later(ctx, what); }
 
@@ -679,28 +582,6 @@ void register_control(Registry& r)
         SAILREC_INTERNAL(_pspocket_cellSailRec_FsWrite),
         SAILREC_INTERNAL(_pspocket_cellSailRec_FsRename),
         SAILREC_INTERNAL(_pspocket_cellSailRec_FsUnlink),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioMakeup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioCleanup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioOpen),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioStart),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioStop),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioCancel),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioCheckout),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioFormat),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioGet),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioRelease),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_AudioClose),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoMakeup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoCleanup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoOpen),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoStart),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoStop),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoCancel),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoCheckout),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoFormat),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoGet),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoRelease),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoClose),
     });
 }
 

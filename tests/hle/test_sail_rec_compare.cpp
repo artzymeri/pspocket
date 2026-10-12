@@ -173,6 +173,59 @@ void write_code(u8* b)
     c.emit(as::stw(8, 0, 7));
     c.emit(as::lwz(3, 0, 2));
     c.emit(as::blr());
+    // The feeders' callbacks the recordings use (their TOC a block: the answer word first). Each records {TOC, r3, ...}
+    // with the handler's records first.
+    const auto record = [&](bool r4, bool r5) {
+        c.emit(as::lis(7, static_cast<s32>(kEvents >> 16)));
+        c.emit(as::ori(7, 7, kEvents & 0xFFFF));
+        c.emit(as::lwz(8, 0, 7));
+        c.emit(as::andi_(10, 8, kEventRecs));
+        c.emit(as::slwi(10, 10, 5));
+        c.emit(as::add(10, 10, 7));
+        c.emit(as::std_(2, 16, 10));
+        c.emit(as::std_(3, 24, 10));
+        c.emit(as::li(9, 0));
+        if (r4) c.emit(as::std_(4, 32, 10));
+        else c.emit(as::std_(9, 32, 10));
+        if (r5) c.emit(as::std_(5, 40, 10));
+        else c.emit(as::std_(9, 40, 10));
+        c.emit(as::lwsync());
+        c.emit(as::addi(8, 8, 1));
+        c.emit(as::stw(8, 0, 7));
+    };
+    while (c.pc() < kCode + 0x700) c.emit(as::nop());
+    // The audio format: {TOC, r3, r4, 0}; the 0x18 bytes at TOC + 8 to r5.
+    record(true, false);
+    for (u32 i = 0; i < 6; i++) {
+        c.emit(as::lwz(9, static_cast<s32>(8 + 4 * i), 2));
+        c.emit(as::stw(9, static_cast<s32>(4 * i), 5));
+    }
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
+    while (c.pc() < kCode + 0x800) c.emit(as::nop());
+    // The checkout: {TOC, r3, 0, 0}; r4 given the frame TOC + 8 holds the table of (32 bytes each) at the index TOC + 4,
+    // the index moved on modulo the count at TOC + 12.
+    record(false, false);
+    c.emit(as::lwz(9, 4, 2));
+    c.emit(as::lwz(10, 8, 2));
+    c.emit(as::slwi(11, 9, 5));
+    c.emit(as::add(11, 10, 11));
+    c.emit(as::stw(11, 0, 4));
+    c.emit(as::addi(9, 9, 1));
+    c.emit(as::lwz(12, 12, 2));
+    c.emit(as::cmpw(0, 9, 12));
+    const auto in_range = c.new_label();
+    c.blt(0, in_range);
+    c.emit(as::li(9, 0));
+    c.bind(in_range);
+    c.emit(as::stw(9, 4, 2));
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
+    while (c.pc() < kCode + 0x900) c.emit(as::nop());
+    // {TOC, r3, r4, 0}.
+    record(true, false);
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
     const std::vector<u8> code = c.finish();
     std::memcpy(b + kCode, code.data(), code.size());
     ps_write32(b, kAllocDesc, kCode);
@@ -1648,6 +1701,448 @@ void script_streams_quiet(H& h)
     finish_spurs(h);
 }
 
+// ------------------------------------------------------------------------------------------------- audio streams
+
+constexpr u32 kAf = kFeeders;                  // the audio feeder (0x200)
+constexpr u32 kAfFuncs = kBoot + 0x1000;       // its 11 callbacks (the game's table)
+constexpr u32 kAfDescs = kBoot + 0x1100;       // their descriptors
+constexpr u32 kAfBlocks = kBoot + 0x1200;      // their TOC blocks (0x40 each): the answer word, then the routine's data
+constexpr u32 kAfFrames = kBoot + 0x2000;      // the frames' records (0x20 each, 16 at most)
+constexpr u32 kPcm = kData + 0x1D0000;         // the frames' samples (192 KB)
+constexpr u32 kAuOut = kArgs + 0xC00;          // TryGetEsAudioAu's records (0x20 each, 16 at most)
+constexpr u32 kAuLeft = kArgs + 0xE00;         // its remaining count
+constexpr u32 kAudioParam = kArgs + 0xE40;     // SetEsAudioParameter's parameter (0x48 bytes)
+constexpr u32 kRecord3 = kCode + 0x500, kRecord345 = kCode + 0x600, kFormatCall = kCode + 0x700,
+              kCheckoutCall = kCode + 0x800, kRecord34 = kCode + 0x900;
+
+u32 af_block(u32 i) { return kAfBlocks + 0x40 * i; }
+
+// The audio feeder's callback `i`: none (0), or a routine with its block (the answer 0).
+void af_callback(H& h, u32 i, u32 routine)
+{
+    if (!routine) {
+        h.w32(kAfFuncs + 4 * i, 0);
+        return;
+    }
+    const u32 d = kAfDescs + 8 * i;
+    h.w32(d, routine);
+    h.w32(d + 4, af_block(i));
+    std::memset(h.b + af_block(i), 0, 0x40);
+    h.w32(kAfFuncs + 4 * i, d);
+}
+
+// An audio stream's case: the frames the feeder gives (`samples` float samples of `channels` channels at `fs` each,
+// tones), and what the profile asks (the rate, -1 for the default; the slot may resample).
+struct AudioCase {
+    u32 frames = 6;
+    s8 channels = 2;
+    u16 samples = 1024;
+    u32 fs = 48000;
+    s32 rate = -1;
+    bool resample = false;
+    bool full = false; // the feeder also with its open, close, start, stop and cancel callbacks (the script answers)
+    s8 want_channels = 2; // the profile's channels when it asks a rate
+    double amplitude = 0.2; // the tones'
+    s32 delay = -1;         // the composer's delay (the stream parameters: its ring's span), -1 for the default
+};
+
+// A feeder with the required callbacks (the format, checkout, checkin, clear) and makeup and cleanup: its steps
+// complete at once. Its frames' times are in the recorder's timescale (1 MHz), from its table of frames in turn.
+void audio_feeder(H& h, const AudioCase& c)
+{
+    for (u32 i = 0; i < 11; i++) af_callback(h, i, 0);
+    af_callback(h, 0, kRecord345);
+    af_callback(h, 1, kRecord3);
+    if (c.full) {
+        af_callback(h, 2, kRecord3);   // open (its format a place on the stack)
+        af_callback(h, 3, kRecord345); // close (0, the handle)
+        af_callback(h, 4, kRecord345); // start (0, the start time)
+        af_callback(h, 5, kRecord34);  // stop (0)
+        af_callback(h, 6, kRecord3);   // cancel
+    }
+    af_callback(h, 7, kFormatCall);
+    af_callback(h, 8, kCheckoutCall);
+    af_callback(h, 9, kRecord34);
+    af_callback(h, 10, kRecord3);
+    const u32 fmt = af_block(7) + 8;
+    h.b[fmt] = 1;
+    h.b[fmt + 1] = static_cast<u8>(c.channels);
+    ps_write16(h.b, fmt + 2, c.samples);
+    h.w32(fmt + 4, c.fs);
+    h.w32(fmt + 8, 0xFFFFFFFF);
+    h.w32(fmt + 12, 0xFFFFFFFF);
+    ps_write64(h.b, fmt + 16, ~u64{0});
+    h.w32(af_block(8) + 4, 0);
+    h.w32(af_block(8) + 8, kAfFrames);
+    h.w32(af_block(8) + 12, c.frames);
+    const u32 bytes = u32{c.samples} * static_cast<u32>(c.channels) * 4;
+    REQUIRE(bytes * c.frames <= 0x30000);
+    for (u32 k = 0; k < c.frames; k++) {
+        const u32 info = kAfFrames + 0x20 * k, pcm = kPcm + bytes * k;
+        std::memset(h.b + info, 0, 0x20);
+        h.w32(info, pcm);
+        h.w32(info + 4, bytes);
+        h.w32(info + 8, c.samples);
+        ps_write64(h.b, info + 0x10, u64{k} * c.samples * 1000000 / c.fs);
+        for (u32 n = 0; n < c.samples; n++) {
+            const double t = static_cast<double>(k * c.samples + n) / c.fs;
+            for (s32 ch = 0; ch < c.channels; ch++)
+                ps_writef32(h.b, pcm + 4 * (n * static_cast<u32>(c.channels) + static_cast<u32>(ch)),
+                    static_cast<float>(c.amplitude * std::sin(2 * 3.14159265358979 * (440 + 110 * ch) * t)));
+        }
+    }
+}
+
+// The records since `from` whose TOC is `toc` (the callback they name).
+u32 records_of(H& h, u32 toc, u32 from)
+{
+    u32 n = 0;
+    for (u32 k = from; k < h.r32(kEvents); k++)
+        if (ps_read64(h.b, kEvents + 16 + 32 * (k & kEventRecs)) == toc) n++;
+    return n;
+}
+
+// Waits (`seconds` at most: the encoder's SPU program runs under the interpreter) for `n` records of `toc` since
+// `from`.
+void wait_records_of(H& h, u32 toc, u32 n, u32 from, const std::string& what, int seconds = 300)
+{
+    for (int i = 0; i < seconds * 100 && records_of(h, toc, from) < n; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (records_of(h, toc, from) < n) FAIL(what << ": " << records_of(h, toc, from) << " records, not " << n);
+}
+
+void wait_event_long(H& h, u64 event, const std::string& what, int seconds = 300)
+{
+    for (int i = 0; i < seconds * 100; i++) {
+        for (u32 k = h.events_seen; k < h.r32(kEvents); k++)
+            if (ps_read64(h.b, kEvents + 16 + 32 * (k & kEventRecs) + 8) == event) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL(what << ": no event " << std::format("{:#x}", event));
+}
+
+// Waits until the recorder is quiet: the control thread waiting for a message while neither the encoder nor the
+// resampler of the audio slot is busy, twice 20 ms apart.
+void wait_quiet(H& h, const std::string& what, int seconds = 300)
+{
+    const u32 p = h.r32(kRec + 0x7F0) + 0x50;
+    const auto quiet = [&] { return h.r32(kRec + 0x510) == 200 && !h.r32(p + 0x1C8) && !h.r32(p + 0x1C4); };
+    for (int i = 0; i < seconds * 50; i++) {
+        if (quiet()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (quiet()) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    FAIL(what << ": the recorder is not quiet");
+}
+
+// An audio stream's objects: the slot (its records' continuations masked), the pipeline (its stop's), the encoder's
+// last message, the composer's stream entry, the feeder (its own table and its step's continuation masked), the
+// stream's parameters (the channel tables' addresses masked: libsail_rec's own data).
+void audio_state(H& h, const std::string& key, u32 profile)
+{
+    const u32 slot = h.r32(kRec + 0x7F0);
+    if (!slot) {
+        h.o.line(key + ": the slots", "none");
+        return;
+    }
+    h.mem(key + ": the slot", slot, 0x50, {{0xC, 4}, {0x24, 4}, {0x3C, 4}});
+    h.mem(key + ": the pipeline", slot + 0x50, 0x228, {{0x14, 4}});
+    if (const u32 m = h.r32(slot + 0x50 + 0x88 + 0x20)) h.mem(key + ": the encoder's message", m, 0x44);
+    h.mem(key + ": the slot's stream entry", slot + 0x278, 0x40);
+    h.mem(key + ": the feeder", kAf, 0x200, {{0, 0x2C}, {0x5C, 4}});
+    if (profile) h.mem(key + ": the audio parameters", h.r32(profile + 0x550), 0x108, {{0xA8, 8}});
+}
+
+// The composer's audio units there taken (their records and bytes) and given back.
+u32 take_units(H& h, const std::string& key)
+{
+    h.w32(kAuLeft, 0xEEEEEEEE);
+    h.call(key + ": TryGetEsAudioAu(0)", "cellSailComposerTryGetEsAudioAu", {kComposer, 0, kAuOut, 0, kAuLeft});
+    const u32 n = std::min<u32>(h.r32(kAuLeft), 16);
+    if (!n) return 0;
+    h.call(std::format("{}: TryGetEsAudioAu({})", key, n), "cellSailComposerTryGetEsAudioAu",
+        {kComposer, 0, kAuOut, n, kAuLeft});
+    h.mem(key + ": the units' records", kAuOut, 0x20 * n);
+    for (u32 i = 0; i < n; i++) {
+        const u32 at = h.r32(kAuOut + 0x20 * i), size = h.r32(kAuOut + 0x20 * i + 4);
+        if (at && size && size < 0x2000) h.mem(std::format("{}: unit {}", key, i), at, size);
+    }
+    h.call(std::format("{}: ReleaseEsAudioAu({})", key, n), "cellSailComposerReleaseEsAudioAu", {kComposer, 0, n});
+    return n;
+}
+
+// A booted recorder with one audio stream (the feeder of `c`) through the game's composer (its open, close, start and
+// stop callbacks none: they complete at once), parameter 68 as `c` asks.
+void boot_audio(H& h, const AudioCase& c)
+{
+    h.tr.lightweight = false;
+    make_spurs(h);
+    tagged_composer(h);
+    for (const u32 i : {2u, 3u, 4u, 5u}) h.w32(kComposerFuncs + 4 * i, 0);
+    attribute(h, 0, 1, 0, 0);
+    REQUIRE(h.call("Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) == 0);
+    if (c.resample) h.call("SetParameter(68, 0, 1)", "cellSailRecorderSetParameter", {kRec, 0x44, 0, 1});
+    h.call("ComposerInitialize", "cellSailComposerInitialize", {kComposer, kComposerFuncs, 0x5A5A});
+    h.call("RegisterComposer(3)", "cellSailRecorderRegisterComposer", {kRec, 3, kComposer});
+    audio_feeder(h, c);
+    h.call("FeederAudioInitialize", "cellSailFeederAudioInitialize", {kAf, kAfFuncs, 0x7700, 0});
+    h.call("SetFeederAudio", "cellSailRecorderSetFeederAudio", {kRec, 0, kAf});
+    h.call("Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, "Boot");
+    wait_idle(h, "Boot");
+    h.logs("Boot");
+    audio_state(h, "Boot", 0);
+}
+
+// A profile for the game's composer; the audio stream's parameters set when `c` asks a rate.
+u32 audio_profile(H& h, const AudioCase& c)
+{
+    const u32 out = kArgs + 0x400;
+    h.call("CreateProfile(3)", "cellSailRecorderCreateProfile", {kRec, 3, out});
+    const u32 profile = h.r32(out);
+    if (c.rate != -1) {
+        const u32 a = kAudioParam;
+        std::memset(h.b + a, 0xFF, 0x48);
+        h.w32(a, 0x48);
+        h.w32(a + 4, 1);
+        h.b[a + 0x31] = static_cast<u8>(c.want_channels);
+        h.w32(a + 0x34, static_cast<u32>(c.rate));
+        h.call("SetEsAudioParameter", "cellSailProfileSetEsAudioParameter", {profile, 0, a, 0});
+    }
+    if (c.delay != -1) {
+        const u32 sp = kAudioParam + 0x60;
+        h.w32(sp, 0xC);
+        h.w32(sp + 4, 90000);
+        h.w32(sp + 8, static_cast<u32>(c.delay));
+        h.call("SetStreamParameter", "cellSailProfileSetStreamParameter", {profile, 0, sp});
+    }
+    h.logs("CreateProfile(3)");
+    return profile;
+}
+
+// One audio stream recorded through the game's composer: OpenStream (libaacenc made and configured on the game's
+// SPURS), Start, the frames given and encoded, the composer's units taken, Stop (the encoder flushed), CloseStream,
+// Finalize.
+void script_audio(H& h, const AudioCase& c)
+{
+    boot_audio(h, c);
+    const u32 profile = audio_profile(h, c);
+    h.call("OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, path_arg(h, "/dev_hdd0/rec"), 0x22, 0x33,
+                                                          0x4455});
+    wait_event_long(h, u64{2} << 32 | 0x21, "OpenStream's completion");
+    wait_idle(h, "OpenStream");
+    h.logs("OpenStream");
+    streams_recorder(h, "OpenStream");
+    streams_composer(h, "OpenStream");
+    audio_state(h, "OpenStream", profile);
+    h.call("Start", "cellSailRecorderStart", {kRec, 0, path_arg(h, "a.mp4"), 0x5566});
+    wait_event_long(h, u64{2} << 32 | 0x29, "Start's completion");
+    wait_idle(h, "Start");
+    h.logs("Start");
+    audio_state(h, "Start", profile);
+    // The frames: each taken, encoded (through the intermediate buffer and the resampler when the case needs them)
+    // and given back; the units after the encoder's delay to the composer.
+    const u32 from = h.events_seen;
+    h.call("NotifyFrameOut", "cellSailFeederAudioNotifyFrameOut", {kAf, c.frames});
+    wait_records_of(h, af_block(9), c.frames, from, "the frames given back");
+    wait_quiet(h, "the frames");
+    h.logs("the frames");
+    audio_state(h, "the frames", profile);
+    streams_composer(h, "the frames");
+    // The composer's units taken as they come (a small ring of the composer's fills up: the rest wait in the
+    // pipeline's until units are given back).
+    for (u32 round = 0; round < 16; round++) {
+        const std::string k = std::format("recorded {}", round);
+        if (!take_units(h, k)) break;
+        wait_quiet(h, k + ": the units given back");
+        h.logs(k + ": the units given back");
+        audio_state(h, k + ": the units given back", profile);
+    }
+    // Stop: the feeder stopped, the encoder flushed, the composer's stream ended once its units are given back.
+    const u32 from_stop = h.events_seen;
+    h.call("Stop", "cellSailRecorderStop", {kRec, 0, 0x6677});
+    for (u32 round = 0; round < 16 && !records_of(h, composer_answer(11), from_stop); round++) {
+        const std::string k = std::format("stopping {}", round);
+        wait_quiet(h, k);
+        if (records_of(h, composer_answer(11), from_stop)) break;
+        take_units(h, k);
+    }
+    wait_records_of(h, composer_answer(11), 1, from_stop, "the composer's stream ended");
+    wait_quiet(h, "Stop");
+    h.logs("Stop");
+    audio_state(h, "Stop", profile);
+    streams_composer(h, "Stop");
+    take_units(h, "the stop");
+    wait_event_long(h, u64{2} << 32 | 0x2A, "Stop's completion");
+    wait_idle(h, "Stop's completion");
+    h.logs("Stop's completion");
+    audio_state(h, "Stop's completion", profile);
+    streams_recorder(h, "Stop's completion");
+    h.call("CloseStream", "cellSailRecorderCloseStream", {kRec, 0x6688});
+    wait_event_long(h, u64{2} << 32 | 0x22, "CloseStream's completion");
+    wait_idle(h, "CloseStream");
+    h.logs("CloseStream");
+    audio_state(h, "CloseStream", profile);
+    streams_recorder(h, "CloseStream");
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    h.o.line("the heap's end", std::format("{:#x}", h.r32(kHeapState) - kHeap));
+    REQUIRE(h.r32(kHeapState) < kPcm);
+    finish_spurs(h);
+}
+
+// Waits (`seconds` at most) for the recorder's state.
+void wait_state(H& h, u32 state, const std::string& what, int seconds = 300)
+{
+    for (int i = 0; i < seconds * 100 && h.r32(kRec + 0x704) != state; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (h.r32(kRec + 0x704) != state) FAIL(what << ": the state is " << h.r32(kRec + 0x704) << ", not " << state);
+}
+
+// The feeder's call `i` answered by the game (cellSailFeederAudioNotifyCallCompleted) once it was made since `from`.
+void answer_feeder(H& h, u32 i, u32 from, s32 result, const std::string& what)
+{
+    wait_records_of(h, af_block(i), 1, from, what);
+    h.call(std::format("{}: NotifyCallCompleted({})", what, result), "cellSailFeederAudioNotifyCallCompleted",
+        {kAf, static_cast<u64>(static_cast<s64>(result))});
+}
+
+// An audio stream's steps with a feeder that answers its calls itself: OpenStream; frames out before Start (taken and
+// given straight back); Cancel; Start with a window (the frames before it given straight back; its end ending the
+// session, the feeder's stop asked, the frames still out drained); Start again; Finalize while recording (everything
+// stopped, the ring flushed, and closed).
+void script_audio_steps(H& h)
+{
+    const AudioCase c{.frames = 12, .full = true};
+    boot_audio(h, c);
+    const u32 profile = audio_profile(h, c);
+    u32 from = h.events_seen;
+    h.call("OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, path_arg(h, "/dev_hdd0/steps"), 0x22, 0x33,
+                                                          0x4455});
+    answer_feeder(h, 2, from, 0, "the feeder's open");
+    wait_event_long(h, u64{2} << 32 | 0x21, "OpenStream's completion");
+    wait_quiet(h, "OpenStream");
+    h.logs("OpenStream");
+    audio_state(h, "OpenStream", profile);
+    from = h.events_seen;
+    h.call("NotifyFrameOut before Start", "cellSailFeederAudioNotifyFrameOut", {kAf, 2});
+    wait_records_of(h, af_block(9), 2, from, "the frames before Start given back");
+    wait_quiet(h, "frames before Start");
+    h.logs("frames before Start");
+    audio_state(h, "frames before Start", profile);
+    from = h.events_seen;
+    h.call("Cancel", "cellSailRecorderCancel", {kRec});
+    wait_records_of(h, af_block(6), 1, from, "the feeder's cancel");
+    wait_quiet(h, "Cancel");
+    h.logs("Cancel");
+    // Start with the window of frames 3 to 6.
+    const u64 t3 = u64{3} * 1024 * 1000000 / 48000, t6 = u64{6} * 1024 * 1000000 / 48000;
+    const u32 param = kArgs + 0x100;
+    std::memset(h.b + param, 0, 0x20);
+    h.w32(param, 0x18);
+    ps_write64(h.b, param + 8, t3);
+    ps_write64(h.b, param + 0x10, t6 - t3);
+    from = h.events_seen;
+    h.call("Start in a window", "cellSailRecorderStart", {kRec, param, path_arg(h, "w.mp4"), 0x7788});
+    answer_feeder(h, 4, from, 0, "the feeder's start");
+    wait_event_long(h, u64{2} << 32 | 0x29, "Start's completion");
+    wait_quiet(h, "Start in a window");
+    h.logs("Start in a window");
+    h.mem("Start in a window: its parameter", param, 0x18);
+    audio_state(h, "Start in a window", profile);
+    from = h.events_seen;
+    h.call("NotifyFrameOut(6)", "cellSailFeederAudioNotifyFrameOut", {kAf, 6});
+    wait_records_of(h, af_block(9), 1, from, "the frame before the window given back");
+    wait_quiet(h, "the frame before the window");
+    h.logs("the frame before the window");
+    audio_state(h, "the frame before the window", profile);
+    h.call("NotifyFrameOut(0)", "cellSailFeederAudioNotifyFrameOut", {kAf, 0});
+    answer_feeder(h, 5, from, 0, "the window's end: the feeder's stop");
+    wait_records_of(h, composer_answer(11), 1, from, "the window's end: the composer's stream ended");
+    wait_quiet(h, "the window's end");
+    h.logs("the window's end");
+    audio_state(h, "the window's end", profile);
+    take_units(h, "the window's end");
+    wait_state(h, 4, "the window's end: open again");
+    wait_quiet(h, "the window's end: open again");
+    h.logs("the window's end: open again");
+    audio_state(h, "the window's end: open again", profile);
+    streams_recorder(h, "the window's end: open again");
+    streams_composer(h, "the window's end: open again");
+    // Start again; two frames; Finalize while recording (the feeder's stop and close then answer at once).
+    from = h.events_seen;
+    h.call("Start again", "cellSailRecorderStart", {kRec, 0, path_arg(h, "x.mp4"), 0x99AA});
+    answer_feeder(h, 4, from, 0, "Start again: the feeder's start");
+    wait_event_long(h, u64{2} << 32 | 0x29, "Start again's completion");
+    wait_quiet(h, "Start again");
+    h.logs("Start again");
+    from = h.events_seen;
+    h.call("NotifyFrameOut(2)", "cellSailFeederAudioNotifyFrameOut", {kAf, 2});
+    wait_records_of(h, af_block(9), 2, from, "two frames given back");
+    wait_quiet(h, "two frames");
+    h.logs("two frames");
+    audio_state(h, "two frames", profile);
+    h.w32(kAf + 0xC0 + 4 * 3, 0);
+    h.w32(kAf + 0xC0 + 4 * 5, 0);
+    const u32 slot = h.r32(kRec + 0x7F0);
+    h.call("Finalize while recording", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize while recording");
+    // The slot's block freed (the test's allocator keeps its bytes): the pipeline as the end left it.
+    h.mem("Finalize while recording: the pipeline", slot + 0x50, 0x228, {{0x14, 4}});
+    h.mem("Finalize while recording: the feeder", kAf, 0x200, {{0, 0x2C}, {0x5C, 4}});
+    h.mem("Finalize while recording: the recorder", kRec, 0x2000, {{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4},
+        {0x518, 8}, {0x580, 4}, {0x5F0, 8}, {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3}, {0x870, 16}, {0x40C, 4},
+        {0x41C, 4}, {0x42C, 4}, {0x45C, 4}, {0x46C, 4}, {0x47C, 4}, {0x48C, 4}, {0x77C, 4}});
+    REQUIRE(h.r32(kHeapState) < kPcm);
+    finish_spurs(h);
+}
+
+// Audio streams refused at OpenStream: the feeder's open answering an error, its format failing, formats libsail_rec
+// does not take (3 channels, a layout of 5, 4 channels, an unknown rate asked to be resampled to 48 kHz): each slot is
+// closed again (an error event, the stream-closed event) while the stream opens without it; CloseStream then.
+void script_audio_refusals(H& h)
+{
+    AudioCase c{.frames = 2, .rate = 48000, .resample = true, .full = true, .want_channels = -1};
+    boot_audio(h, c);
+    const u32 profile = audio_profile(h, c);
+    const u32 fmt = af_block(7) + 8;
+    const auto round = [&](const std::string& k, s32 open_result) {
+        const u32 from = h.events_seen;
+        h.call(k + ": OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, path_arg(h, "/r"), 0x22, 0x33, 4});
+        answer_feeder(h, 2, from, open_result, k + ": the feeder's open");
+        if (open_result >= 0) answer_feeder(h, 3, from, 0, k + ": the feeder's close");
+        wait_event_long(h, u64{2} << 32 | 0x21, k + ": OpenStream's completion");
+        wait_quiet(h, k);
+        h.logs(k);
+        audio_state(h, k, profile);
+        streams_recorder(h, k);
+        h.call(k + ": CloseStream", "cellSailRecorderCloseStream", {kRec, 0x66});
+        wait_event_long(h, u64{2} << 32 | 0x22, k + ": CloseStream's completion");
+        wait_quiet(h, k + ": CloseStream");
+        h.logs(k + ": CloseStream");
+    };
+    round("the feeder's open failing", -5);
+    h.w32(af_block(7), 0x80610799);
+    round("the format failing", 0);
+    h.w32(af_block(7), 0);
+    h.b[fmt + 1] = 3;
+    round("3 channels", 0);
+    h.b[fmt + 1] = 2;
+    h.w32(fmt + 8, 5);
+    round("layout 5", 0);
+    h.w32(fmt + 8, 0xFFFFFFFF);
+    h.b[fmt + 1] = 4;
+    round("4 channels", 0);
+    h.b[fmt + 1] = 2;
+    h.w32(fmt + 4, 37800);
+    round("37.8 kHz to 48 kHz", 0);
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -1715,6 +2210,27 @@ Observed half_streams_quiet(const Setup& s, bool sony)
 {
     H h(s, sony, true);
     script_streams_quiet(h);
+    return std::move(h.o);
+}
+
+Observed half_audio(const Setup& s, bool sony, const AudioCase& c)
+{
+    H h(s, sony, true);
+    script_audio(h, c);
+    return std::move(h.o);
+}
+
+Observed half_audio_steps(const Setup& s, bool sony)
+{
+    H h(s, sony, true);
+    script_audio_steps(h);
+    return std::move(h.o);
+}
+
+Observed half_audio_refusals(const Setup& s, bool sony)
+{
+    H h(s, sony, true);
+    script_audio_refusals(h);
     return std::move(h.o);
 }
 
@@ -1812,5 +2328,43 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: streams through the game's co
             CHECK(o.value("OpenStream while open") == "0x80610702");
         });
     run(s, "cellSailRec: streams with no event", [&](bool sony) { return half_streams_quiet(s, sony); },
+        [](const Observed&) {});
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: an audio stream recorded", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    const auto check = [](const Observed& o) {
+        CHECK(o.value("OpenStream") == "0x0");
+        CHECK(o.value("Start") == "0x0");
+        CHECK(o.value("Stop") == "0x0");
+    };
+    run(s, "cellSailRec: stereo at 48 kHz, the encoder's frames", [&](bool sony) { return half_audio(s, sony, {}); }, check);
+    run(s, "cellSailRec: 6 channels mixed down",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 5, .channels = 6}); }, check);
+    run(s, "cellSailRec: 8 channels mixed down, loud (the limiter)",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 4, .channels = 8, .amplitude = 0.7}); }, check);
+    run(s, "cellSailRec: 6 channels mixed down, loud (the limiter)",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 3, .channels = 6, .amplitude = 0.9}); }, check);
+    run(s, "cellSailRec: a composer's ring of four units",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 8, .delay = 8000}); }, check);
+    run(s, "cellSailRec: frames of 480 samples",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 9, .samples = 480}); }, check);
+    run(s, "cellSailRec: 44.1 kHz resampled to 48 kHz",
+        [&](bool sony) { return half_audio(s, sony, {.frames = 6, .fs = 44100, .rate = 48000, .resample = true}); },
+        check);
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: an audio stream's steps", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: an audio stream's steps", [&](bool sony) { return half_audio_steps(s, sony); },
+        [](const Observed& o) { CHECK(o.value("Start in a window") == "0x0"); });
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: audio streams refused", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: audio streams refused", [&](bool sony) { return half_audio_refusals(s, sony); },
         [](const Observed&) {});
 }

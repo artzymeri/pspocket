@@ -12780,3 +12780,55 @@ refused around them (Start's parameter checks, Stop, a second OpenStream, CloseS
 open stream; Finalize with the stream open; the same with every event unsubscribed: 0 of 229 and 0 of 52 observations
 differ (each half's continuations' descriptors masked in the records and the callbacks' handles). The feeders'
 stream side, the pipelines and the MP4 composer stop the process with the call site until their parts.
+
+### D-918, part 7: cellSailRec's audio streams: the feeders' stream side, the audio pipeline, libsail_rec's AAC encoder
+
+libsail_rec's audio recording, natively (runtime/hle/src/cellSailRecFeed.cpp, cellSailRecAudio.cpp), as fw 4.92's
+module runs it on its control thread:
+- **The feeders**: the eleven callbacks libsail_rec puts in front of the game's (moved from cellSailRecControl.cpp and
+  named by what they do: makeup, cleanup, open, close, start, stop, cancel, the format, checkout, checkin, clear), each
+  passing on the registers it does not set (the game's makeup sees the recorder and the stream's index, open the format
+  and 0, close, start and stop 0 and what follows); open, close, start and stop without the game's callback complete
+  at once. The stream's side (states 1 made to 11 ended): open with the slot and pipeline kept; start with the session
+  and the recording's window; a frame taken through the game's checkout given straight back when before the window's
+  start or not after the last frame's time, a kept one given the session (its +0xC) and held; the window's end ends a
+  recording session (the session-end notification); stop by the state (up to the end time, or forced; the end time
+  reached drains the frames still out, which the pipeline takes); the session's step completes once the pipeline gives
+  its last frame back (the frames still out taken and given back, the game's clear); frames out while nothing records
+  are taken and given back at once.
+- **A stream's configuration** once its feeder is open (libsail_rec's continuation of the open): the format the feeder
+  gives (its format callback into the parameters' +0x50) against the profile's: the channels (6 or 8 mixed down to 2)
+  and their layout (derived from the channels when unset; 1, 2, 8, 9, 11 and 12 taken), the rate (resampled to 24 or
+  48 kHz from 8 to 48 kHz when parameter 68 allows and the profile asks), the timescale (a multiple of the rate), AAC's
+  configuration (64000 bit/s a channel by default, the profile's within half to six times the samples a second; the
+  channel tables libsail_rec's, read from the installed module); anything else UNSUPPORTED_STREAM, an error event, the
+  slot closed again — and the stream opens without it (OpenStream's continuation ignores the slots' results, as
+  libsail_rec's). Then the pipeline opened and the stream added to the composer.
+- **The pipeline** (0x228 bytes in the slot): the encoder (a 1 MB work area from the game's allocator), libapostsrc_mini
+  (cellApostSrcMini, module 0xF03B, through the firmware as the D-197 imports) when resampling, an intermediate buffer
+  of one encoder frame unless the feeder's frames are already that, and one block for it, the ring of units (room for
+  the composer's delay at the bit rate, 32-bit arithmetic as the PPU's) and the units' records. Started: silence
+  aligning the encoder's delay to whole units, the delay's units skipped; frames in (the clock told each, mode 0), the
+  mix-down with the PPU's rounding (0.707 front, half the rest, a soft limit above 0.5, clipped), resampled blocks
+  (message 0x15), units out (0x16) into the ring with their times, handed to the composer as it has room (0x18) and
+  given back (0x2B); stop pads the last frame and flushes the encoder; a forced stop empties the ring.
+- **libaacenc**, libsail_rec's own AAC library: a taskset "_libaacenc_<the encoder>" on the game's SPURS (or a SPURS of
+  its own), its SPU program (libsail_rec's, read from the installed module), overlays (cellOvis), heap (cellSheap), two
+  SPURS queues of one message; commands {code, a, b} answered {.., .., b, result}: open (0x15, the notification's
+  queue), configure (0x10), sizes (0x12), delay (0x13), encode (0x104) and flush (0x105) answered later, finish
+  (0x11), end (1).
+- **The clock** (mode 0): the first stream to tell it owns it; each later time predicts the source's, kept at most three
+  times running while the source's lies outside a step of it.
+- **Messages**: 0xE the feeders' cancel, 0xF a feeder's call completed, 0x10 frames out, 0x11 a session's end (a
+  recording slot stopped outside Stop), 0x14 to 0x18 and 0x2B the pipeline's; the pump takes a frame whenever the
+  streams record (or Stop runs), frames wait and the pipeline has none.
+Compared (tests/hle/test_sail_rec_compare.cpp, one audio stream through the game's composer, the feeder's callbacks
+guest code recording their registers, the frames tones): stereo at 48 kHz in the encoder's frames, 6 and 8 channels
+mixed down (quiet and loud enough for the limiter), frames of 480 samples, 44.1 kHz resampled to 48 kHz, a composer
+ring of four units (the rest waiting in the pipeline's): OpenStream, Start, the frames encoded, the units' records and
+bytes, Stop with the encoder flushed, CloseStream, Finalize: 0 differences in 164, 160, 156, 152, 174, 168 and 172
+observations; a feeder answering its own calls: frames before Start, Cancel, Start in a window (frames before it given
+back, its end ending the session and draining), Start again, Finalize while recording: 0 of 175; refusals (the feeder's
+open failing, its format failing, 3 or 4 channels, a layout of 5, 37.8 kHz asked to be resampled): 0 of 214. libaacenc's
+SPU program and the resampler run under pspocket's SPURS in both halves. The video pipeline and the MP4 composer stop the
+process with the call site until their parts.

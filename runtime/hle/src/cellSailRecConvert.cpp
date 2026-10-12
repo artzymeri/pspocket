@@ -19,7 +19,9 @@
 
 #include <cstring>
 #include <format>
+#include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "cellSailRec.hpp"
@@ -68,6 +70,7 @@ u64 sx(s32 v) { return static_cast<u64>(static_cast<s64>(v)); }
 struct ModuleData {
     std::mutex m;
     std::map<u32, u32> programs; // vaddr -> guest copy (0: could not be had)
+    std::map<std::pair<u32, u32>, u32> copies; // (vaddr, size) -> guest copy (0: could not be had)
 };
 
 std::optional<std::vector<u8>> read_module(u32 vaddr, u32 size)
@@ -119,6 +122,27 @@ u32 spu_program(PPUContext& ctx, u32 vaddr)
     }
     std::memcpy(gb(ctx) + at, image->data(), end);
     PS_LOG_INFO(kChan, "libsail_rec's SPU program at {:#x}: {:#x} bytes of {} at {:#x}", vaddr, end, kModuleFile, at);
+    return at;
+}
+
+u32 module_copy(PPUContext& ctx, u32 vaddr, u32 size)
+{
+    ModuleData& d = HleProcess::current()->state<ModuleData>();
+    std::lock_guard lock(d.m);
+    if (const auto it = d.copies.find({vaddr, size}); it != d.copies.end()) return it->second;
+    u32& at = d.copies[{vaddr, size}];
+    const auto bytes = read_module(vaddr, size);
+    if (!bytes || bytes->size() < size) {
+        PS_LOG_ERROR(kChan, "libsail_rec's data at {:#x} ({:#x} bytes): the module cannot be read (the installed system "
+            "software's {} is needed)", vaddr, size, kModuleFile);
+        return 0;
+    }
+    at = HleProcess::current()->main_memory().alloc((size + 127) & ~127u, 0x80);
+    if (!at) {
+        PS_LOG_ERROR(kChan, "no guest memory for libsail_rec's data at {:#x} ({:#x} bytes)", vaddr, size);
+        return 0;
+    }
+    std::memcpy(gb(ctx) + at, bytes->data(), size);
     return at;
 }
 
