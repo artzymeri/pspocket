@@ -168,6 +168,8 @@ void register_net_syscalls(SyscallTable& table);
 void register_device_syscalls(SyscallTable& table);
 void register_service_syscalls(SyscallTable& table);
 void register_misc_syscalls(SyscallTable& table);
+void register_dbg_syscalls(SyscallTable& table);
+void register_crypto_engine_syscalls(SyscallTable& table);
 void register_prx_syscalls(SyscallTable& table);
 void register_rsxaudio_syscalls(SyscallTable& table);
 void register_raw_spu_syscalls(SyscallTable& table);

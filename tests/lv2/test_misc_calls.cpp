@@ -32,6 +32,63 @@ TEST_CASE("lv2 retail console: debug kernels' calls are not here", "[lv2][misc]"
     }
 }
 
+// The retail kernel's own table (D-936): the calls it points at its not-implemented slot; and the debugging calls it
+// has, ported from its handlers (D-937).
+TEST_CASE("lv2 retail console: what the retail kernel's table lacks, and its console type", "[lv2][misc]")
+{
+    {
+        Fixture f;
+        Caller c(*f.kernel, "game");
+        for (const u32 n : {215u, 216u, 901u, 907u, 908u, 912u, 913u, 915u, 916u, 917u, 918u, 919u, 920u, 921u, 922u,
+                 923u, 924u, 925u, 926u, 927u, 928u, 929u, 930u, 931u, 932u, 934u, 936u, 938u, 939u, 940u, 942u, 946u,
+                 948u, 949u, 950u, 952u, 953u, 954u, 955u, 956u, 970u}) {
+            INFO(n);
+            CHECK(c.call(n, 0, 0, 0) == rc(CELL_ENOSYS));
+        }
+        // sys_dbg_get_console_type: a null pointer first; then a game's control flags are below the system level.
+        CHECK(c.call(985, 0) == rc(CELL_EFAULT));
+        CHECK(c.call(985, f.alloc(8)) == rc(CELL_ENOSYS));
+    }
+    {
+        Fixture f(root_config());
+        Caller c(*f.kernel, "system");
+        const u32 type = f.alloc(8);
+        REQUIRE(c.call(985, type) == CELL_OK);
+        CHECK(f.r64(type) == 1); // a retail console
+        CHECK(c.call(985, 0) == rc(CELL_EFAULT));
+    }
+}
+
+TEST_CASE("lv2 crypto engine: created and destroyed; without the system's keys nothing prepares", "[lv2][misc]")
+{
+    Fixture f;
+    Caller c(*f.kernel, "game");
+    const u32 id = f.alloc(4), buf = f.alloc(0x40);
+    REQUIRE(c.call(976, id) == CELL_OK);
+    const u32 e = f.r32(id);
+    CHECK((e >> 24) == 0x78);
+    // A game may prepare hasher index 1 and cipher table 1 / index 1 / mode 0-1 only.
+    CHECK(c.call(978, e, 2) == rc(CELL_EPERM));
+    CHECK(c.call(978, e, 1) == rc(CELL_ENOENT)); // the system's key tables are not here
+    CHECK(c.call(978, 0x78000999, 1) == rc(CELL_ESRCH));
+    CHECK(c.call(981, e, 1, 2, 1, buf, 16) == rc(CELL_EPERM));
+    CHECK(c.call(981, e, 1, 1, 1, buf, 16) == rc(CELL_ENOENT));
+    CHECK(c.call(981, e, 1, 1, 1, 0x7FFFFFF0, 0x100) == rc(CELL_EFAULT)); // the key is copied in first
+    // Unprepared: a run's first piece and the hash are refused; nothing to run is fine; the hash wants 20 bytes.
+    CHECK(c.call(979, e, buf, 16) == rc(CELL_EINVAL));
+    CHECK(c.call(979, e, buf, 0) == CELL_OK);
+    CHECK(c.call(980, e, buf, 19) == rc(CELL_EFAULT));
+    CHECK(c.call(980, e, buf, 20) == rc(CELL_EINVAL));
+    CHECK(c.call(982, e, buf, buf, 16) == rc(CELL_EINVAL));
+    CHECK(c.call(983, e, buf, 20) == rc(CELL_EINVAL));
+    // Random bytes: 16 at a time.
+    CHECK(c.call(984, buf, 15) == rc(CELL_EINVAL));
+    CHECK(c.call(984, buf, 64) == CELL_OK);
+    REQUIRE(c.call(977, e) == CELL_OK);
+    CHECK(c.call(977, e) == rc(CELL_ESRCH));
+    CHECK(c.call(979, e, buf, 16) == rc(CELL_ESRCH));
+}
+
 TEST_CASE("lv2 retail console: the system software's calls, a game's and root's", "[lv2][misc]")
 {
     const std::initializer_list<u32> system_calls = {583u, 584u, 585u, 586u, 587u, 588u, 589u, 590u, 591u, 592u, 593u,

@@ -13984,3 +13984,31 @@ sys_dbg_get_console_type (985).
 A first reading took the table 26 entries early (into a list of exception names) and drew the wrong set; the
 comparison of every well-known call with its handler is the check that the table now starts where it does.
 Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS).
+
+## D-937 · 2026-10-13 · lv2's debugging and crypto calls a retail console has, ported from its kernel (part 1)
+
+The 33 calls D-936 left are real on a retail console; each is ported from the retail kernel's own handler (the 4.93
+lv2_kernel.self, decompiled into inventory/firmware/kernel493/ghidra; addresses in the code). What their checks rest
+on, read from the kernel:
+- **A process's privileges.** The kernel keeps, per process, its authority ID and two 256-bit vectors: its SELF's
+  capability flags (the encrypted metadata's optional header 1) and its control flags (supplemental header 1). A check
+  either wants bits of the first or compares the second as a number: the kernel's own is 0x8000..., the system
+  software's modules 0x4000...; a game's is 0 (GTA V's EBOOT: control flags zero, capability flags
+  ...0000003b 00000001 00040000). pspocket's root process (tests) stands for the system software's level, a game's
+  process for a game's.
+- **sys_dbg's access check** (0x800000000008CB4C): on a retail console a process may inspect only itself, whatever its
+  flags (another process: 0x80010409). So a game reads its own threads, objects, registers and SPU contexts with them,
+  which is how liblv2coredump writes a game's crash report on a retail console.
+Ported in this part (runtime/lv2/src/dbg.cpp, crypto_engine.cpp):
+- **sys_dbg_get_console_type (985):** a null pointer is CELL_EFAULT; below the system software's level CELL_ENOSYS (a
+  game's answer); else 1, a retail console.
+- **The crypto engine (976 to 984):** engines (object type 0x78) any process may create and destroy; HMAC-SHA1 hashing
+  and ciphers keyed by the system's key tables, which the kernel takes at boot from a validated blob outside its image.
+  pspocket has no such keys: its engines meet what a console meets when that blob does not validate (preparing a hasher
+  or cipher CELL_ENOENT, running one or reading its hash CELL_EINVAL for an unprepared engine). Every other check is the
+  kernel's, in its order: hasher index 1 and cipher table 1 / index 1 / mode 0 or 1 only below the system level (else
+  CELL_EPERM), the key copied in before the engine is looked up (CELL_EFAULT, then CELL_ESRCH), the hash output 20
+  bytes at least (else CELL_EFAULT), the data 1 KB at a time. random_generate writes 16 random bytes whatever larger
+  size is asked (less than 16: CELL_EINVAL).
+Tests: tests/lv2/test_misc_calls.cpp. Left: 353, 356, 361 and sys_dbg's 900, 902, 903, 906, 909 to 911, 914, 933, 935,
+937, 941, 943 to 945, 947, 951, 957, 971 and 975 (the next parts).
