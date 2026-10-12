@@ -41,6 +41,7 @@ enum : s32 {
     CELL_ADEC_TYPE_EAC3 = 8,
     CELL_ADEC_TYPE_TRUEHD = 9,
     CELL_ADEC_TYPE_DTS = 10,
+    CELL_ADEC_TYPE_CELP = 11,
     CELL_ADEC_TYPE_LPCM_BLURAY = 12,
     CELL_ADEC_TYPE_ATRACX_2CH = 13,
     CELL_ADEC_TYPE_ATRACX_6CH = 14,
@@ -54,6 +55,7 @@ enum : s32 {
     CELL_ADEC_TYPE_MPEG_L1 = 22,
     CELL_ADEC_TYPE_MP3S = 23,
     CELL_ADEC_TYPE_M4AAC_2CH_MOD = 24,
+    CELL_ADEC_TYPE_CELP8 = 25,
     // RPCS3's RESERVED22 and RESERVED23, "either WMA Pro or WMA Lossless, never released": libadec has no core for
     // them, so cellAdec refuses them. pspocket's WMA Pro and WMA Lossless cores, reached only through their own
     // modules' tables (cellWMAPROdec, cellWMALSLdec), carry these numbers in their contexts, in the order of the PTS
@@ -177,6 +179,8 @@ std::unique_ptr<AdecCore> make_lpcm_core();
 // pspocket's ATRAC3plus core on FFmpeg (adec_atracx.cpp), for up to `max_channels` channels (its memory size); none in a
 // build without FFmpeg.
 std::unique_ptr<AdecCore> make_atracx_core(u32 max_channels);
+// pspocket's own CELP core (adec_celp.cpp, D-932): libcelpdec's, for MPEG-4 CELP at 16 kHz.
+std::unique_ptr<AdecCore> make_celp_core();
 // pspocket's own core on FFmpeg for a codec whose firmware core serves first (adec_ffmpeg.cpp, D-577): MP3, MPEG audio
 // layers I and II, MPEG-4 AAC (the three types), AC-3 and ATRAC3; Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and
 // ATRAC3 multichannel (D-621); TrueHD, the four DTS types and WMA, and the WMA Pro and WMA Lossless cores under the
@@ -215,5 +219,6 @@ s32 _pspocket_adec_notify_seq_done(PPUContext& ctx, u32 context);
 void _pspocket_lpcm_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_atracx_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_adec_ffmpeg_dec_thread(PPUContext& ctx, u64 core_handle);
+void _pspocket_celp_dec_thread(PPUContext& ctx, u64 core_handle);
 
 } // namespace pspocket::hle::adec

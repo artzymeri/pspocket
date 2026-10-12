@@ -152,6 +152,7 @@ add_library(pspocket_hle STATIC
     src/libmixer.cpp
     src/codec_cores.cpp
     src/cellCelpEnc.cpp
+    src/adec_celp.cpp
     src/celp_math.cpp
     src/celp_rpe.cpp
     src/celp_rpe_enc.cpp

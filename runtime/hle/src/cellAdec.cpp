@@ -7,8 +7,8 @@
 // would for libadec. Where no firmware module gives one, pspocket's own core on FFmpeg serves the codecs it has one of
 // (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; D-621: Dolby Digital Plus, MPEG-2 AAC, MP3
 // Surround, ATRAC3 multichannel; D-622: TrueHD, DTS, DTS-HD, its core, DTS Express, WMA; adec_ffmpeg.hpp): firmware
-// first, as D-563 does for whole libraries, until each is compared with Sony's core on the Mac. CELP and CELP 8 kHz
-// have none (FFmpeg has no MPEG-4 CELP decoder).
+// first, as D-563 does for whole libraries, until each is compared with Sony's core on the Mac. CELP is pspocket's own
+// (adec_celp.cpp, D-932: libcelpdec's, compared with it); CELP 8 kHz has none yet (FFmpeg has no MPEG-4 CELP decoder).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h (get_core_ops, AdecContext, the notifications, the API).
 
 //
@@ -58,7 +58,6 @@ constexpr HostImport kImports[] = {
     {{}, "cellDDPdec", 0xF5E9C15C, true},         // E-AC-3
     {{}, "cellTRHDdec", 0xE88E381B, true},        // TrueHD
     {{}, "cellDTSdec", 0x15248EC5, true},         // DTS
-    {{}, "cellCelpDec", 0xFFE42C22, true},        // CELP
     {{}, "cellM4AacDec", 0xAB61278D, true},       // MPEG-4 AAC
     {{}, "cellWMAdec", 0x88320B10, true},         // WMA
     {{}, "cellDTSLBRdec", 0x8C50AF52, true},      // DTS Express
@@ -74,7 +73,6 @@ constexpr HostImport kImports[] = {
     {{}, "cellAtrac3multidec", 0xC20C6BD7, true}, // ATRAC3 multichannel
     {{}, "cellDDPdec", 0xEE2731D3, false},         // _SceAdecCorrectPtsValue_Ddp
     {{}, "cellDTSHDdec", 0xF3AF1093, false},       // _SceAdecCorrectPtsValue_DtsHd
-    {{}, "cellCelpDec", 0xE4B8FC4D, false},        // _SceAdecCorrectPtsValue_Celp
     {{}, "cellM2AACdec", 0x7CBA9865, false},       // _SceAdecCorrectPtsValue_Aac
     {{}, "cellM2BCdec", 0xEC7DE355, false},        // _SceAdecCorrectPtsValue_mpmc
     {{}, "cellTRHDdec", 0x75080F7B, false},        // _SceAdecCorrectPtsValue_truehd
@@ -234,11 +232,13 @@ private:
     s32 type_;
 };
 
-// pspocket's own core that serves a type before any firmware module's: LPCM (D-197) and ATRAC3plus on FFmpeg (D-198).
+// pspocket's own core that serves a type before any firmware module's: LPCM (D-197), ATRAC3plus on FFmpeg (D-198) and
+// CELP (D-932, compared with libcelpdec's).
 std::unique_ptr<AdecCore> own_first_core(s32 type)
 {
     if (is_lpcm(type)) return make_lpcm_core();
     switch (type) {
+    case CELL_ADEC_TYPE_CELP: return make_celp_core();
     case CELL_ADEC_TYPE_ATRACX:
     case CELL_ADEC_TYPE_ATRACX_8CH: return make_atracx_core(8);
     case CELL_ADEC_TYPE_ATRACX_2CH: return make_atracx_core(2);
@@ -289,11 +289,9 @@ std::unique_ptr<AdecCore> core_of(u8* base, u32 h)
     return std::make_unique<NoCore>(type);
 }
 
-// Whether an open decoder runs on pspocket's own core of a codec the firmware serves first (D-577).
-bool on_own_fallback_core(u8* base, u32 h)
-{
-    return !ps_read32(base, h + ctx_off::core_ops) && !own_first_core(static_cast<s32>(ps_read32(base, h + ctx_off::type)));
-}
+// Whether an open decoder runs on a core of pspocket's own (not a firmware module's table): one of a codec the firmware
+// serves first (D-577), or CELP's (D-932), whose PTS functions are its own.
+bool on_own_core(u8* base, u32 h) { return !ps_read32(base, h + ctx_off::core_ops); }
 
 u32 core_handle(u8* base, u32 h) { return ps_read32(base, h + ctx_off::core_handle); }
 
@@ -593,7 +591,7 @@ s32 correct_pts_value(PPUContext& ctx, u32 h, s32 pcm_handle, s8 type)
     u8* base = guest_base(ctx);
     if (verify_pcm_handle(base, h, pcm_handle) != lv2::CELL_OK) return error(CELL_ADEC_ERROR_FATAL);
     const u32 pts = frame_at(base, h, pcm_handle) + frame_off::au_info + 8;
-    const bool own = on_own_fallback_core(base, h);
+    const bool own = on_own_core(base, h);
     for (const PtsFunction& f : kPtsFunctions)
         if (f.type == type) return own ? own_pts_function(ctx, h, pts) : call_pts_function(ctx, h, f.library, f.nid, pts);
     if (type == CORRECT_PTS_M4AAC) {
