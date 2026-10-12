@@ -12546,3 +12546,29 @@ with a ring and the test answering as the system software in another process wou
 ring, the reply put in, under the channel's mutex): results above and below zero, every battery status with levels in
 and out of range, power words, missing attributes, replies of 0x5000, 0x6000, 0x6001 and more bytes; the answers, the
 outputs, each request's bytes as the system reads them and the lv2 calls of each call: 0 of 293 observations differ.
+
+## D-918 · 2026-10-12 · The module-management entries of the modules pspocket serves itself (part 2)
+
+The chart's "(module management)" (nids.txt's nameless library "[]": RPCS3's names for the NIDs every PRX exports in
+it, module_start, module_stop, module_prologue, module_epilogue, module_exit and the variable module_info) had nothing
+of pspocket's: no game imports them, and a firmware module pspocket replaces never runs. Decided: they are the entries
+of the modules pspocket serves itself. A game that loads a firmware module by its path whose libraries are the host's
+gets a module with no code from the loader (RuntimeModules, D-159), which until now had no entries at all
+(sys_prx_get_module_info reported none, starting and stopping ran nothing). It now has the host's, registered under
+the nameless library (runtime/hle/src/module_management.cpp) and reached as a firmware module's are (D-916 part 1):
+- module_prologue(entry, args, argp) and module_epilogue: as the SDK's start-up code (read from librudp.sprx and other
+  fw 4.92 modules) they call the entry with the arguments' low words unless it is all ones and answer its result (0
+  without one). The SDK's also make the module's lock and run its C++ constructors (the epilogue its destructors and
+  atexit functions): the host's libraries have none, their state being the host's. The SDK's refuse a second start
+  with 0x8001000A by a counter in the module's data; the loader refuses one first (ALREADY_STARTED), so none is kept.
+- module_start: SYS_PRX_RESIDENT (0), as Sony's modules answer; module_stop and module_exit: 0.
+- module_info: the module's description as a PRX carries it (ppu_prx_module_info, 0x34 bytes): attributes 0,
+  version 1.1, the name "pspocket", no TOC or tables.
+sys_prx_start_module on such a module now runs the prologue with module_start (the result word 0, as before), and
+sys_prx_get_module_info reports module_start and module_stop. pspocket-boot --hle-list prints the library's lines with
+its empty name first; scripts/progress.py counts them as "(module management)" (and test_hle's NID check takes the
+names the NID database gives these fixed NIDs).
+Compared (tests/hle/test_module_management.cpp) with librudp's prologue and epilogue on a fresh module: the entry
+called with the low words of 64-bit arguments, its answer passed through, nothing called for an entry of all ones:
+0 of 7 observations differ. A firmware-free test loads a host-served module by path and checks the reported entries,
+the start's and stop's results and the second start's refusal.

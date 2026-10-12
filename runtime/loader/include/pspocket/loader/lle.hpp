@@ -252,6 +252,7 @@ private:
         State state = State::Loaded;
     };
     Entry* find(u32 id);
+    hle::ModuleEntry host_entry(bool start);
     u32 link_function(std::string_view library, u32 nid, std::string_view who);
     u32 link_variable(std::string_view library, u32 nid, std::string_view who);
 

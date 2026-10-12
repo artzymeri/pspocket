@@ -72,6 +72,7 @@ void register_cell_FreeType2(Registry& r);
 void register_cellSail(Registry& r);
 void register_cellSailRec(Registry& r);
 void register_cellSysconfPs1emu(Registry& r);
+void register_module_management(Registry& r);
 void register_cellSpursJq(Registry& r);
 void register_cellFiber(Registry& r);
 void register_cellSync2(Registry& r);
@@ -174,6 +175,7 @@ void register_all_modules(Registry& r)
     register_cellSail(r);
     register_cellSailRec(r);
     register_cellSysconfPs1emu(r);
+    register_module_management(r);
     register_cellSpursJq(r);
     register_cellFiber(r);
     register_cellSync2(r);
