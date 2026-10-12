@@ -12521,3 +12521,28 @@ With the comparisons that now match Sony's modules out of hiding (D-912 to D-916
 installed runs about six minutes (cellRudp's comparison alone about 110 s), past the 300 s ctest limit scripts/gate.sh
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
+
+## D-918 · 2026-10-12 · cellSysconfPs1emu as Sony's libsysutil_sysconf_ps1emu requests it (part 1)
+
+The PS1 emulator's settings library (four exports known only by their NIDs, in libsysutil_sysconf_ps1emu.sprx, a
+libsysutil module pspocket always serves itself, so the four failed when called) is pspocket's own
+(runtime/hle/src/cellSysconfPs1emu.cpp), read from the module (fw 4.92) in a scratch area. The module is a client of
+libsysutil's: each export builds a request as libsysutil's own requests are built (D-534: the packet begun on channel 0
+with ID 0x110, FixedMemory 0, a document with the magic "SYSC"), sends it to the system software and reads the reply
+into the same document, its root's "result" first (a negative one is the answer):
+- 0x83E79A23 (port, u8 out[2]): "getBattery" {portNo}; "status" to out[0], "level" to out[1]; a level out of the
+  status's range (status 0: 1-2, 1: 1-5, 2 and 3 any; a status above 3) is CELL_SYSUTIL_ERROR_VALUE, the bytes written
+  all the same.
+- 0x6A12D11F (port1, port2): "swapGamePad" {port1, port2}; only the same port twice is refused (the low words
+  compared), no range.
+- 0x639ABBDE (port): "disconGamePad" {portNo}.
+- 0xEFDDAF6C (port, u16 out[2]): "getPower" {portNo}; "status" and "reserved" to the two halfwords.
+Ports above 6 (the low word, unsigned) and a null output answer 0x8002BB01 before anything is sent; a reply larger than
+the module's 0x6000-byte buffer is libsysutil's TRUNCATED; a missing attribute is cxml's NO_ATTRIBUTE (with what was
+read before it written). On pspocket's console the channels are closed (D-534), so each request answers 0x8002b007,
+as Sony's module does on pspocket.
+Compared (tests/hle/test_sysconf_ps1emu_compare.cpp): every export's checks on closed channels, then channel 0 opened
+with a ring and the test answering as the system software in another process would (the request taken out of the
+ring, the reply put in, under the channel's mutex): results above and below zero, every battery status with levels in
+and out of range, power words, missing attributes, replies of 0x5000, 0x6000, 0x6001 and more bytes; the answers, the
+outputs, each request's bytes as the system reads them and the lv2 calls of each call: 0 of 293 observations differ.

@@ -48,7 +48,8 @@ target_sources(test_hle PRIVATE
     test_libmixer_compare.cpp
     test_fiber_compare.cpp
     test_vdec_codecs_compare.cpp
-    test_rudp_compare.cpp)
+    test_rudp_compare.cpp
+    test_sysconf_ps1emu_compare.cpp)
 
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE
