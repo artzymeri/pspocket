@@ -12521,3 +12521,89 @@ With the comparisons that now match Sony's modules out of hiding (D-912 to D-916
 installed runs about six minutes (cellRudp's comparison alone about 110 s), past the 300 s ctest limit scripts/gate.sh
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
+
+## D-901 · 2026-10-10 · cellSail's built-in file source (x-cell-fs), as libsail
+
+Every cellSail player registers libsail's own source for the "x-cell-fs" protocol at Initialize. Part 2 of D-562 laid it
+out and left its callbacks and file calls failing loudly; they are now pspocket's own (runtime/hle/src/
+cellSailFileSource.cpp), read from libsail.sprx (fw 4.92, its fn_1bf24..fn_1d0e0 and the reader thread's entry) and
+compared with it running on pspocket (tests/hle/test_sail_source.cpp).
+
+- **The source** (0x138 bytes in the player's block): +0 the command for the reader (-1 none), +1 the items ready, +2 the
+  next to check out, +3 the next to fill, +4 the reader's state (0 ended, 1 closed, 2 open, 3 started), +8 the open
+  file's descriptor, +0x10 the reader's thread ID, +0x18 its path (287 bytes on the reader's stack), +0x1C the path
+  changed, +0x20 two items {buffer, size, session, 0}, +0x40 the CellSailSource it registers (its argument the source
+  itself), +0xC0 an lwmutex and +0xD8 an lwcond (both "_saifs0"), +0xE0 the read size (1 MB), +0xE8 and +0xF0 a Start's
+  length and position, +0xF8 its session (0 once the reader took it), +0xFC Read's arguments (on the reader's stack),
+  +0x100 the file calls.
+- **The file calls** are fourteen words: -1, open, a call after open (none of libsail's), close, fstat, read, lseek,
+  cancel (libsail's answers 0), then none. pspocket's table had read, lseek and fstat in the wrong words; player
+  parameter 33 (the game's 0x28 bytes, D-562 part 5) takes them in libsail's order. libsail's are cellFs's, the
+  registers passed on as they are. A file is opened {path, 0 (read-only), &fd, 0, 0}, then the call after open, when
+  the game gave one, {path, 0, fd, 0, 0}; a descriptor of 0 is CELL_SAIL_ERROR_INVALID_FD.
+- **At once**: ReadSync opens the URI from its 13th character on (past "x-cell-fs://", whatever is there), stats the
+  file for its size (fstat's failure ignored), seeks when the offset is not 0, reads and closes it; a short read
+  answers the read's 0. GetCapabilities answers 0x71 for any stream. InquireCapability refuses start flags 1 (from a
+  byte position, the only start Start takes) and takes every other: libsail's test is inverted.
+- **Playing**: Makeup loads cellFs (cellSysmodule 0xE, when libsail loads modules), makes the lwmutex and lwcond and
+  starts "_libsail-source_fs" (the player's file source priority and stack, 1200 and 4 KB when 0; parameters 7 and 34)
+  and waits for it to run; Cleanup cancels the open file's calls, tells the reader to end (10), joins it
+  (sys_ppu_thread_join, 44), frees the buffer, destroys the lwmutex and lwcond and unloads cellFs. The callbacks hand
+  the reader one command at a time under the lwmutex (each waits for the last to be taken): Open (0; once taken, the
+  path copied, marked changed when it is not the reader's, and the 2 MB buffer allocated from the player's allocator
+  (boundary 0x80): two items of 1 MB), Start (1; only from a byte position, its position, length and session kept until
+  the reader took the last start), Checkin (2), Stop (4), Close (5; the buffer freed at once), Read (7; its arguments
+  written once taken), Clear (8). The open file's calls are cancelled before Stop, Close and Cleanup; Checkout takes
+  the items in turn under the lock (CELL_SAIL_ERROR_FATAL with none ready); Cancel does nothing.
+- **The reader** (libsail's state machine, each answer a cellSailSourceNotify*): closed, Open opens the path (or keeps
+  the file a Read left open when the path did not change) and answers, open; open, Start seeks unless the position is
+  the one it thinks it is at, answers 0 and starts; started, it fills an item while one is free (one read of up to 1 MB
+  or the length left: the item's size and session, StreamOut) and at the length's or the file's end says InputEos and
+  is open again. Stop of a started source answers 0 (open again), of an open one 1, of a closed one nothing; Close
+  answers the close's result (closed), 1 when closed; Start when closed is taken without an answer; Read reads as
+  ReadSync and answers. Waiting, an open source polls each second (fstat's EBADF: media state 2, the file closed, five
+  seconds on opened again: media state 0); a started one without its file opens it again five seconds on (seeking to
+  where it was; ENOTMOUNTED waits again); a read's EIO with fstat's EBADF is the medium gone (media state 2, the file
+  closed, a session error), another read error media state 1 and a session error, read again half a second on. A
+  failed lock, wait or signal ends the reader with a terminating session error.
+- **Stack variables where libsail has them.** libsail hands the file calls stack variables (the descriptor, the stat
+  buffer, the read count, the seek position) and keeps two of its reader's in the source (the path, Read's arguments).
+  pspocket takes each from a frame of the size libsail's function makes (Frame), so they are at libsail's addresses:
+  a game's file calls see the same pointers, the source the same words, and a reader started again on a reused stack
+  finds what libsail's would (the path below).
+- **libsail's slips, kept.** Read in the closed state keeps the file open for an Open of the same path and takes the
+  position after it as the size read, not the offset and the size, so a Start from that position skips the seek and
+  reads from the wrong place. Checkout does not count an item out (Checkin counts one fewer, whichever it is): a third
+  checkout of two ready items gives the first again. Close frees the buffer before the reader has taken the close.
+  Cleanup leaves the descriptor of a file still open in the source (the reader closed it), so the next reader's first
+  Open either reuses it, closed, when the path in its stack frame is still the same, or closes it again first. A
+  failing call after open leaves the file open. Without the buffer, Open clears the path and points the second item
+  at 1 MB; the reader then ignores the Open (Open itself answers CELL_SAIL_ERROR_MEMORY). Closing an open source
+  without a file answers the last lwcond signal's result. Stop goes on when its lock fails.
+- **Where libsail would fault** (a NULL or unmapped URI, start command, capabilities or item pointer, or Read's size
+  pointer), pspocket logs the call site and refuses the call with CELL_SAIL_ERROR_INVALID_ARG (D-042).
+- Calls go where libsail's go: sysPrxForUser's lwmutex, lwcond, thread and string functions through `sail::lv2_lib`,
+  lv2's join through `sail::sc`, cellFs, cellSysmodule and the notifications through `sail::module_call`. The file
+  calls go through their descriptors (libsail's own too, as libsail calls them through its table): the cost is a
+  guest call per file operation, next to a read of up to 1 MB.
+- **Compared** in tests/hle/test_sail_source.cpp (`[sail]`): each script in two fresh processes with libsail loaded,
+  one calling libsail's exports and one pspocket's, the source's callbacks called through the descriptors the source
+  holds; a synthetic /dev_hdd0 (a PAMF header and 2.5 MB of a pattern, a file shorter than its header). Compared: the
+  answers, the script's memory (the player and its source, the messages the source posted, drained from the ring of a
+  player that has not booted, the items' data, a log of the game's file calls and of the allocator's frees), the
+  allocator's memory (the player's block, the read-ahead buffers with what was read into them) and each thread's lv2
+  calls in order. Masked: the callbacks' and libsail's file calls' words (each side's code); with a booted player the
+  control thread's stack words, the handler's r7 and the commands' records in the ring (D-562's); the registers past a
+  file call's arguments in its log (whatever the caller left there); and, where libsail's DescriptorOpen calls ReadSync,
+  the stack variables handed to the game's calls (that caller's stack differs; called directly, they are equal).
+  Scripts: DescriptorOpen through the source (makeup, ReadSync of a missing file, the header read twice, a short file,
+  the capabilities, a shared source, cleanup on the last close, by the game's thread and the control thread at the
+  player's end), the same through the game's file calls (one call after open failing), the reader called directly
+  (every callback in every state, items across chunks to the file's end, a range, the buffer refused, Cleanup while
+  started, Makeup again over the descriptor Cleanup left), the reader through the game's calls, the reader's failures
+  and timeouts (the poll finding the medium gone, the file opened again five seconds on, seeks and reads failing, the
+  retry half a second on), and OpenStream and CloseStream (D-562 part 13) through the source, opening and closing the
+  file, and through the game's calls with the file gone (the stream not opened, CANCEL). Before the merge of D-562
+  parts 9-13 the first five scripts compared with 0 differences (576 checks), the same in five runs. A test without the
+  firmware runs the direct script on pspocket's side alone and checks its answers, messages and the items' data
+  against the file.

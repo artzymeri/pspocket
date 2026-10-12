@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <format>
 
 #include "cellSail.hpp"
 #include "pspocket/core/log.hpp"
@@ -151,85 +150,6 @@ s32 avsync_fini(PPUContext& ctx, u32 a)
     return static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_destroy", {a + av::kMutex}));
 }
 
-// ------------------------------------------------------------------------------------------------- the built-in source
-
-// libsail's file source ("x-cell-fs", 0x138 bytes): +0 its state, +0x40 the CellSailSource it registers, +0x100 its
-// file calls (14 words: -1, then the cellFs wrappers' descriptors), the source callbacks its CellSailSource holds.
-// The callbacks are reached only once the player plays (part 3): until then they fail loudly.
-namespace fs {
-constexpr u32 kSource = 0x40, kCalls = 0x100, kSize = 0x138;
-}
-
-// The internal functions libsail hands out by descriptor: the file source's callbacks and its cellFs wrappers.
-u32 internal(std::string_view name) { return HleProcess::current()->link_function("cellSail", recomp::nid_of(name), name); }
-
-void not_yet(PPUContext& ctx, std::string_view name)
-{
-    log_call_site(ctx, gb(ctx), std::format("cellSail: {} (libsail's built-in file source) is not pspocket's yet", name));
-    PS_FATAL(kChan, "{}: libsail's built-in file source is not pspocket's yet (D-562 part 3)", name);
-}
-
-#define SAIL_FS_STUB(n)                                                                                                \
-    s32 _pspocket_cellSail_##n(PPUContext& ctx)                                                                        \
-    {                                                                                                                  \
-        not_yet(ctx, #n);                                                                                              \
-        return error(CELL_SAIL_ERROR_FATAL);                                                                           \
-    }
-SAIL_FS_STUB(fsOpen)
-SAIL_FS_STUB(fsClose)
-SAIL_FS_STUB(fsRead)
-SAIL_FS_STUB(fsLseek)
-SAIL_FS_STUB(fsFstat)
-SAIL_FS_STUB(fsCancel)
-SAIL_FS_STUB(srcMakeup)
-SAIL_FS_STUB(srcCleanup)
-SAIL_FS_STUB(srcOpen)
-SAIL_FS_STUB(srcClose)
-SAIL_FS_STUB(srcStart)
-SAIL_FS_STUB(srcStop)
-SAIL_FS_STUB(srcCancel)
-SAIL_FS_STUB(srcCheckout)
-SAIL_FS_STUB(srcCheckin)
-SAIL_FS_STUB(srcClear)
-SAIL_FS_STUB(srcRead)
-SAIL_FS_STUB(srcReadSync)
-SAIL_FS_STUB(srcGetCapabilities)
-SAIL_FS_STUB(srcInquireCapability)
-#undef SAIL_FS_STUB
-
-s32 builtin_source_init(PPUContext& ctx, u32 s)
-{
-    u8* b = gb(ctx);
-    std::memset(b + s, 0, fs::kSize);
-    // The file calls: -1, open, 0, close, read, lseek, fstat, cancel, then nothing.
-    const u32 calls[14] = {0xFFFFFFFF, internal("_pspocket_cellSail_fsOpen"), 0, internal("_pspocket_cellSail_fsClose"),
-        internal("_pspocket_cellSail_fsRead"), internal("_pspocket_cellSail_fsLseek"),
-        internal("_pspocket_cellSail_fsFstat"), internal("_pspocket_cellSail_fsCancel"), 0, 0, 0, 0, 0, 0};
-    for (u32 i = 0; i < 14; i++) ps_write32(b, s + fs::kCalls + 4 * i, calls[i]);
-    // The source callbacks (CellSailSourceFuncs), on the stack as libsail's static table.
-    static constexpr std::string_view kFuncs[14] = {"_pspocket_cellSail_srcMakeup", "_pspocket_cellSail_srcCleanup",
-        "_pspocket_cellSail_srcOpen", "_pspocket_cellSail_srcClose", "_pspocket_cellSail_srcStart",
-        "_pspocket_cellSail_srcStop", "_pspocket_cellSail_srcCancel", "_pspocket_cellSail_srcCheckout",
-        "_pspocket_cellSail_srcCheckin", "_pspocket_cellSail_srcClear", "_pspocket_cellSail_srcRead",
-        "_pspocket_cellSail_srcReadSync", "_pspocket_cellSail_srcGetCapabilities",
-        "_pspocket_cellSail_srcInquireCapability"};
-    StackVar funcs(ctx, b, 0x38);
-    for (u32 i = 0; i < 14; i++) ps_write32(b, funcs.addr() + 4 * i, internal(kFuncs[i]));
-    const Function* init = registry().find("cellSail", recomp::nid_of("cellSailSourceInitialize"));
-    u64 saved[3] = {ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]};
-    ctx.gpr[3] = s + fs::kSource;
-    ctx.gpr[4] = funcs.addr();
-    ctx.gpr[5] = s;
-    init->fn(ctx, b);
-    const s32 r = static_cast<s32>(ctx.gpr[3]);
-    ctx.gpr[3] = saved[0];
-    ctx.gpr[4] = saved[1];
-    ctx.gpr[5] = saved[2];
-    return r;
-}
-
-void builtin_source_fini(PPUContext& ctx, u32 s) { w32(ctx, s + fs::kSource + 0x48, 0); }
-
 // ------------------------------------------------------------------------------------------------- sources
 
 s32 cellSailPlayerRegisterSource(PPUContext& ctx, u32 p, u32 protocol, u32 source)
@@ -319,7 +239,7 @@ s32 initialize(PPUContext& ctx, u32 p, u32 allocator, u32 handler, u32 handler_a
         w32(ctx, p + pl::kAudio, mem);
         w32(ctx, p + pl::kUser, ubase);
         w32(ctx, p + pl::kSource, src);
-        w32(ctx, p + pl::kQueue + q::kRing, src + fs::kSize);
+        w32(ctx, p + pl::kQueue + q::kRing, src + fsrc::kSize);
         r = pair_create(ctx, p + pl::kQueue + q::kMutex, "_saiqu0");
         if (r >= 0) {
             made_queue = true;
@@ -348,7 +268,7 @@ s32 initialize(PPUContext& ctx, u32 p, u32 allocator, u32 handler, u32 handler_a
             made_source = true;
             StackVar name(ctx, b, 16);
             std::memcpy(b + name.addr(), "x-cell-fs", 10);
-            r = cellSailPlayerRegisterSource(ctx, p, name.addr(), src + fs::kSource);
+            r = cellSailPlayerRegisterSource(ctx, p, name.addr(), src + fsrc::kSource);
         }
         if (r >= 0) {
             const u32 pa = p + pl::kParams;
@@ -675,8 +595,6 @@ s32 set_video_parameter(PPUContext& ctx, u32 slot, u32 param, u64 v)
     return lv2::CELL_OK;
 }
 
-s32 set_file_calls(PPUContext& ctx, u32 source, u32 calls);
-
 s32 cellSailPlayerSetParameter(PPUContext& ctx, u32 p, u32 param, u64 a, u64 v)
 {
     if (r8(ctx, p + pl::kState) != pl::kInitialized) return error(CELL_SAIL_ERROR_INVALID_STATE);
@@ -696,7 +614,7 @@ s32 cellSailPlayerSetParameter(PPUContext& ctx, u32 p, u32 param, u64 a, u64 v)
     case 29: w32(ctx, p + pl::kThreadStack, a32); break;
     case 33:
         if ((a || v) && (!a || v != 0x28)) return error(CELL_SAIL_ERROR_INVALID_ARG);
-        return set_file_calls(ctx, r32(ctx, p + pl::kSource), a32);
+        return builtin_source_set_file_calls(ctx, r32(ctx, p + pl::kSource), a32);
     case 34: w32(ctx, p + 0x3AC, a32); break; // the file source thread's stack
     case 12: case 13: case 14: case 15: case 26: case 32:
         if (a32 >= r32(ctx, p + pl::kAudioCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
@@ -707,25 +625,6 @@ s32 cellSailPlayerSetParameter(PPUContext& ctx, u32 p, u32 param, u64 a, u64 v)
         return set_video_parameter(ctx, r32(ctx, p + pl::kVideo) + a32 * pl::kVideoStride, param, v);
     default: break; // 9, 28: accepted
     }
-    return lv2::CELL_OK;
-}
-
-// The built-in source's file calls replaced by the game's (parameter 33): NULL puts libsail's back; else the game's
-// structure {0, open, ?, close, fstat, read, lseek, ...} with every call present, its first 0x28 bytes copied.
-s32 set_file_calls(PPUContext& ctx, u32 source, u32 calls)
-{
-    u8* b = gb(ctx);
-    if (!calls) {
-        const u32 own[14] = {0xFFFFFFFF, internal("_pspocket_cellSail_fsOpen"), 0, internal("_pspocket_cellSail_fsClose"),
-            internal("_pspocket_cellSail_fsRead"), internal("_pspocket_cellSail_fsLseek"),
-            internal("_pspocket_cellSail_fsFstat"), internal("_pspocket_cellSail_fsCancel"), 0, 0, 0, 0, 0, 0};
-        for (u32 i = 0; i < 14; i++) ps_write32(b, source + fs::kCalls + 4 * i, own[i]);
-        return lv2::CELL_OK;
-    }
-    if (r32(ctx, calls) != 0 || !r32(ctx, calls + 4) || !r32(ctx, calls + 12) || !r32(ctx, calls + 16) ||
-        !r32(ctx, calls + 20) || !r32(ctx, calls + 24) || !r32(ctx, calls + 28))
-        return error(CELL_SAIL_ERROR_INVALID_ARG);
-    std::memmove(b + source + fs::kCalls, b + calls, 0x28);
     return lv2::CELL_OK;
 }
 
@@ -758,7 +657,7 @@ s32 cellSailPlayerGetParameter(PPUContext& ctx, u32 p, u32 param, u32 a, u32 b)
     case 29: w64(ctx, a, r32(ctx, p + pl::kThreadStack)); return lv2::CELL_OK;
     case 33:
         if (!b || r64(ctx, b) != 0x28) return bad;
-        std::memmove(gb(ctx) + a, gb(ctx) + r32(ctx, p + pl::kSource) + fs::kCalls, 0x28);
+        std::memmove(gb(ctx) + a, gb(ctx) + r32(ctx, p + pl::kSource) + fsrc::kCalls, 0x28);
         return lv2::CELL_OK;
     case 34: w64(ctx, a, r32(ctx, p + 0x3AC) ? r32(ctx, p + 0x3AC) : 0x1000); return lv2::CELL_OK;
     default: break;
@@ -803,15 +702,15 @@ s32 cellSailPlayerGetParameter(PPUContext& ctx, u32 p, u32 param, u32 a, u32 b)
     return lv2::CELL_OK;
 }
 
-#define SAIL_INTERNAL(n)                                                                                               \
-    ::pspocket::hle::Function{{}, "_pspocket_cellSail_" #n, recomp::nid_of("_pspocket_cellSail_" #n),                  \
-        &detail::thunk<&_pspocket_cellSail_##n>, true}
 #define SAIL(f) ::pspocket::hle::Function{{}, #f, recomp::nid_of(#f), &detail::thunk<&f>, false}
 
 } // namespace
 
+void register_cellSailFileSource(Registry& r);
+
 void register_cellSailPlayer(Registry& r)
 {
+    register_cellSailFileSource(r);
     r.add("cellSail", {
         SAIL(cellSailPlayerInitialize),
         SAIL(cellSailPlayerInitialize2),
@@ -835,29 +734,8 @@ void register_cellSailPlayer(Registry& r)
         SAIL(cellSailPlayerSetAuReceiver),
         SAIL(cellSailPlayerSetParameter),
         SAIL(cellSailPlayerGetParameter),
-        SAIL_INTERNAL(fsOpen),
-        SAIL_INTERNAL(fsClose),
-        SAIL_INTERNAL(fsRead),
-        SAIL_INTERNAL(fsLseek),
-        SAIL_INTERNAL(fsFstat),
-        SAIL_INTERNAL(fsCancel),
-        SAIL_INTERNAL(srcMakeup),
-        SAIL_INTERNAL(srcCleanup),
-        SAIL_INTERNAL(srcOpen),
-        SAIL_INTERNAL(srcClose),
-        SAIL_INTERNAL(srcStart),
-        SAIL_INTERNAL(srcStop),
-        SAIL_INTERNAL(srcCancel),
-        SAIL_INTERNAL(srcCheckout),
-        SAIL_INTERNAL(srcCheckin),
-        SAIL_INTERNAL(srcClear),
-        SAIL_INTERNAL(srcRead),
-        SAIL_INTERNAL(srcReadSync),
-        SAIL_INTERNAL(srcGetCapabilities),
-        SAIL_INTERNAL(srcInquireCapability),
     });
 }
 #undef SAIL
-#undef SAIL_INTERNAL
 
 } // namespace pspocket::hle
