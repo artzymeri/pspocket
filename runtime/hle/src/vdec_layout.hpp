@@ -379,6 +379,29 @@ inline void pad_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h)
             }
 }
 
+// The picture (planar 4:2:0, no padding) a frame laid out in strips holds: the samples write_strips() puts there read
+// back (a core whose SPU program predicts from a frame buffer's contents, D-920).
+inline void read_strips(const u8* base, u32 frame, const Plan& p, u32 w, u32 h, std::vector<u8>& y, std::vector<u8>& u,
+    std::vector<u8>& v)
+{
+    const u32 hl = p.lines32 ? align(h, 32) : align(h, 16);
+    const u32 strips = align(w, 16) / 16 + 2, lines = hl + 2 * p.edge_y, clines = hl / 2 + 2 * p.edge_c;
+    const u32 cw = w / 2, ch = h / 2;
+    const u8* luma = base + frame;
+    const u8* chroma = luma + strips * lines * 16;
+    y.resize(w * h);
+    u.resize(cw * ch);
+    v.resize(cw * ch);
+    for (u32 r = 0; r < h; r++)
+        for (u32 x = 0; x < w; x++) y[r * w + x] = luma[((x / 16 + 1) * lines + r + p.edge_y) * 16 + x % 16];
+    for (u32 r = 0; r < ch; r++)
+        for (u32 x = 0; x < cw; x++) {
+            const u8* at = chroma + ((x / 8 + 1) * clines + r + p.edge_c) * 16 + x % 8;
+            u[r * cw + x] = at[0];
+            v[r * cw + x] = at[8];
+        }
+}
+
 // A picture (planar 4:2:0, no padding) in a frame laid out in strips with edges: every sample past the picture repeats
 // its nearest one; with `edges` false the picture's samples alone (a picture no other is predicted from, whose edges a
 // decoder leaves as they were, D-920).

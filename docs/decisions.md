@@ -13361,6 +13361,70 @@ pictures, B pictures, the decode modes, packed bitstreams, N-VOPs, layers of oth
 smaller stream); test_vdec_codecs_compare.cpp ("The DivX core under Sony's libvdec", hidden, and DivX lives with an
 interlaced layer and a colour description).
 
+## D-920 · 2026-10-12 · libsmvd4, the MPEG-4 core, pspocket's own; the s-cores' shared PPU framework (part 5)
+
+libsmvd4's seventeen decoding functions (smvd4GetMemorySize, GetMemorySize2, CreateInstance2, ReleaseInstance,
+Initialize, DecodePicture, FlushPicture, Discontinue, CancelDecode, GetPicture, GetNumPicture, ReleasePicture,
+GetSideInfoPic, GetAuxData, GetSideInfoSeq, GetExistenceFlag, SetAuxData) are pspocket's own
+(runtime/hle/src/vdec_smvd4.cpp), with its version query (D-575) the whole library: no longer firmware-first.
+Compared with Sony's module called directly (test_vdec_cores_compare.cpp: 0 of 5,903 observations differ, samples
+within one step but where noted) and driven by Sony's libvdec (D-912's MPEG-4 family over pspocket's cores and Sony's,
+now with B pictures, interlaced and quarter sample streams: 0 of 1,418 differ).
+
+**The s-cores' framework** (runtime/hle/src/vdec_score.hpp, for libsmvd2, libsvc1d and libsjvtd too): Sony's s-cores
+are one design, a PPU library over an SPU task on the caller's taskset that talks to it through two SPURS queues of
+one 0x80-byte entry (SPU to PPU, PPU to SPU) in the instance's memory, each attached to an lv2 event queue. Their
+answers come from the status word the program leaves, mapped alike in every s-core but for its prefix (answer(),
+strict_answer() for Initialize and CreateInstance2, picture_answer() for GetPicture's 0xF00 warnings); their pictures
+wait in a queue of frame buffer slots in decoding order (a sequence number each, the get and release counters, the
+current picture, the two last anchors as references, FlushPicture's mark: PictureQueue). pspocket makes and attaches
+the queues as Sony's core does (their errors are CreateInstance2's answer: a taskset that is none gives cellSpurs's
+0x80410902) and detaches them at ReleaseInstance, but runs no task: the program's part is each core's own file.
+
+What libsmvd4 does, read in the module and checked against it:
+- **Memory**: levels 0 to 6 (720x576, 176x144, 352x288, 352x288, 720x480, 640x480, 720x576); a block of 0x80 bytes per
+  macroblock, three frame buffers ((height to 32 + 32) x (width to 16 + 32) x 1.5 + 0x80 each) and 0x15380 bytes.
+  GetMemorySize2 takes type 5's size (words 8 and 9, signed, within the level's). CreateInstance2 takes types 4 and 5
+  only (others SEQ), 128-byte aligned memory, the taskset in word 7 (none: SEQ); a refused size is FATAL, too little
+  memory NO_MEMORY. The frames start at +0x14A80.
+- **What the caller reads back is in the instance's memory**, written field by field as Sony's program writes it, so
+  its gaps show the caller's memory: the sequence information at +0x80 (whether a layer is in force, its start code,
+  then its fields in syntax order; a field a layer leaves out keeps the last value, but verid and priority become 1
+  without an identifier and the fixed VOP increment 0 without a fixed rate), the used bytes at +0x13C (to the end of
+  the first VOP; all of an access unit without one; where the parse stopped in a refused layer; 2 when the decoder
+  dies), the existence flag at +0x144 (1 once a layer was accepted, 0x10000 once a VOP was, never cleared; written by
+  every DecodePicture, so 0xA5A5A5A5 before the first), the auxiliary data at +0x148 and each slot's information block
+  at +0x280 (addresses, size, lines, one access unit, the last GOV's fields and the VOP's, the auxiliary data, the
+  status with 0x300 added).
+- **Access units**: headers then the first VOP. A layer whose frame is larger than the instance's kills the decoder
+  (0x..81, then 0x..80 for every command, Initialize included); MPEG quantisation is refused (no picture until the next
+  layer). I and P VOPs are decoded; B and S VOPs are not (0x..02; their slot keeps its frame and information, an anchor
+  all the same, so a P VOP after one predicts from the slot's old frame); an interlaced layer's VOPs are not decoded
+  either (0x..02, P VOPs 0x400 in the picture's status); not coded VOPs give the last anchor's slot again; quarter
+  sample motion is taken as half sample. A P VOP with no anchor is predicted from the third slot's frame and flagged
+  0x800 unless decoded into that slot; Discontinue flags P VOPs until the next I VOP; nothing is concealed.
+
+FFmpeg made to do that: each P VOP's reference rewritten from its anchor slot's frame before it is decoded
+(vdec_ffmpeg.hpp: the decoder keeps its last picture's buffer, which is its reference; writing it is outside FFmpeg's
+API contract and only done for this low-delay use), each picture's buffer filled with its slot's old frame
+(get_buffer2) and error concealment off, so what FFmpeg does not decode keeps what the slot held as Sony's does, the
+quarter sample flag cleared from the layer FFmpeg is given, FF_IDCT_FAAN (155 samples of the comparison's frames one
+step off, in 9 frames).
+
+Not reproduced (logged; notes or wider tolerance in the comparison): bit 2 of an interlaced P VOP's warning (set by
+Sony's program for some P VOPs from their macroblocks; GetPicture's answer is the same), a P VOP with no anchor decoded
+into the third slot itself (Sony's program overwrites its reference as it decodes: a few samples up to 2 steps off),
+a P VOP before FFmpeg has had any picture of the layer's size (grey), and the layer features besides MPEG quantisation
+the program refuses (shapes, sprites, depths, complexity estimation, NEWPRED, reduced resolution, scalability: refused
+alike, not compared). A handle that is no instance (Sony's reads whatever memory it points to) is logged, ARG.
+
+cellVdec's own MPEG-4 decoding still decodes B pictures and interlaced layers (Sony's libvdec over libsmvd4 gives those
+pictures undecoded): not changed.
+
+Tests: test_vdec_cores_compare.cpp ("The MPEG-4 core (libsmvd4) against Sony's", hidden, and a firmware-free test
+against Sony's values); test_vdec_codecs_compare.cpp ("The DivX and MPEG-4 cores under Sony's libvdec", hidden);
+test_codec_cores.cpp and test_codec_cores_compare.cpp (libsmvd4 no longer firmware-first).
+
 ## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
 
 sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole

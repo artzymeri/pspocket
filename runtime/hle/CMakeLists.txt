@@ -140,6 +140,7 @@ add_library(pspocket_hle STATIC
     src/sys_crashdump.cpp
     src/usbd.cpp
     src/vdec_cores.cpp
+    src/vdec_smvd4.cpp
     src/cellVpost.cpp
     src/cellAtrac.cpp
     src/cellJpgEnc.cpp
