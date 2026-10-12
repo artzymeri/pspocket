@@ -12572,3 +12572,73 @@ Compared (tests/hle/test_module_management.cpp) with librudp's prologue and epil
 called with the low words of 64-bit arguments, its answer passed through, nothing called for an entry of all ones:
 0 of 7 observations differ. A firmware-free test loads a host-served module by path and checks the reported entries,
 the start's and stop's results and the second start's refusal.
+
+## D-918 · 2026-10-12 · cellSailRec pspocket's own, from libsail_rec (part 3: the recorder before Boot and the game's objects)
+
+cellSailRec is the recorder side of libsail (libsail_rec.sprx, fw 4.92: 58 exports, all with RPCS3's names, none of
+them pspocket's until now). It is read from the module in a scratch area (nothing of it committed) and made pspocket's
+own part by part (runtime/hle/src/cellSailRec.cpp, cellSailRecObjects.cpp, cellSailRecControl.cpp, cellSailRec.hpp;
+compared in tests/hle/test_sail_rec_compare.cpp: the same script in two fresh processes, libsail_rec loaded in Sony's).
+What it is: the game's feeders (CellSailFeederAudio/Video, its callbacks, which libsail_rec drives) give frames; the
+recorder converts and encodes them on the game's SPURS (its own SPU programs, among them an AAC encoder, and the
+firmware's AVC, MPEG-4 and M4HD encoders) and gives the streams to a composer: the game's (CellSailComposer, type 3) or
+its MP4 writer (type 1, through the firmware's MP4 library). A control thread runs it from a message queue laid out
+as libsail's (D-562), with a second thread bringing the SPU tasks' messages from a SPURS queue. It has no camera or
+microphone of its own: a console without them records what the game's feeders give it, like any other.
+
+This part, everything up to Boot and the objects the game owns:
+- **Initialize** (recorder, allocator, handler, argument, attribute {0x1C, mode 0/1, audio, video and user streams,
+  messages, timescale}, resource {0xC, SPURS, 0}): the recorder (0x2000 bytes) cleared once both sizes are right,
+  then the allocator, SPURS and the resource's last word checked (so a NULL allocator leaves it cleared); SPURS's SPU
+  count asked; one block from the allocator (boundary 8: the slots, 0x2B8 bytes an audio stream, 0x460 a video one,
+  0x28 a user one, and the ring, 16 bytes a message, 50 per stream and 50 when the game gives 0); the queue's lv2
+  pair ("_saiqu0") and the recorder's lwmutex and lwcond ("_saicx0"); the defaults (control thread 900 with 0x3000
+  bytes of stack, task handler 0x370 with 0x8000, the common taskset's eight SPU priorities, the MP4 composer's 600
+  and 0x2000, each audio slot's and video slot's parameters, a video stream's SPU count one less than SPURS's but at
+  least 1), the timescale 1000000 when 0, the MP4 composer's file calls (libsail_rec's own: internal functions here).
+  The allocator failing is MEMORY with the state 9.
+- **Finalize**: INVALID_STATE once finalized; a booted recorder is told to end and its thread joined; then the lwcond,
+  the lwmutex, the queue's pair (skipped when the queue's count reads -1, as libsail_rec checks) and the block.
+- **Set/GetParameter** (before Boot): the recorder's own (2, 29, 64 to 67, 82, 83: set from param0 only with a nonzero
+  param1, read back with param1 NULL, some sign-extended) and the per-stream ones by index (audio 68 to 72, video 73
+  to 77 and 79 to 81; 78 refused; an unknown recorder parameter accepted and kept nowhere).
+- **SetFeederAudio/Video, Register/UnregisterComposer** (type 3 only, once; Unregister also once booted),
+  **Subscribe/UnsubscribeEvent** (events below 12, a subscription's parameter 0), **ReplaceEventHandler** (EDEADLK
+  taken as the lock held), **Boot**'s refusal when a stream has no feeder (INVALID_STATE).
+- **The commands' sending side**: CreateProfile (1), DestroyProfile (2), CreateVideoConverter (3: the two formats'
+  fields checked as libsail_rec does, the conversions 4 and 9 to 1, 11 and 12 to 1, 4 and 9), DestroyVideoConverter
+  (4), OpenStream (5), CloseStream (7), Start (9), Stop (0xB) and Cancel (0xE at the queue's head): each argument
+  check, then INVALID_STATE before Boot (the recorder not running); once running, libsail's command protocol (a
+  reply record posted at the queue's head, one lwcond wait).
+- **DumpImage**: the version (0x492000), the "modules are the process's" flag, the recorder's first 0x880 bytes, the
+  profile in use with its parameters, the MP4 composer and its streams, each slot with its feeder (and a video slot's
+  converter), each block at the next 64-byte boundary, the padding counted only when it fits.
+- **Feeders**: Initialize (four of the game's eleven callbacks required, the attribute NULL; libsail_rec's own eleven
+  callbacks put in front, their argument the feeder), Finalize, the notifications as messages to the recorder (audio
+  0x0F to 0x12, video 0x19 to 0x1C; an error's terminated flag in bit 31 cleared) or to a diagnostic handler the
+  feeder may hold (its value sign-extended); r3 afterwards is what libsail_rec leaves (the queue's unlock).
+- **The composer**: Initialize (the game's 17 callbacks, the last three words 0; its two lwmutex and lwcond pairs
+  "_saimx0", "_saimx1"), Finalize (state 1 only), GetStreamParameter (0 or INVALID_STATE: libsail_rec writes nothing),
+  GetEsUserParameter (0), GetEsVideo/AudioParameter (an open stream's 0x50 and 0x48 bytes; the index checked only
+  against 3, a negative one read before the table), NotifyCallCompleted (the pending call's completion once, or the
+  diagnostic handler), NotifySessionError, Get/TryGet/Release of access units on a stream's ring: times in 90 kHz
+  (the product wrapping in 64 bits, a signed quotient), the number taken n whenever any are there, *remaining the
+  units less that, a Get's failed wait answered 0 (user and video) or its error (audio), Release giving back at most
+  those there (the user stream's message carrying n). libsail_rec's user stream copies the game's first entry over
+  the rest (its units are never read): kept.
+- **Profiles' setters**: SetStreamParameter (the buffer size, all ones for 1 MB, less refused; the stream parameters
+  by the composer type), SetEsAudioParameter (AAC: channels, layout, the five sample rates, equal bit rates within
+  half and six times the rate; the extension copied in before its checks, so a refused one stays; its float 0.0 or
+  -0.0), SetEsVideoParameter (MPEG-4, AVC and M4HD; the frame rate codes; up to 32 encoder options, each ID one the
+  encoder knows: the four and seventeen IDs libsail_rec accepts, interface constants of the encoders).
+- **Video converters' queue**: CanProcess, CanGetResult, Process (FULLED, or one wait for room with the count read
+  once before it), GetResult (EMPTY at once, or after a wait even when woken).
+Registered: all 58 (and the internal functions the objects carry: the feeders' and composer's tables, the file
+calls, the two threads). The control thread, profiles' and converters' making, the streams and the recording are later
+parts: they stop the process with the call site (rule 5). So cellSailRec is marked firmware-first (D-563): where the
+system software is installed a game gets libsail_rec until the rest is compared too.
+Compared: Initialize and Finalize (82 observations), every parameter (1,456), the recorder's API before Boot with
+DumpImage at 26 sizes into aligned and unaligned buffers (390), feeders (119), the composer (388), profiles (612),
+video converters (44): 0 of 3,091 observations differ (each half's code addresses, the lv2 objects' IDs and stack
+words masked; the profiles, converters and composer streams laid out by the script as the control thread lays them
+out).
