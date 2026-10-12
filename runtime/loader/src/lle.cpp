@@ -1044,6 +1044,17 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
     return kOk;
 }
 
+// A module with no code (a firmware module whose libraries the host serves): the host's module-management entries
+// (runtime/hle module_management.cpp, D-918), module_start with module_prologue or module_stop with module_epilogue.
+hle::ModuleEntry RuntimeModules::host_entry(bool start)
+{
+    constexpr u32 kStart = 0xBC9A0086, kStop = 0xAB779874, kPrologue = 0x0D10FD3F, kEpilogue = 0x330F7005;
+    return start ? hle::ModuleEntry{hle_.link_function("", kStart, "module_start"),
+                       hle_.link_function("", kPrologue, "module_prologue")}
+                 : hle::ModuleEntry{hle_.link_function("", kStop, "module_stop"),
+                       hle_.link_function("", kEpilogue, "module_epilogue")};
+}
+
 u32 RuntimeModules::start(u32 id, hle::ModuleEntry* entry)
 {
     std::lock_guard lock(mutex_);
@@ -1051,7 +1062,10 @@ u32 RuntimeModules::start(u32 id, hle::ModuleEntry* entry)
     if (!e) return kNoSuchObject;
     if (e->state == State::Started) return kPrxErrorAlreadyStarted;
     *entry = {};
-    if (!e->module) return kOk;
+    if (!e->module) {
+        *entry = host_entry(true);
+        return kOk;
+    }
     // Its exports into the executable's imports of them (RPCS3 lv2_prx::load_exports): the slots held the host's
     // stubs, which log the call and fail.
     u32 functions = 0, variables = 0;
@@ -1103,7 +1117,7 @@ u32 RuntimeModules::stop(u32 id, hle::ModuleEntry* entry)
     Entry* e = find(id);
     if (!e) return kNoSuchObject;
     if (e->state != State::Started) return kPrxErrorNotStarted;
-    *entry = e->module ? hle::ModuleEntry{e->module->stop, e->module->epilogue} : hle::ModuleEntry{};
+    *entry = e->module ? hle::ModuleEntry{e->module->stop, e->module->epilogue} : host_entry(false);
     return kOk;
 }
 
@@ -1151,7 +1165,11 @@ bool RuntimeModules::info(u32 id, hle::ModuleInfo& out)
     if (!e || e->state == State::Unloaded) return false;
     out = {};
     out.path = e->path;
-    if (const PrxModule* m = e->module) { // an empty module (the host serves it) has no more to say
+    if (!e->module) { // a module with no code (the host serves it): its entries are the host's, nothing more to say
+        out.start = host_entry(true).entry;
+        out.stop = host_entry(false).entry;
+    }
+    if (const PrxModule* m = e->module) {
         out.name = m->name;
         out.version = m->version;
         out.attributes = m->attributes;

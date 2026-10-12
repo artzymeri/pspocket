@@ -48,7 +48,10 @@ target_sources(test_hle PRIVATE
     test_libmixer_compare.cpp
     test_fiber_compare.cpp
     test_vdec_codecs_compare.cpp
-    test_rudp_compare.cpp)
+    test_rudp_compare.cpp
+    test_sysconf_ps1emu_compare.cpp
+    test_module_management.cpp
+    test_sail_rec_compare.cpp)
 
 # libvdec's last functions (D-920) against Sony's libvdec: test_hle "[compare][vdec-ext]". The video codec cores
 # pspocket's own (D-920): test_hle "[vdec-cores]", their comparisons with Sony's "[compare][vdec-cores]".

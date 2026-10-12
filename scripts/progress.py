@@ -76,9 +76,10 @@ def own_functions(boot):
     out = subprocess.run([boot, "--hle-list"], capture_output=True, text=True, check=True).stdout
     own = set()
     for line in out.splitlines():
-        parts = line.split()
+        # "module nid name"; the nameless module-management library's lines start with its empty name (D-918).
+        parts = line.split(" ")
         if len(parts) == 3:
-            own.add((parts[0], parts[2]))
+            own.add((parts[0] or "(module management)", parts[2]))
     return own
 
 
