@@ -13125,6 +13125,21 @@ read was refused, the first buffer a second time, as libsail does). Its total si
   its answers on pspocket alone. The test's source answers its Read at once (ReadSync's copy, then
   NotifyCallCompleted from the control thread).
 
+## D-919 · 2026-10-12 · cellSail's elementary streams of a started stream, as libsail (part 7)
+
+OpenEs, ReopenEs and CloseEs while the stream plays (runtime/hle/src/cellSailEs.cpp): a stream not chosen is opened,
+then started (0x8D/0x93/0x99); a chosen one reopened is stopped first, a video renderer keeping its last frame,
+whether its format changed or not (0x90/0x96/0x9C: event 10), then started again with its entry as it now is (event 9)
+while the stream plays; CloseEs of a started stream stops it (keeping nothing) before closing it (0x9F/0xA2/0xA5). As
+libsail: a failed start of a reopened or newly opened stream closes it with a completion on record 0 (which libsail then
+reads at address 4), and a stopped stream's dmux part stays enabled, so with the later SDKs its start fails (the
+enable is refused), the stream is stopped and closed again and the ReopenEs call never completes, leaving the player's
+Stop and CloseStream refused until Finalize.
+- **Compared** (tests/hle/test_sail.cpp part 22, `[sail]`): an AU receiver's stream while playing: CloseEsUser (stopped
+  through Get, closed), OpenEsUser (opened, started), AUs, ReopenEsUser (stopped through Get, its start refused, closed;
+  the call left running), Stop and CloseStream refused, Finalize: 0 differences in three runs; all 35 `[sail]` tests
+  pass; a firmware-free test checks its answers on pspocket alone.
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
