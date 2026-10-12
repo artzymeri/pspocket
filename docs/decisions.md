@@ -13498,3 +13498,64 @@ diagnostics and registered under their NIDs.
   216 calls, 1,656 lv2 calls, 58 requests answered; the move mode (its own run: the smaller memory made, Open
   unavailable, the data connection's buffer required): 16 calls, 151 lv2 calls, 5 requests; 0 differences. Without the
   firmware: "cellDtcpIpUtility on pspocket's console".
+
+### D-918, part 8: cellSailRec's video streams: the configuration, the video pipeline, the firmware's encoders and scaler
+
+libsail_rec's video recording, natively (runtime/hle/src/cellSailRecVideo.cpp), as fw 4.92's module runs it on its
+control thread:
+- **A stream's configuration** once its feeder is open (libsail_rec's continuation of the open, now
+  `_pspocket_cellSailRec_VideoFeederOpened`): the format the feeder gives (its format callback into the parameters'
+  +0x60) against the profile's (+0x40): the frame rate's code (0 to 7, the profile's or unspecified: the timescale and a
+  frame's duration, doubled for H.264, the profile's timescale when it gives one), the rows within the pitch (a larger
+  pitch a multiple of 32), the encoder's size (the feeder's, or the profile's when parameter 73 lets the slot scale), the
+  pixel aspect (the profile's unspecified or the feeder's: its aspect ratio information by MPEG-4's or H.264's indices),
+  the color matrix (the feeder's when the profile has none, but for RGB and Bayer pictures). Then the encoder's
+  configuration (+0xA8) by the codec: MPEG-4 (0x21) and H.264 (0x22, 0x23) from the firmware's defaults for the profile
+  (0x111 by default) and the level (from the size, the macroblocks a second and the bit rate, estimated when the profile
+  gives none), through cellM4vEnc's and cellAvcEnc's configuration queries (their modules loaded for the question), the
+  GOP, the bit rates and the game's own configuration's settings over them; H.264's video usability information (the
+  color description by the matrix, BT.601 or BT.709, or left out); MPEG-4 HD (0x24) its own (no profile, level 2 by
+  default, a bit rate from the pixels a second). The option IDs are libsail_rec's tables, read from the installed
+  module. Anything else UNSUPPORTED_STREAM (FATAL for another codec): an error event, the slot closed again.
+- **The pipeline** (0x3C0 bytes in the slot): by the feeder's coding and the codec a conversion on an SPU task of
+  libsail_rec's in the common taskset (five kinds: ARGB or RGBA, YUV 4:2:2 or YUV 4:2:0 to the encoder's layout, ARGB
+  or RGBA and YUV 4:2:2 to YUV 4:2:0 planar for the scaler or MPEG-4 HD; the programs and their coefficients
+  libsail_rec's, read from the installed module; messages 0x1F with the scaler to follow, else 0x20), the firmware's
+  scaler cellVpost2 (module 0xF043, message 0x20) when the slot scales, or the feeder's picture straight to the encoder;
+  the encoder (cellM4vEnc 0xF013, cellAvcEnc 0xF03A or 0xF02D, cellM4hdEnc 0xF046, through the firmware as the D-197
+  imports: 44 more) with its work area and the units' records for the composer's delay at the frame rate, its
+  notifications (0x21) on the recorder's SPURS queue; the ring of units (the largest unit; doubled and at least the
+  delay's bytes at the bit rate unless the stream is the composer's first). Started: the pump asked (0x1E); each frame
+  scheduled against the stream's time (the frames so far at the frame's duration, or the shared clock's time for it,
+  libsail_rec's video side of the clock: the stream that sets it follows it, another maps its time through it): earlier
+  than half a frame given back, later encoded as a repeat and again; its options (the pixel aspect: a change drains the
+  encoder and opens it again before the frame; MPEG-4's and H.264's option types, a picture's kind, MPEG-4's repeat);
+  encoded with its time and tag; the output (0x21) taken: units' records with their times, their bytes into the ring,
+  the composer told (0x23) and given them as it has room, given back (0x2C); the frames given back to the feeder
+  (0x22). Stop drains and flushes the encoder, a forced stop empties the ring, the end closes it (MPEG-4 HD's opened
+  again); close frees everything.
+- **Messages**: 0x19 a video feeder's call completed, 0x1A frames out, 0x1B a session's end, 0x1E to 0x23 and 0x2C the
+  pipeline's (0x1C, 0x1D and 0x24 passed over, as libsail_rec's loop does).
+- **Sony's slips, kept or bounded**: libsail_rec copies 0x100 bytes of its stack as the encoder's option list into the
+  stream's parameters (7 or 22 options' worth meaningful: the rest its stack's bytes; pspocket's are zeros), and leaves
+  the third word of H.264's resources unwritten (pspocket's 0). The H.264 encoder leaves two of an access unit's four
+  times unwritten (its own stack frame's bytes), which libsail_rec turns into the unit's second and third times;
+  pspocket clears the stack an encoder's call takes first, so its encoders see what they see on a thread's fresh stack
+  (as in Sony's half here). A slot whose configuration is refused after the slot had a stream frees the slot's old
+  stream object again and walks the composer's list past its end: Sony's module reads guest address 0x14 and the
+  process faults (seen in the comparison); pspocket stops the process there with the call site (composer_free_stream).
+Compared (tests/hle/test_sail_rec_compare.cpp, one video stream through the game's composer, the frames test pictures
+given one at a time, each one's units taken as they come; the encoders' work areas from a 64 MB region both halves
+reserve at the same address): YUV 4:2:0, ARGB, RGBA and UYVY to MPEG-4, YUV 4:2:0 and VYUY to H.264 (with and without a
+color matrix), YUV 4:2:0 scaled, ARGB converted and scaled, YUV 4:2:0 and ARGB to MPEG-4 HD, frames late and early
+without the clock (a repeat, a drop), a frame's options (an aspect ratio change reopening the encoder, a picture's kind,
+a repeat; H.264's pixel aspect and kind), the profile's level, bit rates, timescale and GOP (MPEG-4 and H.264); the
+scaler refusing 32 by 32, the pipeline refusing YUYV, MPEG-4 refusing a 90 kHz timescale, H.264 a bit rate past its
+level's: every call's answer, the slot, pipeline, conversion, feeder and stream parameters, the units' records and
+bytes, the encoders' information of each unit (H.264's two unwritten times masked), the allocator, the events, the lv2
+calls: 0 differences in each of the 20 runs (58 to 249 observations each, 3187 in all); the configuration's refusals
+(the format failing, a frame rate's code of 8 or another than the profile's, pitches, no aspect ratio, another aspect
+ratio, another size without parameter 73, MPEG-4 HD with a profile; raw Bayer refused by the pipeline; the feeder's own
+pixel aspect; a pitch past the rows): 0 of 365. The conversions', encoders' and scaler's SPU programs run under
+pspocket's SPURS in both halves. The recorder's dumps mask the SPURS queue's messages' third words (an SPU program's
+run time). The MP4 composer still stops the process with the call site until its part.

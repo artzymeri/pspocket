@@ -99,48 +99,101 @@ void clock_reset(PPUContext& ctx, u32 c)
 }
 
 // The clock (+4 the stream that set it, +8 its owner, +0x28 and +0x30 the source's and the stream's last times, +0x40
-// and +0x38 their first, +0x48 the timescale, +0x50 the times running the prediction was kept): the first stream to
-// tell it owns it; at each later time `a` of the owner's the source's time is predicted from the times so far (a step
-// `d` on from the last); `b` is taken when it lies within `d` of the prediction, else the prediction is kept, at most
-// three times running.
+// and +0x38 their first, +0x48 the timescale, +0x50 the times running the prediction was kept).
+namespace {
+
+// Set by stream `owner` at its time `a` (the source's `b`, `timescale` its).
+void clock_set(PPUContext& ctx, u32 c, u32 owner, u64 a, u64 b, u64 timescale)
+{
+    w32(ctx, c + 4, owner);
+    w32(ctx, c + 0x50, 0);
+    w64(ctx, c + 0x30, a);
+    w64(ctx, c + 0x28, b);
+    w64(ctx, c + 0x48, timescale);
+    w64(ctx, c + 0x38, a);
+    w64(ctx, c + 0x40, b);
+}
+
+// The setting stream's next time `a`: the source's time predicted from the times so far (a step `d` on from the
+// last); `b` is taken when it lies within `d` of the prediction, else the prediction is kept, at most three times
+// running.
+void clock_follow(PPUContext& ctx, u32 c, u64 a, u64 b)
+{
+    const s64 last_a = static_cast<s64>(r64(ctx, c + 0x30)), span_a = last_a - static_cast<s64>(r64(ctx, c + 0x38));
+    const s64 last_b = static_cast<s64>(r64(ctx, c + 0x28));
+    bool take = span_a == 0;
+    s64 predicted = 0;
+    if (!take) {
+        const double step = static_cast<double>(static_cast<s64>(a) - last_a) *
+                            static_cast<double>(last_b - static_cast<s64>(r64(ctx, c + 0x40))) /
+                            static_cast<double>(span_a);
+        const s64 d = static_cast<s64>(ps_f64_bits(ps_ppu_fctid(step, PS_FPSCR_RN_ZERO)));
+        predicted = last_b + d;
+        const bool far = static_cast<s64>(b) + d <= predicted || d + predicted <= static_cast<s64>(b);
+        if (far) {
+            const u32 kept = r32(ctx, c + 0x50) + 1;
+            w32(ctx, c + 0x50, kept);
+            take = static_cast<s32>(kept) > 3;
+        } else {
+            take = true;
+        }
+        if (take) w32(ctx, c + 0x50, 0);
+    }
+    w64(ctx, c + 0x28, take ? b : static_cast<u64>(predicted));
+    w64(ctx, c + 0x30, a);
+}
+
+s64 fctidz(double x) { return static_cast<s64>(ps_f64_bits(ps_ppu_fctid(x, PS_FPSCR_RN_ZERO))); }
+
+} // namespace
+
+// An audio stream's time (libsail_rec's audio side): the first stream to tell the clock owns it (+8) and sets it.
 void clock_update(PPUContext& ctx, u32 c, u32 owner, u64 a, u64 b, u64 timescale)
 {
     if (lv2(ctx, "sys_lwmutex_lock", {c + 0x10, 0}) < 0) return;
     const u32 held = r32(ctx, c + 8);
     if (!held) {
         w32(ctx, c + 8, owner);
-        w32(ctx, c + 4, owner);
-        w32(ctx, c + 0x50, 0);
-        w64(ctx, c + 0x30, a);
-        w64(ctx, c + 0x28, b);
-        w64(ctx, c + 0x48, timescale);
-        w64(ctx, c + 0x38, a);
-        w64(ctx, c + 0x40, b);
+        clock_set(ctx, c, owner, a, b, timescale);
     } else if (held == owner) {
-        const s64 last_a = static_cast<s64>(r64(ctx, c + 0x30)), span_a = last_a - static_cast<s64>(r64(ctx, c + 0x38));
-        const s64 last_b = static_cast<s64>(r64(ctx, c + 0x28));
-        bool take = span_a == 0;
-        s64 predicted = 0;
-        if (!take) {
-            const double step = static_cast<double>(static_cast<s64>(a) - last_a) *
-                                static_cast<double>(last_b - static_cast<s64>(r64(ctx, c + 0x40))) /
-                                static_cast<double>(span_a);
-            const s64 d = static_cast<s64>(ps_f64_bits(ps_ppu_fctid(step, PS_FPSCR_RN_ZERO)));
-            predicted = last_b + d;
-            const bool far = static_cast<s64>(b) + d <= predicted || d + predicted <= static_cast<s64>(b);
-            if (far) {
-                const u32 kept = r32(ctx, c + 0x50) + 1;
-                w32(ctx, c + 0x50, kept);
-                take = static_cast<s32>(kept) > 3;
-            } else {
-                take = true;
-            }
-            if (take) w32(ctx, c + 0x50, 0);
-        }
-        w64(ctx, c + 0x28, take ? b : static_cast<u64>(predicted));
-        w64(ctx, c + 0x30, a);
+        clock_follow(ctx, c, a, b);
     }
     lv2(ctx, "sys_lwmutex_unlock", {c + 0x10});
+}
+
+// A video stream's time (libsail_rec's video side): the clock unset (+4), it sets it (the owner cleared) and keeps its
+// frame's time `b`; the setting stream follows it; another stream's time `a` is mapped through the setting stream's
+// times so far into the source's (in timescale `timescale`, double arithmetic as libsail_rec's). A lock failure answers
+// the error.
+u64 clock_time(PPUContext& ctx, u32 c, u32 owner, u64 a, u64 b, u64 timescale)
+{
+    const s32 lr = static_cast<s32>(lv2(ctx, "sys_lwmutex_lock", {c + 0x10, 0}));
+    if (lr < 0) return static_cast<u64>(static_cast<s64>(lr));
+    u64 t = b;
+    const u32 set_by = r32(ctx, c + 4);
+    if (!set_by) {
+        w32(ctx, c + 8, 0);
+        clock_set(ctx, c, owner, a, b, timescale);
+    } else if (set_by == owner) {
+        clock_follow(ctx, c, a, b);
+    } else {
+        const u64 last_a = r64(ctx, c + 0x30);
+        const double ts = static_cast<double>(static_cast<s64>(r64(ctx, c + 0x48)));
+        const double scale = static_cast<double>(static_cast<s64>(timescale));
+        const double span = scale * (static_cast<double>(static_cast<s64>(last_a - r64(ctx, c + 0x38))) / ts);
+        if (span != 0.0) {
+            const double from = static_cast<double>(static_cast<s64>(last_a)) / ts * scale;
+            // fctidz, and from 2^63 the PPU's unsigned conversion (libsail_rec's).
+            const u64 origin = from >= 9223372036854775808.0
+                                   ? static_cast<u64>(fctidz(from - 9223372036854775808.0)) ^ 0x8000000000000000ull
+                                   : static_cast<u64>(fctidz(from));
+            const double source = scale * (static_cast<double>(static_cast<s64>(r64(ctx, c + 0x28) - r64(ctx, c + 0x40))) / ts);
+            t = origin + static_cast<u64>(
+                             fctidz(source * static_cast<double>(static_cast<s64>(a - origin)) / span));
+        }
+    }
+    lv2(ctx, "sys_lwmutex_unlock", {c + 0x10});
+    return t;
 }
 
 namespace {
@@ -300,9 +353,12 @@ void message_loop(PPUContext& ctx, u32 rec)
         case 0xB: stop(ctx, rec, m2, m3); break;
         case 0xC: stop_flush(ctx, rec, m2, m3); break;
         case 0x2E: composer_session_error(ctx, rec, m3); break;
-        case 0xF: feeder_completed(ctx, m2, static_cast<s32>(m3)); break;
+        case 0xF: case 0x19: feeder_completed(ctx, m2, static_cast<s32>(m3)); break;
         case 0x10: case 0x11: case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x2B:
             audio_message(ctx, rec, code, m2, m3);
+            break;
+        case 0x1A: case 0x1B: case 0x1E: case 0x1F: case 0x20: case 0x21: case 0x22: case 0x23: case 0x2C:
+            video_message(ctx, rec, code, m2, m3);
             break;
         case 0xE:
             // Cancel: each feeder's cancel (the game's callback 6).
@@ -327,9 +383,7 @@ void message_loop(PPUContext& ctx, u32 rec)
         // Messages libsail_rec's loop passes over.
         case 6: case 8: case 0xA: case 0xD: case 0x12: case 0x13: case 0x1C: case 0x1D: case 0x24: case 0x25:
         case 0x26: case 0x27: case 0x28: case 0x29: case 0x2A: case 0x2D: case 0x2F: break;
-        default:
-            if (code > 0x35) break;
-            later(ctx, std::format("the control thread's message {:#x}", code));
+        default: break;
         }
     }
 }

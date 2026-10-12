@@ -356,6 +356,17 @@ s32 _pspocket_cellSailRec_VideoSlotOpened(PPUContext& ctx, u32 rec, u32 record, 
     return slot_opened(ctx, rec, record, status, true);
 }
 
+// A video slot's feeder open: the stream configured, its pipeline opened and the stream added to the composer (the
+// slot opened after both); a failure here is an error event, then the slot closed again.
+s32 _pspocket_cellSailRec_VideoFeederOpened(PPUContext& ctx, u32 rec, u32 record, s32 status)
+{
+    if (status < 0) return slot_opened(ctx, rec, record, status, true);
+    const s32 r = video_stream_open(ctx, rec, record, handle(record, "_pspocket_cellSailRec_VideoSlotOpened"));
+    if (r >= 0) return r;
+    error_event(ctx, rec, r);
+    return slot_opened(ctx, rec, record, r, true);
+}
+
 // Everything closed: the composer told and its instance freed, the profile's composer let go, the profile no longer in
 // use, event 5 (stream closed, the profile) when subscribed, no stream.
 s32 _pspocket_cellSailRec_AllClosed(PPUContext& ctx, u32 rec, u32, s32 status)
@@ -832,6 +843,7 @@ void register_stream(Registry& r)
         SAILREC_INTERNAL(_pspocket_cellSailRec_AudioSlotOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AudioFeederOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_VideoSlotOpened),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_VideoFeederOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AllClosed),
         SAILREC_INTERNAL(_pspocket_cellSailRec_AllOpened),
         SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerOpened),

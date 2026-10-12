@@ -226,6 +226,33 @@ void write_code(u8* b)
     record(true, false);
     c.emit(as::lwz(3, 0, 2));
     c.emit(as::blr());
+    while (c.pc() < kCode + 0xA00) c.emit(as::nop());
+    // The video format: {TOC, r3, r4, 0}; the 0x20 bytes at TOC + 8 to r5.
+    record(true, false);
+    for (u32 i = 0; i < 8; i++) {
+        c.emit(as::lwz(9, static_cast<s32>(8 + 4 * i), 2));
+        c.emit(as::stw(9, static_cast<s32>(4 * i), 5));
+    }
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
+    while (c.pc() < kCode + 0xB00) c.emit(as::nop());
+    // The video checkout: as the audio's with records of 64 bytes.
+    record(false, false);
+    c.emit(as::lwz(9, 4, 2));
+    c.emit(as::lwz(10, 8, 2));
+    c.emit(as::slwi(11, 9, 6));
+    c.emit(as::add(11, 10, 11));
+    c.emit(as::stw(11, 0, 4));
+    c.emit(as::addi(9, 9, 1));
+    c.emit(as::lwz(12, 12, 2));
+    c.emit(as::cmpw(0, 9, 12));
+    const auto video_in_range = c.new_label();
+    c.blt(0, video_in_range);
+    c.emit(as::li(9, 0));
+    c.bind(video_in_range);
+    c.emit(as::stw(9, 4, 2));
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
     const std::vector<u8> code = c.finish();
     std::memcpy(b + kCode, code.data(), code.size());
     ps_write32(b, kAllocDesc, kCode);
@@ -257,12 +284,20 @@ void observe(void* user, u32 n, const u64*)
     if (std::this_thread::get_id() == tr.caller) tr.calls.push_back(n);
 }
 
+// The guest memory the video encoders' work areas need (both halves reserve it at the same address first).
+constexpr u32 kBig = 0x08000000, kBigSize = 0x04000000;
+
 struct H : Half<> {
     Trace tr;
     std::unique_ptr<loader::LleModules> imports; // pspocket's half: the firmware libraries cellSailRec imports
 
-    H(const Setup& s, bool sony, bool with_imports = false) : Half<>(s, sony, "cellSailRec")
+    H(const Setup& s, bool sony, bool with_imports = false, bool big = false) : Half<>(s, sony, "cellSailRec")
     {
+        if (big) {
+            REQUIRE(f.hle->main_memory().reserve(kBig, kBigSize));
+            REQUIRE(f.mem.commit(kBig, kBigSize));
+            std::memset(b + kBig, 0, kBigSize);
+        }
         // libsail_rec's SPU programs and tables (pspocket's own reads them from the installed module).
         if (const auto flash = test_dev_flash()) REQUIRE(f.kernel->vfs_mount("/dev_flash", *flash, true));
         if (with_imports && !sony && s.mode == Mode::Firmware) {
@@ -344,8 +379,9 @@ struct H : Half<> {
         // a continuation's descriptor: each half's own code (its low word masked).
         const auto handle = [](u64 v) {
             const u64 hi = v >> 32;
-            return (hi >= kRec && hi < kRec + 0x2000) || (hi >= kHeap && hi < kHeapEnd) ? (v & ~u64{0xFFFFFFFF}) | 0x5A5A5A5A
-                                                                                        : v;
+            const bool record = (hi >= kRec && hi < kRec + 0x2000) || (hi >= kHeap && hi < kHeapEnd) ||
+                                (hi >= kBig + 0x200000 && hi < kBig + kBigSize);
+            return record ? (v & ~u64{0xFFFFFFFF}) | 0x5A5A5A5A : v;
         };
         const u32 ne = r32(kEvents);
         for (; events_seen < ne; events_seen++) {
@@ -1533,6 +1569,9 @@ void streams_recorder(H& h, const std::string& key)
              {0x870, 16}, {0x40C, 4}, {0x41C, 4}, {0x42C, 4}, {0x45C, 4}, {0x46C, 4}, {0x47C, 4}, {0x48C, 4},
              {0x77C, 4}})
         for (u32 i = 0; i < n; i++) v[off + i] = 0x5A;
+    // The SPURS queue's messages left in its ring: an SPU program's third word is its run time.
+    for (u32 e = 0; e < 16; e++)
+        for (u32 i = 0; i < 4; i++) v[0x608 + 16 * e + i] = 0x5A;
     h.o.bytes(key + ": the recorder", std::move(v));
 }
 // The game's composer (its table, its lock's sleep queues and the pending handle's continuation masked) and the
@@ -2143,6 +2182,427 @@ void script_audio_refusals(H& h)
     finish_spurs(h);
 }
 
+// ------------------------------------------------------------------------------------------------- video streams
+
+constexpr u32 kVf = kFeeders + 0x800;        // the video feeder (0x200)
+constexpr u32 kVfFuncs = kBoot + 0x1600;     // its 11 callbacks (the game's table)
+constexpr u32 kVfDescs = kBoot + 0x1700;     // their descriptors
+constexpr u32 kVfBlocks = kBoot + 0x1800;    // their TOC blocks (0x40 each): the answer word, then the routine's data
+constexpr u32 kVfFrames = kBoot + 0x2400;    // the frames' records (0x40 each, 16 at most)
+constexpr u32 kVfOptions = kBoot + 0x2800;   // the frames' options (four {type, value} a frame at most)
+constexpr u32 kVfPictures = kBig;            // the pictures (1 MB)
+constexpr u32 kVuOut = kBig + 0x100000;      // TryGetEsVideoAu's records (0x38 each, 16 at most)
+constexpr u32 kVuLeft = kBig + 0x100800;     // its remaining count
+constexpr u32 kVideoParam = kBig + 0x100900; // SetEsVideoParameter's parameter (0x50 bytes)
+constexpr u32 kVideoHeap = kBig + 0x200000;  // the allocator's heap for the video streams
+constexpr u32 kVideoFormatCall = kCode + 0xA00, kVideoCheckoutCall = kCode + 0xB00;
+
+u32 vf_block(u32 i) { return kVfBlocks + 0x40 * i; }
+
+// The video feeder's callback `i`: none (0), or a routine with its block (the answer 0).
+void vf_callback(H& h, u32 i, u32 routine)
+{
+    if (!routine) {
+        h.w32(kVfFuncs + 4 * i, 0);
+        return;
+    }
+    const u32 d = kVfDescs + 8 * i;
+    h.w32(d, routine);
+    h.w32(d + 4, vf_block(i));
+    std::memset(h.b + vf_block(i), 0, 0x40);
+    h.w32(kVfFuncs + 4 * i, d);
+}
+
+// A video stream's case: the feeder's pictures (the coding, the size, the pitch, the frame rate's code, the aspect
+// ratio's and the color matrix's bytes), what the profile asks (the codec, the size: another one scales, parameter 73
+// letting the slot scale), Initialize's mode (0: the recorder's clock schedules the frames), each frame's time off its
+// place (microseconds) and its options.
+struct VideoCase {
+    u32 frames = 3;
+    s8 coding = 3;
+    s16 width = 64, height = 48;
+    s32 pitch = 0; // 0: the coding's row
+    u8 rate = 4;
+    u8 aspect = 1;
+    s8 matrix = 1;
+    u32 codec = 0xFFFFFFFF; // all ones: the game's composer's default (MPEG-4)
+    s16 want_w = -1, want_h = -1;
+    bool scale = false;
+    u32 mode = 0;
+    s32 level = -1, max_rate = -1, bitrate = -1, timescale = -1, gop = -1; // the profile's (all ones: none)
+    std::vector<s32> jitter;
+    std::vector<std::pair<u32, std::pair<u32, u32>>> options;
+};
+
+u32 row_bytes(s8 coding, s16 w)
+{
+    if (coding == 0 || coding == 1) return static_cast<u32>(w) * 4;
+    if (coding == 3) return static_cast<u32>(w);
+    return static_cast<u32>(w) * 2;
+}
+
+u32 picture_pitch(const VideoCase& c) { return c.pitch ? static_cast<u32>(c.pitch) : row_bytes(c.coding, c.width); }
+
+u32 picture_size(const VideoCase& c)
+{
+    const u32 rows = static_cast<u32>(c.height);
+    return c.coding == 3 ? picture_pitch(c) * rows * 3 / 2 : picture_pitch(c) * rows;
+}
+
+// A feeder with the required callbacks (the format, checkout, checkin, clear) and makeup and cleanup. Its frames: test
+// pictures (a pattern moving from frame to frame), 30 a second in the recorder's timescale (1 MHz) with the case's
+// jitter, carrying the case's options.
+void video_feeder(H& h, const VideoCase& c)
+{
+    for (u32 i = 0; i < 11; i++) vf_callback(h, i, 0);
+    vf_callback(h, 0, kRecord345);
+    vf_callback(h, 1, kRecord3);
+    vf_callback(h, 7, kVideoFormatCall);
+    vf_callback(h, 8, kVideoCheckoutCall);
+    vf_callback(h, 9, kRecord34);
+    vf_callback(h, 10, kRecord3);
+    const u32 fmt = vf_block(7) + 8, pitch = picture_pitch(c);
+    std::memset(h.b + fmt, 0, 0x20);
+    h.b[fmt] = static_cast<u8>(c.coding);
+    h.b[fmt + 2] = 8;
+    h.b[fmt + 3] = c.rate;
+    ps_write16(h.b, fmt + 4, static_cast<u16>(c.width));
+    ps_write16(h.b, fmt + 6, static_cast<u16>(c.height));
+    h.w32(fmt + 8, pitch);
+    h.w32(fmt + 12, 0xFF);
+    h.b[fmt + 0x10] = static_cast<u8>(c.matrix);
+    h.b[fmt + 0x11] = c.aspect;
+    h.w32(vf_block(8) + 4, 0);
+    h.w32(vf_block(8) + 8, kVfFrames);
+    h.w32(vf_block(8) + 12, c.frames);
+    const u32 size = (picture_size(c) + 0x7F) & ~0x7Fu;
+    REQUIRE(c.frames <= 16);
+    REQUIRE(size * c.frames <= 0x100000);
+    for (u32 k = 0; k < c.frames; k++) {
+        const u32 info = kVfFrames + 0x40 * k, pic = kVfPictures + size * k;
+        std::memset(h.b + info, 0, 0x40);
+        h.w32(info, pic);
+        const s64 t = static_cast<s64>(u64{k} * 1000000 * 1000 / 30000) + (k < c.jitter.size() ? c.jitter[k] : 0);
+        ps_write64(h.b, info + 0x10, static_cast<u64>(t));
+        u32 n = 0;
+        for (const auto& [frame, opt] : c.options) {
+            if (frame != k || n == 4) continue;
+            const u32 at = kVfOptions + 0x20 * k + 8 * n;
+            h.w32(at, opt.first);
+            h.w32(at + 4, opt.second);
+            n++;
+        }
+        if (n) {
+            h.w32(info + 0x20, n);
+            h.w32(info + 0x24, kVfOptions + 0x20 * k);
+        }
+        for (u32 y = 0; y < static_cast<u32>(c.height); y++)
+            for (u32 x = 0; x < pitch; x++) h.b[pic + y * pitch + x] = static_cast<u8>(x * 2 + y * 3 + k * 9);
+        if (c.coding == 3)
+            for (u32 i = 0; i < pitch * static_cast<u32>(c.height) / 2; i++)
+                h.b[pic + pitch * static_cast<u32>(c.height) + i] = static_cast<u8>(112 + (i * 5 + k * 7) % 32);
+    }
+}
+
+u32 video_slot(H& h) { return h.r32(kRec + 0x7F4); }
+u32 video_pipeline(H& h) { return video_slot(h) + 0x50; }
+
+// A video stream's objects: the slot (its records' continuations masked), the pipeline (its stop's), the slot's stream
+// entry and parameters, the conversion's block, the feeder (its own table and its step's continuation masked), the
+// stream's parameters (the copy of the encoder's options past the defaults masked: libsail_rec copies its stack there,
+// MPEG-4's from +0x120, H.264's from +0x194).
+void video_state(H& h, const std::string& key, u32 profile)
+{
+    const u32 slot = video_slot(h);
+    if (!slot) {
+        h.o.line(key + ": the slots", "none");
+        return;
+    }
+    h.mem(key + ": the slot", slot, 0x50, {{0xC, 4}, {0x24, 4}, {0x3C, 4}});
+    h.mem(key + ": the pipeline", slot + 0x50, 0x3C0, {{0x14, 4}});
+    h.mem(key + ": the slot's stream entry", slot + 0x410, 0x50);
+    if (const u32 conv = h.r32(slot + 0x50 + 0x188)) h.mem(key + ": the conversion", conv, 0x400);
+    h.mem(key + ": the feeder", kVf, 0x200, {{0, 0x2C}, {0x5C, 4}});
+    if (!profile) return;
+    const u32 params = h.r32(profile + 0x554), codec = h.r32(params + 0x14);
+    if (codec == 0x22 || codec == 0x23) h.mem(key + ": the video parameters", params, 0x220, {{0x194, 0x50}});
+    else if (codec == 0x21) h.mem(key + ": the video parameters", params, 0x220, {{0x120, 0xC8}});
+    else h.mem(key + ": the video parameters", params, 0x220);
+}
+
+// Whether the video stream's codec is H.264 (its parameters' codec).
+bool avc_units(H& h)
+{
+    const u32 profile = h.r32(kRec + 0x7A4);
+    if (!profile) return false;
+    const u32 codec = h.r32(h.r32(profile + 0x554) + 0x14);
+    return codec == 0x22 || codec == 0x23;
+}
+
+// The composer's video units there taken (their records, bytes and the encoder's information) and given back.
+u32 take_video_units(H& h, const std::string& key)
+{
+    h.w32(kVuLeft, 0xEEEEEEEE);
+    h.call(key + ": TryGetEsVideoAu(0)", "cellSailComposerTryGetEsVideoAu", {kComposer, 0, kVuOut, 0, kVuLeft});
+    const u32 n = std::min<u32>(h.r32(kVuLeft), 16);
+    if (!n) return 0;
+    h.call(std::format("{}: TryGetEsVideoAu({})", key, n), "cellSailComposerTryGetEsVideoAu",
+        {kComposer, 0, kVuOut, n, kVuLeft});
+    // H.264's units: the encoder leaves its information's second and third times unwritten (bytes of its stack frame),
+    // and libsail_rec turns them into the unit's second and third times: each half's own stack's (masked).
+    const bool avc = avc_units(h);
+    std::vector<std::pair<u32, u32>> times;
+    for (u32 i = 0; i < n && avc; i++) times.push_back({0x38 * i + 0x10, 0x10});
+    std::vector<u8> v(h.b + kVuOut, h.b + kVuOut + 0x38 * n);
+    for (const auto& [off, len] : times)
+        for (u32 k = 0; k < len; k++) v[off + k] = 0x5A;
+    h.o.bytes(key + ": the units' records", std::move(v));
+    for (u32 i = 0; i < n; i++) {
+        const u32 o = kVuOut + 0x38 * i;
+        const u32 at = h.r32(o), size = h.r32(o + 4), info = h.r32(o + 0x34);
+        if (at && size && size < 0x40000) h.mem(std::format("{}: unit {}", key, i), at, size);
+        if (!info) continue;
+        if (avc) h.mem(std::format("{}: unit {}'s record", key, i), info - 0x34, 0xB4, {{0x10, 0x10}, {0x68, 0x18}});
+        else h.mem(std::format("{}: unit {}'s record", key, i), info - 0x34, 0x84);
+    }
+    h.call(std::format("{}: ReleaseEsVideoAu({})", key, n), "cellSailComposerReleaseEsVideoAu", {kComposer, 0, n});
+    return n;
+}
+
+// Waits until the recorder is quiet: the control thread waiting for a message, the pipeline neither converting nor
+// scaling, the encoder with all its inputs free (`inputs`, as at the start) or done (the pipeline open again, or ended
+// waiting for the composer), and nothing moved for 300 ms.
+void wait_video_quiet(H& h, u32 inputs, const std::string& what, int seconds = 600)
+{
+    const u32 p = video_pipeline(h);
+    const auto quiet = [&] {
+        const u32 state = h.r32(p + 0x168);
+        return h.r32(kRec + 0x510) == 200 && !h.r32(p + 0x94) && !h.r32(p + 0xE8) &&
+               (h.r32(p + 0xF0) == inputs || state == 2 || state == 6);
+    };
+    const auto snapshot = [&] {
+        std::vector<u8> v(h.b + p, h.b + p + 0x3C0);
+        v.push_back(static_cast<u8>(h.r32(kEvents)));
+        return v;
+    };
+    for (int i = 0; i < seconds * 20; i++) {
+        if (quiet()) {
+            const std::vector<u8> before = snapshot();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            if (quiet() && snapshot() == before) return;
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    FAIL(what << ": the recorder is not quiet");
+}
+
+// A booted recorder with one video stream (the feeder of `c`) through the game's composer (its open, close, start and
+// stop callbacks none: they complete at once), parameter 73 as `c` asks; its allocator's heap the large region.
+void boot_video(H& h, const VideoCase& c)
+{
+    h.tr.lightweight = false;
+    h.w32(kHeapState, kVideoHeap);
+    make_spurs(h);
+    tagged_composer(h);
+    for (const u32 i : {2u, 3u, 4u, 5u}) h.w32(kComposerFuncs + 4 * i, 0);
+    attribute(h, c.mode, 0, 1, 0);
+    REQUIRE(h.call("Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) == 0);
+    if (c.scale) h.call("SetParameter(73, 0, 1)", "cellSailRecorderSetParameter", {kRec, 0x49, 0, 1});
+    h.call("ComposerInitialize", "cellSailComposerInitialize", {kComposer, kComposerFuncs, 0x5A5A});
+    h.call("RegisterComposer(3)", "cellSailRecorderRegisterComposer", {kRec, 3, kComposer});
+    video_feeder(h, c);
+    h.call("FeederVideoInitialize", "cellSailFeederVideoInitialize", {kVf, kVfFuncs, 0x7700, 0});
+    h.call("SetFeederVideo", "cellSailRecorderSetFeederVideo", {kRec, 0, kVf});
+    h.call("Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, "Boot");
+    wait_idle(h, "Boot");
+    h.logs("Boot");
+    video_state(h, "Boot", 0);
+}
+
+// A profile for the game's composer; the video stream's parameters set when `c` asks a codec or a size.
+u32 video_profile(H& h, const VideoCase& c)
+{
+    const u32 out = kArgs + 0x400;
+    h.call("CreateProfile(3)", "cellSailRecorderCreateProfile", {kRec, 3, out});
+    const u32 profile = h.r32(out);
+    if (c.codec != 0xFFFFFFFF || c.want_w != -1 || c.want_h != -1 || c.level != -1 || c.max_rate != -1 ||
+        c.bitrate != -1 || c.timescale != -1 || c.gop != -1) {
+        const u32 a = kVideoParam;
+        std::memset(h.b + a, 0xFF, 0x50);
+        h.w32(a, 0x50);
+        h.w32(a + 4, c.codec == 0xFFFFFFFF ? 0x21 : c.codec);
+        h.w32(a + 0x10, static_cast<u32>(c.level));
+        h.w32(a + 0x14, static_cast<u32>(c.max_rate));
+        h.w32(a + 0x18, static_cast<u32>(c.bitrate));
+        h.w32(a + 0x1C, static_cast<u32>(c.timescale));
+        h.w32(a + 0x20, static_cast<u32>(c.gop));
+        ps_write16(h.b, a + 0x34, static_cast<u16>(c.want_w));
+        ps_write16(h.b, a + 0x36, static_cast<u16>(c.want_h));
+        h.call("SetEsVideoParameter", "cellSailProfileSetEsVideoParameter", {profile, 0, a, 0});
+    }
+    h.logs("CreateProfile(3)");
+    return profile;
+}
+
+// One video stream recorded through the game's composer: OpenStream (the encoder's configuration from its defaults,
+// the conversion, the scaler and the encoder opened), Start, the frames given one at a time (each converted, scaled
+// and encoded as the case needs; its units taken as they come), Stop (the encoder flushed), CloseStream, Finalize.
+void script_video(H& h, const VideoCase& c)
+{
+    boot_video(h, c);
+    const u32 profile = video_profile(h, c);
+    h.call("OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, path_arg(h, "/dev_hdd0/rec"), 0x22, 0x33,
+                                                          0x4455});
+    wait_event_long(h, u64{2} << 32 | 0x21, "OpenStream's completion");
+    wait_idle(h, "OpenStream");
+    h.logs("OpenStream");
+    streams_recorder(h, "OpenStream");
+    streams_composer(h, "OpenStream");
+    video_state(h, "OpenStream", profile);
+    if (!video_slot(h) || h.b[video_slot(h) + 0x42D] != 1) {
+        // The stream refused (its slot closed again): CloseStream and Finalize.
+        h.call("CloseStream", "cellSailRecorderCloseStream", {kRec, 0x6688});
+        wait_event_long(h, u64{2} << 32 | 0x22, "CloseStream's completion");
+        wait_idle(h, "CloseStream");
+        h.logs("CloseStream");
+        h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+        h.logs("Finalize");
+        finish_spurs(h);
+        return;
+    }
+    h.call("Start", "cellSailRecorderStart", {kRec, 0, path_arg(h, "a.mp4"), 0x5566});
+    wait_event_long(h, u64{2} << 32 | 0x29, "Start's completion");
+    wait_idle(h, "Start");
+    const u32 inputs = h.r32(video_pipeline(h) + 0xF0);
+    h.o.line("the encoder's inputs", std::format("{}", inputs));
+    wait_video_quiet(h, inputs, "Start");
+    h.logs("Start");
+    video_state(h, "Start", profile);
+    for (u32 k = 0; k < c.frames; k++) {
+        const std::string key = std::format("frame {}", k);
+        const u32 from = h.events_seen;
+        h.call(key + ": NotifyFrameOut", "cellSailFeederVideoNotifyFrameOut", {kVf, 1});
+        // The frame given back (once converted, scaled or encoded; at once when dropped), its units taken as they come.
+        for (u32 round = 0; round < 8; round++) {
+            wait_video_quiet(h, inputs, std::format("{}: round {}", key, round));
+            const std::string kr = std::format("{}: round {}", key, round);
+            h.logs(kr);
+            video_state(h, kr, profile);
+            streams_composer(h, kr);
+            if (!take_video_units(h, kr) && records_of(h, vf_block(9), from) >= 1) break;
+        }
+    }
+    // Stop: the feeder stopped, the encoder drained and flushed, the composer's stream ended once its units are given
+    // back.
+    const u32 from_stop = h.events_seen;
+    h.call("Stop", "cellSailRecorderStop", {kRec, 0, 0x6677});
+    for (u32 round = 0; round < 16 && !records_of(h, composer_answer(12), from_stop); round++) {
+        const std::string k = std::format("stopping {}", round);
+        wait_video_quiet(h, inputs, k);
+        if (records_of(h, composer_answer(12), from_stop)) break;
+        h.logs(k);
+        video_state(h, k, profile);
+        take_video_units(h, k);
+    }
+    wait_records_of(h, composer_answer(12), 1, from_stop, "the composer's stream ended");
+    wait_event_long(h, u64{2} << 32 | 0x2A, "Stop's completion");
+    wait_idle(h, "Stop's completion");
+    h.logs("Stop's completion");
+    video_state(h, "Stop's completion", profile);
+    streams_recorder(h, "Stop's completion");
+    streams_composer(h, "Stop's completion");
+    take_video_units(h, "the stop");
+    h.call("CloseStream", "cellSailRecorderCloseStream", {kRec, 0x6688});
+    wait_event_long(h, u64{2} << 32 | 0x22, "CloseStream's completion");
+    wait_idle(h, "CloseStream");
+    h.logs("CloseStream");
+    video_state(h, "CloseStream", profile);
+    streams_recorder(h, "CloseStream");
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    h.o.line("the heap's end", std::format("{:#x}", h.r32(kHeapState) - kVideoHeap));
+    REQUIRE(h.r32(kHeapState) < kBig + kBigSize);
+    finish_spurs(h);
+}
+
+// Video streams the configuration refuses (each an error event and the slot closed again; OpenStream still completes
+// with 0): the feeder's format failing, a frame rate's code past 7 or not the profile's, a picture's rows past its
+// pitch or a pitch past them not a multiple of 32, no aspect ratio, another aspect ratio than the profile's, another
+// size without parameter 73, MPEG-4 HD with a profile; then raw Bayer (the pipeline refuses it, once the composer has
+// the stream), the feeder's own pixel aspect and a pitch past the rows that is a multiple of 32 (opened). The
+// configuration's refusals come first: once the slot has had a stream, libsail_rec's close of a slot whose
+// configuration it refuses frees the slot's old stream again and walks the composer's list past its end (Sony's module
+// faults, pspocket's stops: composer_free_stream).
+void script_video_refusals(H& h)
+{
+    const VideoCase c{.frames = 1};
+    boot_video(h, c);
+    const u32 profile = video_profile(h, c);
+    const u32 fmt = vf_block(7) + 8;
+    const auto round = [&](const std::string& k) {
+        h.call(k + ": OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, path_arg(h, "/r"), 0x22, 0x33, 4});
+        wait_event_long(h, u64{2} << 32 | 0x21, k + ": OpenStream's completion");
+        wait_idle(h, k);
+        h.logs(k);
+        video_state(h, k, profile);
+        streams_recorder(h, k);
+        h.call(k + ": CloseStream", "cellSailRecorderCloseStream", {kRec, 0x66});
+        wait_event_long(h, u64{2} << 32 | 0x22, k + ": CloseStream's completion");
+        wait_idle(h, k + ": CloseStream");
+        h.logs(k + ": CloseStream");
+    };
+    const auto parameter = [&](const std::string& k, u32 codec, u32 profile_id, u8 rate, u8 aspect, s16 w, s16 hgt) {
+        const u32 a = kVideoParam;
+        std::memset(h.b + a, 0xFF, 0x50);
+        h.w32(a, 0x50);
+        h.w32(a + 4, codec);
+        h.w32(a + 0xC, profile_id);
+        h.b[a + 0x33] = rate;
+        h.b[a + 0x41] = aspect;
+        ps_write16(h.b, a + 0x34, static_cast<u16>(w));
+        ps_write16(h.b, a + 0x36, static_cast<u16>(hgt));
+        h.call(k + ": SetEsVideoParameter", "cellSailProfileSetEsVideoParameter", {profile, 0, a, 0});
+    };
+    h.w32(vf_block(7), 0x80610799);
+    round("the format failing");
+    h.w32(vf_block(7), 0);
+    h.b[fmt + 3] = 8;
+    round("a frame rate's code of 8");
+    h.b[fmt + 3] = 4;
+    h.w32(fmt + 8, 32);
+    round("a pitch short of the rows");
+    h.w32(fmt + 8, 80);
+    round("a pitch past the rows, not a multiple of 32");
+    h.w32(fmt + 8, 64);
+    h.b[fmt + 0x11] = 0;
+    round("no aspect ratio");
+    h.b[fmt + 0x11] = 1;
+    parameter("another frame rate", 0x21, 0xFFFFFFFF, 3, 0xFF, -1, -1);
+    round("another frame rate");
+    parameter("another aspect ratio", 0x21, 0xFFFFFFFF, 0xFF, 2, -1, -1);
+    round("another aspect ratio");
+    parameter("another size", 0x21, 0xFFFFFFFF, 0xFF, 0xFF, 48, 32);
+    round("another size without parameter 73");
+    parameter("MPEG-4 HD with a profile", 0x24, 1, 0xFF, 0xFF, -1, -1);
+    round("MPEG-4 HD with a profile");
+    parameter("MPEG-4 again", 0x21, 0xFFFFFFFF, 0xFF, 0xFF, -1, -1);
+    h.b[fmt] = 12;
+    round("raw Bayer");
+    h.b[fmt] = 3;
+    h.b[fmt + 0x11] = 0x10;
+    h.w32(fmt + 0x14, 0x30002);
+    round("the feeder's own pixel aspect");
+    h.b[fmt + 0x11] = 1;
+    h.w32(fmt + 8, 96);
+    round("a pitch past the rows, a multiple of 32");
+    h.w32(fmt + 8, 64);
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -2231,6 +2691,20 @@ Observed half_audio_refusals(const Setup& s, bool sony)
 {
     H h(s, sony, true);
     script_audio_refusals(h);
+    return std::move(h.o);
+}
+
+Observed half_video(const Setup& s, bool sony, const VideoCase& c)
+{
+    H h(s, sony, true, true);
+    script_video(h, c);
+    return std::move(h.o);
+}
+
+Observed half_video_refusals(const Setup& s, bool sony)
+{
+    H h(s, sony, true, true);
+    script_video_refusals(h);
     return std::move(h.o);
 }
 
@@ -2366,5 +2840,51 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: audio streams refused", "[hle
 {
     const Setup s = setup();
     run(s, "cellSailRec: audio streams refused", [&](bool sony) { return half_audio_refusals(s, sony); },
+        [](const Observed&) {});
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: a video stream recorded", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    const auto video = [&](const std::string& title, const VideoCase& c, bool refused = false) {
+        if (!selected(title)) return;
+        run(s, "cellSailRec: " + title, [&](bool sony) { return half_video(s, sony, c); }, [&](const Observed& o) {
+            CHECK(o.value("OpenStream") == "0x0");
+            if (refused) return;
+            CHECK(o.value("Start") == "0x0");
+            CHECK(o.value("Stop") == "0x0");
+        });
+    };
+    video("YUV 4:2:0 to MPEG-4", {});
+    video("YUV 4:2:0 to H.264", {.codec = 0x22});
+    video("YUV 4:2:0 to H.264, no color matrix", {.frames = 2, .matrix = -1, .codec = 0x22});
+    video("ARGB to MPEG-4", {.frames = 2, .coding = 0});
+    video("RGBA to MPEG-4", {.frames = 2, .coding = 1});
+    video("UYVY to MPEG-4", {.frames = 2, .coding = 2});
+    video("VYUY to H.264", {.frames = 2, .coding = 9, .codec = 0x22});
+    video("YUV 4:2:0 scaled", {.frames = 2, .want_w = 48, .want_h = 32, .scale = true});
+    video("YUV 4:2:0 scaled to 32 by 32 (the scaler refuses)", {.frames = 1, .want_w = 32, .want_h = 32, .scale = true},
+        true);
+    video("ARGB converted and scaled", {.frames = 2, .coding = 0, .want_w = 48, .want_h = 32, .scale = true});
+    video("frames late and early (no clock)", {.frames = 5, .mode = 1, .jitter = {0, 20000, -20000, 0, 0}});
+    video("a frame's options (the aspect ratio changed, a picture's kind, a repeat)",
+        {.frames = 4, .options = {{1, {3, 2}}, {2, {4, 1}}, {3, {4, 100}}}});
+    video("H.264 with a frame's options", {.frames = 3, .codec = 0x22, .options = {{1, {6, 0xC000B}}, {2, {4, 2}}}});
+    video("MPEG-4 with the profile's level, bit rates, timescale and GOP",
+        {.frames = 2, .level = 0x11, .max_rate = 600000, .bitrate = 300000, .timescale = 30000, .gop = 45000});
+    video("H.264 with the profile's bit rates, timescale and GOP",
+        {.frames = 2, .codec = 0x22, .max_rate = 128000, .bitrate = 100000, .timescale = 60000, .gop = 30000});
+    video("H.264 with a bit rate past its level's (the encoder refuses)",
+        {.frames = 1, .codec = 0x22, .max_rate = 1000000, .bitrate = 500000, .timescale = 60000, .gop = 30000}, true);
+    video("MPEG-4 with a timescale of 90 kHz (the encoder refuses)", {.frames = 1, .timescale = 90000}, true);
+    video("YUV 4:2:0 to MPEG-4 HD", {.frames = 2, .codec = 0x24});
+    video("ARGB to MPEG-4 HD", {.frames = 2, .coding = 0, .codec = 0x24});
+    video("YUYV (the pipeline refuses)", {.frames = 1, .coding = 4}, true);
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: video streams refused", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: video streams refused", [&](bool sony) { return half_video_refusals(s, sony); },
         [](const Observed&) {});
 }

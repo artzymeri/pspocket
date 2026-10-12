@@ -141,7 +141,10 @@ void composer_free_stream(PPUContext& ctx, u32 cs, u32 entry)
         w32(ctx, cs + cs::kCount, r32(ctx, cs + cs::kCount) - 1);
         return;
     }
-    // libsail_rec walks the list from its head (an entry not in it would read past the list's end: never so).
+    // libsail_rec walks the list from its head. An entry not in it (a slot whose stream the composer never took this
+    // time, its object still the one freed when the slot last closed: a video stream refused by its configuration
+    // after the slot had been open) walks past the list's end: libsail_rec reads guest address 0x14 there and the
+    // process faults (seen with Sony's module, D-918 part 8). pspocket stops the process there as loudly.
     while (cur) {
         const u32 next = r32(ctx, cur + se::kNext);
         if (entry == next) {
@@ -151,6 +154,10 @@ void composer_free_stream(PPUContext& ctx, u32 cs, u32 entry)
         }
         cur = next;
     }
+    log_call_site(ctx, gb(ctx), "cellSailRec: libsail_rec's composer stream list walked past its end");
+    PS_FATAL(kChan, "libsail_rec frees the stream entry {:#x} (its object {:#x} freed before) that its composer's list "
+        "does not hold: Sony's module reads guest address 0x14 here and the process faults", entry,
+        r32(ctx, entry + se::kObject));
 }
 
 void composer_detach_instance(PPUContext& ctx, u32 cs)

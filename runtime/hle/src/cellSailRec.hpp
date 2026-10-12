@@ -353,11 +353,19 @@ s32 audio_stream_open(PPUContext& ctx, u32 rec, u32 record, u64 handle);
 // The control thread's messages for the audio streams (0x10, 0x11, 0x14 to 0x18, 0x2B; `a` and `b` the message's
 // object and argument).
 void audio_message(PPUContext& ctx, u32 rec, u32 code, u32 a, u32 b);
+// A video stream configured once its feeder is open, its pipeline opened and the stream added to the composer (two
+// steps for `handle`): 2, or the error.
+s32 video_stream_open(PPUContext& ctx, u32 rec, u32 record, u64 handle);
+// The control thread's messages for the video streams (0x1A, 0x1B, 0x1E to 0x23, 0x2C).
+void video_message(PPUContext& ctx, u32 rec, u32 code, u32 a, u32 b);
 
 // The recorder's clock (+0x710 in mode 0): reset at each Start; a stream's time `a` for the source's `b` (`c` its
 // timescale), under the clock's lwmutex: the first stream to tell it owns it, later times from it smoothed.
 void clock_reset(PPUContext& ctx, u32 clock);
 void clock_update(PPUContext& ctx, u32 clock, u32 owner, u64 a, u64 b, u64 c);
+// A video stream's time `a` (its frame's `b`, `c` its timescale) on the clock: the first stream to tell it sets it, its
+// own times follow it as clock_update's; another stream's time mapped through the clock's times so far.
+u64 clock_time(PPUContext& ctx, u32 clock, u32 owner, u64 a, u64 b, u64 c);
 
 // A copy of libsail_rec's data (`size` bytes at `vaddr` of the installed module) in guest memory, made once per process
 // (0 without the module, logged).
