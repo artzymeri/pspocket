@@ -603,20 +603,22 @@ namespace {
 void _pspocket_cellSailRec_control(PPUContext& ctx, u64 rec) { control_thread(ctx, rec); }
 void _pspocket_cellSailRec_task(PPUContext& ctx, u64 rec) { task_thread(ctx, rec); }
 
-#define SAILREC_LATER(name, what) \
-    s32 name(PPUContext& ctx) { later(ctx, what); }
-
-SAILREC_LATER(_pspocket_cellSailRec_FsOpen, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsClose, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsFstat, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsRead, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsLseek, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsNone, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsWrite, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsRename, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_FsUnlink, "the MP4 composer's file calls")
-
-#undef SAILREC_LATER
+// libsail_rec's file calls (the recorder's +0x7A8, the MP4 composer's): cellFs's, the registers passed on as they
+// are, the answer sign-extended; the eighth (none) answers 0.
+s32 fs_call(PPUContext& ctx, std::string_view name)
+{
+    return static_cast<s32>(static_cast<u32>(sail::module_call(ctx, "sys_fs", name,
+        {ctx.gpr[3], ctx.gpr[4], ctx.gpr[5], ctx.gpr[6], ctx.gpr[7], ctx.gpr[8], ctx.gpr[9], ctx.gpr[10]})));
+}
+s32 _pspocket_cellSailRec_FsOpen(PPUContext& ctx) { return fs_call(ctx, "cellFsOpen"); }
+s32 _pspocket_cellSailRec_FsClose(PPUContext& ctx) { return fs_call(ctx, "cellFsClose"); }
+s32 _pspocket_cellSailRec_FsFstat(PPUContext& ctx) { return fs_call(ctx, "cellFsFstat"); }
+s32 _pspocket_cellSailRec_FsRead(PPUContext& ctx) { return fs_call(ctx, "cellFsRead"); }
+s32 _pspocket_cellSailRec_FsLseek(PPUContext& ctx) { return fs_call(ctx, "cellFsLseek"); }
+s32 _pspocket_cellSailRec_FsNone(PPUContext&) { return 0; }
+s32 _pspocket_cellSailRec_FsWrite(PPUContext& ctx) { return fs_call(ctx, "cellFsWrite"); }
+s32 _pspocket_cellSailRec_FsRename(PPUContext& ctx) { return fs_call(ctx, "cellFsRename"); }
+s32 _pspocket_cellSailRec_FsUnlink(PPUContext& ctx) { return fs_call(ctx, "cellFsUnlink"); }
 
 #define SAILREC_INTERNAL(fn) PS_HLE_INTERNAL(recomp::nid_of(#fn), fn)
 

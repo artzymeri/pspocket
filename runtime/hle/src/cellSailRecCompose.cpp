@@ -651,8 +651,120 @@ void composer_detach(PPUContext& ctx, u32 c, u32 cs)
 
 // ------------------------------------------------------------------------------------------------- the MP4 composer
 
-s32 mp4_composer_attach(PPUContext& ctx, u32) { later(ctx, "the MP4 composer"); }
-void mp4_composer_destroy(PPUContext& ctx, u32, u32) { later(ctx, "the MP4 composer"); }
+// The MP4 composer is libmp4's (module 0xF031, with cellFs's 0xE): cellMp4's export 0x0B1E4B8F gives the descriptors
+// of its maker and its end into a variable of libsail_rec's (here one of the process's: two words); the maker takes
+// the composer's block (0x800 bytes from the game's allocator), the recorder, the recorder's functions it calls (a
+// completion, a message, the game's allocator's alloc and free: libsail_rec's table of four descriptors), the file
+// calls (the recorder's +0x7A8), the composers (+0x770) with libsail_rec's register function (the composer registers
+// its table as type 1), and parameters 82 and 83 (+0x860, +0x864: its writer thread's priority and stack). One
+// composer for the recorder, counted by its users (+0x58); the last user's close ends it (libmp4's end, with the
+// unregister function) and frees its block.
+
+namespace {
+
+constexpr u32 kMp4Interface = 0x0B1E4B8F;
+constexpr u32 kMp4Module = 0xF031, kFsModule = 0xE;
+
+constexpr HostImport kImports[] = {
+    {{}, "cellMp4", kMp4Interface, false},
+};
+
+// The recorder's functions libmp4's composer is given (libsail_rec's own: post_completion, post, the allocator's).
+s32 _pspocket_cellSailRec_Mp4Completion(PPUContext& ctx, u32 rec, s32 result, u64 handle)
+{
+    return post_completion(ctx, rec, result, handle);
+}
+s32 _pspocket_cellSailRec_Mp4Post(PPUContext& ctx, u32 rec, u32 code, u32 object, u32 arg)
+{
+    return post(ctx, rec, code, object, arg);
+}
+u32 _pspocket_cellSailRec_Mp4Alloc(PPUContext& ctx, u32 rec, u32 boundary, u32 size)
+{
+    return alloc(ctx, rec, boundary, size);
+}
+u64 _pspocket_cellSailRec_Mp4Free(PPUContext& ctx, u32 rec, u32 boundary, u32 ptr)
+{
+    return call_guest(ctx, r32(ctx, rec + rc::kFree), {r32(ctx, rec + rc::kAllocArg), boundary, ptr});
+}
+// The composers' register and unregister (libsail_rec's, given to the composer's maker and its end).
+s32 _pspocket_cellSailRec_Mp4Register(PPUContext& ctx, u32 cs, u32 type, u64 table, u32 arg)
+{
+    return composer_register(ctx, cs, type, table, arg);
+}
+s32 _pspocket_cellSailRec_Mp4Unregister(PPUContext& ctx, u32 cs, u32 type, u32 table_out, u32 arg_out)
+{
+    return composer_unregister(ctx, cs, type, table_out, arg_out);
+}
+
+// The process's guest words for libmp4's composer: the variable cellMp4 fills (two descriptors) and the table of the
+// recorder's four functions, made once.
+struct Mp4Words {
+    u32 variable = 0, functions = 0;
+};
+
+Mp4Words& mp4_words(PPUContext& ctx)
+{
+    Mp4Words& w = HleProcess::current()->state<Mp4Words>();
+    if (!w.variable) {
+        const u32 at = HleProcess::current()->main_memory().alloc(0x20, 16);
+        if (!at) PS_FATAL(kChan, "no main memory left for libsail_rec's MP4 composer words");
+        w32(ctx, at, 0);
+        w32(ctx, at + 4, 0);
+        const std::string_view calls[4] = {"_pspocket_cellSailRec_Mp4Completion", "_pspocket_cellSailRec_Mp4Post",
+            "_pspocket_cellSailRec_Mp4Alloc", "_pspocket_cellSailRec_Mp4Free"};
+        for (u32 i = 0; i < 4; i++) w32(ctx, at + 0x10 + 4 * i, internal(calls[i]));
+        w.variable = at;
+        w.functions = at + 0x10;
+    }
+    return w;
+}
+
+} // namespace
+
+// OpenStream's MP4 composer: its modules loaded, libmp4's descriptors asked; made once for the recorder (a block the
+// game's allocator cannot give leaves the stream without one, as libsail_rec does: the modules unloaded, 0), one more
+// user.
+s32 mp4_composer_attach(PPUContext& ctx, u32 rec)
+{
+    s32 r = load_module(ctx, kFsModule);
+    if (r < 0) return r;
+    r = load_module(ctx, kMp4Module);
+    if (r < 0) {
+        unload_module(ctx, kFsModule);
+        return r;
+    }
+    const Mp4Words& w = mp4_words(ctx);
+    firmware_call(ctx, "cellMp4", kMp4Interface, {w.variable});
+    u32 mp4 = r32(ctx, rec + rc::kMp4);
+    if (!mp4) {
+        const u32 block = alloc(ctx, rec, 8, 0x800);
+        if (!block) {
+            unload_module(ctx, kMp4Module);
+            unload_module(ctx, kFsModule);
+            return 0;
+        }
+        r = static_cast<s32>(static_cast<u32>(call_guest(ctx, r32(ctx, w.variable), {block, rec, w.functions,
+            rec + rc::kFileCalls, rec + rc::kComposers, internal("_pspocket_cellSailRec_Mp4Register"),
+            sx32(r32(ctx, rec + rc::kMp4Param1)), r32(ctx, rec + rc::kMp4Param2)})));
+        if (r < 0) {
+            dealloc(ctx, rec, 8, block);
+            unload_module(ctx, kMp4Module);
+            unload_module(ctx, kFsModule);
+            return r;
+        }
+        w32(ctx, rec + rc::kMp4, block);
+        mp4 = block;
+    }
+    w32(ctx, mp4 + 0x58, r32(ctx, mp4 + 0x58) + 1);
+    return 0;
+}
+
+// The composer's end (libmp4's, with the composers and the unregister function).
+void mp4_composer_destroy(PPUContext& ctx, u32 rec, u32 mp4)
+{
+    call_guest(ctx, r32(ctx, mp4_words(ctx).variable + 4),
+        {mp4, rec + rc::kComposers, internal("_pspocket_cellSailRec_Mp4Unregister")});
+}
 
 #define SAILREC_INTERNAL(fn) PS_HLE_INTERNAL(recomp::nid_of(#fn), fn)
 
@@ -683,7 +795,14 @@ void register_compose(Registry& r)
         SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerUserAu),
         SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerCompleted),
         SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerReleased),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Completion),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Post),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Alloc),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Free),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Register),
+        SAILREC_INTERNAL(_pspocket_cellSailRec_Mp4Unregister),
     });
+    r.add_imports(kChan, kImports);
 }
 
 #undef SAILREC_INTERNAL

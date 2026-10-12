@@ -10,7 +10,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -291,8 +293,17 @@ struct H : Half<> {
     Trace tr;
     std::unique_ptr<loader::LleModules> imports; // pspocket's half: the firmware libraries cellSailRec imports
 
-    H(const Setup& s, bool sony, bool with_imports = false, bool big = false) : Half<>(s, sony, "cellSailRec")
+    std::filesystem::path hdd0; // a writable /dev_hdd0 of this half's (the MP4 composer's file)
+
+    H(const Setup& s, bool sony, bool with_imports = false, bool big = false, bool writable = false)
+        : Half<>(s, sony, "cellSailRec")
     {
+        if (writable) {
+            hdd0 = std::filesystem::temp_directory_path() / std::format("sailrec-hdd0-{}", sony ? "sony" : "pspocket");
+            std::filesystem::remove_all(hdd0);
+            std::filesystem::create_directories(hdd0 / "rec");
+            REQUIRE(f.kernel->vfs_mount("/dev_hdd0", hdd0.string(), false));
+        }
         if (big) {
             REQUIRE(f.hle->main_memory().reserve(kBig, kBigSize));
             REQUIRE(f.mem.commit(kBig, kBigSize));
@@ -323,7 +334,12 @@ struct H : Half<> {
         tr.caller = std::this_thread::get_id();
         f.kernel->set_syscall_observer(&observe, &tr);
     }
-    ~H() { f.kernel->set_syscall_observer(nullptr, nullptr); }
+    ~H()
+    {
+        f.kernel->set_syscall_observer(nullptr, nullptr);
+        std::error_code ec;
+        if (!hdd0.empty()) std::filesystem::remove_all(hdd0, ec);
+    }
 
     u32 r32(u32 a) const { return ps_read32(b, a); }
     void w32(u32 a, u32 v) { ps_write32(b, a, v); }
@@ -2603,6 +2619,173 @@ void script_video_refusals(H& h)
     finish_spurs(h);
 }
 
+// ------------------------------------------------------------------------------------------------- the MP4 composer
+
+// A recording through libmp4's composer (profile type 1): an audio and a video stream (either may be left out), their
+// feeders as the audio and video recordings', the file written under the half's own /dev_hdd0.
+struct Mp4Case {
+    AudioCase audio{.frames = 4};
+    VideoCase video{.frames = 3};
+    bool with_audio = true, with_video = true;
+    u32 users = 1; // profiles opened one after the other on the same composer (each OpenStream to CloseStream)
+};
+
+// Waits until the recorder is quiet: the control thread waiting for a message, neither stream's encoder nor
+// converter nor scaler busy, and nothing moved (the recorder, its slots' pipelines, the records) for 300 ms.
+void wait_mp4_quiet(H& h, const std::string& what, int seconds = 600)
+{
+    const auto snapshot = [&] {
+        std::vector<u8> v(h.b + kRec, h.b + kRec + 0x900);
+        if (const u32 a = h.r32(kRec + 0x7F0); a && h.r32(kRec + 0x7E4)) v.insert(v.end(), h.b + a, h.b + a + 0x2B8);
+        if (const u32 s = h.r32(kRec + 0x7F4); s && h.r32(kRec + 0x7E8)) v.insert(v.end(), h.b + s, h.b + s + 0x460);
+        v.push_back(static_cast<u8>(h.r32(kEvents)));
+        v.push_back(static_cast<u8>(h.r32(kAllocLog)));
+        return v;
+    };
+    const auto busy = [&] {
+        if (h.r32(kRec + 0x510) != 200) return true;
+        if (const u32 a = h.r32(kRec + 0x7F0); a && h.r32(kRec + 0x7E4))
+            if (h.r32(a + 0x50 + 0x1C8) || h.r32(a + 0x50 + 0x1C4)) return true;
+        if (const u32 s = h.r32(kRec + 0x7F4); s && h.r32(kRec + 0x7E8))
+            if (h.r32(s + 0x50 + 0x94) || h.r32(s + 0x50 + 0xE8)) return true;
+        return false;
+    };
+    for (int i = 0; i < seconds * 20; i++) {
+        if (!busy()) {
+            const std::vector<u8> before = snapshot();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            if (!busy() && snapshot() == before) return;
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    FAIL(what << ": the recorder is not quiet");
+}
+
+// The MP4 composer's block (0x800 bytes; libmp4 keeps there the recorder's function table (+4), the composers'
+// register function (+0xC) and a function of its own (+0x2C): each half's own addresses, masked).
+void mp4_state(H& h, const std::string& key)
+{
+    const u32 mp4 = h.r32(kRec + 0x844);
+    if (!mp4) {
+        h.o.line(key + ": the MP4 composer", "none");
+        return;
+    }
+    h.mem(key + ": the MP4 composer", mp4, 0x800, {{4, 4}, {0xC, 4}, {0x2C, 4}});
+}
+
+// An MP4 file's boxes walked: the creation and modification times of mvhd, tkhd and mdhd (the wall clock's, seconds
+// since 1904) masked.
+void mask_mp4_times(std::vector<u8>& v, usize off, usize end)
+{
+    while (off + 8 <= end) {
+        const usize size = ps_ld32(v.data() + off);
+        const std::string type(reinterpret_cast<const char*>(v.data() + off + 4), 4);
+        if (size < 8 || off + size > end) return;
+        if (type == "moov" || type == "trak" || type == "mdia") mask_mp4_times(v, off + 8, off + size);
+        if ((type == "mvhd" || type == "tkhd" || type == "mdhd") && size >= 12 + 16) {
+            const usize n = v[off + 8] == 1 ? 16 : 8;
+            for (usize i = 0; i < n; i++) v[off + 12 + i] = 0x5A;
+        }
+        off += size;
+    }
+}
+
+// The file the composer wrote (the half's /dev_hdd0/rec), or that there is none.
+void mp4_file(H& h, const std::string& key, const std::string& name)
+{
+    const std::filesystem::path p = h.hdd0 / "rec" / name;
+    std::ifstream in(p, std::ios::binary);
+    if (!in) {
+        h.o.line(key + ": " + name, "none");
+        return;
+    }
+    std::vector<u8> v((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    h.o.line(key + ": " + name + "'s size", std::format("{}", v.size()));
+    mask_mp4_times(v, 0, v.size());
+    h.o.bytes(key + ": " + name, std::move(v));
+}
+
+void script_mp4(H& h, const Mp4Case& c)
+{
+    h.tr.lightweight = false;
+    h.w32(kHeapState, kVideoHeap);
+    make_spurs(h);
+    attribute(h, 0, c.with_audio ? 1 : 0, c.with_video ? 1 : 0, 0);
+    REQUIRE(h.call("Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) == 0);
+    if (c.with_audio) {
+        audio_feeder(h, c.audio);
+        h.call("FeederAudioInitialize", "cellSailFeederAudioInitialize", {kAf, kAfFuncs, 0x7700, 0});
+        h.call("SetFeederAudio", "cellSailRecorderSetFeederAudio", {kRec, 0, kAf});
+    }
+    if (c.with_video) {
+        video_feeder(h, c.video);
+        h.call("FeederVideoInitialize", "cellSailFeederVideoInitialize", {kVf, kVfFuncs, 0x7700, 0});
+        h.call("SetFeederVideo", "cellSailRecorderSetFeederVideo", {kRec, 0, kVf});
+    }
+    h.call("Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, "Boot");
+    wait_idle(h, "Boot");
+    h.logs("Boot");
+    const u32 out = kArgs + 0x400;
+    h.call("CreateProfile(1)", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    const u32 profile = h.r32(out);
+    h.logs("CreateProfile(1)");
+    for (u32 user = 0; user < c.users; user++) {
+        const std::string u = c.users > 1 ? std::format("user {}: ", user) : std::string();
+        h.call(u + "OpenStream", "cellSailRecorderOpenStream",
+            {kRec, profile, 0x11, path_arg(h, "/dev_hdd0/rec"), 0x22, 0x33, 0x4455});
+        wait_event_long(h, u64{2} << 32 | 0x21, u + "OpenStream's completion");
+        wait_mp4_quiet(h, u + "OpenStream");
+        h.logs(u + "OpenStream");
+        streams_recorder(h, u + "OpenStream");
+        mp4_state(h, u + "OpenStream");
+        if (c.with_audio) audio_state(h, u + "OpenStream", profile);
+        if (c.with_video) video_state(h, u + "OpenStream", profile);
+        const std::string name = std::format("a{}.mp4", user);
+        h.call(u + "Start", "cellSailRecorderStart", {kRec, 0, path_arg(h, name), 0x5566});
+        wait_event_long(h, u64{2} << 32 | 0x29, u + "Start's completion");
+        wait_mp4_quiet(h, u + "Start");
+        h.logs(u + "Start");
+        mp4_state(h, u + "Start");
+        if (c.with_video) {
+            for (u32 k = 0; k < c.video.frames; k++) {
+                const std::string key = std::format("{}video frame {}", u, k);
+                h.call(key + ": NotifyFrameOut", "cellSailFeederVideoNotifyFrameOut", {kVf, 1});
+                wait_mp4_quiet(h, key);
+                h.logs(key);
+                video_state(h, key, profile);
+            }
+        }
+        if (c.with_audio) {
+            h.call(u + "audio: NotifyFrameOut", "cellSailFeederAudioNotifyFrameOut", {kAf, c.audio.frames});
+            wait_mp4_quiet(h, u + "audio frames");
+            h.logs(u + "audio frames");
+            audio_state(h, u + "audio frames", profile);
+        }
+        mp4_state(h, u + "the frames");
+        h.call(u + "Stop", "cellSailRecorderStop", {kRec, 0, 0x6677});
+        wait_event_long(h, u64{2} << 32 | 0x2A, u + "Stop's completion");
+        wait_mp4_quiet(h, u + "Stop");
+        h.logs(u + "Stop");
+        streams_recorder(h, u + "Stop");
+        mp4_state(h, u + "Stop");
+        if (c.with_audio) audio_state(h, u + "Stop", profile);
+        if (c.with_video) video_state(h, u + "Stop", profile);
+        h.call(u + "CloseStream", "cellSailRecorderCloseStream", {kRec, 0x6688});
+        wait_event_long(h, u64{2} << 32 | 0x22, u + "CloseStream's completion");
+        wait_mp4_quiet(h, u + "CloseStream");
+        h.logs(u + "CloseStream");
+        streams_recorder(h, u + "CloseStream");
+        mp4_state(h, u + "CloseStream");
+        mp4_file(h, u + "CloseStream", name);
+    }
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    h.o.line("the heap's end", std::format("{:#x}", h.r32(kHeapState) - kVideoHeap));
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -2705,6 +2888,13 @@ Observed half_video_refusals(const Setup& s, bool sony)
 {
     H h(s, sony, true, true);
     script_video_refusals(h);
+    return std::move(h.o);
+}
+
+Observed half_mp4(const Setup& s, bool sony, const Mp4Case& c)
+{
+    H h(s, sony, true, true, true);
+    script_mp4(h, c);
     return std::move(h.o);
 }
 
@@ -2887,4 +3077,21 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: video streams refused", "[hle
     const Setup s = setup();
     run(s, "cellSailRec: video streams refused", [&](bool sony) { return half_video_refusals(s, sony); },
         [](const Observed&) {});
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: recordings through the MP4 composer", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    const auto mp4 = [&](const std::string& title, const Mp4Case& c) {
+        if (!selected(title)) return;
+        run(s, "cellSailRec: " + title, [&](bool sony) { return half_mp4(s, sony, c); }, [](const Observed& o) {
+            CHECK(o.value("OpenStream") == "0x0");
+            CHECK(o.value("Start") == "0x0");
+        });
+    };
+    mp4("audio and video into an MP4 file", {});
+    mp4("H.264 video into an MP4 file", {.video = {.frames = 3, .codec = 0x22}, .with_audio = false});
+    mp4("audio into an MP4 file", {.audio = {.frames = 6}, .with_video = false});
+    mp4("two recordings one after the other (the composer made twice)",
+        {.audio = {.frames = 2}, .video = {.frames = 2}, .users = 2});
 }

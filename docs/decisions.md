@@ -13559,3 +13559,31 @@ ratio, another size without parameter 73, MPEG-4 HD with a profile; raw Bayer re
 pixel aspect; a pitch past the rows): 0 of 365. The conversions', encoders' and scaler's SPU programs run under
 pspocket's SPURS in both halves. The recorder's dumps mask the SPURS queue's messages' third words (an SPU program's
 run time). The MP4 composer still stops the process with the call site until its part.
+
+### D-918, part 9: cellSailRec's MP4 composer: libmp4's composer made and ended by the recorder, the file calls
+
+A profile of type 1 records into an MP4 file through libmp4's composer (cellMp4, module 0xF031, with cellFs's 0xE),
+now driven by pspocket's libsail_rec as Sony's drives it (runtime/hle/src/cellSailRecCompose.cpp):
+- **OpenStream** loads both modules and asks cellMp4's export 0x0B1E4B8F for the descriptors of the composer's maker
+  and its end (into two words of the process's, where libsail_rec has them in its data); the first OpenStream makes the
+  composer in a block of 0x800 bytes from the game's allocator: the maker gets the recorder, the four recorder
+  functions it calls (a step's completion, a message, the game's allocator's alloc and free: libsail_rec's own, here
+  internal functions of cellSailRec), the file calls (the recorder's +0x7A8), the composers table with libsail_rec's
+  register function (the composer registers its own table as type 1), and parameters 82 and 83 (its writer thread's
+  priority and stack). A refused maker frees the block and unloads both modules (OpenStream's error event, everything
+  closed); an allocator that cannot give the block leaves the stream without a composer, as libsail_rec does (its
+  composer open then faults on the empty table: pspocket stops there). Each OpenStream counts one more user
+  (the block's +0x58); the stream's close counts one less, the last one ends the composer (libmp4's end with the
+  composers table and libsail_rec's unregister function) and frees the block; every close unloads the two modules.
+- **The file calls** (the recorder's table of 14: open, close, fstat, read, lseek, a call answering 0, write, rename,
+  unlink) are cellFs's, the registers passed on as they are and the answer sign-extended, as libsail_rec's wrappers.
+- What libmp4 posts to the recorder (units released 0x2B and 0x2C, a session's error 0x2E) goes through the message
+  loop as before. The loop's flushing stop (0xC, part 6) has no poster that a comparison reaches: none of libmp4's
+  calls through the recorder's functions posts it.
+Compared (tests/hle/test_sail_rec_compare.cpp, the halves' own writable /dev_hdd0, the encoders' work areas from the
+64 MB region): audio (AAC) and video (MPEG-4) into an MP4 file, H.264 video alone, audio alone, two recordings one
+after the other (the composer made and ended twice): every call's answer, the recorder, the composer's block (libmp4's
+three words holding each half's function addresses masked), the slots and pipelines, the allocator, the events, the
+lv2 calls and the file libmp4 wrote byte for byte (the mvhd, tkhd and mdhd boxes' creation and modification times, the
+wall clock's, masked): 0 of 157, 113, 99 and 259 observations differ. With the MP4 composer every one of cellSailRec's
+58 functions and libsail_rec's internal paths are pspocket's own; nothing stops the process for a later part.

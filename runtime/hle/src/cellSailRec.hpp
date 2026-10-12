@@ -222,9 +222,6 @@ u32 modules_flag(PPUContext& ctx);
 void control_thread(PPUContext& ctx, u64 rec);
 void task_thread(PPUContext& ctx, u64 rec);
 
-// A part of libsail_rec this part of D-918 does not make yet: the call site logged, the process stopped.
-[[noreturn]] void later(PPUContext& ctx, std::string_view what);
-
 // The control thread's answer to a command (the answer stored, the caller signalled, the lwmutex released), and an
 // error event ("error 0x%X" printed first), as libsail_rec makes them.
 void reply(PPUContext& ctx, u32 rec, u32 record, s32 answer);

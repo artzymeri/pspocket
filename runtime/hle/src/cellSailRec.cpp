@@ -13,7 +13,10 @@
 //
 // This file: the recorder's set-up and parameters, events, DumpImage and the commands' sending side;
 // cellSailRecObjects.cpp: the game's objects (feeders, composer, profiles, video converters); cellSailRecControl.cpp:
-// the control thread.
+// the control thread, the task handler, the clock and the file calls; cellSailRecStream.cpp: the streams' steps
+// (OpenStream to CloseStream); cellSailRecCompose.cpp: the composers (the game's, libmp4's); cellSailRecFeed.cpp: the
+// feeders' stream side; cellSailRecConvert.cpp: the video converters and the module's data; cellSailRecAudio.cpp and
+// cellSailRecVideo.cpp: the audio and video streams (configuration, pipelines, encoders).
 
 #include "cellSailRec.hpp"
 
@@ -137,12 +140,6 @@ void event(PPUContext& ctx, u32 rec, u32 major, u32 minor, u64 a, u64 b)
     const u32 frame = (static_cast<u32>(over < 0 ? 0 : over) + 30) & ~15u;
     StackVar room(ctx, gb(ctx), frame);
     call_guest(ctx, handler, {r32(ctx, rec + rc::kHandlerArg), u64{major} << 32 | minor, a, b});
-}
-
-void later(PPUContext& ctx, std::string_view what)
-{
-    log_call_site(ctx, gb(ctx), std::format("cellSailRec: {} is a later part of D-918", what));
-    PS_FATAL(kChan, "libsail_rec's {} is a later part of D-918", what);
 }
 
 u32 modules_flag(PPUContext& ctx)
