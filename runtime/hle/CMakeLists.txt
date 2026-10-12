@@ -166,6 +166,7 @@ add_library(pspocket_hle STATIC
     src/cellGamePs1Emu.cpp
     src/cellDtcpIpUtility.cpp
     src/sys_fs.cpp
+    src/fs_utility_init.cpp
     src/sys_io.cpp
     src/sys_net.cpp
     src/sysutil_misc.cpp

@@ -13815,3 +13815,38 @@ on the same owner); the step is a race in the guest, the comparison's own doing,
   +0x10) sleeps on the encoder's lwcond. Asleep there, nothing wakes it again: the second Open makes a new lwcond and
   every later signal goes to that one; the thread ends with the process.
 - tests/own_temp_dir.cpp is D-924's again (D-931's check of the creating process answered a fork that does not happen).
+
+## D-935 · 2026-10-12 · fs_utility_init from libfs_utility_init: the disk's identity, its partitions, fsck and growfs
+
+The system menu's disk utilities (libfs_utility_init.sprx in /dev_flash/sys/internal), RPCS3's placeholders until now
+(and its "2 partitions" for 6B5896B0, D-189), are pspocket's own (runtime/hle/src/fs_utility_init.cpp), read from the
+module (decompiled into inventory/, with FreeBSD 7.2's fsck_ffs and growfs, which Sony built for lv2, in
+external/freebsd-7.2) and compared with it call for call. A game has no use for them; each does what the module does
+on pspocket's lv2 in a game's process:
+- **665DF255 / E7563CE6**: the disk's serial number and model from an ATA IDENTIFY DEVICE through sys_storage, whose
+  open is a root process's call: a game gets CELL_ENOSYS and its buffer untouched (null: CELL_EFAULT).
+- **6B5896B0**: the partitions from the module's disk object, whose information (sys_storage_get_device_info, also a
+  root process's) is asked for three times: none, so 0 partitions and CELL_ENODEV, where RPCS3 answered 2.
+- **4E949DA4**: the raw device's mount at /dev_simple_hdd0 is refused (CELL_EPERM), the mount point unmounted all the
+  same, the mount's error the answer.
+- **fsck (A9B04535, 263172B8, 1F3CD9F1)**: Sony's own getopt (an index that each run starts again; an unknown option
+  ends the options; -b, -c and -m go through a strtol stub that prints "my_strtol: to avoid link error for prx" and
+  answers 0), exit() as the answer (exit(0) and exit(1) told apart by the module's flag), the heaps (liblv2's: 2 MB
+  with -F and 32 MB without from lv2, or in the caller's memory, which must be that large: "wrong size" and
+  CELL_ENOMEM), 1F3CD9F1's callback and notification ID with their messages, and the disk through a mount of its raw
+  device for hdd0, /dev_hdd0 and CELL_FS_UTILITY:HDD0 (refused: each stat and open is one refused mount). Then
+  getmntpt, blockcheck (/dev_ before a name without a '/'), the superblock's pre-read, -F's answer 3, setup's "Can't
+  stat", -B's "dummy_entry(setitimer)" and NOT MOUNTED, preening's pfatal with ckfini (whose close of descriptor -1
+  tries to unmount /dev_hdd0), 8 at the end; every message through liblv2's printf, as the module prints it.
+- **growfs (F691D443)**: the raw device's mount at /dev_hdd0 is refused: "Error Status: 1", "Mount failed 0x…", a blank
+  line, CELL_EIO.
+Not ported, logged loudly where reached: checking or growing a file system (the disk is never a game's, and pspocket's
+lv2 runs no root process), a root process's continuations (the disk's sector size and partition table), and fsck of a
+file or directory that exists, which the module reads block by block as a disk (1,040 lseeks for six paths in the
+probe) to answer 8 nearly always: here it logs and exits 8 at the first stat or open that succeeds. The module reads
+an end pointer its strtol stub never sets (it faults under the comparison with -b, -c or -m): here the 0 is taken.
+The module keeps its state in globals and takes no lock; pspocket's calls run one at a time.
+Compared (tests/hle/test_fs_utility_init.cpp, the comparison in the gate with the firmware): 44 calls and 112 lv2 calls
+in a game's process, the TTY's text included: 0 differ. sysutil_sub_compare.hpp now records each step's TTY lines (a
+script asks for them to be compared), compares the path arguments of the file system's calls by their text, knows the
+storage and mount calls' arguments, and PSPOCKET_TEST_DUMP=2 prints pspocket's run beside Sony's.

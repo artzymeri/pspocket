@@ -98,6 +98,7 @@ void register_cellLibprof(Registry& r);
 void register_sys_libstdcxx(Registry& r);
 void register_sysutil_more(Registry& r);
 void register_sys_fs(Registry& r);
+void register_fs_utility_init(Registry& r);
 void register_sys_io(Registry& r);
 void register_sys_net(Registry& r);
 void register_sysutil_misc(Registry& r);
@@ -201,6 +202,7 @@ void register_all_modules(Registry& r)
     register_sys_libstdcxx(r);
     register_sysutil_more(r);
     register_sys_fs(r);
+    register_fs_utility_init(r);
     register_sys_io(r);
     register_sys_net(r);
     register_sysutil_misc(r);

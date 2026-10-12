@@ -1287,20 +1287,6 @@ s32 cellFsUnregisterL10nCallbacks(PPUContext&)
     return lv2::CELL_OK;
 }
 
-// RPCS3 libfs_utility_init.cpp fs_utility_init_6B5896B0(u64* dest): the number of partitions, 2. The library's other
-// functions are RPCS3's stubs (rpcs3_stubs.inc).
-s32 fs_utility_init_6B5896B0(PPUContext& ctx, u32 dest)
-{
-    if (!dest || !guest_readable(thread_of(ctx), dest, 8)) {
-        if (dest) log_call_site(ctx, guest_base(ctx), "fs_utility_init_6B5896B0: dest is not guest memory");
-        PS_LOG_WARN(kChan, "fs_utility_init_6B5896B0({:#x}): CELL_EFAULT", dest);
-        return lv2::err(lv2::CELL_EFAULT);
-    }
-    ps_write64(guest_base(ctx), dest, 2);
-    PS_LOG_INFO(kChan, "fs_utility_init_6B5896B0({:#x}): 2 partitions", dest);
-    return lv2::CELL_OK;
-}
-
 } // namespace
 
 // The NPD opener (D-165, D-581), as RPCS3's lv2_file::open_raw wraps an "NPD\0" file opened as SDATA or EDATA:
@@ -1439,9 +1425,6 @@ void register_sys_fs(Registry& r)
         f("cellFsSetIoBuffer", &thunk<&cellFsSetIoBuffer>), f("cellFsSymbolicLink", &thunk<&cellFsSymbolicLink>),
         f("cellFsTruncate2", &thunk<&cellFsTruncate2>),
         f("cellFsUnregisterL10nCallbacks", &thunk<&cellFsUnregisterL10nCallbacks>),
-    });
-    r.add("fs_utility_init", {
-        PS_HLE_FUNC(0x6B5896B0, fs_utility_init_6B5896B0),
     });
 }
 
