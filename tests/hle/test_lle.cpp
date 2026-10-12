@@ -344,17 +344,17 @@ TEST_CASE("LLE: a firmware-first library goes to its module when one is installe
     fs::remove_all(root);
 }
 
-// D-594: a function the host made from RPCS3 without Sony's module to compare it with (libvdec's cellVdecSetPts) is
-// unverified in a library whose other functions were compared (cellVdecOpen, cellVdecClose): an import of it goes to
-// the library's module when one is installed, for the game and for a module importing it, as an import of a function
-// the host lacks would; with no module, the host's serves it. Imports of only verified functions stay on the host
-// either way.
+// D-594: a function the host made from RPCS3 without Sony's module to compare it with (libvdec's cellVdecOpenExt; the
+// first example, cellVdecSetPts, was compared since, D-920) is unverified in a library whose other functions were
+// compared (cellVdecOpen, cellVdecClose): an import of it goes to the library's module when one is installed, for the
+// game and for a module importing it, as an import of a function the host lacks would; with no module, the host's
+// serves it. Imports of only verified functions stay on the host either way.
 TEST_CASE("LLE: an unverified function's import goes to its library's module when one is installed, to the host when "
           "not", "[hle][lle]")
 {
     using Needs = loader::LleModules::LibraryNeeds;
     const u32 open = recomp::nid_of("cellVdecOpen"), close = recomp::nid_of("cellVdecClose"),
-              set_pts = recomp::nid_of("cellVdecSetPts");
+              set_pts = recomp::nid_of("cellVdecOpenExt");
     REQUIRE(hle::registry().find("libvdec", open));
     REQUIRE(hle::registry().find("libvdec", close));
     REQUIRE(hle::registry().find("libvdec", set_pts));
@@ -388,14 +388,14 @@ TEST_CASE("LLE: an unverified function's import goes to its library's module whe
     CHECK(lle.chosen_files().empty()); // verified functions only: the host's
     CHECK_FALSE(lle.chooses("libvdec"));
     lle.decide({Needs{"libvdec", {open, set_pts}, {}}}, bound);
-    CHECK(lle.chosen_files() == Files{"libvdec.sprx"}); // Sony's module, as when the host lacked cellVdecSetPts
+    CHECK(lle.chosen_files() == Files{"libvdec.sprx"}); // Sony's module, as when the host lacked cellVdecOpenExt
     CHECK(lle.chooses("libvdec"));
     lle.decide({Needs{"synthVdecUser2", {0x77777777}, {}}}, bound);
     CHECK(lle.chosen_files() == Files{"libuser2.sprx"}); // its libvdec imports from the host
     CHECK_FALSE(lle.gaps().contains("libuser2.sprx"));
     lle.decide({Needs{"synthVdecUser", {0x66666666}, {}}}, bound);
     CHECK(lle.chosen_files() == Files{"libuser.sprx", "libvdec.sprx"});
-    // Both imports went to the module, which exports only cellVdecOpen: cellVdecSetPts is a gap though the host has it.
+    // Both imports went to the module, which exports only cellVdecOpen: cellVdecOpenExt is a gap though the host has it.
     REQUIRE(lle.gaps().contains("libuser.sprx"));
     CHECK(lle.gaps().at("libuser.sprx") ==
         std::vector<std::string>{std::format("libvdec::{:#010x} (not exported by libvdec.sprx)", set_pts)});
