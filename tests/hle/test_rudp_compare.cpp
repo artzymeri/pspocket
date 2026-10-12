@@ -1507,15 +1507,66 @@ void io_thread(Run& h, u16 port)
     h.r("cellRudpPollWait", {p, kEvents, 2, 2000000}, w + "PollWait(2 s)");
     h.o.line(w + "PollWait(2 s): the events", hex(b + kEvents, 24));
     h.read(child, 0x1000, w + "Read the 10 bytes");
+    // A PollWait without a timeout on another thread, ended by PollCancel.
+    const u32 tls = h.f.hle->alloc_tls();
+    REQUIRE(tls);
+    const auto on_other = [&](std::string_view fn, std::initializer_list<u64> args) {
+        const u32 d = h.side.descriptor(fn);
+        std::vector<u64> a(args);
+        auto answer_of = std::make_shared<std::atomic<u64>>(~0ull);
+        std::thread th([&h, d, a, tls, answer_of] {
+            GuestThread g(h.f, 1, "other");
+            g.ctx.gpr[13] = tls + hle::kTlsR13Offset;
+            u64 r = ~0ull;
+            switch (a.size()) {
+            case 4: r = hle::call_guest(g.ctx, d, {a[0], a[1], a[2], a[3]}); break;
+            default: r = hle::call_guest(g.ctx, d, {a[0], a[1], a[2], a[3], a[4], a[5], a[6]}); break;
+            }
+            answer_of->store(r);
+        });
+        return std::make_pair(std::move(th), answer_of);
+    };
+    {
+        auto [th, got] = on_other("cellRudpPollWait", {p, kEvents + 0x40, 2, ~0ull});
+        std::this_thread::sleep_for(200ms);
+        h.r("cellRudpPollCancel", {p}, w + "PollCancel while another thread waits");
+        th.join();
+        h.o.line(w + "the other thread's PollWait without a timeout", answer(got->load()));
+    }
     h.r("cellRudpPollDestroy", {p}, w + "PollDestroy");
     h.pump(w + "polling", 300ms);
+    // A blocking listener: Accept on another thread returns the child of a connection made meanwhile.
+    const s32 lis2 = h.create(w + "a blocking listener");
+    h.set(lis2, 7, 0, w + "the blocking listener blocks");
+    h.set(lis2, 13, 0, w + "the blocking listener: no cookies");
+    h.r("cellRudpBind", {static_cast<u64>(lis2), static_cast<u64>(sa), 30, 2}, w + "Bind the blocking listener");
+    h.r("cellRudpListen", {static_cast<u64>(lis2), 2}, w + "Listen on the blocking listener");
+    {
+        ps_write32(b, kArgs + 0x100, 0xEEEEEEEE);
+        auto [th, got] = on_other("cellRudpAccept", {static_cast<u64>(lis2), kCtxOpd, kCtxRing, kArgs + 0x100, 0, 0, 0});
+        std::this_thread::sleep_for(100ms);
+        const s32 c2 = h.create(w + "a second client");
+        h.r("cellRudpBind", {static_cast<u64>(c2), static_cast<u64>(sb), 31, 2}, w + "Bind the second client");
+        sockaddr(b, kPeer, port);
+        h.r("cellRudpInitiate", {static_cast<u64>(c2), kPeer, 16, 30}, w + "Initiate the second client");
+        th.join();
+        h.o.line(w + "the other thread's blocking Accept", answer(got->load()));
+        h.o.line(w + "the other thread's blocking Accept: the ID", hex(b + kArgs + 0x100, 4));
+    }
     h.r("cellRudpTerminate", {static_cast<u64>(child)}, w + "Terminate the accepted context");
     h.pump(w + "the reset", 300ms);
     h.events(w + "the reset");
     h.read(client, 0x1000, w + "Read after the reset");
     h.ctx_status(client, w + "the client after the reset");
     h.status(w + "the end");
-    h.r("cellRudpEnd", {}, w + "End with contexts");
+    // End while another thread waits in the blocking listener's Accept: it returns CANCELLED.
+    {
+        auto [th, got] = on_other("cellRudpAccept", {static_cast<u64>(lis2), kCtxOpd, kCtxRing, kArgs + 0x100, 0, 0, 0});
+        std::this_thread::sleep_for(200ms);
+        h.r("cellRudpEnd", {}, w + "End with contexts, another thread waiting");
+        th.join();
+        h.o.line(w + "the other thread's Accept when End came", answer(got->load()));
+    }
     h.pump(w + "after End", 100ms);
     h.events(w + "after End");
     h.close(sa);

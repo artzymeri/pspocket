@@ -12494,3 +12494,10 @@ note, how many SYNs and probes fit in a time is compared for the first ones only
 nothing more is freed for 1.5 s (the timers of contexts that went are freed when they come due, up to a retransmission
 timeout later). The comparison: 0 of 2,631 observations differ, three runs in a row (about 110 s a run).
 Test: test_rudp.cpp "a packet larger than the datagram leaves its start in it".
+
+## D-916 · 2026-10-12 · cellRudp's comparison: waits on another thread (part 4)
+
+The internal I/O thread's part now also waits on a second PPU thread, as a game's network thread would: a PollWait
+without a timeout ended by PollCancel (CANCELLED), a blocking listener's Accept returning the child of a connection
+made meanwhile, and a blocking Accept still waiting when cellRudpEnd comes (CANCELLED, and End returns 0). All three
+agree with librudp as they are; the comparison: 0 of 2,649 observations differ.
