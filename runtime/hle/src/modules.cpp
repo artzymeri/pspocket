@@ -90,6 +90,7 @@ void register_libsynth2(Registry& r);
 void register_libmixer(Registry& r);
 void register_codec_cores(Registry& r);
 void register_cellCelpEnc(Registry& r);
+void register_cellCelpDec(Registry& r);
 void register_cellRudp(Registry& r);
 void register_cellNetAoi(Registry& r);
 void register_libad(Registry& r);
@@ -194,6 +195,7 @@ void register_all_modules(Registry& r)
     register_libmixer(r);
     register_codec_cores(r);
     register_cellCelpEnc(r);
+    register_cellCelpDec(r);
     register_cellRudp(r);
     register_cellNetAoi(r);
     register_libad(r);

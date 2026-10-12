@@ -13912,3 +13912,45 @@ interpreter (inventory/, never in the repository), every intermediate of the enc
 the quantiser, each subframe's targets, energies, lag candidates, searches and states) for every subframe of 30 to 60
 frames in each configuration: 0 differences. Without the firmware, test_celp_compare.cpp encodes speech through the
 library and decodes it with pspocket's CELP decoder (part 2): about 6 dB SNR in each configuration.
+
+### D-932, part 2: cellCelpDec, libcelpdec's cellAdec core, pspocket's own
+
+libcelpdec exports two things: the operation table of its cellAdec core (g_cell_adec_core_ops_Celp, NID 0xFFE42C22)
+and _SceAdecCorrectPtsValue_Celp. pspocket's (runtime/hle/src/adec_celp.cpp) is libcelpdec's PPU side with the SPU
+program's decoding on the host (celp_rpe.cpp, part 1: bit for bit with the SPU program on 7,200 frames).
+
+What Sony's core does, and pspocket's with it:
+- Memory 0x3CC00 bytes, four PCM handles, 16 bytes of information, version 0x02500000.
+- openExt (open: no SPURS resource) checks the AUDONE, PCMOUT and ERROR functions and the resource (SEQDONE may be
+  missing), PPU priority at most 0xBFF, SPU priority at most 0xFF: the core's ARG, 0x80612E03. Then a SPURS instance
+  of its own or a task set on the game's, two SPURS queues and the SPU task; mutexes "_cedm01" and conditions
+  "_cedc01"; the input thread "_CelpDecInputThrFunc" at the resource's priority and stack.
+- StartSeq (CellAdecParamCelp: excitationMode 1, sampleRate 2, configuration up to 3, wordSize up to 1, else ARG) and
+  EndSeq are queued (BUSY, 0x80612E01, with four commands waiting); the parameters are kept for DecodeAu's check.
+  DecodeAu: the unit's size must be the frame's of the last StartSeq's configuration (27, 20, 35 or 43 bytes) and its
+  user data's low seven bits at most 63 (ARG); then queued. Those bits choose one of the SPU program's 64 decoders,
+  bit 7 makes that decoder again (and clears its PTS slot), bits 8 to 15 mute the frame.
+- The thread runs one command at a time on the SPU program. Start: the 64 PTS slots cleared, the parameters in force,
+  64 decoders made; the core started. End: the decoders dropped, then SEQDONE. A unit: decoded by its decoder into the
+  next of four PCM slots (960 bytes of samples, then the parameters in force as its information), then AUDONE and
+  PCMOUT (PTS correction type 24). A unit the core is not started for (cellAdec takes one after EndSeq) fails: ERROR
+  (SEQ, 0x80612E04), then AUDONE and PCMOUT without samples.
+- The samples: 16-bit little-endian, or big-endian floats (each clamped to 16 bits' range, times 0x38000107, about
+  1/32767.75, clamped to [-1, 1]). Muting zeroes the three quarters of the excitation largest in magnitude: the first
+  frame of a new decoder is then silent.
+- _SceAdecCorrectPtsValue_Celp uses the last unit's decoder's slot: a PTS given is kept there a frame on (1350 ticks
+  of 90 kHz, 900 in configuration 1); one not given takes the slot's (and steps it on).
+- realign copies the PCM slot's bytes by its information's configuration and word size; releasePcm does nothing.
+
+pspocket's cellAdec now serves CELP with this core before any firmware module's (no longer importing libcelpdec's
+exports), and its PTS correction asks any core of pspocket's own for its own correction (before, only those of codecs
+the firmware serves first). The core's exports are pspocket's too: Sony's libadec, given them, drives pspocket's core.
+Not reproduced: no SPURS instance, task set, queues or SPU task (their errors cannot happen); the 64 decoders' states
+are on the host.
+
+Compared (tests/hle/test_celp_dec_compare.cpp, firmware 4.92): a decoder for each configuration and word size, units on
+decoders 0, 5 and 63, resets, muting, missing PTS, StartSeq again in the middle, refusals (decoders 64 and 127, a unit
+a byte short and a byte long, one before StartSeq), a unit after EndSeq. pspocket's cellAdec and core against Sony's
+libadec and libcelpdec, and Sony's libadec on pspocket's core against the same: 0 differences in 1108 lines and 105
+PCM outputs (70,400 bytes) each. Found on the way: Sony's libadec keeps the frame of a unit its core refuses (BUSY
+after four), as pspocket's cellAdec does. test_adec_more.cpp's D-623 test now expects CELP's core.
