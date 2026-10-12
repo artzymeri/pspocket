@@ -253,7 +253,7 @@ TEST_CASE("sys_fs against libfs", "[hle][lle][fs]")
                 {"cellFsSymbolicLink", {0, S(10)}}, {"cellFsSymbolicLink", {S(0), 0}},
                 {"cellFsSymbolicLink", {S(0), S(23)}}, {"cellFsSymbolicLink", {S(20), S(16)}},
                 {"cellFsStat", {S(4), O(0x100)}}},
-            "symbolic links");
+            "symbolic links", 0, {{0x100 + 0xC, 24}}); // the link's times: the host's clock when each run made it (D-928)
     }
 
     SECTION("opens: cellFsOpen, cellFsOpen2, SDATA with a version")
@@ -312,7 +312,8 @@ TEST_CASE("sys_fs against libfs", "[hle][lle][fs]")
         ops.push_back({"cellFsTruncate", {S(9), 12}});
         ops.push_back({"cellFsFtruncate", {FD(0), 20}});
         for (const u32 o : {0u, 4u, 8u, 12u, 16u}) ops.push_back({"cellFsClose", {FD(o)}});
-        compare(fl, tree, ops, "sizes");
+        // The stats' times: the host's clock when each run last changed the files (D-928).
+        compare(fl, tree, ops, "sizes", 0, {{0x100 + 0xC, 24}, {0x200 + 0xC, 24}});
     }
 
     SECTION("block sizes and directory entries")
