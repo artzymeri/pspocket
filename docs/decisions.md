@@ -12521,3 +12521,66 @@ With the comparisons that now match Sony's modules out of hiding (D-912 to D-916
 installed runs about six minutes (cellRudp's comparison alone about 110 s), past the 300 s ctest limit scripts/gate.sh
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
+
+## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
+
+libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
+Sony's libvdec 4.92 and compared with it (tests/hle/test_vdec_ext_compare.cpp: DivX 3.11, DivX, MPEG-4 part 2, VC-1 and
+H.264, each a process of its own per half; 0 of 954, 961, 958, 1,036 and 1,004 observations differ).
+
+- **cellVdecGetPicItemExt** (and **GetPicItemEx**, the same code in Sony's module; GetPicItem is it with no third
+  argument): the next item, then the codec part's extra: H.264 and MVC write the address of the picture information's
+  part past 0x138 bytes to the third argument when it is given; the other codecs write nothing.
+- **cellVdecSetFrameRateExt(handle, rate, scale)**: scale 0: `rate` is the codec's code (H.264 and MVC 0 to 7, the
+  others 1 to 8; else ARG), kept with its frame duration in 27 MHz ticks (24000/1001 1126125 ... 60 450000); else the
+  duration is scale x (27000000 / rate) in the PPU's 32-bit arithmetic (a division by 0 gives 0), and the code the one
+  of its whole frames a second (23, 24, 25, 29, 30, 50, 59, 60), none for another. Set at once on the game's thread (it
+  was queued in order with the access units); a closed decoder SEQ. **cellVdecSetFrameRate** is it with the code less
+  0x80, plus one but for H.264, MVC and JVT: JVT's codes start at 1, so its 0x80 is ARG, as Sony's.
+- **StartSeq** forgets the frame rate for every codec (it did for DivX only), the PTS base and the VOP time.
+  **cellVdecStartSeqExt(handle, arg)**: StartSeq with the codec part's argument (H.264's low byte 1 and top four bits,
+  MVC's top bits, the SMVD codecs' low byte), kept; pspocket's decoders do nothing different with it (logged when not 0).
+- **cellVdecGetInputStatus(handle, status)**: libvdec's input queue (access units and EndSeq's flush not yet done by its
+  decoder thread) as two bytes and a half word: full (four or more: DecodeAu would be BUSY) 1 0, empty 0 1, else 0 0;
+  no state checked. MVC: Sony's reads a word its MVC part never writes: FATAL here. A closed H.264 decoder: libavcdec
+  refuses the query and libvdec reads its stack word, 0 in the runs: full.
+- **cellVdecSetPts** sets the ring's PTS base (33 bits) and loses its unverified mark (D-594).
+- **cellVdecDecodeAuEx2** is the form Sony's libvdec decodes in (its DecodeAu converts its CellVdecAuInfo to it, with
+  the two words RPCS3 calls unknown 0); **libvdec_652B7BC0** is it again (Sony's export runs the same code). Compared
+  with the two words 0: as DecodeAu. Given (a probe with them set), Sony's libvdec hands them to its codec part: the
+  DivX, DivX 3.11 and MPEG-4 parts leave them, the H.264 and VC-1 parts take them as a second piece of the access unit
+  (its address and size: libavcdec's access unit call takes two pieces, and refuses one past its limits, FATAL).
+  pspocket decodes the first piece alone, so the two stay unverified for now, as OpenExt (it takes the game's SPURS,
+  which pspocket's decoder does not use) and **libvdec_20DA0CFA**, MVC's decode of an access unit in its two views
+  ({base view address, size, 2 words, dependent view address, size, 2 words, PTS, DTS, user data, codec specific data}):
+  its checks (MVC only, ARG; mode past 2 ARG) and a ring element per view; pspocket decodes the base view (D-590) and
+  frees the dependent view's element when the access unit is done.
+- **_cell_vdec_prx_ver**: 0x00492000.
+
+What they act on, missing in pspocket's libvdec until now:
+- **A picture whose access unit had no PTS gets one** (Sony's ring, when it announces the picture): the last PTS's time
+  plus the frame duration, kept in 27 MHz ticks (33-bit PTSs, wrapping at 2^33 x 300), once a PTS is known (an access
+  unit's or SetPts'). The duration is the rate set, else the stream's: DivX 3.11 none (Sony's word is its stack's: 0
+  here); DivX 0 (libdivxdec reports the same VOP time for every picture); MPEG-4 part 2 a fixed VOP rate's increment,
+  else the VOP time since the previous picture (modulo time base and increment; then added before the picture's time);
+  VC-1 the sequence header's FRAMERATENR/DR (libvdec's table, 48000/1001 rounded up) or FRAMERATEEXP; H.264 the VUI
+  timing (two ticks a frame: the eight rates by their whole frames a second, else 27 x 10^9 / (fps x 1000)).
+- **Frame rate codes**: DivX's information block takes the code set, else the one of the duration's whole frames a
+  second (0 for none); VC-1's the code set (the stream's when none is set; a rate set that names none leaves the byte);
+  H.264's the code set, else the VUI timing's (0xFF for an unnamed rate), else the byte as it was.
+- **VC-1's frame buffers** (D-912 had them in turn): libsvc1d takes, when it decodes the access unit, the first frame
+  buffer neither holding a picture not yet released (decoded, announced or not, or of an access unit still in the
+  decoder) nor a reference (the last anchor; for a B picture the one before); a skipped picture shows the frame before.
+  The choice is made when the access unit is given to FFmpeg (which hands the picture over later).
+
+The comparisons with Sony's libvdec now force Sony's codec cores too (tests/hle/firmware_compare.hpp FirmwareLibrary's
+`also`, compare_util.hpp Setup::forced, vdec_test_util.hpp kVideoCores): as pspocket gets cores of its own (part 2 on),
+Sony's libvdec loaded in a test would otherwise be linked to them, and the comparisons would no longer be with Sony's
+cores. Setup::ours_on_firmware runs Sony's module in pspocket's half too, over pspocket's libraries: the codec cores
+driven by Sony's libvdec (part 2).
+
+Tests: test_vdec_ext_compare.cpp (hidden, [compare][vdec-ext]; each life: PTSs missing, SetPts first, SetFrameRate's
+codes, SetFrameRateExt's codes and rate/scale forms, a rate before the sequence, StartSeqExt, DecodeAuEx2 and its twin,
+the refusals, the input queue held until DecodeAu is BUSY; the input status right after EndSeq is a note, the threads'
+timing); test_vdec_codecs_compare.cpp's VC-1 comparison (its held pictures now in Sony's frame buffers); test_vdec.cpp
+(the unverified marks).

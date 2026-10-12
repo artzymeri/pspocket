@@ -242,7 +242,7 @@ TEST_CASE("cellVdec: the same as Sony's libvdec (the user's firmware): sizes, an
     {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
-        FirmwareLibrary sony(f, t, *flash, "libvdec");
+        FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
         theirs = vdec_run(f.base(),
             [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); });
         sizes(f.base(), [&](u32 type, u32 attr) { return sony.call(t, 0xFF6F6EBE, {type, attr}); }, their_sizes);
@@ -486,11 +486,12 @@ TEST_CASE("cellVdec: OpenExt opens on its resource, SetPts' answers, DecodeAuEx2
 {
     const std::pair<const char*, u32> kExtFunctions[] = {{"cellVdecOpenExt", 0xEF4D8AD7}, {"cellVdecSetPts", 0x3CE2E4F8},
         {"cellVdecDecodeAuEx2", 0x1533C6A9}};
-    for (const auto& [name, nid] : kExtFunctions) {
-        CHECK(recomp::nid_of(name) == nid);
+    for (const auto& [name, nid] : kExtFunctions) CHECK(recomp::nid_of(name) == nid);
+    // OpenExt, MVC's two-view decode and DecodeAuEx2 with its twin (an access unit's second piece) stay unverified
+    // (D-594); SetPts is compared with Sony's (D-920).
+    for (const u32 nid : {0xEF4D8AD7u, 0x20DA0CFAu, 0x1533C6A9u, 0x652B7BC0u})
         CHECK(hle::registry().is_unverified("libvdec", nid));
-    }
-    for (const u32 nid : {0xB6BBCD5Du, 0x0053E2D8u, 0x2BF4DDD2u, 0x807C861Au, 0x17C702B9u, 0xE13EF6FCu})
+    for (const u32 nid : {0xB6BBCD5Du, 0x0053E2D8u, 0x2BF4DDD2u, 0x807C861Au, 0x17C702B9u, 0xE13EF6FCu, 0x3CE2E4F8u})
         CHECK_FALSE(hle::registry().is_unverified("libvdec", nid));
     InterpretMisses interpret;
     BigFixture f;
@@ -578,7 +579,7 @@ TEST_CASE("cellVdec: Sony's libvdec pictures, items and frame buffers dumped (pr
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
     u8* b = f.base();
     const auto call = [&](u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); };
     const auto save = [&](const std::string& name, u32 addr, u32 size) {
@@ -651,7 +652,7 @@ TEST_CASE("cellVdec: Sony's sizes for every codec and level (probe)", "[hle][vde
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
     u8* b = f.base();
     for (const u32 codec : {0u, 1u, 2u, 3u, 5u, 7u, 9u, 11u, 13u}) {
         for (u32 level = 0; level < 1100; level++) {

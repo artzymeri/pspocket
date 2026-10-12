@@ -712,12 +712,20 @@ Observed mvc(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// The comparison's setup: Sony's libvdec over Sony's codec cores, which pspocket now has its own of (D-920).
+Setup libvdec_setup()
+{
+    Setup s = setup();
+    s.forced = kVideoCores;
+    return s;
+}
+
 } // namespace
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: DivX 3.11", "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_encoder(AV_CODEC_ID_MSMPEG4V3)) SKIP(kNoDivx);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's DivX 3.11 against Sony's libvdec", [&](bool sony) { return divx311(s, sony); },
         [](const Observed& o) {
             // pspocket's own half: the values Sony's gave (D-912).
@@ -745,7 +753,7 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX a
     "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP(kNoDivx);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's MPEG-4 part 2 against Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("QueryAttrEx MPEG-4 SP L1 96x64: the attribute").starts_with("hex:0006ac0b"));
@@ -767,7 +775,7 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX a
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: VC-1's advanced profile", "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's VC-1 against Sony's libvdec", [&](bool sony) { return vc1_family(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("OpenEx VC-1 level 0") == "0x0"); // the simple and main profiles open, as Sony's
@@ -791,7 +799,7 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: VC-1's advanced profile
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MVC", "[.][hle][lle][compare][vdec]")
 {
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's MVC against Sony's libvdec", [&](bool sony) { return mvc(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("QueryAttrEx codec 11 level 21 64x64: the attribute").starts_with("hex:00a4117d"));

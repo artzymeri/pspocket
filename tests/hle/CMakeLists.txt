@@ -50,6 +50,9 @@ target_sources(test_hle PRIVATE
     test_vdec_codecs_compare.cpp
     test_rudp_compare.cpp)
 
+# libvdec's last functions (D-920) against Sony's libvdec: test_hle "[compare][vdec-ext]".
+target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp)
+
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE
     test_netaoi.cpp
