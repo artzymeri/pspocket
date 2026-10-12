@@ -10,6 +10,7 @@ void register_sysutil_more(Registry& r)
     sysutil::sub::register_print(r);
     sysutil::sub::register_pesm(r);
     sysutil::sub::register_game_ps1emu(r);
+    sysutil::sub::register_dtcp(r);
 }
 
 } // namespace pspocket::hle

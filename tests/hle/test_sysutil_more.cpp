@@ -15,6 +15,7 @@
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/recomp/nid.hpp"
+#include "sysutil_sub.hpp"
 #include "sysutil_sub_compare.hpp"
 
 using namespace pspocket;
@@ -343,6 +344,395 @@ void script_game_ps1emu(Script& s)
     sys.open(1);
 }
 
+// ------------------------------------------------------------------------------------------------- cellDtcpIpUtility
+
+constexpr u64 kDtcpMemory = 0x8006040000000A10ull; // the client's shared memory, the system software's
+constexpr u32 kDtcpCode = kData + 0x3800;          // the game's callback (its descriptor at +0xF0)
+constexpr u32 kDtcpRecords = kData + 0x3A00;       // what it was called with: a count, then 0x20 bytes a call
+
+// The DTCP-IP client's set-up in both runs: the game's callback (it records r3..r7: stw r3..r7 at
+// records + 0x10 + 0x20 * count, the count incremented), the module's data named alike in the lv2 calls (Sony's in its
+// data segment, pspocket's block laid out the same). Answers the data's address.
+u32 dtcp_setup(Script& s)
+{
+    const u32 words[] = {0x3D600000u | (kDtcpRecords >> 16), 0x616B0000u | (kDtcpRecords & 0xFFFF), 0x818B0000u,
+        0x558A2834u, 0x7D4A5A14u, 0x906A0010u, 0x908A0014u, 0x90AA0018u, 0x90CA001Cu, 0x90EA0020u, 0x398C0001u,
+        0x918B0000u, 0x38600000u, 0x4E800020u};
+    for (u32 i = 0; i < std::size(words); i++) s.w32(kDtcpCode + 4 * i, words[i]);
+    s.w32(kDtcpCode + 0xF0, kDtcpCode);
+    s.w32(kDtcpCode + 0xF4, 0);
+    u32 data = 0;
+    if (s.sony()) {
+        // Its data segment (vaddr 0x8740 in the module's image) as the loader placed it; 0x87E0 is 0xA0 into it.
+        REQUIRE(s.module().segments.size() >= 2);
+        data = s.module().segments[1].first + 0xA0;
+    } else {
+        data = pspocket::hle::sysutil::sub::dtcp_data();
+    }
+    REQUIRE(data);
+    s.name_region(data, 0x200, "dtcp");
+    return data;
+}
+
+// An lv2 call of the script's (a memory container's making), its own step.
+u32 script_sc(Script& s, u32 n, std::initializer_list<u64> args, const char* what)
+{
+    const u32 r = static_cast<u32>(lv2_syscall(s.thread().ctx, n, args));
+    s.step(std::format("{} -> {:#x}", what, r));
+    return r;
+}
+
+// The open options: `n` IDs and values.
+void dtcp_options(Script& s, u32 ids, u32 values, std::initializer_list<std::pair<u32, u32>> o)
+{
+    u32 i = 0;
+    for (const auto& [id, v] : o) {
+        s.w32(ids + 4 * i, id);
+        s.w32(values + 4 * i, v);
+        i++;
+    }
+}
+
+void script_dtcp(Script& s)
+{
+    const u32 data = dtcp_setup(s), cb = kDtcpCode + 0xF0;
+    const u32 url = S(0), ip = S(1), host = kOut + 0x80, nohost = kOut + 0x90, ids = kOut + 0xA0, vals = kOut + 0xC0,
+              got = kOut, emi = kOut + 4, copied = kOut + 8, freep = kOut + 12, status = kOut + 16, buf = kBuf,
+              seen = kBuf + 0x1000, big = kData + 0x20000, cid = kOut + 0x20, mem = kOut + 0x24;
+    s.str(url, "http://192.168.0.2:8200/MediaItems/22.mp4");
+    s.str(ip, "192.168.0.2");
+    s.w32(host, ip);
+    s.w8(host + 4, 0x20);
+    s.w8(host + 5, 0x08);
+    for (u32 i = 0; i < 0x20000; i++) s.w8(big + i, static_cast<u8>(i * 13 + (i >> 9)));
+    const auto look = [&](u32 at, const char* what) {
+        std::memcpy(s.base() + seen, s.base() + at, 0x400);
+        s.step(std::format("the shared memory: {}", what));
+    };
+    const auto shm = [&] { return s.r32(data + 0x190); };
+
+    // Not initialized: no shared memory, no callback.
+    s.call("cellDtcpIpSuspendActivationForDebug", {});
+    for (const char* f : {"cellDtcpIpActivate", "cellDtcpIpCheckActivation", "cellDtcpIpClose",
+             "cellDtcpIpStartSequence", "cellDtcpIpStopSequence", "cellDtcpIpFinalize",
+             "cellDtcpIpUtilityClearTextByte_7F4A8B0E", "cellDtcpIpUtilityClearTextByte_1EC068FB",
+             "cellDtcpIpUtilityClearTextByte_550D3527", "cellDtcpIpUtilityClearTextByte_97619DB5",
+             "cellDtcpIpUtilityMove_A98DEADE", "cellDtcpIpUtilityMove_9A219C98"})
+        s.call(f, {});
+    s.call("cellDtcpIpOpen", {url, host});
+    s.call("cellDtcpIpRead", {buf, 0x100});
+    s.call("cellDtcpIpRead", {0, 0x100});
+    s.call("cellDtcpIpRead", {buf, 0});
+    s.call("cellDtcpIpRead", {buf, 0x20001});
+    s.call("cellDtcpIpSeek", {1000});
+    s.call("cellDtcpIpSetEncryptedData", {big, 0x100, 0, copied, freep});
+    s.call("cellDtcpIpGetDecryptedData", {0, 0x100, got, emi});
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x100, 0, emi});
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x100, got, 0});
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x100, got, emi});
+    s.call("cellDtcpIpUtilityClearTextByte_0AA9D63F", {host});
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 0, 0, 0});
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0, 0});
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 0, 0, 0});
+    s.call("cellDtcpIpUtilityMove_F4EF1B28", {url, host});
+    s.call("cellDtcpIpUtilityMove_CA87F652", {buf, 0x100});
+    s.call("cellDtcpIpUtilityEx_B17436B5", {big, 0x100, 0, copied, freep, 1});
+    s.call("cellDtcpIpUtilityEx_4654188A", {url, host, 0, 0, 0});
+    s.dispatch(0x14A, 1ull << 32, 0); // no dispatcher registered
+
+    // Initialize's checks: the container (none, not there, too small, not all available), the callback.
+    s.call("cellDtcpIpInitialize", {0xFFFFFFFF, cb, 0x1234, 1000, 0});
+    s.call("cellDtcpIpInitialize", {0x12345, cb, 0x1234, 1000, 0});
+    script_sc(s, 324, {cid, 0x500000}, "sys_memory_container_create(5 MB)");
+    const u32 c5 = s.r32(cid);
+    s.call("cellDtcpIpInitialize", {c5, cb, 0x1234, 1000, 0});
+    script_sc(s, 324, {cid, 0x600000}, "sys_memory_container_create(6 MB)");
+    const u32 c6 = s.r32(cid);
+    s.call("cellDtcpIpInitialize", {c6, 0, 0x1234, 1000, 0});
+    script_sc(s, 324, {cid, 0x700000}, "sys_memory_container_create(7 MB)");
+    const u32 c7 = s.r32(cid);
+    script_sc(s, 350, {0x100000, c7, 0x400, mem}, "sys_memory_allocate_from_container(1 MB)");
+    s.call("cellDtcpIpInitialize", {c7, cb, 0x1234, 1000, 0});
+    // pspocket's console: Initialize meets the closed channel and undoes itself.
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x1234, 1000, 0});
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x1234, 1000, 0x4000000000000001ull}); // the move bit cleared
+    s.call("cellDtcpIpActivate", {});
+
+    // A system that answers; the system software's shared memory for the client.
+    SystemSide& sys = s.system();
+    sys.open(0);
+    REQUIRE(s.fixture().kernel->create_system_shared_memory(kDtcpMemory, 0x180000, 0x200));
+    sys.reply(0, reply("x", {{"result", -9}}));
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x1234, 1000, 0}); // refused: undone
+    sys.reply(0, reply("x", {{"result", 3}}));
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x1234, 1000, 0});
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x1234, 1000, 0}); // already
+    s.call("cellDtcpIpActivate", {});                          // no shared memory yet
+    s.dispatch(0x14A, 1ull << 32 | 5, 0x77ull << 32 | 0x55);  // a status not 0: nothing made
+    s.dispatch(0x14A, 1ull << 32, 0x77ull << 32 | 0x55);       // the shared memory made
+    for (u32 i = 0; i < 0x400; i++) s.w8(shm() + i, static_cast<u8>(0x80 + i * 3));
+    look(shm(), "after its making");
+    for (const u32 kind : {3u, 4u, 5u, 7u, 0xCu, 0xDu, 0x1000001u, 0x1000002u, 0x1000003u, 0x1000004u, 0x1000005u,
+             0x2000001u, 0x3000001u, 0xEu, 0u})
+        s.dispatch(0x14A, u64{kind} << 32 | 2, 0x11ull << 32 | 0x22);
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpActivate", {});
+    sys.reply(0, reply("x", {{"result", -3}}));
+    s.call("cellDtcpIpCheckActivation", {});
+    sys.reply(0, reply("x", {}));
+    s.call("cellDtcpIpCheckActivation", {}); // no result
+    {
+        Cxml c;
+        const int e = c.element("x");
+        c.str(e, "result", "0");
+        sys.reply(0, c);
+    }
+    s.call("cellDtcpIpActivate", {}); // a result that is no int
+    sys.reply(0, records(0x40, 1, 0x30));
+    s.call("cellDtcpIpActivate", {}); // no document
+    sys.reply(0, records(0x6100, 1, 0));
+    s.call("cellDtcpIpActivate", {}); // truncated
+    sys.open(0);
+    s.call("cellDtcpIpActivate", {}); // no reply: the system goes away
+    sys.open(0);
+    // Opening.
+    s.call("cellDtcpIpOpen", {0, host});
+    s.call("cellDtcpIpOpen", {url, 0});
+    s.call("cellDtcpIpOpen", {url, nohost});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpOpen", {url, host});
+    s.call("cellDtcpIpUtilityEx_4654188A", {url, host, 0, 0, 0}); // OpenEx: the buffering mode only
+    // OpenContentEx's options.
+    dtcp_options(s, ids, vals, {{2, 4}, {20000, 1}, {1, 2}, {3, 0x80}, {4, 1}, {5, 0xFFFF}});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 6, ids, vals});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {0, 0, 0, 0});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 1, 0, vals});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 1, ids, 0});
+    for (const auto& [id, v] : std::initializer_list<std::pair<u32, u32>>{{1, 3}, {2, 0x401}, {3, 0x81}, {4, 0x81},
+             {20000, 2}, {6, 0}, {0, 0}, {0xFFFFFFFF, 0}}) {
+        dtcp_options(s, ids, vals, {{5, 1}, {id, v}});
+        s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 2, ids, vals});
+    }
+    // Authentication, the content's end.
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_7F4A8B0E", {});
+    s.call("cellDtcpIpUtilityClearTextByte_0AA9D63F", {0});
+    s.call("cellDtcpIpUtilityClearTextByte_0AA9D63F", {nohost});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_0AA9D63F", {host});
+    sys.reply(0, reply("x", {{"result", -1}}));
+    s.call("cellDtcpIpUtilityClearTextByte_1EC068FB", {});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_550D3527", {});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_97619DB5", {});
+    // The HTTP status: the reply's "param".
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {0});
+    sys.reply(0, reply("x", {{"result", 0}, {"param", 404}}));
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status}); // no param
+    sys.reply(0, reply("x", {{"result", -2}, {"param", 200}}));
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status});
+    // Reading: one at a time; the system's event 9 copies it.
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpRead", {buf, 0x100});
+    s.call("cellDtcpIpRead", {buf, 0x100}); // busy
+    s.dispatch(0x14A, 9ull << 32, 0x80ull << 32 | 0x33);
+    s.dispatch(0x14A, 9ull << 32, 0x80ull << 32 | 0x33); // no buffer
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpRead", {buf + 0x200, 0x40});
+    s.dispatch(0x14A, 9ull << 32, 0x41ull << 32); // larger than the buffer
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpRead", {buf + 0x200, 0x40});
+    s.dispatch(0x14A, 9ull << 32 | 7, 0x10ull << 32 | 1); // a status: passed on
+    sys.reply(0, reply("x", {{"result", -4}}));
+    s.call("cellDtcpIpRead", {buf + 0x200, 0x40}); // refused: the buffer forgotten
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_CA87F652", {buf + 0x300, 0x20});
+    s.dispatch(0x14A, 9ull << 32, 0x20ull << 32);
+    // Seeking: one at a time, ended by the system's events 8 and 0x2000002.
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpSeek", {0x123456789ull});
+    s.call("cellDtcpIpSeek", {5}); // busy
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0x10, 0x20}); // busy
+    s.dispatch(0x14A, 8ull << 32, 0);
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0x7FFFFFFFFFFFull, 0});
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0, 0x7FFFFFFFFFFFull});
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0x200, 0x100});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0x7FFFFFFFFFFEull, 0});
+    s.dispatch(0x14A, 0x2000002ull << 32 | 1, 0);
+    sys.reply(0, reply("x", {{"result", -6}}));
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0x100, 0x200}); // refused: not seeking
+    // Moving.
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 1, 0, vals});
+    s.call("cellDtcpIpUtilityMove_269A634B", {0, host, 0, 0, 0});
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, nohost, 0, 0, 0});
+    for (const auto& [id, v] : std::initializer_list<std::pair<u32, u32>>{{2, 0x401}, {3, 0x81}, {4, 0x81}, {1, 1},
+             {20000, 1}}) {
+        dtcp_options(s, ids, vals, {{5, 3}, {id, v}});
+        s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 2, ids, vals});
+    }
+    dtcp_options(s, ids, vals, {{2, 0x400}, {3, 8}, {4, 0x80}, {5, 2}});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 4, ids, vals});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_F4EF1B28", {url, host});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_9A219C98", {});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_A98DEADE", {}); // the cancel set
+    s.call("cellDtcpIpRead", {buf, 0x10});
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status});
+    s.call("cellDtcpIpSeek", {1});
+    s.dispatch(0x14A, 8ull << 32, 0);        // a seek's end while cancelled
+    s.dispatch(0x14A, 9ull << 32, 0x10ull << 32); // a read's end while cancelled
+    s.dispatch(0x14A, 10ull << 32, 0x10ull << 32 | 0x10); // ring space while cancelled: not passed on
+    s.dispatch(0x14A, 6ull << 32 | 3, 0);    // the buffers reset: the cancel cleared
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpStartSequence", {});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpStopSequence", {});
+    s.dispatch(0x14A, 6ull << 32, 0);
+    sys.reply(0, reply("x", {{"result", -1}}));
+    s.call("cellDtcpIpStopSequence", {}); // refused: no cancel
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpClose", {});
+    // Finalizing: the system's event 2 finalizes.
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpFinalize", {});
+    s.dispatch(0x14A, 2ull << 32 | 4, 0);
+    s.call("cellDtcpIpFinalize", {});
+    s.call("cellDtcpIpActivate", {});
+    s.dispatch(0x14A, 2ull << 32, 0); // no dispatcher any more
+
+    // The buffering mode.
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpInitialize", {c6, cb, 0x99, 500, 1});
+    s.dispatch(0x14A, 1ull << 32, 0);
+    for (const char* f : {"cellDtcpIpUtilityClearTextByte_7F4A8B0E", "cellDtcpIpUtilityClearTextByte_97619DB5"})
+        s.call(f, {});
+    s.call("cellDtcpIpRead", {buf, 0x10});
+    s.call("cellDtcpIpSeek", {1});
+    s.call("cellDtcpIpUtilityClearTextByte_2070C99E", {0, 0});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 0, 0, 0});
+    s.call("cellDtcpIpUtilityClearTextByte_65A86A64", {status});
+    s.call("cellDtcpIpUtilityMove_CA87F652", {buf, 0x10});
+    dtcp_options(s, ids, vals, {{3, 64}, {5, 9}, {4, 1}});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityEx_4654188A", {url, host, 3, ids, vals});
+    for (const auto& [id, v] : std::initializer_list<std::pair<u32, u32>>{{2, 1}, {4, 0x81}, {3, 0x81}}) {
+        dtcp_options(s, ids, vals, {{id, v}});
+        s.call("cellDtcpIpUtilityEx_4654188A", {url, host, 1, ids, vals});
+    }
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpOpen", {0, host}); // no URL needed
+    // The ring: full until the system resets it; then filled, consumed, wrapped.
+    s.call("cellDtcpIpSetEncryptedData", {big, 0x8000, 0, copied, freep});
+    s.call("cellDtcpIpSetEncryptedData", {0, 0x8000, 0, copied, freep});
+    s.dispatch(0x14A, 6ull << 32, 0);
+    s.call("cellDtcpIpSetEncryptedData", {0, 0, 0, copied, freep}); // nothing: no request
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpSetEncryptedData", {0, 0, 1, copied, freep}); // the file's end alone
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpSetEncryptedData", {big, 0x18000, 0, copied, freep});
+    look(shm() + 0x40000, "the ring's start");
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityEx_B17436B5", {big + 0x100, 0x10000, 1, copied, 0, 1});
+    sys.reply(0, reply("x", {{"result", 2}}));
+    s.call("cellDtcpIpUtilityEx_B17436B5", {big, 0x100, 0, 0, freep, 0});
+    s.dispatch(0x14A, 10ull << 32 | 1, 0x20000ull << 32 | 0x20000);
+    for (u32 i = 0; i < 8; i++) {
+        sys.reply(0, reply("x", {{"result", 0}}));
+        s.call("cellDtcpIpSetEncryptedData", {big + 0x10 * i, 0x20000, i & 1, copied, freep});
+    }
+    s.call("cellDtcpIpSetEncryptedData", {big, 0x100, 0, copied, freep}); // full: nothing
+    s.dispatch(0x14A, 10ull << 32, 0x60000ull << 32 | 0x40000);
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpSetEncryptedData", {big + 0x777, 0x1FFFF, 1, copied, freep}); // around the ring's end
+    look(shm() + 0x40000, "the ring's start, wrapped");
+    look(shm() + 0x40000 + 0xFFC00, "the ring's end");
+    // Decrypted data: the system's event 11 fills the slots.
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi}); // empty
+    for (u32 i = 0; i < 0x200; i++) s.w8(shm() + i, static_cast<u8>(i ^ 0x5A));
+    for (u32 i = 0; i < 0x200; i++) s.w8(shm() + 0x20000 + i, static_cast<u8>(i ^ 0xA5));
+    s.dispatch(0x14A, 0xBull << 32, 0x100ull << 32 | 3);
+    s.dispatch(0x14A, 0xBull << 32 | 1, 0x80ull << 32 | 1);
+    s.dispatch(0x14A, 0xBull << 32, 0ull << 32 | 2);
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi});
+    s.call("cellDtcpIpGetDecryptedData", {buf + 0x200, 0x40, got, emi}); // too small
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpGetDecryptedData", {buf + 0x200, 0x80, got, emi});
+    sys.reply(0, reply("x", {{"result", -8}}));
+    s.call("cellDtcpIpGetDecryptedData", {buf + 0x300, 0x80, got, emi}); // an empty one
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpStopSequence", {}); // the slots stopped, the cancel set
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi});
+    s.call("cellDtcpIpSetEncryptedData", {big, 0x100, 0, copied, freep});
+    s.dispatch(0x14A, 0xBull << 32, 0x10ull << 32 | 1); // a stopped slot kept
+    s.dispatch(0x14A, 6ull << 32, 0);
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi});
+    // Finalizing refused: undone here.
+    sys.reply(0, reply("x", {{"result", -1}}));
+    s.call("cellDtcpIpFinalize", {});
+    s.call("cellDtcpIpGetDecryptedData", {buf, 0x200, got, emi});
+    s.dispatch(0x14A, 0xBull << 32, 0x10ull << 32 | 1); // no dispatcher
+    // The move mode here: the system's memory is the other mode's size, so its making fails.
+    script_sc(s, 324, {cid, 0x500000}, "sys_memory_container_create(5 MB)");
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_545E08CB", {s.r32(cid), cb, 8, 1000, 0x4000000000000000ull});
+    s.dispatch(0x14A, 1ull << 32, 0);
+    s.call("cellDtcpIpActivate", {});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpFinalize", {});
+    s.dispatch(0x14A, 2ull << 32, 0);
+}
+
+// The move mode: the shared memory's smaller size (5 MB of container suffice), Open unavailable, the data
+// connection's buffer required.
+void script_dtcp_move(Script& s)
+{
+    const u32 data = dtcp_setup(s), cb = kDtcpCode + 0xF0;
+    (void)data;
+    const u32 url = S(0), ip = S(1), host = kOut + 0x80, ids = kOut + 0xA0, vals = kOut + 0xC0, cid = kOut + 0x20;
+    s.str(url, "http://10.0.0.1/c.mp4");
+    s.str(ip, "10.0.0.1");
+    s.w32(host, ip);
+    s.w8(host + 5, 80);
+    script_sc(s, 324, {cid, 0x500000}, "sys_memory_container_create(5 MB)");
+    const u32 c5 = s.r32(cid);
+    s.call("cellDtcpIpInitialize", {c5, cb, 7, 1000, 0x4000000000000000ull}); // the move bit cleared: 6 MB needed
+    SystemSide& sys = s.system();
+    sys.open(0);
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_545E08CB", {c5, cb, 7, 1000, 0x4000000000000000ull});
+    REQUIRE(s.fixture().kernel->create_system_shared_memory(kDtcpMemory, 0xD0000, 0x200));
+    s.dispatch(0x14A, 1ull << 32, 0);
+    s.call("cellDtcpIpOpen", {url, host});
+    s.call("cellDtcpIpUtilityMove_F4EF1B28", {url, host});
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 0, 0, 0}); // no buffer size
+    dtcp_options(s, ids, vals, {{2, 0x101}});
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 1, ids, vals});
+    dtcp_options(s, ids, vals, {{2, 0x100}});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_269A634B", {url, host, 1, ids, vals});
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 0, 0, 0});
+    dtcp_options(s, ids, vals, {{2, 1}, {20000, 1}});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityClearTextByte_2F87926F", {url, 2, ids, vals});
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpUtilityMove_CA87F652", {kBuf, 0x100});
+    s.dispatch(0x14A, 9ull << 32, 0x100ull << 32);
+    sys.reply(0, reply("x", {{"result", 0}}));
+    s.call("cellDtcpIpFinalize", {});
+    s.dispatch(0x14A, 2ull << 32, 0);
+}
+
 } // namespace
 
 TEST_CASE("cellPrintUtility against libsysutil_print", "[hle][lle][sysutil]")
@@ -419,4 +809,39 @@ TEST_CASE("cellGamePs1Emu on pspocket's console: the pad rumble request meets th
     CHECK(t.call("cellGamePs1Emu_61CE2BCD", 1) == r3_of_code(CLOSED));
     CHECK(t.call("cellGamePs1Emu_61CE2BCD", 0) == r3_of_code(CLOSED));
     CHECK(t.call("cellGamePs1Emu_61CE2BCD", 2) == r3_of_code(0x8002CB07)); // before any request
+}
+
+TEST_CASE("cellDtcpIpUtility against libsysutil_dtcp_ip", "[hle][lle][sysutil]")
+{
+    compare_script("cellDtcpIpUtility",
+        {"cellDtcpIpUtility", "cellDtcpIpUtilityClearTextByte", "cellDtcpIpUtilityMove", "cellDtcpIpUtilityEx"},
+        script_dtcp);
+}
+
+TEST_CASE("cellDtcpIpUtility against libsysutil_dtcp_ip: the move mode", "[hle][lle][sysutil]")
+{
+    compare_script("cellDtcpIpUtility (move)",
+        {"cellDtcpIpUtility", "cellDtcpIpUtilityClearTextByte", "cellDtcpIpUtilityMove", "cellDtcpIpUtilityEx"},
+        script_dtcp_move);
+}
+
+TEST_CASE("cellDtcpIpUtility on pspocket's console: Initialize meets the closed channel and undoes itself",
+    "[hle][sysutil]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
+    u8* b = f.base();
+    const u32 cb = kData + 0x3000; // a callback's descriptor (never called: no system sends events)
+    ps_write32(b, cb, kData + 0x3100);
+    CHECK(t.call("cellDtcpIpActivate") == r3_of_code(0x80024E02));
+    CHECK(t.call("cellDtcpIpFinalize") == r3_of_code(0x80024E02));
+    CHECK(t.call("cellDtcpIpInitialize", 0xFFFFFFFF, cb, 0, 1000, 0) == r3_of_code(0x8002B107));
+    REQUIRE(lv2_syscall(t.ctx, 324, {kOut, 0x600000}) == 0); // sys_memory_container_create
+    const u32 container = ps_read32(b, kOut);
+    for (int i = 0; i < 2; i++) CHECK(t.call("cellDtcpIpInitialize", container, cb, 0, 1000, 0) == r3_of_code(CLOSED));
+    CHECK(hle::sysutil_dispatcher(0x14A) == 0); // given back
+    CHECK(t.call("cellDtcpIpFinalize") == r3_of_code(0x80024E02));
+    CHECK(t.call("cellDtcpIpRead", kBuf, 0x10) == r3_of_code(0x80024E02));
+    CHECK(t.call("cellDtcpIpSuspendActivationForDebug") == 0);
 }

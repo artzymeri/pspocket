@@ -1993,6 +1993,17 @@ s32 sysutil_send_event(u64 status, u64 param)
     return count;
 }
 
+u32 sysutil_dispatcher(u32 event_code)
+{
+    HleProcess* p = HleProcess::current();
+    if (!p) return 0;
+    SysutilCallbacks& cb = p->state<SysutilCallbacks>();
+    std::lock_guard lock(cb.mutex);
+    for (const auto& d : cb.dispatchers)
+        if (d.first == event_code) return d.second;
+    return 0;
+}
+
 void sysutil_queue_call(std::function<s32(PPUContext& ctx)> fn)
 {
     HleProcess* p = HleProcess::current();

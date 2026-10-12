@@ -13432,6 +13432,9 @@ of the first CellFsStat's ctime). Both runs share one tree of host files: the fi
 file's ctime to the host's clock, which the second run's first cellFsStat then reads, so the two first stats agree
 only when no second boundary falls between the tree's making and the first run's change. The two stats' ctimes (the
 host's clock, not libfs's doing) are no longer compared; their other fields still are. Alone it agreed every time.
+Two more sections read times their runs set from the host's clock, and a later gate failed one ("symbolic links": the
+link's times at +0x113): the link's stat and the "sizes" section's stats after the files' changes leave their three
+times out; the times the "attributes" section sets itself (SetAttribute's atime and mtime) are still compared.
 
 ## D-929 · 2026-10-12 · cellGamePs1Emu's one function: the PS1 emulator's pad rumble request
 
@@ -13446,3 +13449,52 @@ as the exports answer them (as_export, D-926). Compared with Sony's module (test
 closed channel, the mode's check, a system answering with results, another root, no result, a result that is a string,
 no reply, a truncated one: 13 calls, 209 lv2 calls, 6 requests answered, 0 differences. The module's start and stop do
 nothing a game sees.
+
+## D-930 · 2026-10-12 · cellDtcpIpUtility from libsysutil_dtcp_ip: twenty-nine functions and the system's events
+
+The front end of the system software's DTCP-IP client (protected streams from a DLNA server), read from
+libsysutil_dtcp_ip.sprx (4.92): runtime/hle/src/cellDtcpIpUtility.cpp. RPCS3 names thirteen of its functions and leaves
+them stubs; the module exports sixteen more in cellDtcpIpUtilityClearTextByte (InitializeEx, the authentication calls,
+CloseContent, OpenContentEx, SetByteSeekRange, GetHttpStatusCode), cellDtcpIpUtilityMove (MoveOpen, MoveOpenEx, MoveRead,
+MoveCommitment, MoveClose) and cellDtcpIpUtilityEx (SetEncryptedDataEx, OpenEx), named here from the module's own
+diagnostics and registered under their NIDs.
+
+- **The module's state** lives in its data: the game's callback and argument, the memory container, the 64-bit function
+  flags (bit 0 buffering: the game writes the encrypted stream into a 1 MB ring; bit 62 the move mode), the system's
+  shared memory (two 128 KB buffers of decrypted data, the ring at +256 KB), the ring's positions and use, three slots of
+  decrypted data, the user's read buffer and size, an lwmutex "_vppdrl", the cancel and seek flags. pspocket keeps it in
+  a block of main memory laid out as the module's data from 0x87E0 (its initial values too), so the lwmutex's and the
+  shared memory pointer's addresses passed to lv2 sit at the same offsets.
+- **Requests** on channel 0, packet 0x140, magic "DTCP", in FixedMemory 0: each call's checks (shared memory there, the
+  mode, its arguments, the cancel and busy flags under the lwmutex), the element and its attributes (ints, the game's
+  strings, 8- and 28-byte files: the seek positions, the open option block: a first byte 0 for Open and 1 for the others,
+  option 1, options 2 to 5 in KB, option 20000's 1 else -1; its three bytes after the first are never written by the
+  module), the write, then receiveResponsePacket: the reply over FixedMemory's whole 0x6000 bytes, "result" negative the
+  answer, else 0 (and "param" read into the game's word for GetHttpStatusCode). Every failure printed through liblv2's
+  printf as the module prints it: its file "sysutil_dtcp_ip.cpp", function and line. What each call does around its
+  request is the module's: Read and MoveRead keep their buffer for the system's event 9 and forget it on a failure; Seek
+  and SetByteSeekRange hold the seek flag until the system's event 8 or 0x2000002; StopSequence marks the slots stopped
+  and sets the cancel; OpenEx and MoveOpenEx clear it, MoveClose sets it; Finalize finalizes itself only when refused.
+- **Initialize** (and InitializeEx, which keeps the move bit Initialize clears): the container checked through
+  sys_memory_container_get_size (6 MB, 5 in the move mode, all available), the lwmutex made, the dispatcher of event
+  0x14A registered, then "dtcpIpInitialize" with the container, the priority and the flags as a file. On pspocket's
+  console the write meets the closed channel (0x8002b007, D-534): the dispatcher, the lwmutex and the state are undone and
+  that is the answer; the other calls then find no shared memory (0x80024E02).
+- **The system's events** (cellDtcpIpCallbackHandler, pspocket's internal function): 1 makes the shared memory through
+  cellSysutilSharedMemoryAlloc (key 0x8006040000000A10, 0x180000 bytes, 0xD0000 in the move mode), 2 finalizes, 6
+  resets the ring, 8 and 0x2000002 end a seek, 9 ends a read (the data copied to the user's buffer, or a read error), 10
+  frees ring space, 11 fills a slot; each passes on to the game's callback as (argument, kind, status, values). Nothing
+  sends them on pspocket's console. libsysutil keeps registered dispatchers without calling them (as RPCS3); a new host
+  accessor, sysutil_dispatcher(event), gives the comparisons' system side the function to call.
+- **The comparisons' harness** (tests/hle/sysutil_sub_compare.hpp) now names memory each run has at its own address
+  (the module's data: Sony's in its data segment, pspocket's block) in the lv2 calls' arguments, zeroes the 32 KB below
+  the script's stack pointer before each call (so stack bytes a module never writes read alike), delivers a system event
+  to the registered dispatcher (Script::dispatch), and counts sys_memory_container_create's two arguments.
+- **Compared** with Sony's module (tests/hle/test_sysutil_more.cpp): every call uninitialized, Initialize's checks and
+  the closed channel, then a system answering with the system software's shared memory made: results, missing and
+  mistyped results, no document, truncated, the system gone; opening with every option and limit, authentication, the
+  HTTP status, reads and their events, seeks, moving, cancels, finalizing by event and by refusal; the buffering mode's
+  ring filled, consumed and wrapped, its slots of decrypted data; a move-mode making refused (the other mode's size).
+  216 calls, 1,656 lv2 calls, 58 requests answered; the move mode (its own run: the smaller memory made, Open
+  unavailable, the data connection's buffer required): 16 calls, 151 lv2 calls, 5 requests; 0 differences. Without the
+  firmware: "cellDtcpIpUtility on pspocket's console".

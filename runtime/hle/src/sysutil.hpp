@@ -28,6 +28,11 @@ inline constexpr u64 CELL_SYSUTIL_BGMPLAYBACK_STOP = 0x0142;
 // process is running. Callable from any thread.
 s32 sysutil_send_event(u64 status, u64 param);
 
+// The function registered for the system's event `event_code` (cellSysutilRegisterCallbackDispatcher), 0 for none:
+// what the system software would call with an event's two values (pspocket's console sends none; the comparisons'
+// system side does, D-930).
+u32 sysutil_dispatcher(u32 event_code);
+
 // Queues a host function for the game's next cellSysutilCheckCallback, which runs it on the calling guest thread with
 // that thread's context (RPCS3 sysutil_register_cb: dialogs call the game's callbacks this way, with call_guest). A
 // non-zero result ends that check early and is its return value; the functions queued after it wait for the next

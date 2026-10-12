@@ -36,10 +36,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "firmware_compare.hpp"
 #include "pspocket/recomp/nid.hpp"
+#include "sysutil.hpp"
 #include "sysutil_cxml.hpp" // runtime/hle/src
 
 namespace pspocket::hle::test::sub {
@@ -198,6 +200,9 @@ struct Trace {
     u8* base = nullptr;
     SystemSide* system = nullptr;
     std::vector<std::string> calls;
+    // Memory each run has at its own address, named alike in the lv2 calls' arguments (a module's data: Sony's in its
+    // image, pspocket's in a block of its own laid out the same). Set before the calls that use it.
+    std::vector<std::tuple<u32, u32, std::string>> regions;
 };
 
 void observe(void* user, u32 n, const u64* a);
@@ -369,7 +374,7 @@ inline u32 lv2_args(u32 n)
     case 41: case 96: case 98: case 99: case 101: case 103: case 104: case 106: case 108: case 109: case 135: case 137:
     case 141: case 329: case 331: case 342: case 349: case 804: case 807: case 813: case 814: case 30:
         return 1;
-    case 44: case 97: case 100: case 102: case 107: case 110: case 129: case 136: case 335: case 341: case 343:
+    case 44: case 97: case 100: case 102: case 107: case 110: case 129: case 136: case 324: case 335: case 341: case 343:
     case 805: case 808: case 809: case 811: case 812:
         return 2;
     case 105: case 130: case 134: case 348: case 806:
@@ -391,7 +396,12 @@ inline void observe(void* user, u32 n, const u64* a)
 {
     auto& tr = *static_cast<Trace*>(user);
     if (std::this_thread::get_id() != tr.script) return;
-    const auto arg = [](u64 v) { return on_stack(v) ? std::string("stack") : std::format("{:#x}", v); };
+    const auto arg = [&tr](u64 v) {
+        if (on_stack(v)) return std::string("stack");
+        for (const auto& [at, size, name] : tr.regions)
+            if (v >= at && v < u64{at} + size) return std::format("{}+{:#x}", name, v - at);
+        return std::format("{:#x}", v);
+    };
     std::string s = std::format("sc {}(", n);
     for (u32 i = 0; i < lv2_args(n); i++) s += std::format("{}{}", i ? ", " : "", arg(a[i]));
     s += ")";
@@ -453,10 +463,12 @@ public:
     u32 globals() const { return globals_; }
     const loader::PrxModule& module() const { return *lib_->module; }
 
-    // A call of `name` (a function known only by its NID is "<library>_<NID>"), recorded as a step. f1 = `f`.
+    // A call of `name` (a function known only by its NID is "<library>_<NID>"), recorded as a step. f1 = `f`. The 32 KB
+    // below the stack pointer are zeroed first, in both runs, so a module's stack bytes it never writes read alike.
     u32 call(std::string_view name, std::vector<u64> args, double f = 0)
     {
         t_.ctx.fpr[1] = f;
+        zero_stack();
         if (std::getenv("PSPOCKET_TEST_VERBOSE")) std::fprintf(stderr, "%s %s\n", sony_ ? "sony" : "mine", std::string(name).c_str());
         u32 v = 0;
         const u64 sp = t_.ctx.gpr[1];
@@ -485,6 +497,21 @@ public:
         Step& last = steps_.back();
         last.call = last.call.substr(0, last.call.rfind(" -> ")) + " -> (void)";
     }
+
+    // The system's event `event_code` with its two values, to the dispatcher registered for it (as the system software
+    // would send it; pspocket's console sends none), recorded as a step.
+    void dispatch(u32 event_code, u64 value1, u64 value2)
+    {
+        zero_stack();
+        const u32 fn = sysutil_dispatcher(event_code);
+        const u64 sp = t_.ctx.gpr[1];
+        if (fn) call_guest(t_.ctx, fn, {value1, value2});
+        CHECK(t_.ctx.gpr[1] == sp);
+        step(std::format("event {:#x}({:#x}, {:#x}){}", event_code, value1, value2, fn ? "" : ": no dispatcher"));
+    }
+
+    // Memory this run has at `at` named `name` in the lv2 calls' arguments.
+    void name_region(u32 at, u32 size, std::string name) { tr_.regions.emplace_back(at, size, std::move(name)); }
 
     // The state after a step.
     void step(std::string text)
@@ -515,6 +542,12 @@ public:
     }
 
 private:
+    void zero_stack()
+    {
+        const u32 sp = static_cast<u32>(t_.ctx.gpr[1]);
+        std::memset(b_ + sp - 0x8000, 0, 0x8000);
+    }
+
     u32 descriptor(std::string_view name) const
     {
         for (const std::string& lib : libraries_) {
