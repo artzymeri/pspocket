@@ -975,3 +975,77 @@ TEST_CASE("sceNpTrophy progress, unlock flags, icons and sound level: RPCS3's ch
     CHECK(a.call("sceNpTrophySetSoundLevel", 2, 1, 20, 0) == 0);
     REQUIRE(a.call("sceNpTrophyTerm") == 0);
 }
+
+TEST_CASE("sceNpTrophy's later queries from the installed sets: game details, trophy details in Sony's batches, the "
+          "latest trophies, the user, an offline sync (D-922)",
+    "[hle][trophy]")
+{
+    TrophyDirs dirs("later");
+    dirs.add_disc_pack("NPWR24680_00", make_trp({{"TROP.SFM", many_trophies(20)}}));
+    InterpretMisses interpret;
+    Fixture f;
+    dirs.mount(f);
+    GuestThread a(f, 0, "trophy");
+    u8* b = f.base();
+    write_status_callback(b);
+    constexpr u32 kNpId = kData + 0x3000, kEntries = kData + 0x3100, kUser = kData + 0x3400;
+    constexpr u32 kManyDetails = kData + 0x8000; // 24 SceNpTrophyDetails
+
+    // Sony's checks before the library's state.
+    CHECK(a.call("sceNpTrophyGetGameDetails", 1, 1, 0, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetGameDetails", 1, 1, kGameDetails, 0) == kNotInit);
+    CHECK(a.call("sceNpTrophyGetTrophyDetails", 1, 1, 0, kManyDetails, kCount, 0) == kInvalArg);
+    ps_write32(b, kCount, 0);
+    CHECK(a.call("sceNpTrophyGetTrophyDetails", 1, 1, kFlags, kManyDetails, kCount, 0) == 0); // nothing asked
+    CHECK(a.call("sceNpTrophyGetLatestTrophies", 1, 0, 8, kEntries, kCount, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyGetLatestTrophies", 1, kNpId, 8, kEntries, kCount, 1) == kNotSupported);
+    CHECK(a.call("sceNpTrophyGetUserInfo", 1, kNpId, 0, 0) == kInvalArg);
+    CHECK(a.call("sceNpTrophyNetworkSync", 1, 0, 0, 1) == kNotSupported);
+
+    open_session(a, b, "NPWR24680", 0);
+    register_checked(f, a, b, 1, 1);
+    CHECK(a.call("sceNpTrophyGetGameDetails", 1, 1, kGameDetails, 1) == kNotSupported);
+    CHECK(a.call("sceNpTrophyGetGameDetails", 1, 2, kGameDetails, 0) == kUnknownHandle);
+    REQUIRE(a.call("sceNpTrophyGetGameDetails", 1, 1, kGameDetails, 0) == 0);
+    CHECK(ps_read32(b, kGameDetails) == 20);
+    CHECK(guest_string(b, kGameDetails + 20) == "Many");
+
+    // Trophies 3 to 17 (15 of them, past one request of 12): the first request writes from details[0], the second
+    // from details[15], where its scan began (Sony's indexing); *count says 15.
+    std::memset(b + kFlags, 0, 16);
+    for (u32 id = 3; id <= 17; id++) ps_write32(b, kFlags + 4 * (id / 32), ps_read32(b, kFlags + 4 * (id / 32)) | 1u << (id % 32));
+    std::memset(b + kManyDetails, 0xEE, 24 * 1164);
+    ps_write32(b, kCount, 24);
+    REQUIRE(a.call("sceNpTrophyGetTrophyDetails", 1, 1, kFlags, kManyDetails, kCount, 0) == 0);
+    CHECK(ps_read32(b, kCount) == 15);
+    for (u32 k = 0; k < 12; k++) CHECK(ps_read32(b, kManyDetails + k * 1164) == 3 + k);
+    for (u32 k = 0; k < 3; k++) CHECK(ps_read32(b, kManyDetails + (15 + k) * 1164) == 15 + k);
+    CHECK(ps_read32(b, kManyDetails + 12 * 1164) == 0xEEEEEEEEu);
+    // A hidden trophy still locked is refused, as GetTrophyInfo refuses it.
+    std::memset(b + kFlags, 0, 16);
+    ps_write32(b, kFlags, 0x3); // trophies 0 and 1 (hidden)
+    ps_write32(b, kCount, 4);
+    CHECK(a.call("sceNpTrophyGetTrophyDetails", 1, 1, kFlags, kManyDetails, kCount, 0) == kHidden);
+
+    // The latest trophies: none, then two unlocked in order (newest first), each with its set's communication ID.
+    ps_write32(b, kCount, 0xEEEEEEEE);
+    REQUIRE(a.call("sceNpTrophyGetLatestTrophies", 1, kNpId, 8, kEntries, kCount, 0) == 0);
+    CHECK(ps_read32(b, kCount) == 0);
+    REQUIRE(a.call("sceNpTrophyUnlockTrophy", 1, 1, 5, kPlatinum) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(a.call("sceNpTrophyUnlockTrophy", 1, 1, 9, kPlatinum) == 0);
+    REQUIRE(a.call("sceNpTrophyGetLatestTrophies", 1, kNpId, 8, kEntries, kCount, 0) == 0);
+    REQUIRE(ps_read32(b, kCount) == 2);
+    CHECK(ps_read32(b, kEntries + 8) == 9);
+    CHECK(ps_read32(b, kEntries + 12) == 1);
+    CHECK(guest_string(b, kEntries + 16) == "NPWR24680");
+    CHECK(ps_read32(b, kEntries + 32 + 8) == 5);
+    CHECK(ps_read64(b, kEntries) >= ps_read64(b, kEntries + 32));
+    REQUIRE(a.call("sceNpTrophyGetLatestTrophies", 1, kNpId, 1, kEntries, kCount, 0) == 0);
+    CHECK(ps_read32(b, kCount) == 1);
+
+    // The user: a name; a sync offline: the callback hears 10 (failed) before the call returns.
+    REQUIRE(a.call("sceNpTrophyGetUserInfo", 1, kNpId, kUser, 0) == 0);
+    CHECK(!guest_string(b, kUser).empty());
+    CHECK(a.call("sceNpTrophyNetworkSync", 1, 0, 0, 0) == 0);
+}

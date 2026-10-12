@@ -12565,3 +12565,34 @@ nothing here, is left out). These eleven are unverified (D-594): comparing them 
 Tests: test_np_commerce_compare.cpp (with the firmware); test_np.cpp: the product category test now checks Sony's
 behaviour, and a new case covers the client heap before, during and after NP, the closed channel's answer and the
 matching 2 flag (its low byte).
+
+## D-922 · 2026-10-12 · sceNpTrophy's later queries from pspocket's trophy service
+
+sceNpTrophy's five functions answered as RPCS3's stubs (RPCS3: UNIMPLEMENTED) are pspocket's own
+(runtime/hle/src/sceNpTrophy.cpp), so the library (24 functions) is. Sony's libsysutil_np_trophy (4.92) asks the system
+software's trophy service for every query (request 295 on channel 1; these build documents "2", "3", "k", "j" and
+"a"); pspocket's trophy service is its own module, so they answer from the installed sets as GetGameInfo and
+GetTrophyInfo do, after Sony's own checks in its order. Read from Sony's module; unverified (D-594), the system's side
+being in no module.
+- **GetGameDetails(context, handle, details, u64 options)**: GetGameInfo's details alone (Sony's calls the same
+  request without game data). No details: INVALID_ARGUMENT before anything; options: NOT_SUPPORTED after the context
+  and handle.
+- **GetTrophyDetails(context, handle, flags, details, u32* count, u64 options)**: no flags, details or count:
+  INVALID_ARGUMENT; *count (the room) read and set to 0 first, nothing asked for none. Sony's asks in requests of up to
+  12 trophies: from bit position p, the next set bits (at most room - p of them), their details written from
+  details[p], p being where that request's scan began, and *count adds each request's; so a request that is not one run
+  of trophies from 0 spreads over the array as Sony's spreads it (kept). Each trophy's details are GetTrophyInfo's (a
+  hidden one still locked: HIDDEN). Sony's goes on asking without end when the room is past 128 (empty requests); the
+  loop stops there, logged.
+- **GetLatestTrophies(handle, npId, max, entries, u32* count, u64 options)**: the user's unlocked trophies over every
+  installed set (each TROPUSR.DAT under /dev_hdd0/home/00000001/trophy), newest first, max of them, as 32-byte entries
+  as Sony's parser lays out the reply: be64 tick, be32 trophy ID, be32 1 (the reply's "unlocked" stored as a word),
+  then the set's communication ID (nine characters, NUL, its number). pspocket's console has one user: any npId is
+  that user's.
+- **GetUserInfo(handle, npId, user_info, u64 options)**: the reply's 48-byte "user_info" string: the user's name as
+  cellUserInfoGetStat reads it (localusername), "User" without one.
+- **NetworkSync(handle, callback, arg, u64 options)**: Sony's calls callback(12, 0, 0, arg) when the system's
+  "reqsync" says 0 and (10, 0, 0, arg) otherwise, before it returns; offline the synchronisation fails: 10.
+Test: tests/hle/test_trophy.cpp "sceNpTrophy's later queries": the checks before init, details and options, the
+batches' layout over 15 trophies, a hidden trophy, the latest trophies before and after two unlocks, the user's name,
+the sync.
