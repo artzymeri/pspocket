@@ -12514,3 +12514,10 @@ times (round trips, acknowledgement delays, time stamps), which the comparison m
 of a packet header that fitted a full datagram, pspocket drops the header whole (part 3; only below a 0x40-byte segment
 size). Its comparison (test_rudp_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware (about 110 s)
 and skips without it; the name check and test_rudp.cpp check the library is pspocket's and unmarked.
+
+## D-917 · 2026-10-12 · The gate gives each suite 20 minutes
+
+With the comparisons that now match Sony's modules out of hiding (D-912 to D-916), test_hle on the Mac with the firmware
+installed runs about six minutes (cellRudp's comparison alone about 110 s), past the 300 s ctest limit scripts/gate.sh
+set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
+skip and the suites take as long as before.
