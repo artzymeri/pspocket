@@ -8,6 +8,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <functional>
@@ -47,8 +48,11 @@ constexpr u32 kProfile = kData + 0xA000;     // a profile and its parameter tabl
 constexpr u32 kConv = kData + 0xC000;        // a video converter (0x200)
 constexpr u32 kStreams = kData + 0xD000;     // composer streams and their units (12 KB)
 constexpr u32 kDump = kData + 0x10000;       // DumpImage's buffer (0x8000)
+constexpr u32 kBoot = kData + 0x20000;       // the booted recorder's feeders' callbacks: 4 tables of 11 (0x40 apart),
+constexpr u32 kBootDescs = kBoot + 0x100;    // their 44 descriptors (the recording callback, TOC: its answer word)
+constexpr u32 kBootAnswers = kBoot + 0x300;  // and their 44 answers
 constexpr u32 kHeap = kData + 0x40000;       // the allocator's heap
-[[maybe_unused]] constexpr u32 kHeapEnd = kData + 0x100000;
+constexpr u32 kHeapEnd = kData + 0x100000;
 
 // The allocator: alloc(arg, boundary, size) hands out the heap aligned to the boundary (failing once its countdown,
 // when set, runs out); free(arg, boundary, pointer) only records. Both log their calls. The event handler records
@@ -131,6 +135,25 @@ void write_code(u8* b)
     // the generic callback
     c.emit(as::li(3, 0));
     c.emit(as::blr());
+    while (c.pc() < kCode + 0x500) c.emit(as::nop());
+    // the recording callback: a record {its TOC (r2, which names it), r3, 0, 0} with the handler's, the word at r2 its
+    // answer
+    c.emit(as::lis(7, static_cast<s32>(kEvents >> 16)));
+    c.emit(as::ori(7, 7, kEvents & 0xFFFF));
+    c.emit(as::lwz(8, 0, 7));
+    c.emit(as::andi_(10, 8, kEventRecs));
+    c.emit(as::slwi(10, 10, 5));
+    c.emit(as::add(10, 10, 7));
+    c.emit(as::std_(2, 16, 10));
+    c.emit(as::std_(3, 24, 10));
+    c.emit(as::li(9, 0));
+    c.emit(as::std_(9, 32, 10));
+    c.emit(as::std_(9, 40, 10));
+    c.emit(as::lwsync());
+    c.emit(as::addi(8, 8, 1));
+    c.emit(as::stw(8, 0, 7));
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
     const std::vector<u8> code = c.finish();
     std::memcpy(b + kCode, code.data(), code.size());
     ps_write32(b, kAllocDesc, kCode);
@@ -151,11 +174,13 @@ struct Trace {
     std::mutex m;
     std::thread::id caller;
     std::vector<u32> calls;
+    bool lightweight = true; // false: the lwmutex and lwcond calls (95 to 99, 111 to 115) left out
 };
 void observe(void* user, u32 n, const u64*)
 {
     if (n == 1 || n == 871) return;
     Trace& tr = *static_cast<Trace*>(user);
+    if (!tr.lightweight && ((n >= 95 && n <= 99) || (n >= 111 && n <= 115))) return;
     std::lock_guard lock(tr.m);
     if (std::this_thread::get_id() == tr.caller) tr.calls.push_back(n);
 }
@@ -944,6 +969,172 @@ void script_converter(H& h)
     }
 }
 
+// ------------------------------------------------------------------------------------------------- booted
+
+// Feeder k's (0 to 3) callbacks: the recording callback, named by its TOC (its answer word), each answering 0.
+void tagged_feeders(H& h)
+{
+    for (u32 k = 0; k < 4; k++)
+        for (u32 i = 0; i < 11; i++) {
+            const u32 n = k * 11 + i, d = kBootDescs + 8 * n;
+            h.w32(d, kCode + 0x500);
+            h.w32(d + 4, kBootAnswers + 4 * n);
+            h.w32(kBootAnswers + 4 * n, 0);
+            h.w32(kBoot + 0x40 * k + 4 * i, d);
+        }
+}
+u32 answer_of(u32 feeder, u32 callback) { return kBootAnswers + 4 * (feeder * 11 + callback); }
+u32 table_of(u32 feeder) { return kBoot + 0x40 * feeder; }
+// The feeders: audio i is feeder i, video j feeder 2 + j.
+u32 feeder_at(u32 k) { return kFeeders + 0x200 * k; }
+
+// Waits (10 s at most) for the handler's records to reach `n`, or for a record of `event` from the next one on.
+void wait_records(H& h, u32 n, const std::string& what)
+{
+    for (int i = 0; i < 10000 && h.r32(kEvents) < n; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (h.r32(kEvents) < n) FAIL(what << ": " << h.r32(kEvents) << " of the handler's records, not " << n);
+}
+void wait_event(H& h, u64 event, const std::string& what)
+{
+    for (int i = 0; i < 10000; i++) {
+        for (u32 k = h.events_seen; k < h.r32(kEvents); k++)
+            if (ps_read64(h.b, kEvents + 16 + 32 * (k & kEventRecs) + 8) == event) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    FAIL(what << ": no event " << std::format("{:#x}", event));
+}
+// Waits for the control thread to wait for its next message (+0x510 200).
+void wait_idle(H& h, const std::string& what)
+{
+    for (int i = 0; i < 10000 && h.r32(kRec + 0x510) != 200; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (h.r32(kRec + 0x510) != 200) FAIL(what << ": the control thread does not wait for a message");
+}
+
+// A booted recorder's bytes: also masked the threads' IDs, the message the control thread is at (its timing), the SPURS
+// queue's pop index (marked while the task handler waits) and its lv2 event queue, the clock's lwmutex's sleep queue.
+void booted(H& h, const std::string& key)
+{
+    h.mem(key + ": the recorder", kRec, 0x2000,
+        {{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4}, {0x510, 4}, {0x518, 8}, {0x580, 4}, {0x5F0, 8}, {0x730, 4},
+            {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3}, {0x870, 16}});
+}
+void feeders(H& h, const std::string& key, u32 n)
+{
+    for (u32 k = 0; k < n; k++) h.mem(std::format("{}: feeder {}", key, k), feeder_at(k), 0x200, {{0, 0x2C}});
+}
+
+// One recorder booted: mode, 2 audio and 2 video streams (feeders 0 to 3), 1 user stream; `fail` the feeder whose makeup
+// answers `answer` (none: 4); `cleanup` false: feeder 1 and 3 without a cleanup callback.
+void boot_round(H& h, const std::string& k, u32 mode, u32 fail, u32 answer, bool cleanup, bool composer = false)
+{
+    tagged_feeders(h);
+    if (fail < 4) h.w32(answer_of(fail, 0), answer);
+    if (!cleanup) {
+        h.w32(table_of(1) + 4, 0);
+        h.w32(table_of(3) + 4, 0);
+    }
+    attribute(h, mode, 2, 2, 1);
+    REQUIRE(h.call(k + ": Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) ==
+            0);
+    for (u32 i = 0; i < 4; i++) {
+        const bool video = i >= 2;
+        const std::string kind = video ? "Video" : "Audio";
+        h.call(std::format("{}: Feeder{}Initialize({})", k, kind, i), "cellSailFeeder" + kind + "Initialize",
+            {feeder_at(i), table_of(i), 0x100 + i, 0});
+        h.call(std::format("{}: SetFeeder{}({})", k, kind, i), "cellSailRecorderSetFeeder" + kind,
+            {kRec, video ? i - 2 : i, feeder_at(i)});
+    }
+    if (composer) h.call(k + ": RegisterComposer(3)", "cellSailRecorderRegisterComposer", {kRec, 3, kComposer});
+    h.call(k + ": Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, k + ": Boot");
+    if (fail < 4) {
+        for (int i = 0; i < 10000 && h.r32(kRec + 0x704) != 10; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } else {
+        wait_idle(h, k + ": Boot");
+    }
+    h.o.line(k + ": Boot: the state", std::format("{}", h.r32(kRec + 0x704)));
+    booted(h, k + ": Boot");
+    h.block(k + ": Boot");
+    feeders(h, k + ": Boot", 4);
+    h.logs(k + ": Boot");
+}
+
+// Boot, the profiles, Cancel and Finalize on a booted recorder; Boot failing at a feeder's makeup; a recorder without a
+// clock (mode 1).
+void script_boot(H& h)
+{
+    h.tr.lightweight = false;
+    make_spurs(h);
+    boot_round(h, "mode 0", 0, 4, 0, true, true);
+    const u32 out = kArgs + 0x400;
+    h.w32(out, 0xEEEEEEEE);
+    h.call("CreateProfile(1)", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    const u32 p1 = h.r32(out);
+    h.o.line("CreateProfile(1): the profile's place", std::format("{:#x}", p1 - kHeap));
+    if (p1 >= kHeap && p1 < kHeapEnd) h.mem("CreateProfile(1): the profile", p1, 0x1000 + (2 * 2 + 2 + 1) * 0x200);
+    h.logs("CreateProfile(1)");
+    booted(h, "CreateProfile(1)");
+    h.call("CreateProfile(3)", "cellSailRecorderCreateProfile", {kRec, 3, out});
+    const u32 p2 = h.r32(out);
+    if (p2 >= kHeap && p2 < kHeapEnd) h.mem("CreateProfile(3): the profile", p2, 0x1000 + (2 * 2 + 2 + 1) * 0x200);
+    h.logs("CreateProfile(3)");
+    h.w32(kHeapState + 4, 1);
+    h.w32(out, 0xEEEEEEEE);
+    h.call("CreateProfile with the allocator failing", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    h.mem("CreateProfile with the allocator failing: the out word", out, 4);
+    h.logs("CreateProfile with the allocator failing");
+    h.call("CreateProfile(1) a third time", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    const u32 p3 = h.r32(out);
+    h.logs("CreateProfile(1) a third time");
+    h.call("DestroyProfile(the first)", "cellSailRecorderDestroyProfile", {kRec, p1});
+    h.logs("DestroyProfile(the first)");
+    if (p1 >= kHeap && p1 < kHeapEnd) h.mem("DestroyProfile(the first): its first 4 KB", p1, 0x1000);
+    h.call("DestroyProfile(the first) again", "cellSailRecorderDestroyProfile", {kRec, p1});
+    h.call("DestroyProfile(not a profile)", "cellSailRecorderDestroyProfile", {kRec, kArgs + 0x800});
+    h.logs("DestroyProfile(not a profile)");
+    booted(h, "the profiles");
+    // Cancel: each feeder's callback 6 (asynchronous: the handler's records awaited).
+    const u32 before = h.r32(kEvents);
+    h.call("Cancel", "cellSailRecorderCancel", {kRec});
+    wait_records(h, before + 4, "Cancel");
+    h.logs("Cancel");
+    h.w32(table_of(0) + 4 * 6, 0);
+    h.w32(table_of(3) + 4 * 6, 0);
+    h.call("FeederAudioInitialize(0) with no callback 6", "cellSailFeederAudioInitialize", {feeder_at(0), table_of(0), 0x200, 0});
+    h.call("FeederVideoInitialize(1) with no callback 6", "cellSailFeederVideoInitialize", {feeder_at(3), table_of(3), 0x203, 0});
+    h.call("Cancel with two feeders without callback 6", "cellSailRecorderCancel", {kRec});
+    wait_records(h, before + 6, "Cancel with two feeders without callback 6");
+    h.logs("Cancel with two feeders without callback 6");
+    (void)p3;
+    // Finalize: the control thread ends (the feeders cleaned up, the profiles freed), the recorder taken down.
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.mem("Finalize: the recorder", kRec, 0x2000, {{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4}, {0x518, 8}, {0x580, 4},
+        {0x5F0, 8}, {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3}, {0x870, 16}});
+    feeders(h, "Finalize", 4);
+    h.logs("Finalize");
+    h.call("Finalize again", "cellSailRecorderFinalize", {kRec});
+
+    // Boot failing: audio feeder 1's makeup, then video feeder 0's (feeder 2), each answering an error.
+    boot_round(h, "audio 1's makeup failing", 0, 1, 0x80610777, true);
+    h.call("audio 1's makeup failing: Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("audio 1's makeup failing: Finalize");
+    boot_round(h, "video 0's makeup failing", 0, 2, 0xFFFFFFFE, false);
+    h.call("video 0's makeup failing: Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("video 0's makeup failing: Finalize");
+    boot_round(h, "audio 0's makeup failing, mode 1", 1, 0, 0x80000000, true);
+    h.call("audio 0's makeup failing, mode 1: Finalize", "cellSailRecorderFinalize", {kRec});
+    // A recorder without a clock (mode 1), feeders 1 and 3 without a cleanup.
+    boot_round(h, "mode 1", 1, 4, 0, false);
+    h.call("mode 1: CreateProfile(1)", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    h.logs("mode 1: CreateProfile(1)");
+    h.call("mode 1: Finalize", "cellSailRecorderFinalize", {kRec});
+    feeders(h, "mode 1: Finalize", 4);
+    h.logs("mode 1: Finalize");
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -983,6 +1174,13 @@ Observed half_converter(const Setup& s, bool sony)
 {
     H h(s, sony);
     script_converter(h);
+    return std::move(h.o);
+}
+
+Observed half_boot(const Setup& s, bool sony)
+{
+    H h(s, sony);
+    script_boot(h);
     return std::move(h.o);
 }
 
@@ -1044,4 +1242,19 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: feeders, the composer, profil
     run(s, "cellSailRec: the composer", [&](bool sony) { return half_composer(s, sony); }, [](const Observed&) {});
     run(s, "cellSailRec: profiles", [&](bool sony) { return half_profiles(s, sony); }, [](const Observed&) {});
     run(s, "cellSailRec: video converters", [&](bool sony) { return half_converter(s, sony); }, [](const Observed&) {});
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: the booted recorder", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: Boot, profiles, Cancel, Finalize", [&](bool sony) { return half_boot(s, sony); },
+        [](const Observed& o) {
+            CHECK(o.value("mode 0: Boot: the state") == "2");
+            CHECK(o.value("CreateProfile(1)") == "0x0");
+            CHECK(o.value("CreateProfile with the allocator failing") == "0x806107f0");
+            CHECK(o.value("DestroyProfile(not a profile)") == "0x0");
+            CHECK(o.value("Finalize") == "0x0");
+            CHECK(o.value("audio 1's makeup failing: Boot: the state") == "10");
+            CHECK(o.value("mode 1: Boot: the state") == "2");
+        });
 }

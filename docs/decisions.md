@@ -12642,3 +12642,51 @@ DumpImage at 26 sizes into aligned and unaligned buffers (390), feeders (119), t
 video converters (44): 0 of 3,091 observations differ (each half's code addresses, the lv2 objects' IDs and stack
 words masked; the profiles, converters and composer streams laid out by the script as the control thread lays them
 out).
+
+### D-918, part 4: cellSailRec's control thread, task handler, profiles, Cancel and Finalize once booted
+
+libsail_rec's own threads, natively (runtime/hle/src/cellSailRecControl.cpp), as fw 4.92's module runs them:
+- **The control thread** ("_libsail-control-ex", from Boot): the command it answers is 0x20 (Boot's); its stack's top
+  less 2000 kept for the event handler; under the recorder's lwmutex a SPURS queue of 16 messages of 16 bytes (SPU to
+  PPU) at +0x580 with an lv2 event queue attached, the task handler started ("_libsail-task-handler", its priority and
+  stack from +0x858), the clock in mode 0 (0x58 bytes, its lwmutex "_saisr0", priority protocol, recursive), the
+  composers' table (none in use, the recorder), each audio and video stream's pipeline (cleared, state 1, the
+  recorder and the clock) and its feeder's makeup (the recorder, the index, the state 1, the game's makeup through
+  libsail_rec's table). Then running (+0x700), the state 2, the state event, Boot's completion event, the lwcond
+  signalled, the lwmutex released, the messages taken. At the end, in the reverse order: the video and then audio
+  feeders' cleanups and pipelines, the clock (also when its making failed, as libsail_rec does), the profiles freed
+  (each one's first 4 KB cleared), the task handler stopped (+0x514) and joined, the event queue detached, the state
+  10; a failure ends with the state event 9 and Boot's completion with the error (sign-extended). Which steps are
+  undone follows libsail_rec's flags exactly (no detach when the attach failed, no join when the thread was not made).
+- **The message loop**: 200 at +0x510 while waiting (the queue's condition, 3 s at a time), then the message's first
+  word; codes above 0x35 passed over, as are 6, 8, 0xA, 0xD, 0x12, 0x13, 0x1C, 0x1D, 0x24 to 0x2A, 0x2D, 0x2F.
+  Completions drive the continuation engine (a failed step marks its record and is an error event, "error 0x%X"
+  printed first, unless it is a cancellation; the record's last step runs its continuation with 0 or CANCEL; an
+  answer above 0 is the steps sent out again, else the record's own completion goes to the step it belongs to).
+  CreateProfile (INVALID_STATE in state 0; one block of (2 video + audio + user) * 512 + 4096 bytes, boundary 8, or
+  MEMORY; the profile's 0x118 bytes from +0x438 all ones, the type, state 1, the recorder; each stream's parameter
+  entry {1, index, profile} and the rest all ones; first on the recorder's list), DestroyProfile (taken off the list
+  and freed; 0 also for one not there), Cancel (each audio and video feeder's callback 6), Finalize's message 0x30
+  (the stop record in use, the recorder no longer running, every event unsubscribed; a booted recorder told to end
+  with 0x31), the converters' notifications 0x32 to 0x35 (their callback).
+- **The task handler** pops the SPURS queue as libsail_rec does inline (not through libsre): its pop index marked while
+  it waits on the event queue 10 ms at a time and unmarked when a wait times out, so it sees +0x514 go to 0; a pop
+  already marked (BUSY), a queue without its port (STAT) or the recorder's end stop it; a full queue's oldest push
+  waiter signalled through its taskset (looked up by workload ID without one); each message posted to the control
+  thread's queue as {code, 0, a, b}.
+- **The feeders' internal callbacks** (libsail_rec's eleven in front of the game's): makeup and cleanup (0 without the
+  game's), open (the format kept: audio 0x18 bytes at +0xA8, video 0x20 at +0xB0), start, stop, cancel (each with 0;
+  without the game's callback the call completed at once, through the diagnostic handler or the feeder's message),
+  callback 6, the format (the kept one without the game's), and the last three always the game's; each passes on the
+  registers it does not set, and sign-extends where libsail_rec does.
+The streams (OpenStream, CloseStream, Start, Stop and their messages), the video converters' making and conversions,
+the composer's and the MP4 composer's internals stay later parts: they stop the process with the call site (rule 5),
+so cellSailRec stays firmware-first.
+Compared (a new script: the booted recorder): Boot with four feeders and a registered composer, CreateProfile 1 and 3,
+the allocator failing, DestroyProfile of a profile, the same again and one not there, Cancel twice (the second with
+two feeders without callback 6), Finalize; Boot failing at audio feeder 1's makeup, at video feeder 0's (feeders 1
+and 3 without cleanup) and at audio 0's in mode 1; a mode 1 recorder booted, a profile made, finalized: 0 of 246
+observations differ (the feeders' callbacks are one recording function told apart by its TOC, each answering a word
+the script sets; the threads' IDs, the message the control thread is at, the SPURS queue's pop index and event queue
+and the clock's lwmutex's sleep queue masked as each process's own or timing; the lwmutex and lwcond calls left out of
+the script thread's lv2 calls, since contention decides them). The earlier scripts still 0 of 3,091.
