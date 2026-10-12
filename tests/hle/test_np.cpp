@@ -2403,3 +2403,50 @@ TEST_CASE("libsysutil_np's requests to the system's NP service: the client heap 
     REQUIRE(g.call("sceNpTerm") == 0);
     CHECK(g.call("_sceNpSysutilClientMalloc", 64) == 0);
 }
+
+TEST_CASE("NP's last stubs: matching's cancels and room messages, Plus, TSS without a limit, a product list's result, "
+          "the second authorization code (D-923)",
+    "[hle][np]")
+{
+    constexpr u64 kMatchTooBig = 0xFFFFFFFF8002A70Dull, kMatchNoRequest = 0xFFFFFFFF8002A727ull;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtxOut = kData + 0x200, kMsg = kData + 0x300, kRoom = kData + 0x400;
+    write_nop(b);
+    CHECK(g.call("sceNpManagerIsSP") == 0);
+    CHECK(g.call("sceNpMatchingCancelRequest", 0x9001, 6u << 23) == kMatchNotInit);
+    CHECK(g.call("sceNpMatchingCancelRequestGUI", 0x9001) == 0);
+    np_up(g); // sceNp2Init brings NP up too
+    CHECK(g.call("sceNpManagerIsSP") == 0);
+    CHECK(g.call("sceNpMatchingCancelRequest", 0x9001, 6u << 23) == kMatchCtxNotFound);
+    put_np_id(b, kNpId, "");
+    REQUIRE(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == 0);
+    const u32 ctx = ps_read32(b, kCtxOut);
+    CHECK(g.call("sceNpMatchingCancelRequest", ctx, 5u << 23) == kMatchInvalReqId);
+    for (const u32 kind : {6u, 15u, 23u}) CHECK(g.call("sceNpMatchingCancelRequest", ctx, kind << 23) == kMatchNoRequest);
+    // A room message: its words, its size (1 to 256), then the context; no room offline.
+    std::memset(b + kMsg, 0, 16);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, 0, kRoom) == kMatchInval);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchInval);
+    ps_write32(b, kMsg, 1);
+    ps_write32(b, kMsg + 8, kData + 0x800);
+    ps_write32(b, kMsg + 12, 257);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchTooBig);
+    ps_write32(b, kMsg + 12, 256);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", 0x9002, kMsg, kRoom) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchRoomNotFound);
+    // Matching 2 running: the older library's calls refuse first.
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 1);
+    CHECK(g.call("sceNpMatchingCancelRequestGUI", ctx) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchUnavailable);
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 0);
+    CHECK(g.call("sceNpCommerce2DestroyGetProductInfoListResult", kData) == 0);
+    // TSS without a limit and the second authorization code answer as their neighbours do.
+    CHECK(g.call("sceNpTssGetDataNoLimit", 0x8001, 1, 0, 16, kData, 16, 0) ==
+          g.call("sceNpTssGetData", 0x8001, 1, 0, 16, kData, 16, 0));
+    CHECK(g.call("sceNpTssGetDataNoLimitAsync", 0x8001, 1, 0, 16, kData, 16, 0) ==
+          g.call("sceNpTssGetDataAsync", 0x8001, 1, 0, 16, kData, 16, 0));
+    CHECK(g.call("sceNpAuthGetAuthorizationCode2", 1, kData, kData, kData) ==
+          g.call("sceNpAuthGetAuthorizationCode", 1, kData, kData, kData));
+}

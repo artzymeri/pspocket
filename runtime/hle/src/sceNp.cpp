@@ -102,10 +102,12 @@ enum : u32 {
     SCE_NP_MATCHING_ERROR_INVALID_ARG = 0x8002A703,
     SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND = 0x8002A709,
     SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND = 0x8002A70B,
+    SCE_NP_MATCHING_ERROR_TOO_BIG_VALUE = 0x8002A70D,
     SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID = 0x8002A70F,
     SCE_NP_MATCHING_ERROR_CTX_STILL_RUNNING = 0x8002A713,
     SCE_NP_MATCHING_ERROR_CTX_MAX = 0x8002A716,
     SCE_NP_MATCHING_ERROR_INVALID_REQ_ID = 0x8002A717,
+    SCE_NP_MATCHING_ERROR_REQUEST_NOT_FOUND = 0x8002A727,
     SCE_NP_MATCHING_ERROR_RESULT_NOT_FOUND = 0x8002A718,
     SCE_NP_MATCHING_ERROR_BUSY = 0x8002A719,
     SCE_NP_MATCHING_ERROR_COND_MAX = 0x8002A71D,
@@ -3442,6 +3444,60 @@ s32 sceNpMatchingSetRoomSearchFlag(PPUContext&, u32 ctx_id, u32 lobby_id, u32 ro
 }
 
 // RPCS3 sceNpMatchingLeaveRoom: the context, then (RPCS3 ensure()s it) a room.
+// sceNpMatchingCancelRequest(ctx_id, req_id), libsysutil_np's (D-923): matching 2 and NP first, then the context, then
+// the request ID's kind (bits 23..28: 6, 15 or 23 are request IDs, else INVALID_REQ_ID); then Sony's asks the system
+// to cancel it. pspocket never issues a request offline, so none is there: REQUEST_NOT_FOUND.
+s32 sceNpMatchingCancelRequest(PPUContext&, u32 ctx_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    const u32 kind = (req_id >> 23) & 0x3F;
+    if (kind > 23 || !((0x808040u >> kind) & 1)) return error(SCE_NP_MATCHING_ERROR_INVALID_REQ_ID);
+    PS_LOG_DEBUG(kChan, "sceNpMatchingCancelRequest(context {:#x}, request {:#x}): no such request offline", ctx_id,
+        req_id);
+    return error(SCE_NP_MATCHING_ERROR_REQUEST_NOT_FOUND);
+}
+
+// sceNpMatchingCancelRequestGUI(ctx_id): matching 2 first (Sony's checks neither NP nor the context), then a request
+// to the system to close the GUI. pspocket's matching GUIs are answered at once, so none is open: CELL_OK.
+s32 sceNpMatchingCancelRequestGUI(PPUContext&, u32 ctx_id)
+{
+    if (const s32 r = matching_check(false)) return r;
+    PS_LOG_DEBUG(kChan, "sceNpMatchingCancelRequestGUI(context {:#x}): no GUI is open", ctx_id);
+    return lv2::CELL_OK;
+}
+
+// sceNpMatchingSendRoomMessage(ctx_id, msg, room, ...): matching 2 and NP, then Sony's checks of the message (its
+// words at +0 and +8 set, its size at +12 1 to 256: past it TOO_BIG_VALUE) and the room, then the context; offline no
+// room is ever joined: ROOM_NOT_FOUND.
+s32 sceNpMatchingSendRoomMessage(PPUContext& ctx, u32 ctx_id, u32 msg, u32 room)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!msg || !room) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (!guest_readable(thread_of(ctx), msg, 16)) {
+        log_call_site(ctx, guest_base(ctx), "sceNpMatchingSendRoomMessage: the message is not guest memory");
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    u8* base = guest_base(ctx);
+    const u32 size = ps_read32(base, msg + 12);
+    if (!ps_read32(base, msg) || !ps_read32(base, msg + 8) || !size) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (size > 256) return error(SCE_NP_MATCHING_ERROR_TOO_BIG_VALUE);
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    return matching_room_offline("sceNpMatchingSendRoomMessage", ctx_id);
+}
+
+// sceNpManagerIsSP(): whether the user subscribes to PlayStation Plus. Sony's asks the system (request 262) once NP is
+// up and answers 0 when it can't; pspocket's user is offline, never a subscriber: 0.
+s32 sceNpManagerIsSP(PPUContext&) { return 0; }
+
 s32 sceNpMatchingLeaveRoom(PPUContext& ctx, u32 ctx_id, u32 room_id, u32 req_id)
 {
     if (const s32 r = matching_check(true)) return r;
@@ -4614,8 +4670,11 @@ void register_sceNp(Registry& r)
     });
     // sceNpMatchingInt (RPCS3 sceNpMatchingInt.cpp): the matching library's internal entry points. Three share their
     // names, and so their NIDs, with sceNp's (RPCS3 registers its OLD_ functions under them); they do the same here.
-    // RPCS3's sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage are stubs (rpcs3_stubs.inc).
+    // sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage, RPCS3's stubs, are libsysutil_np's (D-923).
     r.add("sceNpMatchingInt", {
+        PS_HLE_UNVERIFIED(0xE61F7EE9, sceNpMatchingCancelRequest),
+        PS_HLE_UNVERIFIED(0xC4100412, sceNpMatchingCancelRequestGUI),
+        PS_HLE_UNVERIFIED(0x033D5BA0, sceNpMatchingSendRoomMessage),
         PS_HLE_FUNC(0x170829D3, sceNpMatchingGetRoomMemberList),
         PS_HLE_FUNC(0x31B2B978, sceNpMatchingJoinRoomWithoutGUI),
         PS_HLE_FUNC(0x474B7B13, sceNpMatchingJoinRoomGUI),
@@ -4624,6 +4683,10 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0xB00F408A, sceNpMatchingGetRoomListGUI),
         PS_HLE_FUNC(0xB020684E, sceNpMatchingGetRoomInfoNoLimit),
         PS_HLE_FUNC(0xEADCB5CA, sceNpMatchingCreateRoomWithoutGUI),
+    });
+    // sceNpPlus: PlayStation Plus (D-923).
+    r.add("sceNpPlus", {
+        PS_HLE_UNVERIFIED(0x9CE5AC0B, sceNpManagerIsSP),
     });
 }
 

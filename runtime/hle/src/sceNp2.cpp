@@ -701,6 +701,14 @@ s32 sceNpAuthGetAuthorizationCode(PPUContext&, s32 req_id, u32 param, u32 auth_c
     return oauth_todo("sceNpAuthGetAuthorizationCode", req_id);
 }
 
+// sceNpAuthGetAuthorizationCode2 (D-923): libsysutil_np2 runs GetAuthorizationCode's code with a request of its own
+// (326) to the system; offline it answers as GetAuthorizationCode does.
+s32 sceNpAuthGetAuthorizationCode2(PPUContext&, s32 req_id, u32 param, u32 auth_code, u32 issuer_id)
+{
+    PS_LOG_DEBUG(kChan, "sceNpAuthGetAuthorizationCode2: {:#x} {:#x} {:#x}", param, auth_code, issuer_id);
+    return oauth_todo("sceNpAuthGetAuthorizationCode2", req_id);
+}
+
 // RPCS3 sceNpUtilBuildCdnUrl: a URL and no option, then a TODO (CELL_OK, nothing written).
 s32 sceNpUtilBuildCdnUrl(PPUContext&, u32 url, u32 buf, u32 buf_size, u32 required, u32 option)
 {
@@ -802,6 +810,7 @@ void register_sceNp2(Registry& r)
         PS_HLE_FUNC(0x2880D8D5, sceNpAuthDeleteOAuthRequest),
         PS_HLE_FUNC(0x9DB622E8, sceNpAuthAbortOAuthRequest),
         PS_HLE_FUNC(0xE8BB13FF, sceNpAuthGetAuthorizationCode),
+        PS_HLE_UNVERIFIED(0x3D6ABE37, sceNpAuthGetAuthorizationCode2),
         PS_HLE_FUNC(0x8E930999, sceNpUtilBuildCdnUrl),
     });
 }

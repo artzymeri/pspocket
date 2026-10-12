@@ -454,6 +454,10 @@ s32 sceNpCommerce2DestroyGetProductInfoResult(PPUContext&, u32 result)
     return todo("nothing to free", "sceNpCommerce2DestroyGetProductInfoResult({:#x})", result)(lv2::CELL_OK);
 }
 
+// sceNpCommerce2DestroyGetProductInfoListResult(result): Sony's libsysutil_np_commerce2 answers 0 and does nothing
+// (D-923).
+s32 sceNpCommerce2DestroyGetProductInfoListResult(PPUContext&, u32) { return lv2::CELL_OK; }
+
 s32 sceNpCommerce2GetGameSkuInfoFromGameProductInfo(PPUContext&, u32 game_product_info, u32 index, u32 game_sku_info)
 {
     return get_info(todo("*gameSkuInfo is not written",
@@ -865,6 +869,7 @@ void register_sceNpCommerce2(Registry& r)
         PS_HLE_FUNC(0xF798F5E3, sceNpCommerce2InitGetProductInfoResult),
         PS_HLE_FUNC(0xEF645654, sceNpCommerce2GetGameProductInfo),
         PS_HLE_FUNC(0xEF8EAFCD, sceNpCommerce2DestroyGetProductInfoResult),
+        PS_HLE_FUNC(0xF6139B58, sceNpCommerce2DestroyGetProductInfoListResult),
         PS_HLE_FUNC(0xDB19194C, sceNpCommerce2GetGameSkuInfoFromGameProductInfo),
         PS_HLE_FUNC(0xDA8E322D, sceNpCommerce2GetPrice),
         PS_HLE_FUNC(0x8DF0057F, sceNpCommerce2AbortReq),

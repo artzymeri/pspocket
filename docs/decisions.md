@@ -12596,3 +12596,24 @@ being in no module.
 Test: tests/hle/test_trophy.cpp "sceNpTrophy's later queries": the checks before init, details and options, the
 batches' layout over 15 trophies, a hidden trophy, the latest trophies before and after two unlocks, the user's name,
 the sync.
+
+## D-923 · 2026-10-12 · NP's last eight stubs: matching's cancels and room messages, Plus, TSS, Commerce2, OAuth
+
+The last functions of the NP libraries answered as RPCS3's stubs are pspocket's own, so sceNpMatchingInt (11),
+sceNpPlus (1), sceNpTus (62), sceNpCommerce2 (52) and sceNp2 (80) are whole. Each was read in Sony's module
+(libsysutil_np, _np_tus, _np_commerce2, _np2); its own checks come first in its order, then the offline answer that
+matches the rest of pspocket's NP (no PSN, D-059). Unverified (D-594) but the Commerce2 one, which is Sony's exactly.
+- **sceNpMatchingCancelRequest(ctx, req)**: matching 2 running (UTILITY_UNAVAILABLE), NP (NOT_INITIALIZED), the
+  context (CTX_NOT_FOUND), then the request ID's kind in bits 23..28 (6, 15 or 23, else INVALID_REQ_ID); pspocket never
+  issues a request offline: REQUEST_NOT_FOUND (0x8002A727).
+- **sceNpMatchingCancelRequestGUI(ctx)**: matching 2 only (Sony's checks neither NP nor the context), then the system
+  asked to close a GUI: pspocket's matching GUIs are answered at once, none is open: CELL_OK.
+- **sceNpMatchingSendRoomMessage(ctx, msg, room)**: matching 2, NP, then the message (its words at +0 and +8 set, its
+  size at +12 from 1 to 256: past it TOO_BIG_VALUE) and the room (INVALID_ARG), then the context; no room offline:
+  ROOM_NOT_FOUND, as the other room requests.
+- **sceNpManagerIsSP()** (sceNpPlus): Sony's asks the system once NP is up (request 262) and answers 0 when it cannot
+  tell; pspocket's user is offline, never a PlayStation Plus subscriber: 0.
+- **sceNpTssGetDataNoLimit / Async**: libsysutil_np_tus runs GetData's code with the size limit off: GetData's answers.
+- **sceNpCommerce2DestroyGetProductInfoListResult**: Sony's answers 0 and does nothing; so here.
+- **sceNpAuthGetAuthorizationCode2**: GetAuthorizationCode's code with a request of its own (326): its answers.
+Test: tests/hle/test_np.cpp "NP's last stubs".
