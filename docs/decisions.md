@@ -12732,3 +12732,28 @@ cellSailAuReceiverGet, cellSailSoundAdapterGetFrame and cellSailGraphicsAdapterG
   in three runs; every earlier `[sail]` test passes. Without the firmware, the same script runs on pspocket's side
   alone and its answers are checked against libsail's (`cellSail: the playback through an AU receiver on pspocket
   alone`).
+
+## D-919 · 2026-10-12 · cellSail's adapters' frames compared, as libsail (part 4)
+
+The adapters' frame calls of part 3 (cellSailSoundAdapterGetFrame, cellSailGraphicsAdapterGetFrame and GetFrame2)
+and the decoders' play side behind them (cellAdec and libvdec fed AU by AU, both copy threads filling the adapters'
+frames) compared with libsail running on pspocket, with no change to part 3's code:
+- **Part 17** (`[sail]`): a mode-1 player (no AV sync: the renderers' flag 4) with a sound adapter and a graphics adapter
+  (the game's pictures) over a synthetic PAMF stream (twelve AVC 96x64 I_PCM IDR pictures, 24 silent ATRAC3plus frames
+  after their ATS headers) fed through a game's source in guest code: GetFrame of each adapter before the stream is
+  open, open, started; the frames copied (the graphics adapter buffering until its four frames are full); sound
+  GetFrame of 100 to 2048 samples, GetFrame and GetFrame2 (each keep flag); the input's end drained through both until
+  each has ended (the graphics adapter only once the frames the game was given are past its delay), the stream open
+  again; CloseStream; Finalize.
+- **Part 18**: the same through a mode-0 player, the adapters synced to the clock the game's UpdateAvSync reports
+  drive: a tick of 256 samples with its report, a video frame every third tick (none for the first 30 ticks, so the
+  frames due by then are dropped but the latest; every ninth for a while) with its report, the audio reports jumping
+  ahead once, the input's end: frames due, early (12), not due (28), shown again (0x104, 0x10C), late with frames given
+  back (0x310, 0x410, 0x510), the output running out (0x205), the end (48).
+- 0 differences in three runs each (answers, each thread's lv2 calls, the script's memory, the allocator's memory, the
+  callback records); every `[sail]` test passes (27). The decoders' and copy threads' messages reach the control thread
+  as those threads run, so from part 17 on each thread's lv2 calls are compared in no order, and the script waits for
+  the player's queue to stay empty between calls. Without the firmware, both scripts run on pspocket's side alone and
+  their answers are checked against libsail's (`cellSail: the playback through the adapters on pspocket alone`).
+- libsail's sound adapter copies a GetFrame's samples into a buffer of 2048 (0x2000 bytes per channel): a game asking
+  for more overwrites what follows it (with SDKs before 4.0 the decoder's context after the adapter's block), kept.
