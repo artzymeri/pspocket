@@ -16,6 +16,31 @@
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
+namespace sail {
+
+s32 clear_es(PPUContext& ctx, u32 d, s32 kind, u32 index)
+{
+    const u32 p = r32(ctx, d + 0x1C);
+    u32 es;
+    if (kind == 1) {
+        if (index >= r32(ctx, p + pl::kVideoCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        es = r32(ctx, d + 0x2C) + index * 0x78;
+    } else if (kind == 2) {
+        if (index >= r32(ctx, p + pl::kUserCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        es = r32(ctx, d + 0x30) + index * 0x4C;
+    } else if (kind == 0) {
+        if (index >= r32(ctx, p + pl::kAudioCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
+        es = r32(ctx, d + 0x28) + index * 0x90;
+    } else {
+        return error(CELL_SAIL_ERROR_INVALID_ARG);
+    }
+    if (r8(ctx, es) != 1) return error(CELL_SAIL_ERROR_INVALID_STATE);
+    w8(ctx, es, 0);
+    return lv2::CELL_OK;
+}
+
+} // namespace sail
+
 namespace {
 
 using namespace sail;
@@ -359,27 +384,11 @@ s32 cellSailDescriptorCreateDatabase(PPUContext& ctx, u32 d, u32 db, u32 size, u
 }
 
 // ClearEs(descriptor, kind (0 audio, 1 video, 2 user), index): the stream's state 1 back to 0; the descriptor no further
-// than open.
+// than open (the player's own use, clear_es, does not look at the descriptor's state).
 s32 cellSailDescriptorClearEs(PPUContext& ctx, u32 d, s32 kind, u32 index)
 {
     if (r8(ctx, d + ds::kState) > 1) return error(CELL_SAIL_ERROR_INVALID_STATE);
-    const u32 p = r32(ctx, d + ds::kPlayer);
-    u32 es;
-    if (kind == 1) {
-        if (index >= r32(ctx, p + pl::kVideoCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
-        es = r32(ctx, d + ds::kVideo) + index * ds::kVideoStride;
-    } else if (kind == 2) {
-        if (index >= r32(ctx, p + pl::kUserCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
-        es = r32(ctx, d + ds::kUser) + index * ds::kUserStride;
-    } else if (kind == 0) {
-        if (index >= r32(ctx, p + pl::kAudioCount)) return error(CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE);
-        es = r32(ctx, d + ds::kAudio) + index * ds::kAudioStride;
-    } else {
-        return error(CELL_SAIL_ERROR_INVALID_ARG);
-    }
-    if (r8(ctx, es) != 1) return error(CELL_SAIL_ERROR_INVALID_STATE);
-    w8(ctx, es, 0);
-    return lv2::CELL_OK;
+    return clear_es(ctx, d, kind, index);
 }
 
 s32 cellSailDescriptorDestroyDatabase(PPUContext& ctx, u32 d)

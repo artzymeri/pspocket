@@ -1,14 +1,15 @@
-// cellSail's sound and graphics adapters (D-562, part 4a): libsail's own renderers that the game reads frames from
-// (GetFrame) instead of writing its own renderer. What does not need playback, as libsail (fw 4.92) has it:
+// cellSail's sound and graphics adapters (D-562 part 4, D-919): libsail's own renderers that the game reads frames from
+// (GetFrame) instead of writing its own renderer, and the user streams' AU receivers, as libsail (fw 4.92) has them:
 // - Sound adapter (0xD8 bytes): a CellSailRendererAudio (its callbacks libsail's own) with +0x50 the game's 3 callbacks
-//   and +0x5C their argument, +0x60 an lwmutex "_saisa0", +0x78 its state (7 initialized, 6 finalized), +0x90 the
-//   format it delivers, +0xC0 its AV-sync record, +0xD0 the first PTS (-1 none).
+//   and +0x5C their argument, +0x60 an lwmutex "_saisa0", +0x78 its state (7 initialized, 6 finalized, 0 closed, 1
+//   open), +0x90 the format it delivers, +0xA8 its frames, +0xAC a silent buffer, +0xB0 the frames' buffers, +0xB4
+//   their records, +0xC0 its AV-sync record, +0xD0 the first PTS (-1 none).
 // - Graphics adapter (0x100 bytes): a CellSailRendererVideo with +0x60 the game's 5 callbacks and +0x74 their argument,
-//   +0x78 an lwmutex "_saiga0", +0x90 its state, +0x98 the first PTS, +0xA8 the format it delivers, +0xDC its AV-sync
-//   record.
+//   +0x78 an lwmutex "_saiga0", +0x90 its state, +0x98 the first PTS, +0xA8 the format it delivers, +0xC8 a frame's
+//   duration, +0xCC its pictures (the game's), +0xD0 their records, +0xDC its AV-sync record.
 // UpdateAvSync feeds the player's clock: the audio and video halves measure the time per frame from the game's (frame,
-// time) reports, smoothed by a quarter. The adapters' renderer callbacks run once the player plays (a later part);
-// until then they fail loudly.
+// time) reports, smoothed by a quarter. The adapters' open and close are here; their start, stop and frames, and the
+// AU receiver's, are a later part and fail loudly until then.
 
 #include <cstring>
 #include <format>
@@ -25,12 +26,14 @@ namespace {
 using namespace sail;
 
 namespace sa {
-constexpr u32 kFuncs = 0x50, kArg = 0x5C, kMutex = 0x60, kState = 0x78, kFormat = 0x90, kSync = 0xC0, kFirstPts = 0xD0,
-              kSize = 0xD8, kPreferred = 0x38;
+constexpr u32 kFuncs = 0x50, kArg = 0x5C, kMutex = 0x60, kState = 0x78, kSession = 0x7C, kWord = 0x80, kFormat = 0x90,
+              kCount = 0xA8, kSilence = 0xAC, kBuffers = 0xB0, kRecords = 0xB4, kFrameBytes = 0xB8, kRead = 0xC4,
+              kWrite = 0xC8, kGet = 0xCC, kSync = 0xC0, kFirstPts = 0xD0, kSize = 0xD8, kPreferred = 0x38;
 }
 namespace ga {
-constexpr u32 kFuncs = 0x60, kArg = 0x74, kMutex = 0x78, kState = 0x90, kFirstPts = 0x98, kFormat = 0xA8, kSync = 0xDC,
-              kSize = 0x100, kPreferred = 0x40;
+constexpr u32 kFuncs = 0x60, kArg = 0x74, kMutex = 0x78, kState = 0x90, kSession = 0x94, kFirstPts = 0x98,
+              kFormat = 0xA8, kDuration = 0xC8, kCount = 0xCC, kDelay = 0xCE, kRecords = 0xD0, kSync = 0xDC,
+              kFree = 0xE0, kSize = 0x100, kPreferred = 0x40;
 }
 constexpr u32 kInitialized = 7, kFinalized = 6;
 
@@ -48,20 +51,14 @@ void not_yet(PPUContext& ctx, std::string_view name)
         not_yet(ctx, #n);                                                                                              \
         return error(CELL_SAIL_ERROR_FATAL);                                                                           \
     }
-SAIL_ADAPTER_STUB(saOpen)
-SAIL_ADAPTER_STUB(saClose)
 SAIL_ADAPTER_STUB(saStart)
 SAIL_ADAPTER_STUB(saStop)
 SAIL_ADAPTER_STUB(saCheckout)
 SAIL_ADAPTER_STUB(saCheckin)
-SAIL_ADAPTER_STUB(gaOpen)
-SAIL_ADAPTER_STUB(gaClose)
 SAIL_ADAPTER_STUB(gaStart)
 SAIL_ADAPTER_STUB(gaStop)
 SAIL_ADAPTER_STUB(gaCheckout)
 SAIL_ADAPTER_STUB(gaCheckin)
-SAIL_ADAPTER_STUB(auOpen)
-SAIL_ADAPTER_STUB(auClose)
 SAIL_ADAPTER_STUB(auStart)
 SAIL_ADAPTER_STUB(auStop)
 SAIL_ADAPTER_STUB(auCheckout)
@@ -95,6 +92,182 @@ s32 _pspocket_cellSail_auCleanup(PPUContext& ctx, u32 a) { return call_game(ctx,
 void _pspocket_cellSail_auCancel(PPUContext& ctx, u32 a) { call_game(ctx, a + 0xDC, a + 0xE8); }
 
 u32 internal(std::string_view name) { return HleProcess::current()->link_function("cellSail", recomp::nid_of(name), name); }
+
+u32 adapter_player(PPUContext& ctx, u32 a) { return r32(ctx, a + 0x14); }
+
+void audio_done(PPUContext& ctx, u32 a, s32 result) { post(ctx, adapter_player(ctx, a), 0x33, a, static_cast<u32>(result)); }
+void video_done(PPUContext& ctx, u32 a, s32 result) { post(ctx, adapter_player(ctx, a), 0x34, a, static_cast<u32>(result)); }
+
+// The sound adapter's open(format, frames): the frame buffers, their records and a silent buffer in one block from the
+// player's allocator (the silence after them before SDK 4.0, first since), the game told of the format (the session's
+// low 10 bits after it); answers the frames, or MEMORY.
+void _pspocket_cellSail_saOpen(PPUContext& ctx, u32 a, u32 format, u32 n)
+{
+    s32 result = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_lock", {a + sa::kMutex, 0}));
+    if (result >= 0) {
+        const s32 ch = static_cast<s8>(r8(ctx, format + 1));
+        const u32 frame = static_cast<u32>(static_cast<s16>(ps_read16(gb(ctx), format + 2)) * ch * 4);
+        std::memmove(gb(ctx) + a + sa::kFormat, gb(ctx) + format, 0x18);
+        w32(ctx, a + sa::kCount, n);
+        w32(ctx, a + sa::kFrameBytes, frame);
+        const u32 size = (n * frame + 0x7F) & ~0x7Fu;
+        const u32 mem = player_alloc(ctx, adapter_player(ctx, a), 0x80,
+            size + static_cast<u32>(ch) * 0x2000 + n * 0x20 - n * 4);
+        result = error(CELL_SAIL_ERROR_MEMORY);
+        if (mem) {
+            u32 ptrs, recs, silence;
+            if (sdk_version(ctx) < 0x400000) {
+                ptrs = mem + size;
+                for (u32 i = 0; i < n; i++) w32(ctx, ptrs + 4 * i, mem + i * frame);
+                recs = ptrs + 4 * n;
+                silence = recs + 0x18 * n;
+            } else {
+                const u32 base = mem + static_cast<u32>(ch) * 0x2000;
+                ptrs = base + size;
+                for (u32 i = 0; i < n; i++) w32(ctx, ptrs + 4 * i, base + i * frame);
+                recs = ptrs + 4 * n;
+                silence = mem;
+            }
+            w32(ctx, a + sa::kSilence, silence);
+            w32(ctx, a + sa::kState, 1);
+            w32(ctx, a + sa::kWord, 0);
+            w32(ctx, a + sa::kWrite, 0);
+            w32(ctx, a + sa::kRead, 0);
+            w32(ctx, a + sa::kGet, 0);
+            w32(ctx, a + sa::kSession, 0);
+            w32(ctx, a + sa::kBuffers, ptrs);
+            w32(ctx, a + sa::kRecords, recs);
+            StackVar copy(ctx, gb(ctx), 0x20);
+            std::memmove(gb(ctx) + copy.addr(), gb(ctx) + format, 0x18);
+            call_guest(ctx, r32(ctx, a + sa::kFuncs + 8),
+                {r32(ctx, a + sa::kArg), copy.addr(), (r32(ctx, a + sa::kSession) + 1) & 0x3FF});
+            result = static_cast<s32>(n);
+        }
+        lv2_lib(ctx, "sys_lwmutex_unlock", {a + sa::kMutex});
+    }
+    audio_done(ctx, a, result);
+}
+
+// Close: the block freed, closed (0); answers 0.
+void _pspocket_cellSail_saClose(PPUContext& ctx, u32 a)
+{
+    if (static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_lock", {a + sa::kMutex, 0})) >= 0) {
+        const u32 ptrs = r32(ctx, a + sa::kBuffers);
+        if (ptrs && r32(ctx, a + sa::kCount) && r32(ctx, a + sa::kSilence)) {
+            const u32 block = sdk_version(ctx) < 0x400000 ? r32(ctx, ptrs) : r32(ctx, a + sa::kSilence);
+            player_free(ctx, adapter_player(ctx, a), 0x80, block);
+            w32(ctx, a + sa::kBuffers, 0);
+        }
+        w32(ctx, a + sa::kState, 0);
+        lv2_lib(ctx, "sys_lwmutex_unlock", {a + sa::kMutex});
+    }
+    audio_done(ctx, a, 0);
+}
+
+// The frame's duration in 90 kHz ticks by frame rate code (23.976, 24, 25, 29.97, 30, 50, 59.94, 60 Hz; others 30).
+constexpr u16 kDuration[9] = {3753, 3750, 3600, 3003, 3000, 1800, 1501, 1500, 3000};
+
+// The graphics adapter's open(format, frames, least): the game's allocator gives the pictures (fewer than asked, not
+// fewer than the least), their records (0x28 bytes each) from the player's allocator, the game told of the format;
+// answers the pictures, or MEMORY (the pictures given back).
+void _pspocket_cellSail_gaOpen(PPUContext& ctx, u32 a, u32 format, u32 n, u32 least)
+{
+    StackVar arr(ctx, gb(ctx), (n * 4 + 30) & ~15u);
+    std::memset(gb(ctx) + arr.addr(), 0, n * 4);
+    s32 result = static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_lock", {a + ga::kMutex, 0}));
+    if (result < 0) {
+        video_done(ctx, a, result);
+        return;
+    }
+    std::memmove(gb(ctx) + a + ga::kFormat, gb(ctx) + format, 0x20);
+    w32(ctx, a + ga::kDuration, kDuration[static_cast<u32>(static_cast<s32>(static_cast<s8>(r8(ctx, format + 3)))) % 9]);
+    u32 size = static_cast<u32>(static_cast<s16>(ps_read16(gb(ctx), format + 6))) * r32(ctx, format + 8);
+    if (r8(ctx, format) == 3) size = (size * 3) >> 1;
+    const s32 got = static_cast<s32>(call_guest(ctx, r32(ctx, a + ga::kFuncs + 12),
+        {r32(ctx, a + ga::kArg), (size + 127) & ~127u, static_cast<u64>(static_cast<s64>(static_cast<s32>(n))), arr.addr()}));
+    bool ok = got >= 0;
+    if (ok && got != 0) {
+        if (static_cast<s32>(least) > got) ok = false;
+        else n = static_cast<u32>(got);
+    }
+    u32 recs = 0;
+    if (ok) ok = (recs = player_alloc(ctx, adapter_player(ctx, a), 8, (n * 40) & ~7u)) != 0;
+    for (u32 i = 0; ok && i < n; i++) {
+        const u32 buf = r32(ctx, arr.addr() + 4 * i);
+        w32(ctx, recs + 40 * i, buf);
+        if (!buf) {
+            player_free(ctx, adapter_player(ctx, a), 8, recs);
+            ok = false;
+            break;
+        }
+        w8(ctx, recs + 40 * i + 0x27, static_cast<u8>(i));
+    }
+    if (!ok) {
+        if (r32(ctx, arr.addr()))
+            call_guest(ctx, r32(ctx, a + ga::kFuncs + 16),
+                {r32(ctx, a + ga::kArg), static_cast<u64>(static_cast<s64>(static_cast<s32>(n))), arr.addr()});
+        lv2_lib(ctx, "sys_lwmutex_unlock", {a + ga::kMutex});
+        video_done(ctx, a, error(CELL_SAIL_ERROR_MEMORY));
+        return;
+    }
+    w32(ctx, a + ga::kState, 1);
+    for (const u32 f : {0xF8u, 0xE4u, 0xECu, 0xE8u, 0xF0u}) w32(ctx, a + f, 0);
+    w32(ctx, a + ga::kSession, 0);
+    w8(ctx, a + ga::kCount, static_cast<u8>(n));
+    w32(ctx, a + ga::kFree, recs);
+    w32(ctx, a + ga::kRecords, recs);
+    StackVar copy(ctx, gb(ctx), 0x20);
+    std::memmove(gb(ctx) + copy.addr(), gb(ctx) + format, 0x20);
+    call_guest(ctx, r32(ctx, a + ga::kFuncs + 8),
+        {r32(ctx, a + ga::kArg), copy.addr(), (r32(ctx, a + ga::kSession) + 1) & 0x3FF});
+    w8(ctx, a + ga::kDelay, static_cast<u8>(least - 1));
+    result = r8(ctx, a + ga::kCount);
+    lv2_lib(ctx, "sys_lwmutex_unlock", {a + ga::kMutex});
+    video_done(ctx, a, result);
+}
+
+// Close: the pictures given back to the game, the records freed, closed (0); answers 0.
+void _pspocket_cellSail_gaClose(PPUContext& ctx, u32 a)
+{
+    const u32 n = r8(ctx, a + ga::kCount);
+    StackVar arr(ctx, gb(ctx), (n * 4 + 30) & ~15u);
+    if (static_cast<s32>(lv2_lib(ctx, "sys_lwmutex_lock", {a + ga::kMutex, 0})) >= 0) {
+        if (const u32 recs = r32(ctx, a + ga::kRecords)) {
+            if (n) {
+                for (u32 i = 0; i < n; i++) w32(ctx, arr.addr() + 4 * i, r32(ctx, recs + 40 * i));
+                call_guest(ctx, r32(ctx, a + ga::kFuncs + 16), {r32(ctx, a + ga::kArg), n, arr.addr()});
+            }
+            player_free(ctx, adapter_player(ctx, a), 8, recs);
+            w32(ctx, a + ga::kRecords, 0);
+        }
+        w32(ctx, a + ga::kState, 0);
+        lv2_lib(ctx, "sys_lwmutex_unlock", {a + ga::kMutex});
+    }
+    video_done(ctx, a, 0);
+}
+
+// The AU receiver's open(type, filter): the game's open (none in fw 4.92), open (2) with its queue of four AUs empty;
+// answers through message 0x35. Close: the game's close, closed (1), message 0x36.
+void receiver_post(PPUContext& ctx, u32 rcv, u32 code, u32 value)
+{
+    post(ctx, r32(ctx, rcv + 0x20 + 0x30), code, rcv + 0x20, value);
+}
+
+void _pspocket_cellSail_auOpen(PPUContext& ctx, u32 rcv, u32 type, u32 filter)
+{
+    if (const u32 f = r32(ctx, rcv + 0xCC)) call_guest(ctx, f, {r32(ctx, rcv + 0xE8), type, filter});
+    w32(ctx, rcv, 2);
+    w32(ctx, rcv + 0xF4, 4);
+    for (const u32 f : {0x1ACu, 0xF8u, 0xFCu, 0xF0u, 0x1A4u, 0x1A8u}) w32(ctx, rcv + f, 0);
+    receiver_post(ctx, rcv, 0x35, 0);
+}
+
+void _pspocket_cellSail_auClose(PPUContext& ctx, u32 rcv)
+{
+    if (const u32 f = r32(ctx, rcv + 0xD0)) call_guest(ctx, f, {r32(ctx, rcv + 0xE8)});
+    w32(ctx, rcv, 1);
+    receiver_post(ctx, rcv, 0x36, 0);
+}
 
 // The adapters' renderer callback tables (libsail's data): 9 descriptors each.
 void init_sound_table(u8* b, u32 at)

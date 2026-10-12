@@ -12607,3 +12607,76 @@ compared with it running on pspocket (tests/hle/test_sail_source.cpp).
   parts 9-13 the first five scripts compared with 0 differences (576 checks), the same in five runs. A test without the
   firmware runs the direct script on pspocket's side alone and checks its answers, messages and the items' data
   against the file.
+
+## D-919 · 2026-10-12 · cellSail's playback engine from libsail (part 1: the file source merged)
+
+cellSail's last 17 functions (Start, Stop, Next, Cancel, OpenEs/ReopenEs/CloseEs of each kind, the adapters' GetFrame
+and GetFrame2, cellSailAuReceiverGet) need libsail's playback engine behind them: the elementary streams opened and
+closed, the data flow through the source, cellDmux, the decoders' pipelines and their copy threads to the renderers
+and AU receivers, the clock. It is made pspocket's own part by part, read from libsail.sprx (fw 4.92) and compared with
+it running on pspocket in tests/hle/test_sail.cpp (parts 14 on).
+
+Part 1: the built-in x-cell-fs file source (D-901; its first commit message says D-564) merged. Its OpenStream scripts
+had not run since the merge of D-562 parts 9-13 and differed only in the test: cellDmux keeps the pipeline's callback
+(each side's own code) in its memory, which the source's 2 MB buffer now comes before, so the fixed place the script
+masked missed it (masked now by value wherever it is in the allocator's memory); and the player's message ring held
+the reader thread's answer and the control thread's own completions in whatever order the threads ran (compared in no
+order now). The eight file source comparisons and the D-562 parts pass, three runs.
+
+## D-919 · 2026-10-12 · cellSail's elementary streams opened and closed, as libsail (part 2)
+
+The elementary streams of the current descriptor (runtime/hle/src/cellSailEs.cpp, cellSailDmux.cpp,
+cellSailRenderers.cpp, cellSailPipelines.cpp, cellSailAdapters.cpp): OpenEsAudio/Video/User, ReopenEs* and CloseEs*
+(9 of the 17), and the streams OpenStream opens and CloseStream closes.
+- **A stream's open** (state 1 at the slot's +0x155/+0x185/+0x85, its descriptor entry 2): with SDKs past 0x21FFFF its
+  part of the dmux pipeline is added (the slot's +0x10, 0x70 bytes: cellDmuxQueryEsAttr's memory from the player's
+  allocator, not enabled until it starts; a pipeline not open answers CANCEL); then at once the renderer's open
+  (audio: a sixth of a second of frames; video: the stream's frames by its rate, at least the extra frames + 1, which
+  it is also given) and the decoders' pipeline (audio, video) or the AU receiver (user), the slot's record counting them
+  (messages 0x54-0x56, 0x57-0x59, 0x5A-0x5B). The renderer is given its format: audio the stream's (ATRAC3plus folded
+  to stereo for a renderer that wants two channels; 48 kHz with audio parameter 32), video the picture's with the
+  renderer's pitch and alpha, its coding without post-processing, with it (video parameter 0) progressive pictures, its
+  aspect code and the size scaled by the two pixel aspect ratios (libsail's two small tables: the BT.601 ratios and the
+  doubled frame rates); SDKs 3.1 and 3.2 flag the audio renderer (0x40) for PAMF. All in: open (2), counted in +0x164 /
+  +0x165 (and +0x1CA/+0x1CB in mode 1), event 9 {kind, index}; failed (an error event, but not CANCEL with the later
+  SDKs) it is closed again with the open's handle and the record marked.
+- **The decoders**: audio by codec, its cellAdec parameters completed (LPCM's channel code by layout, AC3's mode, LFE,
+  output order and 1.0 gains, ATRAC3plus's output, the 0xF01D codec's rate index; module 38, 39, 40, 0xF01E, 0xF01B,
+  0xF01D), the parameters kept, cellAdecQueryAttr, the memory, cellAdecOpenExt with the slot's resource (+0x15C) on the
+  player's SPURS and libsail's callback (AU done 6, PCM out 7, sequence done 0x30, an error 0xD2 {error, 4, index}).
+  Video: MPEG-2 (36), AVC (37; the slot's SPU count by level), 0xF021, VC-1 (60), 0xF036; cellVdecQueryAttrEx and
+  cellVdecOpenEx with the slot's resource (+0x1F0) and libsail's callback (0xC, 0xD, 0x32, 0x24), the profile raised to
+  the codec's highest when refused; a refused open frees the memory and queries the original type again, so a decoder
+  that keeps refusing loops as libsail's does. cellVpost first with video parameter 0. libsail's sample rate converter
+  (audio parameter 32) is the firmware's libapostsrc_mini, which pspocket does not have: that path stops the process.
+- **A stream's close** (7): the pipeline closed (decoder, converter, cellVpost; an error message for each failure),
+  the renderer's close, the dmux part removed (a failure one more step at once; messages 0x64-0x66, 0x67-0x69,
+  0x6A-0x6B); all in: closed (0), the entry chosen again (1) or, after a failed open, cleared, uncounted, event 10
+  {kind, index} (libsail names a user stream's kind 1 here, its slip, kept).
+- **The calls** need an open stream (player state 4 or 6) with no call running and nothing deferred (+0x260); OpenEs a
+  stream not chosen (else USING), chosen through select_es with the game's reader (its answer the call's refusal);
+  ReopenEs one chosen: unchanged and not started, its dmux part set again (events 10 and 9) and the call completes with
+  that answer; changed, closed (0x8F) and opened again (0x8E). CloseEs an open stream (entry 2) closed (0xA0, 0xA3, 0xA6:
+  the entry cleared, the call completed with the close's answer). A failed open completes the call with 0 (the stream
+  closed again first); an open's step failing leaves only a ClearEs of the entry (2: refused), libsail's. The streams
+  of a started stream (stopped first, started after) are part 3's and stop the process until then.
+- The renderers' answers (0x33, 0x34): opening with frames is open with them, without closed; starting started (the
+  free frames announced: 0x11, 0x13); stopping waits for the frames out (8), a video renderer keeping its last frame
+  open; closing closed. The AU receiver answers 0x35 (opened), 0x36 (closed), 0x37, 0x38. The sound adapter's open
+  makes its frame buffers, records and a silent buffer in one block (the silence after them before SDK 4.0, first
+  since), the graphics adapter's asks the game for the pictures (fewer than asked, not fewer than the least) and keeps
+  0x28-byte records from the player's allocator; both tell the game of the format; their closes give them back.
+- The shared machinery moved where the parts can reach it: the player's lock and allocator, the events, the command
+  protocol, the modules, the SDK version (cellSail.hpp, sail namespace); the dmux pipeline to cellSailDmux.cpp with
+  its elementary streams and both cellDmux callbacks; cellSailDescriptorClearEs's body (clear_es) without its
+  descriptor check, as the player uses it. libvdec is the module pspocket registers cellVdec's functions under.
+- **Compared** (tests/hle/test_sail.cpp parts 14 and 15, `[sail]`): a mode-0 player with the game's audio renderer, a
+  graphics adapter (the game's pictures) and an AU receiver over AVC 96x64, ATRAC3plus and user data: OpenStream
+  opening all three, each call's refusals, CloseEs/OpenEs/ReopenEs of each kind, CloseStream; a mode-1 player with a
+  sound adapter, the game's video renderer and an AU receiver over five streams: ReopenEs to LPCM and to a 128x64
+  picture (closed and opened again with the new decoders), an open the renderer refuses, OpenEs again, CloseStream, a
+  second stream left open at Finalize. The answers, each thread's lv2 calls, the script's memory, the allocator's
+  memory (the player's block, descriptors, the decoders' and dmux memory) and a records area of every callback and
+  event with tags for what they are: 0 differences, three runs. The parts' harness gives them a 64 MB heap, links the
+  decoders' internal functions as the loader does, masks each side's own code by value (pspocket's descriptors,
+  anything in libsail's segments) and compares the message rings in no order.

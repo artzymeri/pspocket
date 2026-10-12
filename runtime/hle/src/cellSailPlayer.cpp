@@ -17,6 +17,29 @@
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
+namespace sail {
+
+// What libsail's module start reads once: the process's SDK version (sys_process_get_sdk_version); its flag for SDKs
+// past 0x21FFFF follows from it.
+struct SailGlobals {
+    bool read = false;
+    u32 sdk = 0;
+};
+
+u32 sdk_version(PPUContext& ctx)
+{
+    SailGlobals& g = HleProcess::current()->state<SailGlobals>();
+    if (!g.read) {
+        g.read = true;
+        g.sdk = thread_of(ctx).kernel.config().sdk_version;
+    }
+    return g.sdk;
+}
+
+bool sdk_after_22(PPUContext& ctx) { return sdk_version(ctx) > 0x21FFFF; }
+
+} // namespace sail
+
 namespace {
 
 using namespace sail;
@@ -75,23 +98,6 @@ s32 lwmutex_create(PPUContext& ctx, u32 at, const char* name)
 
 s32 lock(PPUContext& ctx, u32 p) { return sc(ctx, 102, {r32(ctx, p + pl::kLock), 0}); }
 s32 unlock(PPUContext& ctx, u32 p) { return sc(ctx, 104, {r32(ctx, p + pl::kLock)}); }
-
-// What libsail's module start reads once: the process's SDK version (sys_process_get_sdk_version) and the default it
-// gives a video stream's +0x188 (2; module start arguments may change it, which pspocket's modules do not have).
-struct SailGlobals {
-    bool read = false;
-    u32 sdk = 0;
-};
-
-u32 sdk_version(PPUContext& ctx)
-{
-    SailGlobals& g = HleProcess::current()->state<SailGlobals>();
-    if (!g.read) {
-        g.read = true;
-        g.sdk = thread_of(ctx).kernel.config().sdk_version;
-    }
-    return g.sdk;
-}
 
 // ------------------------------------------------------------------------------------------------- AV sync
 

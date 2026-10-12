@@ -94,6 +94,8 @@ u64 module_call(PPUContext& ctx, std::string_view module, std::string_view name,
 // through `es` (for PAMF, a reader set to the stream) or, without, the descriptor's reader set to the kind's `index`-th
 // stream. 1 when the stream's format changed, 0 when not, or the error.
 s32 select_es(PPUContext& ctx, u32 d, s32 kind, u32 index, u32 es);
+// A chosen (1) elementary stream's entry back to 0 (cellSailDescriptorClearEs without its descriptor check).
+s32 clear_es(PPUContext& ctx, u32 d, s32 kind, u32 index);
 
 // The per-stream pipelines (cellSailPipelines.cpp): the audio one at an audio slot's +0x80, the video one at a video
 // slot's +0x80; the renderers' and AU receivers' makeup and cleanup through their callbacks.
@@ -116,5 +118,130 @@ s32 post_urgent(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
 s32 post_message(PPUContext& ctx, u32 player, u32 code, u32 a, u32 b, u32 c);
 // Posts a call's completion {0, result, handle} (nothing when the handle is 0).
 s32 post_completion(PPUContext& ctx, u32 player, s32 result, u64 handle);
+
+// ------------------------------------------------------------------------------------------------- the playback engine
+
+// What the playback's parts share (D-919; cellSailControl.cpp unless noted).
+
+// The game's allocator (alloc(arg, boundary, size), free(arg, boundary, ptr)) and the player's lock.
+u32 player_alloc(PPUContext& ctx, u32 p, u32 boundary, u32 size);
+void player_free(PPUContext& ctx, u32 p, u32 boundary, u32 ptr);
+s32 player_lock(PPUContext& ctx, u32 p);
+s32 player_unlock(PPUContext& ctx, u32 p);
+
+// Events: the game's handler (major << 32, a, b) when it subscribed to `major`; an error (major 1, "error 0x%X" printed
+// first); a call's completion (major 2) when the call is the one running, and the same under the player's lock.
+void notify_event(PPUContext& ctx, u32 p, u32 major, u64 a, u64 b);
+void notify_error(PPUContext& ctx, u32 p, s32 err);
+void notify_completed(PPUContext& ctx, u32 p, u32 command, s32 result);
+void call_completed(PPUContext& ctx, u32 p, u32 call, s32 result);
+// A pipeline's error for the player (message 0xD2 {error, kind (3 dmux, 4 audio, 5 video), index}).
+s32 post_error(PPUContext& ctx, u32 p, s32 err, u32 kind, u32 index);
+// Stops the process at a path a later part of D-919 makes pspocket's (the call site logged).
+[[noreturn]] void later_part(PPUContext& ctx, std::string_view what);
+
+// libsail's command protocol: the game's thread posts the command at the queue's head with a reply record and waits
+// (the lock's error, or 0 with the answer at `reply`); the control thread answers under the player's lock (false when
+// the signal failed: the lock kept).
+s32 command(PPUContext& ctx, u32 p, u32 code, u32 arg, u32 reply);
+s32 command_answer(PPUContext& ctx, u32 p, u32 code, u32 arg);
+bool answer(PPUContext& ctx, u32 p, u32 record, s32 result);
+
+// Whether libsail loads the modules it needs (not in system software, as its module start reads the authority).
+bool loads_modules(PPUContext& ctx);
+// cellSysmodule's loads and unloads as libsail makes them (none in system software; internal ones from 0xF000).
+s32 load_module(PPUContext& ctx, u32 id);
+s32 unload_module(PPUContext& ctx, u32 id);
+// The process's SDK version as libsail's module start reads it, and libsail's flag for SDKs past 0x21FFFF.
+u32 sdk_version(PPUContext& ctx);
+bool sdk_after_22(PPUContext& ctx);
+
+// A step's handle: the message its completion becomes (code << 32) and its record (+0 flags: 0x20 in use, 1 failed; +4
+// the steps still out; +8 the handle of what it belongs to).
+inline u64 step(u32 code, u32 record) { return u64{code} << 32 | record; }
+
+// The descriptor's fields.
+namespace ds {
+constexpr u32 kType = 0, kHeader = 4, kUri = 0x10, kMediaInfo = 0x14, kPlayer = 0x1C, kProtocol = 0x20,
+              kSource = 0x24, kAudio = 0x28, kVideo = 0x2C, kUser = 0x30, kNext = 0x34, kState = 0x38, kNoAuto = 0x39,
+              kReader = 0x40, kMuxRate = 0xC4, kModule = 0xC0, kBuffer = 0xC8, kHeaderSize = 0xCC, kStreamSize = 0xD0,
+              kDuration = 0xD8;
+constexpr u32 kAudioStride = 0x90, kVideoStride = 0x78, kUserStride = 0x4C;
+} // namespace ds
+
+// The stream slots in the player's block: +0 the record of the stream's open or close (0x10 bytes), +0x10 its part of
+// the dmux pipeline (0x70 bytes), then its pipeline, renderer or AU receiver, and its settings.
+namespace as {
+constexpr u32 kDmuxEs = 0x10, kPipeline = 0x80, kRenderer = 0x150, kIndex = 0x154, kState = 0x155, kMode = 0x156,
+              kSrc = 0x158, kAdecResource = 0x15C;
+}
+namespace vs {
+constexpr u32 kDmuxEs = 0x10, kPipeline = 0x80, kRenderer = 0x180, kIndex = 0x184, kState = 0x185, kMode = 0x186,
+              kExtraFrames = 0x188, kFrames = 0x189, kFramesMany = 0x18A, kSpus = 0x18B, kSpusHigh = 0x18C,
+              kVpost = 0x18D, kVc1 = 0x18E, kVpostCtrl = 0x190, kVdecResource = 0x1F0, kSpursResource = 0x20C,
+              kVpostResource = 0x21C;
+}
+namespace us {
+constexpr u32 kDmuxEs = 0x10, kReceiver = 0x80, kIndex = 0x84, kState = 0x85;
+}
+inline u32 audio_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kAudio) + i * pl::kAudioStride; }
+inline u32 video_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kVideo) + i * pl::kVideoStride; }
+inline u32 user_slot(PPUContext& ctx, u32 p, u32 i) { return r32(ctx, p + pl::kUser) + i * pl::kUserStride; }
+
+// The dmux pipeline (0x58 bytes at the player's +0x300) and the elementary streams in it (cellSailDmux.cpp).
+namespace dmx {
+constexpr u32 kHandleCall = 0, kState = 0x10, kWanted = 0x14, kWord = 0x18, kModule = 0x1C, kField20 = 0x20,
+              kPending = 0x24, kEsList = 0x28, kEsCount = 0x2C, kEnabled = 0x30, kPlayer = 0x34, kSource = 0x38,
+              kMemory = 0x3C, kDeferred = 0x40, kHandle = 0x44, kType = 0x48, kSize = 0x58;
+}
+// An elementary stream's part (0x70 bytes): +0 cellDmux's ES handle, +4 the kind, +8 AUs found and not taken, +0xC AUs
+// not released, +0x10 an AU put back (0x28 bytes), +0x38 the slot, +0x3C the next on the pipeline's list, +0x40 the
+// pipeline, +0x44 its memory, +0x48 the memory's size, +0x4C the ES filter (16 bytes), +0x5C the ES specific info (12),
+// +0x68 1 while an AU is put back.
+namespace des {
+constexpr u32 kHandle = 0, kKind = 4, kFound = 8, kHeld = 0xC, kSaved = 0x10, kSlot = 0x38, kNext = 0x3C,
+              kPipeline = 0x40, kMemory = 0x44, kMemorySize = 0x48, kFilter = 0x4C, kSpecific = 0x5C, kHasSaved = 0x68,
+              kSize = 0x70;
+}
+void dmux_init(PPUContext& ctx, u32 dm, u32 p);
+void dmux_open(PPUContext& ctx, u32 dm, u32 type, u32 source, u64 handle);
+void dmux_close(PPUContext& ctx, u32 dm, u64 handle);
+void dmux_fini(PPUContext& ctx, u32 dm);
+s32 dmux_es_add(PPUContext& ctx, u32 dm, u32 kind, u32 filter, u32 specific, u32 slot, u32 es, bool enable);
+s32 dmux_es_remove(PPUContext& ctx, u32 dm, u32 es);
+s32 dmux_es_readd(PPUContext& ctx, u32 dm, u32 kind, u32 filter, u32 specific, u32 slot, u32 es);
+
+// The renderers as the player drives them (cellSailRenderers.cpp), and the user streams' AU receivers (their object at
+// the receiver's +0x20): each step completes the handle given.
+void audio_renderer_open(PPUContext& ctx, u32 r, u32 format, u32 slot, u64 handle);
+void video_renderer_open(PPUContext& ctx, u32 r, u32 format, u32 slot, u64 handle);
+void audio_renderer_close(PPUContext& ctx, u32 r, u64 handle);
+void video_renderer_close(PPUContext& ctx, u32 r, u64 handle);
+void audio_renderer_completed(PPUContext& ctx, u32 r, s32 result);
+void video_renderer_completed(PPUContext& ctx, u32 r, s32 result);
+void receiver_open(PPUContext& ctx, u32 t, u32 type, u32 filter, u32 slot, u64 handle);
+void receiver_close(PPUContext& ctx, u32 t, u64 handle);
+void receiver_answered(PPUContext& ctx, u32 t, u32 code, s32 result);
+
+// The decoders' pipelines (cellSailPipelines.cpp): opened for an elementary stream's entry, closed; each completes the
+// handle given.
+void audio_pipeline_open(PPUContext& ctx, u32 a, u32 type, u32 params, u32 format, u32 es, u32 renderer, u32 slot,
+    u64 handle);
+void audio_pipeline_close(PPUContext& ctx, u32 a, u64 handle);
+void video_pipeline_open(PPUContext& ctx, u32 v, u32 type, u32 picture, u32 format, u32 es, u32 renderer, u32 slot,
+    u64 handle);
+void video_pipeline_close(PPUContext& ctx, u32 v, u64 handle);
+
+// The elementary streams opened and closed (cellSailEs.cpp): one stream of each kind, the slot's record counting its
+// steps (`failed` marks the record: the stream is being closed after a failed open).
+void es_open_audio(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 entry, u64 handle);
+void es_open_video(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 entry, u64 handle);
+void es_open_user(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 entry, u64 handle);
+void es_close_audio(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
+void es_close_video(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
+void es_close_user(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
+// The control thread's messages of the elementary streams (their steps and the OpenEs, ReopenEs and CloseEs calls):
+// true when `code` was one of them.
+bool es_message(PPUContext& ctx, u32 p, u32 code, u32 a, u32 b, u32 c);
 
 } // namespace pspocket::hle::sail
