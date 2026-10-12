@@ -52,6 +52,8 @@ u32 dmux(u32 p) { return p + pl::kDmux; }
 constexpr u8 kAspect[6][2] = {{4, 3}, {1, 1}, {16, 15}, {8, 9}, {64, 45}, {32, 27}};
 constexpr u32 kDoubled[9] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 5, 6, 7, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 
+} // namespace
+
 // The audio format the renderer is given (the entry's +0x78): the stream's, ATRAC3plus's channels folded to two for a
 // renderer that wants two, 48 kHz with audio parameter 32 when the renderer wants it (its frame 640 samples for the
 // 44.1 kHz family, else 480).
@@ -140,6 +142,8 @@ void video_out_format(PPUContext& ctx, u32 e, u32 slot)
     }
     w32(ctx, f + 8, static_cast<u32>(out));
 }
+
+namespace {
 
 // The dmux part added for an open (SDKs past 0x21FFFF): 0, or the error (INVALID_STATE, a pipeline not open, reads as
 // CANCEL) completing the open's first step with the record's one step.
@@ -347,6 +351,21 @@ void close_kind(PPUContext& ctx, u32 p, u32 kind, u32 slot, u64 handle, bool fai
     else es_close_user(ctx, p, slot, handle, failed);
 }
 
+// A started stream's stop and start (cellSailPlay.cpp's, by kind).
+void stop_kind(PPUContext& ctx, u32 p, u32 kind, u32 d, u32 slot, u32 index, u32 keep, u64 handle)
+{
+    if (kind == 0) es_stop_audio(ctx, p, d, slot, index, keep, handle, false);
+    else if (kind == 1) es_stop_video(ctx, p, d, slot, index, keep, handle, false);
+    else es_stop_user(ctx, p, d, slot, index, keep, handle, false);
+}
+
+void start_kind(PPUContext& ctx, u32 p, u32 kind, u32 d, u32 slot, u32 index, u64 handle)
+{
+    if (kind == 0) es_start_audio(ctx, p, d, slot, index, handle);
+    else if (kind == 1) es_start_video(ctx, p, d, slot, index, handle);
+    else es_start_user(ctx, p, d, slot, index, handle);
+}
+
 u32 slot_index(PPUContext& ctx, u32 slot, u32 kind)
 {
     return r8(ctx, slot + (kind == 0 ? as::kIndex : kind == 1 ? vs::kIndex : us::kIndex));
@@ -360,7 +379,7 @@ constexpr u32 kCloseSteps[3] = {0x9F, 0xA2, 0xA5};
 // OpenEs / ReopenEs {index, the elementary stream, the game's u64, reopen}: the stream chosen through select_es (one
 // chosen already needs reopen: USING), its call running (4-6, or 13-15 for a reopen). A stream not chosen is opened; a
 // reopened one has its entry chosen and, not started and its format unchanged, its dmux part set again (events 10 and
-// 9, completing at once), else it is closed and opened again (started streams: a later part).
+// 9, completing at once), else it is closed and opened again; in a started stream it is stopped and started again.
 void open_es_call(PPUContext& ctx, u32 p, u32 kind, u32 args, u32 record)
 {
     const u32 d = r32(ctx, p + pl::kCurrentDescriptor);
@@ -402,8 +421,11 @@ void open_es_call(PPUContext& ctx, u32 p, u32 kind, u32 args, u32 record)
         return;
     }
     w8(ctx, e, 2);
-    const bool open_only = r8(ctx, p + kStreamPhase) == 2;
-    if (!open_only) later_part(ctx, "reopening an elementary stream of a started stream");
+    if (r8(ctx, p + kStreamPhase) != 2) {
+        // A started stream is stopped first (a video renderer keeping its last frame), its format changed or not.
+        stop_kind(ctx, p, kind, d, slot, index, 1, step(steps + 3, rec));
+        return;
+    }
     if (changed != 0) {
         close_kind(ctx, p, kind, slot, step(steps + 2, rec), false);
         return;
@@ -423,13 +445,13 @@ void open_es_step(PPUContext& ctx, u32 p, u32 kind, u32 which, s32 result, u32 r
     const u8 phase = r8(ctx, p + kStreamPhase);
     const u32 call = r32(ctx, p + kCallRunning);
     switch (which) {
-    case 0: // started
-        if (result < 0) close_kind(ctx, p, kind, slot, step(steps + 2, rec), true);
+    case 0: // started: failed, closed again (libsail gives the close the record 0, whose completion it then reads)
+        if (result < 0) close_kind(ctx, p, kind, slot, step(steps + 2, 0), true);
         else call_completed(ctx, p, call, 0);
         break;
-    case 1: // opened
+    case 1: // opened: in a started stream started too
         if (result < 0) clear_es(ctx, d, static_cast<s32>(kind), index);
-        else if (phase == 4) later_part(ctx, "starting an elementary stream opened in a started stream");
+        else if (phase == 4) start_kind(ctx, p, kind, d, slot, index, step(steps + 0, rec));
         else call_completed(ctx, p, call, 0);
         break;
     case 2: // closed (to open again)
@@ -440,12 +462,22 @@ void open_es_step(PPUContext& ctx, u32 p, u32 kind, u32 which, s32 result, u32 r
             open_kind(ctx, p, kind, d, slot, entry_of(ctx, d, kind, index), step(steps + 1, rec));
         }
         break;
-    default: later_part(ctx, "an elementary stream of a started stream stopped for a reopen"); break;
+    default: // stopped for a reopen: event 10; failed, closed (on record 0, as libsail); started again while the stream
+             // plays (event 9), its new entry's format taken as it is
+        notify_event(ctx, p, 10, kind, index);
+        if (result < 0) {
+            close_kind(ctx, p, kind, slot, step(steps + 2, 0), true);
+            break;
+        }
+        if (phase != 4) break;
+        notify_event(ctx, p, 9, kind, index);
+        start_kind(ctx, p, kind, d, slot, index, step(steps + 0, rec));
+        break;
     }
 }
 
-// CloseEs {index, the game's u64}: a chosen and open stream (its entry 2) closed (started ones stopped first: a later
-// part), its call 7-9 running.
+// CloseEs {index, the game's u64}: a chosen and open stream (its entry 2) closed (a started one stopped first), its call
+// 7-9 running.
 void close_es_call(PPUContext& ctx, u32 p, u32 kind, u32 args, u32 record)
 {
     const u32 d = r32(ctx, p + pl::kCurrentDescriptor);
@@ -472,7 +504,7 @@ void close_es_call(PPUContext& ctx, u32 p, u32 kind, u32 args, u32 record)
     w32(ctx, rec + 4, index);
     const u32 slot = slot_of(ctx, p, kind, index);
     const u32 st = slot_state(ctx, slot, kind);
-    if (st == 4) later_part(ctx, "closing an elementary stream of a started stream");
+    if (st == 4) stop_kind(ctx, p, kind, d, slot, index, 0, step(kCloseSteps[kind], rec));
     else if (st == 2) close_kind(ctx, p, kind, slot, step(kCloseSteps[kind] + 1, rec), false);
 }
 

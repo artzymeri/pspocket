@@ -24,6 +24,8 @@
 
 #include "firmware_compare.hpp"
 #include "hle_test_util.hpp"
+#include "atrac_writer.hpp"
+#include "h264_writer.hpp"
 #include "pamf_writer.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/nid.hpp"
@@ -113,6 +115,13 @@ void part13(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part14(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part15(u8* b, const Call& call, u32 cb, GuestThread& t);
 void part16(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part17(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part18(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part19(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part20(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part21(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part22(u8* b, const Call& call, u32 cb, GuestThread& t);
+void part23(u8* b, const Call& call, u32 cb, GuestThread& t);
 constexpr u32 kHeap = kData + 0x40000, kHeapPtr = kArea + 0xF00, kDump = kData + 0x100000, kDumpSize = 0x8000;
 // Parts 14 on (the playback, D-919): the decoders' memory needs a larger heap of its own, the many callbacks and events
 // a records area of their own, and the guest code its own place.
@@ -208,7 +217,14 @@ Run run(const std::string& flash, bool sony, int part)
     else if (part == 13) part13(b, call, cb, t);
     else if (part == 14) part14(b, call, cb, t);
     else if (part == 15) part15(b, call, cb, t);
-    else part16(b, call, cb, t);
+    else if (part == 16) part16(b, call, cb, t);
+    else if (part == 17) part17(b, call, cb, t);
+    else if (part == 18) part18(b, call, cb, t);
+    else if (part == 19) part19(b, call, cb, t);
+    else if (part == 20) part20(b, call, cb, t);
+    else if (part == 21) part21(b, call, cb, t);
+    else if (part == 22) part22(b, call, cb, t);
+    else part23(b, call, cb, t);
     f.kernel->set_syscall_observer(nullptr, nullptr);
     if (std::getenv("SAIL_RECORDS") && part >= 14)
         for (u32 i = 0; i < ps_read32(b, kRecords2); i++) {
@@ -272,14 +288,19 @@ Run run(const std::string& flash, bool sony, int part)
     std::vector<std::string> others;
     for (const auto& [id, calls] : tr.others) {
         // A wait for work and the signal after it (other threads' only) depend on when the work came: left out.
-        std::string all = "thread:";
+        std::vector<std::string> kept;
         for (usize i = 0; i < calls.size(); i++) {
             if (calls[i].starts_with("107(")) {
                 if (i + 1 < calls.size() && calls[i + 1].starts_with("108(")) i++;
                 continue;
             }
-            all += " " + calls[i];
+            kept.push_back(calls[i]);
         }
+        // Parts 17 on (the decoders' and copy threads' messages arriving as those threads run): each thread's calls
+        // compared in no order.
+        if (part >= 17) std::sort(kept.begin(), kept.end());
+        std::string all = "thread:";
+        for (const std::string& c : kept) all += " " + c;
         others.push_back(all);
     }
     std::sort(others.begin(), others.end());
@@ -2046,10 +2067,10 @@ void part16(u8* b, const Call& call_, u32, GuestThread&)
         tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
         kSrcCode + 0x78};
     for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
-    std::memset(b + kItems, 0, 0x100);
+    std::memset(b + kItems, 0, 0x1000);
     // The source's capabilities (getCapabilities(arg, type, media info, URI, out): {by position, by time, to the end,
     // by index}).
-    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF0;
+    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF00;
     const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
         0x38600000u, 0x4E800020u};
     for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
@@ -2091,7 +2112,7 @@ void part16(u8* b, const Call& call_, u32, GuestThread&)
     const auto items = [&](u32 first, u32 n) {
         ps_write32(b, kItems, 0);
         for (u32 i = 0; i < n; i++) {
-            const u32 item = kItems + 0x40 + 0x10 * i;
+            const u32 item = kItems + 0x400 + 0x10 * i;
             ps_write32(b, item, kStreamData + 0x1000 * (first + i));
             ps_write32(b, item + 4, 0x1000);
             ps_write32(b, item + 8, ps_read32(b, kP + 4));
@@ -2203,6 +2224,1220 @@ void part16(u8* b, const Call& call_, u32, GuestThread&)
     mask_records(b);
     mask_ring(b, kP);
 }
+
+// AVC pictures (I_PCM IDRs; 96x64 on channel 0 unless asked otherwise) and silent ATRAC3plus frames (each after its
+// ATS header: 48 kHz stereo, 688 bytes) in packs: each picture's AU over packs of up to 1900 bytes (its PTS and DTS on the first, which names the RAP), then
+// `audio` packs of two frames each; a program end last.
+std::vector<u8> av_packs(u32 pictures, u32 audio, int width = 96, int height = 64, u8 video_id = 0xE0)
+{
+    std::vector<u8> s;
+    const auto add = [&](const pamf::Pes& p) {
+        const std::vector<u8> pk = pamf::pack(p);
+        s.insert(s.end(), pk.begin(), pk.end());
+    };
+    std::vector<u8> frame = {0x0F, 0xD0, 0x48, 0x55, 0, 0, 0, 0};
+    const std::vector<u8> body = atrac::silent_frame(8);
+    frame.insert(frame.end(), body.begin(), body.end());
+    u32 frames = 0;
+    for (u32 i = 0; i < pictures; i++) {
+        const std::vector<u8> v = h264::access_unit(h264::pattern(width, height, static_cast<int>(i)), i);
+        const u64 pts = 0x1000 + 3003 * u64{i};
+        for (usize at = 0; at < v.size(); at += 1900) {
+            pamf::Pes pes{video_id, pamf::slice(v, at, std::min(v.size(), at + 1900)), std::nullopt, std::nullopt};
+            if (at == 0) {
+                pes.pts = pts;
+                pes.dts = pts;
+                pes.rap_channel = 0;
+            }
+            add(pes);
+        }
+        for (u32 k = 0; k < audio; k++) {
+            std::vector<u8> two = frame;
+            two.insert(two.end(), frame.begin(), frame.end());
+            add({0xBD, pamf::private_stream(0x00, two), 0x1000 + 3840 * u64{frames}, std::nullopt});
+            frames += 2;
+        }
+    }
+    std::vector<u8> end(pamf::kPack, 0xFF);
+    end[0] = 0x00, end[1] = 0x00, end[2] = 0x01, end[3] = 0xB9;
+    s.insert(s.end(), end.begin(), end.end());
+    return s;
+}
+
+// The playback through the adapters (D-919 part 4): a mode-1 player (no AV sync) with a sound adapter and a graphics
+// adapter (the game's pictures) over AVC 96x64 and ATRAC3plus: started, the items fed, the decoders' frames copied into
+// the adapters' frames; SoundAdapterGetFrame of several sizes, GraphicsAdapterGetFrame and GetFrame2 (the previous
+// frame asked for, each flag); the input's end drained through them until the end; CloseStream; Finalize.
+void adapters_playback(u8* b, const Call& call_, bool sync)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    const std::vector<u8> packs = av_packs(12, 1);
+    write_pamf(b, {avc96x64(), at3_stereo()}, static_cast<u32>(packs.size() / pamf::kPack));
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSad = kArea + 0x2800, kGad = kArea + 0x2900, kInfo = kArea + 0x2A00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kSF = kCode3 + 0xA00, kGF = kCode3 + 0xA40, kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480, kGetCaps = kCode2 + 0x500, kRecAdapter = kCode2 + 0x580,
+              kRecFormat = kCode2 + 0x600, kRecFree = kCode2 + 0x680, kPicsCode = kCode2 + 0x700;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    tagged_code(b, kRecAdapter, 4);
+    tagged_code(b, kRecFormat, 5);
+    tagged_code(b, kRecFree, 6);
+    items_code(b, kCheckoutCode, kItems);
+    pictures_code(b, kPicsCode, g_heap + kBigHeapSize - 0x200000);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    const u32 kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    const u32 sf[3] = {tagged(kRecAdapter), tagged(kRecAdapter), tagged(kRecFormat)};
+    for (u32 i = 0; i < 3; i++) ps_write32(b, kSF + 4 * i, sf[i]);
+    const u32 gf[5] = {tagged(kRecAdapter), tagged(kRecAdapter), tagged(kRecFormat), kPicsCode + 0x70, tagged(kRecFree)};
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kGF + 4 * i, gf[i]);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    const u32 quiet_ms = sync ? 30 : 100;
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < quiet_ms && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items: four packs each (the last what is left), their session word the player's.
+    const u32 total = static_cast<u32>(packs.size());
+    const u32 n_items = (total + 0x1FFF) / 0x2000;
+    const auto items = [&] {
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n_items; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, kStreamData + 0x2000 * i);
+            ps_write32(b, item + 4, std::min<u32>(0x2000, total - 0x2000 * i));
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+    };
+    u32 infos = 0;
+    const auto info = [&] { return kInfo + 0x20 * (infos % 0x28); };
+    const auto sound = [&](u32 samples) {
+        const u64 r = call("cellSailSoundAdapterGetFrame", {kSad, samples, info()});
+        infos++;
+        settle();
+        return r;
+    };
+    const auto graphics = [&] {
+        const u64 r = call("cellSailGraphicsAdapterGetFrame", {kGad, info()});
+        infos++;
+        settle();
+        return r;
+    };
+    const auto graphics2 = [&](u64 flags) {
+        const u64 r = call("cellSailGraphicsAdapterGetFrame2", {kGad, info(), info() + 0x18, kOut + 0xF0, flags});
+        infos++;
+        settle();
+        return r;
+    };
+    // The game's AV-sync reports: audio every 256 samples (5333 us), video every frame of 59.94 Hz.
+    u32 audio_frame = 0, video_frame = 0;
+    const auto audio_sync = [&] {
+        call("cellSailSoundAdapterUpdateAvSync", {kSad, audio_frame, 1000 + 5333 * u64{audio_frame}}, true);
+        audio_frame++;
+    };
+    const auto video_sync = [&] {
+        call("cellSailGraphicsAdapterUpdateAvSync", {kGad, video_frame, 1000 + 16683 * u64{video_frame}}, true);
+        video_frame++;
+    };
+
+    call("cellSailPlayerInitialize", {kP, sync ? 0u : 1u, kMem, tagged(kRecHandler), 0x22, 1, 1, 0, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailSoundAdapterInitialize", {kSad, kSF, 0x55});
+    call("cellSailGraphicsAdapterInitialize", {kGad, kGF, 0x66});
+    call("cellSailPlayerSetSoundAdapter", {kP, 0, kSad});
+    call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGad});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    // The adapters before anything is open.
+    sound(256);
+    graphics();
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut});
+    const u32 d = ps_read32(b, kOut);
+    call("cellSailDescriptorOpen", {d});
+    call("cellSailPlayerAddDescriptor", {kP, d});
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    sound(256);
+    graphics2(0);
+    call("cellSailPlayerStart", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    sound(256);
+    graphics();
+    items();
+    for (u32 i = 0; i < n_items; i++) {
+        call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+        settle();
+    }
+    until([&] { return tagged_count(10) >= 2; });
+    settle();
+    if (std::getenv("SAIL_TRACE"))
+        std::fprintf(stderr, "DBG checkins %u sound state %u ready %u of %u graphics state %u ready %u of %u\n",
+            tagged_count(10), ps_read32(b, kSad + 0x78), ps_read32(b, kSad + 0xBC), ps_read32(b, kSad + 0xA8),
+            ps_read32(b, kGad + 0x90), ps_read32(b, kGad + 0xD8), b[kGad + 0xCC]);
+    if (!sync) {
+        // (The adapter's buffer holds 2048 samples: libsail copies past it for more.)
+        for (const u32 n : {256u, 1024u, 2048u, 100u, 1500u}) sound(n);
+        graphics();
+        graphics2(0);
+        graphics2(1);
+        graphics2(2);
+        graphics();
+        call("cellSailSourceNotifyInputEos", {kSource}, true);
+        settle();
+        // Drained: each adapter until it has ended (open again: the frames it gave the game back too).
+        for (u32 i = 0; i < 40 && load32_acquire(b, kGad + 0x90) != 1; i++) graphics2(0);
+        for (u32 i = 0; i < 40 && load32_acquire(b, kSad + 0x78) != 1; i++) sound(2048);
+    } else {
+        // A game's output: 256 samples a tick with its report, a video frame (each GetFrame2 flag in turn) every third
+        // tick with its report; the input's end meanwhile; on until both adapters have ended.
+        static const u64 kFlags[] = {0, 2, 1, 0, 3};
+        for (u32 tick = 0; tick < 400; tick++) {
+            if (tick == 60) {
+                call("cellSailSourceNotifyInputEos", {kSource}, true);
+                settle();
+            }
+            const bool audio_on = load32_acquire(b, kSad + 0x78) != 1 || tick < 60;
+            const bool video_on = load32_acquire(b, kGad + 0x90) != 1 || tick < 60;
+            if (!audio_on && !video_on) break;
+            // The game shows no video for its first 30 ticks (the frames due by then dropped but the latest), slows
+            // down for a while (a video frame every ninth tick) and its audio reports jump ahead once.
+            if (tick == 120) audio_frame += 30;
+            if (audio_on) {
+                sound(256);
+                audio_sync();
+            }
+            if (video_on && tick >= 30 && tick % (tick < 100 ? 9 : 3) == 0) {
+                if (tick % 15 == 9) graphics();
+                else graphics2(kFlags[(tick / 3) % 5]);
+                video_sync();
+            }
+        }
+    }
+    if (std::getenv("SAIL_TRACE")) {
+        const u32 as_ = ps_read32(b, kP + 0x384), vs_ = ps_read32(b, kP + 0x388), dm = kP + 0x300;
+        std::fprintf(stderr, "END phase %u end rec %x/%u audio %u rec %x/%u video %u rec %x/%u dmux %u found %d/%d\n",
+            b[kP + 0x160], ps_read32(b, kP + 0x110), ps_read32(b, kP + 0x114), b[as_ + 0x155], ps_read32(b, as_),
+            ps_read32(b, as_ + 4), b[vs_ + 0x185], ps_read32(b, vs_), ps_read32(b, vs_ + 4), ps_read32(b, dm + 0x10),
+            static_cast<s32>(ps_read32(b, as_ + 0x18)), static_cast<s32>(ps_read32(b, vs_ + 0x18)));
+    }
+    state(4);
+    idle();
+    sound(256);
+    graphics();
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    state(2);
+    idle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+// Next (D-919 part 5) through a player with an AU receiver: refused before a stream is open, without a next descriptor
+// and with a command the descriptor refuses; from the open stream (the next descriptor made ready, switched to: the
+// same source told of it, the dmux pipeline and the receiver kept; the old descriptor closed for the player; started);
+// AUs; Next while playing with a start command (stopped first, the receiver's stop answered through Get); AUs; Stop.
+void part19(u8* b, const Call& call_, u32, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    write_pamf(b, {user_data()}, 14);
+    const std::vector<u8> packs = user_packs(14);
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kAuR = kArea + 0x2800, kGot = kArea + 0x2A00, kCmd = kArea + 0x2B00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    items_code(b, kCheckoutCode, kItems);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    // The source's capabilities (getCapabilities(arg, type, media info, URI, out): {by position, by time, to the end,
+    // by index}).
+    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    // Settled: the player's queue empty for 30 ms in a row.
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < 30 && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items: two packs each, their session word the player's.
+    const auto items = [&](u32 first, u32 n) {
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, kStreamData + 0x1000 * (first + i));
+            ps_write32(b, item + 4, 0x1000);
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+    };
+    u32 gets = 0;
+    const auto get = [&](u32 flags, u32 session, u64 time) {
+        call("cellSailAuReceiverGet", {kAuR, flags, session, time, kGot + 4 * gets});
+        gets++;
+        settle();
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, tagged(kRecHandler), 0x22, 0, 0, 1, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    call("cellSailPlayerNext", {kP, 0, 0x10});
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    const auto descriptor = [&](u32 i) {
+        call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut + 4 * i});
+        const u32 d = ps_read32(b, kOut + 4 * i);
+        call("cellSailDescriptorOpen", {d});
+        call("cellSailPlayerAddDescriptor", {kP, d});
+        return d;
+    };
+    descriptor(0);
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    // No next descriptor; then one whose command the descriptor refuses; then Next from the open stream (switched to
+    // and started).
+    call("cellSailPlayerNext", {kP, 0, 0x11});
+    descriptor(1);
+    std::memset(b + kCmd, 0, 0x28);
+    ps_write32(b, kCmd, 7);
+    call("cellSailPlayerNext", {kP, kCmd, 0x12});
+    call("cellSailPlayerNext", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    const u32 session = ps_read32(b, kP + 4) & 0x3FF;
+    items(0, 3);
+    for (u32 i = 0; i < 3; i++) {
+        call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+        settle();
+    }
+    until([&] { return tagged_count(10) == 3 && load32_acquire(b, kAuR + 0x1A4) == 4; });
+    settle();
+    get(0, session, ~u64{0});
+    get(0, session, ~u64{0});
+    // Next while playing, with a start command: the stream stopped first (the receiver's stop answered through Get).
+    descriptor(2);
+    std::memset(b + kCmd, 0, 0x28);
+    ps_write32(b, kCmd, 1);
+    call("cellSailPlayerNext", {kP, kCmd, 0x200});
+    settle();
+    // (Refused while Next runs: the command posted at the queue's head once the player is waiting, so both sides'
+    // queues are in the same place.)
+    call("cellSailPlayerNext", {kP, 0, 0x13});
+    settle();
+    get(0, session, ~u64{0});
+    state(6);
+    idle();
+    settle();
+    const u32 session2 = ps_read32(b, kP + 4) & 0x3FF;
+    items(3, 2);
+    for (u32 i = 0; i < 2; i++) {
+        call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+        settle();
+    }
+    until([&] { return tagged_count(10) == 5 && load32_acquire(b, kAuR + 0x1A4) == 4; });
+    settle();
+    get(0, session2, ~u64{0});
+    call("cellSailPlayerStop", {kP, 0x300});
+    settle();
+    get(0, session2, ~u64{0});
+    state(4);
+    idle();
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    state(2);
+    idle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+// Next through the adapters (D-919 part 5): a mode-1 player playing a descriptor of AVC 96x64 and ATRAC3plus moves on
+// while playing to one of AVC 128x64 (another channel) and the same ATRAC3plus: the audio stream kept as it is, the
+// video stream's decoder and renderer (the graphics adapter: the game's pictures given back and asked for again) closed
+// and opened again; the new stream played to its end.
+void part20(u8* b, const Call& call_, u32, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    // The first descriptor's stream (AVC 96x64 on channel 0) and the next one's (AVC 128x64 on channel 1, its own
+    // place), the same ATRAC3plus in both.
+    const std::vector<u8> packs = av_packs(8, 1), packs2 = av_packs(6, 1, 128, 64, 0xE1);
+    constexpr u32 kStreamData2 = kData + 0xA0000;
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    std::memcpy(b + kStreamData2, packs2.data(), packs2.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kSad = kArea + 0x2800, kGad = kArea + 0x2900, kInfo = kArea + 0x2A00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kSF = kCode3 + 0xA00, kGF = kCode3 + 0xA40, kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480, kGetCaps = kCode2 + 0x500, kRecAdapter = kCode2 + 0x580,
+              kRecFormat = kCode2 + 0x600, kRecFree = kCode2 + 0x680, kPicsCode = kCode2 + 0x700;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    tagged_code(b, kRecAdapter, 4);
+    tagged_code(b, kRecFormat, 5);
+    tagged_code(b, kRecFree, 6);
+    items_code(b, kCheckoutCode, kItems);
+    pictures_code(b, kPicsCode, g_heap + kBigHeapSize - 0x200000);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    const u32 kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    const u32 sf[3] = {tagged(kRecAdapter), tagged(kRecAdapter), tagged(kRecFormat)};
+    for (u32 i = 0; i < 3; i++) ps_write32(b, kSF + 4 * i, sf[i]);
+    const u32 gf[5] = {tagged(kRecAdapter), tagged(kRecAdapter), tagged(kRecFormat), kPicsCode + 0x70, tagged(kRecFree)};
+    for (u32 i = 0; i < 5; i++) ps_write32(b, kGF + 4 * i, gf[i]);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    const u32 quiet_ms = 100;
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < quiet_ms && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items of a stream: four packs each (the last what is left), their session word the player's; their count.
+    const auto items = [&](u32 data, u32 total) {
+        const u32 n = (total + 0x1FFF) / 0x2000;
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, data + 0x2000 * i);
+            ps_write32(b, item + 4, std::min<u32>(0x2000, total - 0x2000 * i));
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+        return n;
+    };
+    u32 infos = 0;
+    const auto info = [&] { return kInfo + 0x20 * (infos % 0x28); };
+    const auto sound = [&](u32 samples) {
+        const u64 r = call("cellSailSoundAdapterGetFrame", {kSad, samples, info()});
+        infos++;
+        settle();
+        return r;
+    };
+    const auto graphics2 = [&](u64 flags) {
+        const u64 r = call("cellSailGraphicsAdapterGetFrame2", {kGad, info(), info() + 0x18, kOut + 0xF0, flags});
+        infos++;
+        settle();
+        return r;
+    };
+
+    call("cellSailPlayerInitialize", {kP, 1, kMem, tagged(kRecHandler), 0x22, 1, 1, 0, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailSoundAdapterInitialize", {kSad, kSF, 0x55});
+    call("cellSailGraphicsAdapterInitialize", {kGad, kGF, 0x66});
+    call("cellSailPlayerSetSoundAdapter", {kP, 0, kSad});
+    call("cellSailPlayerSetGraphicsAdapter", {kP, 0, kGad});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    // Each descriptor reads its header (the source's ReadSync) when opened.
+    const auto descriptor = [&](u32 i, const std::vector<PamfStream>& streams, u32 size) {
+        write_pamf(b, streams, size / pamf::kPack);
+        call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut + 4 * i});
+        const u32 d = ps_read32(b, kOut + 4 * i);
+        call("cellSailDescriptorOpen", {d});
+        call("cellSailPlayerAddDescriptor", {kP, d});
+        return d;
+    };
+    descriptor(0, {avc96x64(), at3_stereo()}, static_cast<u32>(packs.size()));
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    descriptor(1, {avc128x64(), at3_stereo()}, static_cast<u32>(packs2.size()));
+    call("cellSailPlayerStart", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    u32 checkins = 0;
+    const auto feed = [&](u32 data, u32 total) {
+        const u32 n = items(data, total);
+        for (u32 i = 0; i < n; i++) {
+            call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+            settle();
+        }
+        checkins += n;
+        until([&] { return tagged_count(10) >= checkins; });
+        settle();
+    };
+    feed(kStreamData, static_cast<u32>(packs.size()));
+    for (u32 i = 0; i < 3; i++) {
+        sound(2048);
+        graphics2(0);
+    }
+    // Next while playing: the stream stopped, the next descriptor switched to (the audio stream kept; the video
+    // stream's decoder and the graphics adapter closed and opened again for the larger picture, its dmux part replaced
+    // for channel 1), started.
+    call("cellSailPlayerNext", {kP, 0, 0x200});
+    settle();
+    // The graphics adapter's stop waits for the frames the game holds: GetFrame2 gives them back.
+    for (u32 i = 0; i < 20 && b[kP + 0x163] != 6; i++) graphics2(0);
+    state(6);
+    idle();
+    settle();
+    feed(kStreamData2, static_cast<u32>(packs2.size()));
+    for (u32 i = 0; i < 3; i++) {
+        sound(2048);
+        graphics2(0);
+    }
+    call("cellSailSourceNotifyInputEos", {kSource}, true);
+    settle();
+    for (u32 i = 0; i < 40 && load32_acquire(b, kGad + 0x90) != 1; i++) graphics2(0);
+    for (u32 i = 0; i < 40 && load32_acquire(b, kSad + 0x78) != 1; i++) sound(2048);
+    state(4);
+    idle();
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    state(2);
+    idle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+// Descriptors the game never opened (D-919 part 6): OpenStream of an added descriptor, its header read through the
+// source's Read (2 KB, then again whole: two units), the streams chosen; a start and AUs; Next to another such
+// descriptor (made ready the same way), AUs; Stop; CloseStream; then a descriptor whose Read fails (OpenStream fails).
+void part21(u8* b, const Call& call_, u32, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    write_pamf(b, {user_data()}, 14);
+    const std::vector<u8> packs = user_packs(14);
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kAuR = kArea + 0x2800, kGot = kArea + 0x2A00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    items_code(b, kCheckoutCode, kItems);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    // The source's capabilities (getCapabilities(arg, type, media info, URI, out): {by position, by time, to the end,
+    // by index}).
+    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    // The source's Read(arg, type, media info, URI, offset, buffer, size, total): ReadSync's copy of the header, then
+    // NotifyCallCompleted with the result at its table's +4 (as a source that answers at once).
+    const u32 kReadCode = kCode2 + 0x580, kReadNotify = kCode2 + 0x600, kReadTable = kTables + 0x40;
+    const u32 read_code[] = {0x7C0802A6u, 0xF8010010u, 0xF821FF81u, 0xF8610070u,
+        0x48000001u | ((kSrcCode - (kReadCode + 0x10)) & 0x03FFFFFCu), 0xE8610070u, 0x38210080u, 0xE8010010u,
+        0x7C0803A6u, 0x48000000u | ((kReadNotify - (kReadCode + 0x24)) & 0x03FFFFFCu)};
+    for (u32 k = 0; k < std::size(read_code); k++) ps_write32(b, kReadCode + 4 * k, read_code[k]);
+    ps_write32(b, kReadCode + 0x70, kReadCode);
+    ps_write32(b, kReadCode + 0x74, 0);
+    notify_code(b, kReadNotify, kReadTable);
+    ps_write32(b, kReadTable, g_export("cellSailSourceNotifyCallCompleted"));
+    g_mask.push_back({kReadTable, 4});
+    ps_write32(b, kFuncs + 40, kReadCode + 0x70);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    // Settled: the player's queue empty for 30 ms in a row.
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < 30 && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items: two packs each, their session word the player's.
+    const auto items = [&](u32 first, u32 n) {
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, kStreamData + 0x1000 * (first + i));
+            ps_write32(b, item + 4, 0x1000);
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+    };
+    u32 gets = 0;
+    const auto get = [&](u32 flags, u32 session, u64 time) {
+        call("cellSailAuReceiverGet", {kAuR, flags, session, time, kGot + 4 * gets});
+        gets++;
+        settle();
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, tagged(kRecHandler), 0x22, 0, 0, 1, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    // A header of two units: read in 2 KB first, then again whole.
+    b[kPamf + 0xB] = 2;
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    const auto descriptor = [&](u32 i) {
+        call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut + 4 * i});
+        const u32 d = ps_read32(b, kOut + 4 * i);
+        call("cellSailPlayerAddDescriptor", {kP, d});
+        return d;
+    };
+    descriptor(0);
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    call("cellSailPlayerStart", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    const u32 session = ps_read32(b, kP + 4) & 0x3FF;
+    items(0, 2);
+    for (u32 i = 0; i < 2; i++) {
+        call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+        settle();
+    }
+    until([&] { return tagged_count(10) == 2 && load32_acquire(b, kAuR + 0x1A4) == 4; });
+    settle();
+    get(0, session, ~u64{0});
+    // Next to a descriptor not opened either: made ready through the source's Read before the switch.
+    descriptor(1);
+    call("cellSailPlayerNext", {kP, 0, 0x200});
+    settle();
+    get(0, session, ~u64{0});
+    state(6);
+    idle();
+    settle();
+    const u32 session2 = ps_read32(b, kP + 4) & 0x3FF;
+    items(2, 2);
+    for (u32 i = 0; i < 2; i++) {
+        call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+        settle();
+    }
+    until([&] { return tagged_count(10) == 4 && load32_acquire(b, kAuR + 0x1A4) == 4; });
+    settle();
+    get(0, session2, ~u64{0});
+    call("cellSailPlayerStop", {kP, 0x300});
+    settle();
+    get(0, session2, ~u64{0});
+    state(4);
+    idle();
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    state(2);
+    idle();
+    // A descriptor whose source's Read fails: OpenStream fails (the descriptor's stream closed again).
+    ps_write32(b, kReadTable + 4, 0x80010009);
+    descriptor(2);
+    call("cellSailPlayerOpenStream", {kP, 0x1235});
+    state(2);
+    idle();
+    settle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+// The elementary streams of a started stream (D-919 part 7), an AU receiver's: CloseEs (stopped first, the receiver's
+// stop answered through Get, then closed), OpenEs (opened, then started), ReopenEs (stopped and started again), AUs
+// between; Stop.
+void part22(u8* b, const Call& call_, u32, GuestThread& t)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    write_pamf(b, {user_data()}, 14);
+    const std::vector<u8> packs = user_packs(14);
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kAuR = kArea + 0x2800, kGot = kArea + 0x2A00, kRdU = kArea + 0x2B00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    items_code(b, kCheckoutCode, kItems);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    // The source's capabilities (getCapabilities(arg, type, media info, URI, out): {by position, by time, to the end,
+    // by index}).
+    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    // Settled: the player's queue empty for 30 ms in a row.
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < 30 && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items: two packs each, their session word the player's.
+    const auto items = [&](u32 first, u32 n) {
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, kStreamData + 0x1000 * (first + i));
+            ps_write32(b, item + 4, 0x1000);
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+    };
+    u32 gets = 0;
+    const auto get = [&](u32 flags, u32 session, u64 time) {
+        call("cellSailAuReceiverGet", {kAuR, flags, session, time, kGot + 4 * gets});
+        gets++;
+        settle();
+    };
+
+    const auto pamf = [&](const char* name, std::initializer_list<u64> a) {
+        const Function* fn = registry().find("cellPamf", recomp::nid_of(name));
+        REQUIRE(fn);
+        u32 i = 3;
+        for (const u64 v : a) t.ctx.gpr[i++] = v;
+        fn->fn(t.ctx, b);
+        return static_cast<s32>(t.ctx.gpr[3]);
+    };
+    call("cellSailPlayerInitialize", {kP, 0, kMem, tagged(kRecHandler), 0x22, 0, 0, 1, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut});
+    const u32 d = ps_read32(b, kOut);
+    call("cellSailDescriptorOpen", {d});
+    call("cellSailPlayerAddDescriptor", {kP, d});
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    CHECK(pamf("cellPamfReaderInitialize", {kRdU, kPamf, 0, 1}) == 0);
+    CHECK(pamf("cellPamfReaderSetStreamWithTypeAndIndex", {kRdU, 5, 0}) >= 0);
+    call("cellSailPlayerStart", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    u32 fed = 0, checkins = 0;
+    const auto feed = [&](u32 n) {
+        items(fed, n);
+        for (u32 i = 0; i < n; i++) {
+            call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+            settle();
+        }
+        fed += n;
+        checkins += n;
+        until([&] { return tagged_count(10) == checkins; });
+        settle();
+    };
+    feed(2);
+    const auto session = [&] { return ps_read32(b, kP + 4) & 0x3FF; };
+    get(0, session(), ~u64{0});
+    // CloseEs of the started stream: stopped first (the receiver's stop answered through Get), then closed.
+    call("cellSailPlayerCloseEsUser", {kP, 0, 0x50});
+    settle();
+    get(0, session(), ~u64{0});
+    idle();
+    settle();
+    // OpenEs in the started stream: opened, then started.
+    call("cellSailPlayerOpenEsUser", {kP, 0, kRdU, 1, 0x51});
+    idle();
+    settle();
+    feed(1);
+    get(0, session(), ~u64{0});
+    // ReopenEs of the started stream: stopped (through Get) and started again, which libsail refuses for an AU
+    // receiver (its dmux part, never disabled by the stop, cannot be enabled again): the stream is stopped and closed
+    // once more and the call never completes, so Stop and CloseStream are refused after it; Finalize ends the player.
+    call("cellSailPlayerReopenEsUser", {kP, 0, kRdU, 1, 0x52});
+    settle();
+    get(0, session(), ~u64{0});
+    settle();
+    call("cellSailPlayerStop", {kP, 0x300});
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    settle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+// A repeat into the next descriptor (D-919 part 8), repeat mode 2 through an AU receiver: the input's end with a next
+// descriptor whose streams are compatible swaps to it without stopping (a new session through the same source); with
+// a next descriptor that chooses no streams the stream ends first (drained through Get) and is switched to; Stop.
+void part23(u8* b, const Call& call_, u32, GuestThread&)
+{
+    const auto call = [&](const char* n, std::initializer_list<u64> a, bool v = false) { return call_(n, a, v); };
+    allocator_code(b);
+    ps_write32(b, kHeapPtr, g_heap);
+    write_pamf(b, {user_data()}, 14);
+    const std::vector<u8> packs = user_packs(14);
+    std::memcpy(b + kStreamData, packs.data(), packs.size());
+    constexpr u32 kP = kArea + 0x1400, kMem = kArea + 0x1300, kOut = kArea + 0x1900, kUri = kArea + 0x1A00,
+                  kLog = kArea + 0x1B00, kAuR = kArea + 0x2800, kGot = kArea + 0x2A00,
+                  kSrcCode = kCode3, kOpenCode = kCode3 + 0x800, kCloseCode = kCode3 + 0x880, kTables = kCode3 + 0x900,
+                  kCode2 = kCode3 + 0xB00;
+    const u32 kRecHandler = kCode2, kRecSource = kCode2 + 0x80, kStartCode = kCode2 + 0x100,
+              kStopCode = kCode2 + 0x180, kCancelCode = kCode2 + 0x200, kCheckinCode = kCode2 + 0x280,
+              kClearCode = kCode2 + 0x300, kCheckoutCode = kCode2 + 0x380, kStartNotify = kCode2 + 0x400,
+              kStopNotify = kCode2 + 0x480;
+    tagged_code(b, kRecHandler, 1);
+    tagged_code(b, kRecSource, 2);
+    tagged_then(b, kStartCode, 7, kStartNotify);
+    tagged_then(b, kStopCode, 8, kStopNotify);
+    tagged_code(b, kCancelCode, 9);
+    tagged_code(b, kCheckinCode, 10);
+    tagged_code(b, kClearCode, 11);
+    items_code(b, kCheckoutCode, kItems);
+    ps_write32(b, kMem, kAllocCode + 0x70);
+    ps_write32(b, kMem + 4, kFreeCode + 0x70);
+    ps_write32(b, kMem + 8, 0x4321);
+    source_code(b, kSrcCode, kLog);
+    notify_code(b, kOpenCode, kTables);
+    notify_code(b, kCloseCode, kTables + 0x10);
+    notify_code(b, kStartNotify, kTables + 0x20);
+    notify_code(b, kStopNotify, kTables + 0x30);
+    for (const u32 tb : {kTables, kTables + 0x10, kTables + 0x20, kTables + 0x30}) {
+        ps_write32(b, tb, g_export("cellSailSourceNotifyCallCompleted"));
+        g_mask.push_back({tb, 4});
+    }
+    const auto str = [&](u32 at, const char* text) { std::memcpy(b + at, text, std::strlen(text) + 1); return at; };
+    for (u32 i = 0; i < 14; i++) ps_write32(b, kFuncs + 4 * i, 0);
+    const u32 funcs[12] = {tagged(kRecSource), kSrcCode + 0xB0, kOpenCode + 0x58, kCloseCode + 0x58, tagged(kStartCode),
+        tagged(kStopCode), tagged(kCancelCode), kCheckoutCode + 0x70, tagged(kCheckinCode), tagged(kClearCode), 0,
+        kSrcCode + 0x78};
+    for (u32 i = 0; i < 12; i++) ps_write32(b, kFuncs + 4 * i, funcs[i]);
+    std::memset(b + kItems, 0, 0x1000);
+    // The source's capabilities (getCapabilities(arg, type, media info, URI, out): {by position, by time, to the end,
+    // by index}).
+    const u32 kGetCaps = kCode2 + 0x500, kCaps = kItems + 0xF00;
+    const u32 caps_code[] = {0x3D600000u | (kCaps >> 16), 0x616B0000u | (kCaps & 0xFFFF), 0xE80B0000u, 0xF8070000u,
+        0x38600000u, 0x4E800020u};
+    for (u32 k = 0; k < std::size(caps_code); k++) ps_write32(b, kGetCaps + 4 * k, caps_code[k]);
+    ps_write32(b, kGetCaps + 0x70, kGetCaps);
+    ps_write64(b, kCaps, 0xD1);
+    ps_write32(b, kFuncs + 48, kGetCaps + 0x70);
+    const auto until = [&](const std::function<bool()>& done) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (!done() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(done());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    };
+    // Settled: the player's queue empty for 30 ms in a row.
+    const auto settle = [&] {
+        u32 quiet = 0;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (quiet < 30 && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            quiet = load32_acquire(b, kP + 0x174) == 0 ? quiet + 1 : 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    const auto idle = [&] {
+        until([&] { return __atomic_load_n(reinterpret_cast<u32*>(b + kP + 0x250), __ATOMIC_ACQUIRE) == 0; });
+    };
+    const auto state = [&](u8 st) {
+        until([&] { return __atomic_load_n(b + kP + 0x163, __ATOMIC_ACQUIRE) == st; });
+        if (std::getenv("SAIL_TRACE"))
+            std::fprintf(stderr, "STATE want %u have %u call %u\n", st, b[kP + 0x163], ps_read32(b, kP + 0x250));
+    };
+    const auto tagged_count = [&](u64 tag) {
+        u32 n = 0;
+        for (u32 i = 0; i < load32_acquire(b, kRecords2); i++)
+            if (ps_read64(b, kRecords2 + 16 + 48 * i + 40) == tag) n++;
+        return n;
+    };
+    // The items: two packs each, their session word the player's.
+    const auto items = [&](u32 first, u32 n) {
+        ps_write32(b, kItems, 0);
+        for (u32 i = 0; i < n; i++) {
+            const u32 item = kItems + 0x400 + 0x10 * i;
+            ps_write32(b, item, kStreamData + 0x1000 * (first + i));
+            ps_write32(b, item + 4, 0x1000);
+            ps_write32(b, item + 8, ps_read32(b, kP + 4));
+            ps_write32(b, item + 12, 0);
+            ps_write32(b, kItems + 8 + 4 * i, item);
+        }
+    };
+    u32 gets = 0;
+    const auto get = [&](u32 flags, u32 session, u64 time) {
+        call("cellSailAuReceiverGet", {kAuR, flags, session, time, kGot + 4 * gets});
+        gets++;
+        settle();
+    };
+
+    call("cellSailPlayerInitialize", {kP, 0, kMem, tagged(kRecHandler), 0x22, 0, 0, 1, 0});
+    call("cellSailSourceInitialize", {kSource, kFuncs, kSource});
+    call("cellSailPlayerRegisterSource", {kP, str(kUri + 0x100, "x-test"), kSource});
+    call("cellSailAuReceiverInitialize", {kAuR, 0, 0, 0x78});
+    call("cellSailPlayerSetAuReceiver", {kP, 0, kAuR});
+    for (u32 e = 1; e < 12; e++) call("cellSailPlayerSubscribeEvent", {kP, e, 0});
+    call("cellSailPlayerBoot", {kP, 0x99});
+    state(2);
+    const u32 uri = str(kUri, "x-test://movie.pam");
+    const auto descriptor = [&](u32 i, bool autosel) {
+        call("cellSailPlayerCreateDescriptor", {kP, 0, kUri + 0x80, uri, kOut + 4 * i});
+        const u32 d = ps_read32(b, kOut + 4 * i);
+        if (!autosel) call("cellSailDescriptorSetAutoSelection", {d, 0});
+        call("cellSailDescriptorOpen", {d});
+        call("cellSailPlayerAddDescriptor", {kP, d});
+        return d;
+    };
+    descriptor(0, true);
+    call("cellSailPlayerOpenStream", {kP, 0x1234});
+    state(4);
+    idle();
+    descriptor(1, true);
+    call("cellSailPlayerSetRepeatMode", {kP, 2, 0});
+    call("cellSailPlayerStart", {kP, 0, 0x100});
+    state(6);
+    idle();
+    settle();
+    u32 fed = 0, checkins = 0;
+    const auto feed = [&](u32 n) {
+        items(fed, n);
+        for (u32 i = 0; i < n; i++) {
+            call("cellSailSourceNotifyStreamOut", {kSource, 1}, true);
+            settle();
+        }
+        fed += n;
+        checkins += n;
+        until([&] { return tagged_count(10) == checkins; });
+        settle();
+    };
+    const auto session = [&] { return ps_read32(b, kP + 4) & 0x3FF; };
+    feed(2);
+    get(0, session(), ~u64{0});
+    // The input's end with a compatible next descriptor: swapped to without stopping (the source told of it, a new
+    // session started on it).
+    call("cellSailSourceNotifyInputEos", {kSource}, true);
+    settle();
+    idle();
+    settle();
+    feed(2);
+    get(0, session(), ~u64{0});
+    get(0, session(), ~u64{0});
+    // A next descriptor with no streams chosen: the stream ends first (drained through Get), then switched to (the
+    // receiver closed), its (no) streams started.
+    descriptor(2, false);
+    call("cellSailSourceNotifyInputEos", {kSource}, true);
+    settle();
+    for (u32 i = 0; i < 6 && load32_acquire(b, kAuR + 0x1B8) != 0; i++) get(0, session(), ~u64{0});
+    settle();
+    idle();
+    settle();
+    call("cellSailPlayerStop", {kP, 0x300});
+    state(4);
+    idle();
+    call("cellSailPlayerCloseStream", {kP, 0x60});
+    state(2);
+    idle();
+    call("cellSailPlayerFinalize", {kP});
+    g_mask.push_back({kP + 0x3C8, 16});
+    mask_records(b);
+    mask_ring(b, kP);
+}
+
+void part17(u8* b, const Call& call_, u32, GuestThread&) { adapters_playback(b, call_, false); }
+
+// The same through a mode-0 player (the adapters synced to the clock the game's reports drive, D-919 part 4): each
+// tick's GetFrame and report, the frames due, early and late, the input's end, the end.
+void part18(u8* b, const Call& call_, u32, GuestThread&) { adapters_playback(b, call_, true); }
 } // namespace
 
 void compare_runs(int part)
@@ -2353,5 +3588,214 @@ TEST_CASE("cellSail: the playback through an AU receiver on pspocket alone", "[h
         "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214", "cellSailPlayerStop -> 0x0",
         "cellSailAuReceiverGet -> 0x1c", "cellSailAuReceiverGet -> 0x1c", "cellSailPlayerCancel -> 0x0",
         "cellSailPlayerCloseStream -> 0x0", "cellSailPlayerFinalize -> 0x0"};
+    compare_lines("answer", answers, expected);
+}
+
+
+TEST_CASE("cellSail against libsail: the playback through the sound and graphics adapters", "[hle][lle][sail]")
+{
+    compare_runs(17);
+}
+
+
+TEST_CASE("cellSail against libsail: the playback through the adapters synced to the game's clock", "[hle][lle][sail]")
+{
+    compare_runs(18);
+}
+
+// The adapters' playbacks on pspocket's side alone (no firmware): libsail's answers, as the comparisons found them (in
+// order for the mode-1 player; how many of each for the synced one).
+TEST_CASE("cellSail: the playback through the adapters on pspocket alone", "[hle][sail]")
+{
+    std::vector<std::string> answers;
+    for (const std::string& l : run("", false, 17).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) answers.push_back(l);
+    const std::vector<std::string> expected = {
+        "cellSailPlayerInitialize -> 0x0", "cellSailSourceInitialize -> 0x0", "cellSailPlayerRegisterSource -> 0x0",
+        "cellSailSoundAdapterInitialize -> 0x0", "cellSailGraphicsAdapterInitialize -> 0x0",
+        "cellSailPlayerSetSoundAdapter -> 0x0", "cellSailPlayerSetGraphicsAdapter -> 0x0", "cellSailPlayerBoot -> 0x0",
+        "cellSailSoundAdapterGetFrame -> 0x1c", "cellSailGraphicsAdapterGetFrame -> 0x1c",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x1",
+        "cellSailPlayerOpenStream -> 0x0", "cellSailSoundAdapterGetFrame -> 0x1c",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x1c", "cellSailPlayerStart -> 0x0",
+        "cellSailSoundAdapterGetFrame -> 0x1c", "cellSailGraphicsAdapterGetFrame -> 0x1c",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailGraphicsAdapterGetFrame -> 0x214", "cellSailGraphicsAdapterGetFrame2 -> 0x214",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x214", "cellSailGraphicsAdapterGetFrame2 -> 0x214",
+        "cellSailGraphicsAdapterGetFrame -> 0x214", "cellSailSourceNotifyInputEos -> (void)",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x214", "cellSailGraphicsAdapterGetFrame2 -> 0x214",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x214", "cellSailGraphicsAdapterGetFrame2 -> 0x214",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x214", "cellSailGraphicsAdapterGetFrame2 -> 0x214",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x30", "cellSailGraphicsAdapterGetFrame2 -> 0x30",
+        "cellSailGraphicsAdapterGetFrame2 -> 0x30", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x214",
+        "cellSailSoundAdapterGetFrame -> 0x214", "cellSailSoundAdapterGetFrame -> 0x30",
+        "cellSailSoundAdapterGetFrame -> 0x1c", "cellSailGraphicsAdapterGetFrame -> 0x1c",
+        "cellSailPlayerCloseStream -> 0x0", "cellSailPlayerFinalize -> 0x0"};
+    compare_lines("answer", answers, expected);
+    std::map<std::string, u32> counts;
+    for (const std::string& l : run("", false, 18).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) counts[l]++;
+    const std::map<std::string, u32> expected_counts = {
+        {"cellSailDescriptorOpen -> 0x0", 1},
+        {"cellSailGraphicsAdapterGetFrame -> 0x1c", 3},
+        {"cellSailGraphicsAdapterGetFrame -> 0x210", 1},
+        {"cellSailGraphicsAdapterGetFrame -> 0xc", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x1c", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x210", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x30", 3},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x310", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x410", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0x510", 1},
+        {"cellSailGraphicsAdapterGetFrame2 -> 0xc", 2},
+        {"cellSailGraphicsAdapterInitialize -> 0x0", 1},
+        {"cellSailGraphicsAdapterUpdateAvSync -> (void)", 11},
+        {"cellSailPlayerAddDescriptor -> 0x1", 1},
+        {"cellSailPlayerBoot -> 0x0", 1},
+        {"cellSailPlayerCloseStream -> 0x0", 1},
+        {"cellSailPlayerCreateDescriptor -> 0x0", 1},
+        {"cellSailPlayerFinalize -> 0x0", 1},
+        {"cellSailPlayerInitialize -> 0x0", 1},
+        {"cellSailPlayerOpenStream -> 0x0", 1},
+        {"cellSailPlayerRegisterSource -> 0x0", 1},
+        {"cellSailPlayerSetGraphicsAdapter -> 0x0", 1},
+        {"cellSailPlayerSetSoundAdapter -> 0x0", 1},
+        {"cellSailPlayerStart -> 0x0", 1},
+        {"cellSailSoundAdapterGetFrame -> 0x1c", 59},
+        {"cellSailSoundAdapterGetFrame -> 0x204", 175},
+        {"cellSailSoundAdapterGetFrame -> 0x205", 1},
+        {"cellSailSoundAdapterGetFrame -> 0x30", 1},
+        {"cellSailSoundAdapterInitialize -> 0x0", 1},
+        {"cellSailSoundAdapterUpdateAvSync -> (void)", 232},
+        {"cellSailSourceInitialize -> 0x0", 1},
+        {"cellSailSourceNotifyInputEos -> (void)", 1},
+        {"cellSailSourceNotifyStreamOut -> (void)", 19}};
+    std::vector<std::string> mine, sony;
+    for (const auto& [l, n] : counts) mine.push_back(std::format("{} x{}", l, n));
+    for (const auto& [l, n] : expected_counts) sony.push_back(std::format("{} x{}", l, n));
+    compare_lines("answer count", mine, sony);
+}
+
+
+TEST_CASE("cellSail against libsail: Next through an AU receiver", "[hle][lle][sail]") { compare_runs(19); }
+
+TEST_CASE("cellSail against libsail: Next through the adapters to a larger picture", "[hle][lle][sail]")
+{
+    compare_runs(20);
+}
+
+TEST_CASE("cellSail against libsail: descriptors the game never opened", "[hle][lle][sail]") { compare_runs(21); }
+
+TEST_CASE("cellSail against libsail: the elementary streams of a started stream", "[hle][lle][sail]")
+{
+    compare_runs(22);
+}
+
+TEST_CASE("cellSail against libsail: a repeat into the next descriptor", "[hle][lle][sail]") { compare_runs(23); }
+
+// Next on pspocket's side alone (no firmware): libsail's answers, as the comparison found them.
+TEST_CASE("cellSail: Next through an AU receiver on pspocket alone", "[hle][sail]")
+{
+    std::vector<std::string> answers;
+    for (const std::string& l : run("", false, 19).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) answers.push_back(l);
+    const std::vector<std::string> expected = {
+        "cellSailPlayerInitialize -> 0x0", "cellSailSourceInitialize -> 0x0", "cellSailPlayerRegisterSource -> 0x0",
+        "cellSailAuReceiverInitialize -> 0x0", "cellSailPlayerSetAuReceiver -> 0x0", "cellSailPlayerBoot -> 0x0",
+        "cellSailPlayerNext -> 0xffffffff80610702", "cellSailPlayerCreateDescriptor -> 0x0",
+        "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x1", "cellSailPlayerOpenStream -> 0x0",
+        "cellSailPlayerNext -> 0xffffffff80610702", "cellSailPlayerCreateDescriptor -> 0x0",
+        "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x2",
+        "cellSailPlayerNext -> 0xffffffff80610701", "cellSailPlayerNext -> 0x0",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214", "cellSailAuReceiverGet -> 0x214",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x2",
+        "cellSailPlayerNext -> 0x0", "cellSailPlayerNext -> 0xffffffff80610702", "cellSailAuReceiverGet -> 0x1c",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailAuReceiverGet -> 0x214", "cellSailPlayerStop -> 0x0", "cellSailAuReceiverGet -> 0x1c",
+        "cellSailPlayerCloseStream -> 0x0", "cellSailPlayerFinalize -> 0x0"};
+    compare_lines("answer", answers, expected);
+}
+
+// Descriptors the game never opened, on pspocket's side alone (no firmware): libsail's answers.
+TEST_CASE("cellSail: descriptors the game never opened on pspocket alone", "[hle][sail]")
+{
+    std::vector<std::string> answers;
+    for (const std::string& l : run("", false, 21).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) answers.push_back(l);
+    const std::vector<std::string> expected = {
+        "cellSailPlayerInitialize -> 0x0", "cellSailSourceInitialize -> 0x0", "cellSailPlayerRegisterSource -> 0x0",
+        "cellSailAuReceiverInitialize -> 0x0", "cellSailPlayerSetAuReceiver -> 0x0", "cellSailPlayerBoot -> 0x0",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailPlayerAddDescriptor -> 0x1",
+        "cellSailPlayerOpenStream -> 0x0", "cellSailPlayerStart -> 0x0", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailPlayerAddDescriptor -> 0x2", "cellSailPlayerNext -> 0x0",
+        "cellSailAuReceiverGet -> 0x1c", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214", "cellSailPlayerStop -> 0x0",
+        "cellSailAuReceiverGet -> 0x1c", "cellSailPlayerCloseStream -> 0x0", "cellSailPlayerCreateDescriptor -> 0x0",
+        "cellSailPlayerAddDescriptor -> 0x1", "cellSailPlayerOpenStream -> 0x0", "cellSailPlayerFinalize -> 0x0"};
+    compare_lines("answer", answers, expected);
+}
+
+// The elementary streams of a started stream on pspocket's side alone (no firmware): libsail's answers.
+TEST_CASE("cellSail: the elementary streams of a started stream on pspocket alone", "[hle][sail]")
+{
+    std::vector<std::string> answers;
+    for (const std::string& l : run("", false, 22).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) answers.push_back(l);
+    const std::vector<std::string> expected = {
+        "cellSailPlayerInitialize -> 0x0", "cellSailSourceInitialize -> 0x0", "cellSailPlayerRegisterSource -> 0x0",
+        "cellSailAuReceiverInitialize -> 0x0", "cellSailPlayerSetAuReceiver -> 0x0", "cellSailPlayerBoot -> 0x0",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x1",
+        "cellSailPlayerOpenStream -> 0x0", "cellSailPlayerStart -> 0x0", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214",
+        "cellSailPlayerCloseEsUser -> 0x0", "cellSailAuReceiverGet -> 0x1c", "cellSailPlayerOpenEsUser -> 0x0",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailAuReceiverGet -> 0x214",
+        "cellSailPlayerReopenEsUser -> 0x0", "cellSailAuReceiverGet -> 0x1c",
+        "cellSailPlayerStop -> 0xffffffff80610702", "cellSailPlayerCloseStream -> 0xffffffff80610702",
+        "cellSailPlayerFinalize -> 0x0"};
+    compare_lines("answer", answers, expected);
+}
+
+// A repeat into the next descriptor on pspocket's side alone (no firmware): libsail's answers.
+TEST_CASE("cellSail: a repeat into the next descriptor on pspocket alone", "[hle][sail]")
+{
+    std::vector<std::string> answers;
+    for (const std::string& l : run("", false, 23).lines)
+        if (!l.starts_with("cellSailPlayerSubscribeEvent")) answers.push_back(l);
+    const std::vector<std::string> expected = {
+        "cellSailPlayerInitialize -> 0x0", "cellSailSourceInitialize -> 0x0", "cellSailPlayerRegisterSource -> 0x0",
+        "cellSailAuReceiverInitialize -> 0x0", "cellSailPlayerSetAuReceiver -> 0x0", "cellSailPlayerBoot -> 0x0",
+        "cellSailPlayerCreateDescriptor -> 0x0", "cellSailDescriptorOpen -> 0x0", "cellSailPlayerAddDescriptor -> 0x1",
+        "cellSailPlayerOpenStream -> 0x0", "cellSailPlayerCreateDescriptor -> 0x0", "cellSailDescriptorOpen -> 0x0",
+        "cellSailPlayerAddDescriptor -> 0x2", "cellSailPlayerSetRepeatMode -> 0x2", "cellSailPlayerStart -> 0x0",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailAuReceiverGet -> 0x214", "cellSailSourceNotifyInputEos -> (void)",
+        "cellSailSourceNotifyStreamOut -> (void)", "cellSailSourceNotifyStreamOut -> (void)",
+        "cellSailAuReceiverGet -> 0x1", "cellSailAuReceiverGet -> 0x214", "cellSailPlayerCreateDescriptor -> 0x0",
+        "cellSailDescriptorSetAutoSelection -> 0x0", "cellSailDescriptorOpen -> 0x0",
+        "cellSailPlayerAddDescriptor -> 0x2", "cellSailSourceNotifyInputEos -> (void)",
+        "cellSailAuReceiverGet -> 0x214", "cellSailAuReceiverGet -> 0x214", "cellSailAuReceiverGet -> 0x214",
+        "cellSailAuReceiverGet -> 0x1c", "cellSailPlayerStop -> 0x0", "cellSailPlayerCloseStream -> 0x0",
+        "cellSailPlayerFinalize -> 0x0"};
     compare_lines("answer", answers, expected);
 }

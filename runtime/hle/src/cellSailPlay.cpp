@@ -48,6 +48,7 @@ u8 phase(PPUContext& ctx, u32 p) { return r8(ctx, p + kPhase); }
 bool playing(PPUContext& ctx, u32 p) { return static_cast<u8>(phase(ctx, p) - 3) <= 2; }
 bool slot_playing(PPUContext& ctx, u32 slot, u32 state_at) { return static_cast<u8>(r8(ctx, slot + state_at) - 3) <= 2; }
 bool has_next(PPUContext& ctx, u32 p) { return r32(ctx, p + kNextDescriptor) != 0; }
+bool subscribed(PPUContext& ctx, u32 p, u32 major) { return (r64(ctx, p + pl::kEventMask) >> major) & 1; }
 u32 entry(PPUContext& ctx, u32 d, u32 table, u32 stride, u32 i) { return r32(ctx, d + table) + i * stride; }
 
 void inc32(PPUContext& ctx, u32 a, u32 by = 1) { w32(ctx, a, r32(ctx, a) + by); }
@@ -827,9 +828,319 @@ void input_end(PPUContext& ctx, u32 p, u32 d)
         source_session(ctx, p, d, true, false, step(0xCA, rec));
         return;
     }
-    if (mode == 2 && has_next(ctx, p)) later_part(ctx, "the stream repeated into the next descriptor");
+    if (mode == 2 && has_next(ctx, p)) {
+        // On into the next descriptor: made ready first (0xCB), the record at +0x120 running (kind 4).
+        const u32 rec = p + 0x120;
+        std::memset(gb(ctx) + rec, 0, 0x40);
+        w32(ctx, rec, r32(ctx, rec) | 0x20);
+        w64(ctx, rec + 8, 0);
+        w32(ctx, p + kDeferred, rec);
+        w32(ctx, p + kDeferredKind, 4);
+        prepare_descriptor(ctx, p, r32(ctx, p + kNextDescriptor), rec + 0x10, step(0xCB, rec));
+        return;
+    }
     if (mode != 0 && mode != 2) return;
     stream_end(ctx, p, d, p + 0x110, 0, 0);
+}
+
+// ------------------------------------------------------------------------------------------------- Next
+
+// Next moves the player on to the next descriptor (+0x228; libsail's): the stream running stopped (or, with the start
+// flag 1, ended; 0xA9), the next descriptor made ready (0xAA, its start information from the repeat command), then
+// switched to (the records at +0xD0 and +0xE0): the source closed and the next one's opened (0xAB, 0xB2) or the same
+// source told of it (0xB2), the dmux pipeline reopened when the kind differs (0xAC, 0xB3), each stream slot kept when the
+// next descriptor's stream is compatible (its dmux part, decoder and renderer each compared) or its decoder and
+// renderer closed and reopened for the new format (0xAD-0xB1, 0xB7-0xBB; their completions 0xB4-0xB6 on the switch's
+// record); once all are in, the current descriptor's streams are chosen again (event 10), it is closed for the player
+// (1, event 5), the next one is current (event 9 for each stream kept, event 4) and its streams start (or a call deferred
+// meanwhile runs). Next completes (0xA8) in state 6 with the run type from the start information.
+
+// The next descriptor's chosen streams given the formats of the current slots' renderers.
+void next_out_formats(PPUContext& ctx, u32 p, u32 nd)
+{
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 e = entry(ctx, nd, ds::kAudio, ds::kAudioStride, i);
+        if (r8(ctx, e)) audio_out_format(ctx, e, audio_slot(ctx, p, i));
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 e = entry(ctx, nd, ds::kVideo, ds::kVideoStride, i);
+        if (r8(ctx, e)) video_out_format(ctx, e, video_slot(ctx, p, i));
+    }
+}
+
+// The comparisons of a descriptor's stream entry with the next one's (libsail's): the dmux part (the ES filter's four
+// words; for PAMF, by the audio coding: ATRAC3plus +28/+32/+36, LPCM +28, others the coding and +28; video +28; user
+// the filter at +60 and +72), the decoder (audio: coding, channels, rate, frame; video: coding, profile, the specific
+// information's bytes (8 for coding 5, else as many as +44 says), the picture and its format out), the renderer's
+// format (audio the stream's 16 bytes at +96; video the 18 at +88).
+bool same_words(PPUContext& ctx, u32 a, u32 b, u32 at, u32 n)
+{
+    for (u32 i = 0; i < n; i++)
+        if (r32(ctx, a + at + 4 * i) != r32(ctx, b + at + 4 * i)) return false;
+    return true;
+}
+bool same_audio_part(PPUContext& ctx, u32 type, u32 a, u32 b)
+{
+    if (!same_words(ctx, a, b, 12, 4)) return false;
+    if (type != 0) return true;
+    const u32 coding = r32(ctx, a + 40);
+    if (coding == 1) return same_words(ctx, a, b, 28, 3);
+    if (coding == 2) return r32(ctx, a + 28) == r32(ctx, b + 28);
+    return r32(ctx, b + 40) == coding && r32(ctx, a + 28) == r32(ctx, b + 28);
+}
+bool same_video_part(PPUContext& ctx, u32 type, u32 a, u32 b)
+{
+    if (!same_words(ctx, a, b, 12, 4)) return false;
+    return type != 0 || r32(ctx, a + 28) == r32(ctx, b + 28);
+}
+bool same_user_part(PPUContext& ctx, u32 a, u32 b) { return same_words(ctx, a, b, 60, 4); }
+bool same_audio_decoder(PPUContext& ctx, u32 a, u32 b)
+{
+    return r32(ctx, a + 40) == r32(ctx, b + 40) && r8(ctx, a + 97) == r8(ctx, b + 97) &&
+           r32(ctx, a + 100) == r32(ctx, b + 100) && ps_read16(gb(ctx), a + 98) == ps_read16(gb(ctx), b + 98);
+}
+bool same_video_decoder(PPUContext& ctx, u32 a, u32 b)
+{
+    u8* m = gb(ctx);
+    if (!same_words(ctx, a, b, 32, 2)) return false;
+    const u32 n = r32(ctx, b + 32) == 5 ? 8 : r32(ctx, b + 44);
+    if (n != 0 && std::memcmp(m + a + 44, m + b + 44, std::max<u32>(n, 1)) != 0) return false;
+    for (const u32 f : {56u, 88u})
+        if (ps_read16(m, a + f + 4) != ps_read16(m, b + f + 4) || ps_read16(m, a + f + 6) != ps_read16(m, b + f + 6) ||
+            m[a + f + 2] != m[b + f + 2] || m[a + f] != m[b + f])
+            return false;
+    return true;
+}
+bool same_audio_format(PPUContext& ctx, u32 a, u32 b)
+{
+    return std::memcmp(gb(ctx) + a + 96, gb(ctx) + b + 96, 4) == 0 && same_words(ctx, a, b, 100, 2);
+}
+bool same_video_format(PPUContext& ctx, u32 a, u32 b) { return std::memcmp(gb(ctx) + a + 88, gb(ctx) + b + 88, 18) == 0; }
+
+// The switch to the next descriptor (libsail's): `rec` (+0x260 the record running, kind 2) counts the source's and the
+// dmux pipeline's steps and each slot that is not kept; its slots' records (+0 cleared, their handles the switch's
+// steps 0xB4-0xB6) count their closes. One step at least (the source's), so the record always waits. The player's
+// descriptor count drops by one.
+void descriptor_switch(PPUContext& ctx, u32 p, u32 rec)
+{
+    const u32 nd = r32(ctx, p + kNextDescriptor), od = current(ctx, p), dm = dmux(p);
+    w32(ctx, p + kDeferredKind, 2);
+    w32(ctx, p + kDeferred, rec);
+    next_out_formats(ctx, p, nd);
+    clock_reset(ctx, p + pl::kSync);
+    if (r32(ctx, od + ds::kSource) != r32(ctx, nd + ds::kSource)) {
+        if (const u32 t = r32(ctx, od + ds::kType); t == 1 || t == 2) container(ctx, od, "Next's source close");
+        source_close(ctx, r32(ctx, od + ds::kSource), step(0xAB, rec));
+    } else {
+        if (const u32 t = r32(ctx, nd + ds::kType); t == 1 || t == 2) container(ctx, nd, "Next's source open");
+        source_open(ctx, r32(ctx, nd + ds::kSource), nd, step(0xB2, rec));
+    }
+    const bool same_dmux = r32(ctx, od + ds::kHeader) == r32(ctx, nd + ds::kHeader);
+    u8 steps = 1;
+    if (!same_dmux) {
+        steps = 2;
+        dmux_close(ctx, dm, step(0xAC, rec));
+    } else {
+        w32(ctx, dm + dmx::kSource, r32(ctx, nd + ds::kSource));
+    }
+    const u32 type = r32(ctx, od + ds::kType);
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 slot = audio_slot(ctx, p, i), oe = entry(ctx, od, ds::kAudio, ds::kAudioStride, i),
+                  ne = entry(ctx, nd, ds::kAudio, ds::kAudioStride, i);
+        std::memset(gb(ctx) + slot, 0, 0x10);
+        w32(ctx, rec, r32(ctx, rec) | 0x20);
+        w64(ctx, slot + 8, step(0xB4, rec));
+        const bool gone = r8(ctx, slot + as::kState) != 2 || r8(ctx, oe) == 0, chosen = r8(ctx, ne) == 1;
+        w8(ctx, slot + as::kState, 0);
+        const u64 hp = step(0xAD, slot), hr = step(0xAE, slot);
+        if (gone) {
+            post_completion(ctx, p, 0, hp);
+            post_completion(ctx, p, 0, hr);
+            steps++;
+            w32(ctx, slot + 4, 2);
+            continue;
+        }
+        if (same_dmux && (!chosen || !same_audio_part(ctx, type, oe, ne))) dmux_es_remove(ctx, dm, slot + as::kDmuxEs);
+        u32 n = 0;
+        if (!chosen || !same_audio_decoder(ctx, oe, ne)) {
+            audio_pipeline_close(ctx, slot + as::kPipeline, hp);
+            n = chosen ? 1 : 2;
+        }
+        if (!chosen) audio_renderer_close(ctx, r32(ctx, slot + as::kRenderer), hr);
+        else if (!same_audio_format(ctx, oe, ne)) {
+            n++;
+            audio_renderer_close(ctx, r32(ctx, slot + as::kRenderer), hr);
+        }
+        if (n == 0) {
+            if (chosen) w8(ctx, slot + as::kState, 2);
+        } else {
+            steps++;
+        }
+        w32(ctx, slot + 4, n);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 slot = video_slot(ctx, p, i), oe = entry(ctx, od, ds::kVideo, ds::kVideoStride, i),
+                  ne = entry(ctx, nd, ds::kVideo, ds::kVideoStride, i);
+        std::memset(gb(ctx) + slot, 0, 0x10);
+        w32(ctx, rec, r32(ctx, rec) | 0x20);
+        w64(ctx, slot + 8, step(0xB5, rec));
+        const bool gone = r8(ctx, slot + vs::kState) != 2 || r8(ctx, oe) == 0, chosen = r8(ctx, ne) == 1;
+        w8(ctx, slot + vs::kState, 0);
+        const u64 hp = step(0xAF, slot), hr = step(0xB0, slot);
+        if (gone) {
+            post_completion(ctx, p, 0, hp);
+            post_completion(ctx, p, 0, hr);
+            steps++;
+            w32(ctx, slot + 4, 2);
+            continue;
+        }
+        if (same_dmux && (!chosen || !same_video_part(ctx, type, oe, ne))) dmux_es_remove(ctx, dm, slot + vs::kDmuxEs);
+        u32 n = 0;
+        if (!chosen || !same_video_decoder(ctx, oe, ne)) {
+            video_pipeline_close(ctx, slot + vs::kPipeline, hp);
+            n = chosen ? 1 : 2;
+        }
+        if (!chosen) video_renderer_close(ctx, r32(ctx, slot + vs::kRenderer), hr);
+        else if (!same_video_format(ctx, oe, ne)) {
+            n++;
+            video_renderer_close(ctx, r32(ctx, slot + vs::kRenderer), hr);
+        }
+        if (n == 0) {
+            if (chosen) w8(ctx, slot + vs::kState, 2);
+        } else {
+            steps++;
+        }
+        w32(ctx, slot + 4, n);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+        const u32 slot = user_slot(ctx, p, i), oe = entry(ctx, od, ds::kUser, ds::kUserStride, i),
+                  ne = entry(ctx, nd, ds::kUser, ds::kUserStride, i);
+        std::memset(gb(ctx) + slot, 0, 0x10);
+        w32(ctx, rec, r32(ctx, rec) | 0x20);
+        w64(ctx, slot + 8, step(0xB6, rec));
+        const bool gone = r8(ctx, slot + us::kState) != 2 || r8(ctx, oe) == 0, chosen = r8(ctx, ne) == 1;
+        w8(ctx, slot + us::kState, 0);
+        const u64 h = step(0xB1, slot);
+        if (gone) {
+            post_completion(ctx, p, 0, h);
+            steps++;
+            w32(ctx, slot + 4, 1);
+            continue;
+        }
+        if (same_dmux && (!chosen || !same_user_part(ctx, oe, ne))) dmux_es_remove(ctx, dm, slot + us::kDmuxEs);
+        if (!chosen) {
+            receiver_close(ctx, r32(ctx, slot + us::kReceiver), h);
+            steps++;
+            w32(ctx, slot + 4, 1);
+            continue;
+        }
+        w32(ctx, slot + 4, 0);
+        w8(ctx, slot + us::kState, 2);
+    }
+    w32(ctx, rec + 4, steps);
+    w32(ctx, p + pl::kDescriptorCount, r32(ctx, p + pl::kDescriptorCount) - 1);
+}
+
+// Whether a repeat can go on into the next descriptor without stopping (libsail's): each stream open now must be
+// chosen in the next descriptor and compatible (its dmux part, decoder and renderer's format; user streams need only
+// be chosen), a stream not chosen now must not be chosen next, one chosen but not open need only be compatible.
+bool seamless_next(PPUContext& ctx, u32 p, u32 od, u32 nd)
+{
+    const u32 type = r32(ctx, od + ds::kType);
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kAudio, ds::kAudioStride, i), ne = entry(ctx, nd, ds::kAudio, ds::kAudioStride, i);
+        const u8 o = r8(ctx, oe);
+        if (o == 0 ? r8(ctx, ne) != 0
+                   : (o == 2 && r8(ctx, ne) != 1) || !same_audio_part(ctx, type, oe, ne) ||
+                         !same_audio_decoder(ctx, oe, ne) || !same_audio_format(ctx, oe, ne))
+            return false;
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kVideo, ds::kVideoStride, i), ne = entry(ctx, nd, ds::kVideo, ds::kVideoStride, i);
+        const u8 o = r8(ctx, oe);
+        if (o == 0 ? r8(ctx, ne) != 0
+                   : (o == 2 && r8(ctx, ne) != 1) || !same_video_part(ctx, type, oe, ne) ||
+                         !same_video_decoder(ctx, oe, ne) || !same_video_format(ctx, oe, ne))
+            return false;
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+        const u8 o = r8(ctx, entry(ctx, od, ds::kUser, ds::kUserStride, i)),
+                 n = r8(ctx, entry(ctx, nd, ds::kUser, ds::kUserStride, i));
+        if ((o == 2 && n != 1) || (o == 0 && n != 0)) return false;
+    }
+    return true;
+}
+
+// The repeat's swap to the next descriptor without stopping (libsail's): the dmux pipeline given the next source, each
+// open or chosen stream's old entry chosen again (event 10) and its new entry open (event 9; a user stream's new entry
+// takes the old one's value and the old one is chosen, whatever they were), the old descriptor closed for the player
+// (1, event 5), the next one current (one descriptor fewer), `rec` running (kind 4), the source told of the descriptor
+// (0xCC).
+void seamless_swap(PPUContext& ctx, u32 p, u32 od, u32 nd, u32 rec)
+{
+    w32(ctx, dmux(p) + dmx::kSource, r32(ctx, nd + ds::kSource));
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kAudio, ds::kAudioStride, i);
+        if (r8(ctx, oe) == 0) continue;
+        w8(ctx, oe, 1);
+        if (subscribed(ctx, p, 10)) {
+            notify_event(ctx, p, 10, 0, i);
+            if (r8(ctx, oe) != 1) continue; // looked at again after the game's handler
+        }
+        w8(ctx, entry(ctx, nd, ds::kAudio, ds::kAudioStride, i), 2);
+        notify_event(ctx, p, 9, 0, i);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kVideo, ds::kVideoStride, i);
+        if (r8(ctx, oe) == 0) continue;
+        w8(ctx, oe, 1);
+        if (subscribed(ctx, p, 10)) {
+            notify_event(ctx, p, 10, 1, i);
+            if (r8(ctx, oe) != 1) continue;
+        }
+        w8(ctx, entry(ctx, nd, ds::kVideo, ds::kVideoStride, i), 2);
+        notify_event(ctx, p, 9, 1, i);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kUser, ds::kUserStride, i);
+        w8(ctx, entry(ctx, nd, ds::kUser, ds::kUserStride, i), r8(ctx, oe));
+        w8(ctx, oe, 1);
+        notify_event(ctx, p, 10, 2, i);
+        notify_event(ctx, p, 9, 2, i);
+    }
+    w8(ctx, od + ds::kState, 1);
+    w32(ctx, p + kNextDescriptor, 0);
+    w32(ctx, p + pl::kDescriptorCount, r32(ctx, p + pl::kDescriptorCount) - 1);
+    w32(ctx, p + pl::kCurrentDescriptor, nd);
+    notify_event(ctx, p, 5, od, 0);
+    w32(ctx, p + kDeferred, rec);
+    w32(ctx, p + kDeferredKind, 4);
+    if (const u32 t = r32(ctx, nd + ds::kType); t == 1 || t == 2) container(ctx, nd, "a repeat's source open");
+    source_open(ctx, r32(ctx, nd + ds::kSource), nd, step(0xCC, rec));
+}
+
+// The next descriptor made ready (libsail's): `rec` (0x30 bytes) with its handle, the descriptor's preparation on its
+// +0x10 completing 0xAA.
+void next_prepare(PPUContext& ctx, u32 p, u32 rec, u64 handle)
+{
+    record_begin(ctx, rec, 0x30, handle);
+    prepare_descriptor(ctx, p, r32(ctx, p + kNextDescriptor), rec + 0x10, step(0xAA, rec));
+}
+
+// Next's work (libsail's, the call's record at +0xD0, 0x40 bytes cleared): an open stream moves on at once; a started or
+// ending one is stopped first (or ended, with the start flag 1), completing 0xA9.
+void next_call(PPUContext& ctx, u32 p, u32 d)
+{
+    const u32 rec = p + kCallRecord;
+    std::memset(gb(ctx) + rec, 0, 0x40);
+    w32(ctx, rec, r32(ctx, rec) | 0x20);
+    const u8 ph = phase(ctx, p);
+    if (ph == 2) {
+        next_prepare(ctx, p, p + 0xE0, step(0xA8, rec));
+    } else if (static_cast<u8>(ph - 4) <= 1) {
+        if (r64(ctx, p + kStartFlags) & 1) stream_end(ctx, p, d, p + 0x110, step(0xA9, rec), 1);
+        else stream_stop(ctx, p, d, p + 0xE0, 0, step(0xA9, rec));
+    }
 }
 
 // A deferred call run once the step running is done (libsail's, by the record's flags): start, next, stop, the input's
@@ -838,7 +1149,7 @@ void run_deferred(PPUContext& ctx, u32 p, u32 d, u32 rec)
 {
     switch (r32(ctx, rec) & 0x1E) {
     case 2: start_call(ctx, p, d); return;
-    case 4: later_part(ctx, "a deferred Next");
+    case 4: next_call(ctx, p, d); return;
     case 8: stop_call(ctx, p, d); return;
     case 0x10: input_end(ctx, p, d); return;
     default: return;
@@ -1384,6 +1695,287 @@ bool play_message(PPUContext& ctx, u32 p, u32 code, s32 result, u32 b, u32 c)
     case 0x87: case 0x88: case 0x89: es_step(ctx, p, 1, result, c, false); return true;
     case 0x8A: case 0x8B: es_step(ctx, p, 2, result, c, false); return true;
     // ---- Cancel
+    // ---- Next
+    case 0xA7: { // Next {the command, 0, the game's u64}
+        player_lock(ctx, p);
+        const u8 st = r8(ctx, p + pl::kState);
+        s32 r = error(CELL_SAIL_ERROR_INVALID_STATE);
+        if ((st == 4 || st == 6) && r32(ctx, p + kCallRunning) == 0 && has_next(ctx, p)) {
+            const u32 cmd = r32(ctx, b);
+            s32 q = 0;
+            if (cmd) q = static_cast<s32>(module_call(ctx, "cellSail", "cellSailDescriptorInquireCapability",
+                         {r32(ctx, p + kNextDescriptor), cmd}));
+            if (q < 0) {
+                r = q;
+            } else if (r32(ctx, p + kDeferred) == 0 || r32(ctx, p + kDeferredKind) == 3) {
+                w64(ctx, p + pl::kBootArg, r64(ctx, b + 8));
+                w32(ctx, p + kCallRunning, 12);
+                if (cmd) std::memmove(gb(ctx) + p + kRepeatInfo, gb(ctx) + cmd, 0x28);
+                w8(ctx, p + kRepeatSet, cmd ? 1 : 0);
+                w8(ctx, p + pl::kState, 5);
+                notify_event(ctx, p, 3, 5, 0);
+                r = q;
+            }
+        }
+        answer_command(ctx, p, c, r);
+        if (r < 0) return true;
+        set_paused(ctx, p, 0);
+        if (const u32 rec = r32(ctx, p + kDeferred)) defer(ctx, rec, 4);
+        else next_call(ctx, p, current(ctx, p));
+        return true;
+    }
+    case 0xA8: { // Next done
+        if (r8(ctx, p + kRepeatSet) && !(r32(ctx, p + kRepeatInfo + 0xC) & 0x10)) w8(ctx, p + kRepeatSet, 0);
+        if (result < 0) {
+            w8(ctx, p + pl::kState, 4);
+            notify_event(ctx, p, 3, 4, 0);
+        } else {
+            const u32 type = r32(ctx, p + kStartType);
+            if (type == 0) w32(ctx, p + kRunType, 1);
+            else if (type != 64) w32(ctx, p + kRunType, type);
+            w8(ctx, p + pl::kState, 6);
+            notify_event(ctx, p, 3, 6, 0);
+        }
+        call_completed(ctx, p, 12, result);
+        return true;
+    }
+    case 0xA9: // the stream stopped (or ended) for Next
+        w32(ctx, p + kRunType, 0);
+        if (result < 0) post_completion(ctx, p, result, r64(ctx, c + 8));
+        else next_prepare(ctx, p, c + 0x10, step(0xA8, c));
+        return true;
+    case 0xAA: { // the next descriptor made ready
+        if (result < 0) {
+            post_completion(ctx, p, result, r64(ctx, c + 8));
+            return true;
+        }
+        u32 cmd = 0;
+        if (r8(ctx, p + kRepeatSet)) {
+            cmd = p + kRepeatInfo;
+            if (!(r32(ctx, cmd + 0xC) & 0x10)) w8(ctx, p + kRepeatSet, 0);
+        }
+        start_info(ctx, r32(ctx, p + kNextDescriptor), cmd, p + kStartInfo, false);
+        descriptor_switch(ctx, p, c);
+        return true;
+    }
+    case 0xAB: { // the current source closed: the next one opened
+        if (result < 0) {
+            post_completion(ctx, p, result, r64(ctx, c + 8));
+            return true;
+        }
+        const u32 nd = r32(ctx, p + kNextDescriptor);
+        if (const u32 t = r32(ctx, nd + ds::kType); t == 1 || t == 2) container(ctx, nd, "Next's source open");
+        source_open(ctx, r32(ctx, nd + ds::kSource), nd, step(0xB2, c));
+        return true;
+    }
+    case 0xAC: { // the dmux pipeline closed: opened for the next descriptor
+        if (result < 0) {
+            post_completion(ctx, p, result, r64(ctx, c + 8));
+            return true;
+        }
+        const u32 nd = r32(ctx, p + kNextDescriptor);
+        dmux_open(ctx, dm, nd + ds::kHeader, r32(ctx, nd + ds::kSource), step(0xB3, c));
+        return true;
+    }
+    case 0xAD: case 0xAE: case 0xAF: case 0xB0: case 0xB1: { // a slot's decoder, renderer or receiver closed
+        const u32 nd = r32(ctx, p + kNextDescriptor);
+        u32 e;
+        if (code <= 0xAE) e = entry(ctx, nd, ds::kAudio, ds::kAudioStride, r8(ctx, c + as::kIndex));
+        else if (code <= 0xB0) e = entry(ctx, nd, ds::kVideo, ds::kVideoStride, r8(ctx, c + vs::kIndex));
+        else e = entry(ctx, nd, ds::kUser, ds::kUserStride, r8(ctx, c + us::kIndex));
+        if (result >= 0 && r8(ctx, e) == 1) {
+            switch (code) {
+            case 0xAD:
+                audio_pipeline_open(ctx, c + as::kPipeline, e + 0x28, e + 0x2C, e + 0x60, c + as::kDmuxEs,
+                    r32(ctx, c + as::kRenderer), c, step(0xB7, c));
+                break;
+            case 0xAE: audio_renderer_open(ctx, r32(ctx, c + as::kRenderer), e + 0x78, c, step(0xB8, c)); break;
+            case 0xAF:
+                video_pipeline_open(ctx, c + vs::kPipeline, e + 0x20, e + 0x38, e + 0x58, c + vs::kDmuxEs,
+                    r32(ctx, c + vs::kRenderer), c, step(0xB9, c));
+                break;
+            case 0xB0: video_renderer_open(ctx, r32(ctx, c + vs::kRenderer), e + 0x58, c, step(0xBA, c)); break;
+            default:
+                receiver_open(ctx, r32(ctx, c + us::kReceiver), r32(ctx, nd + ds::kType), e + 0x3C, c, step(0xBB, c));
+                break;
+            }
+            return true;
+        }
+        if (count_down(ctx, c)) return true;
+        post_completion(ctx, p, result, r64(ctx, c + 8));
+        return true;
+    }
+    case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6: { // a step of the switch done
+        if (result < 0) {
+            mark_failed(ctx, c);
+            notify_error(ctx, p, result);
+        }
+        if (count_down(ctx, c)) return true;
+        const u32 od = current(ctx, p);
+        for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+            const u32 e = entry(ctx, od, ds::kAudio, ds::kAudioStride, i);
+            if (r8(ctx, e) != 2) continue;
+            w8(ctx, e, 1);
+            inc8(ctx, p + kAudioOpen, -1);
+            if (ps_read16(gb(ctx), audio_slot(ctx, p, i) + as::kMode)) inc8(ctx, p + kAudioModeOpen, -1);
+            notify_event(ctx, p, 10, 0, i);
+        }
+        for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+            const u32 e = entry(ctx, od, ds::kVideo, ds::kVideoStride, i);
+            if (r8(ctx, e) != 2) continue;
+            w8(ctx, e, 1);
+            inc8(ctx, p + kVideoOpen, -1);
+            if (ps_read16(gb(ctx), video_slot(ctx, p, i) + vs::kMode)) inc8(ctx, p + kVideoModeOpen, -1);
+            notify_event(ctx, p, 10, 1, i);
+        }
+        for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+            const u32 e = entry(ctx, od, ds::kUser, ds::kUserStride, i);
+            if (r8(ctx, e) != 2) continue;
+            w8(ctx, e, 1);
+            notify_event(ctx, p, 10, 2, i);
+        }
+        w8(ctx, od + ds::kState, 1);
+        notify_event(ctx, p, 5, od, 0);
+        const u32 nd = r32(ctx, p + kNextDescriptor);
+        const bool failed = (r32(ctx, c) & 1) != 0;
+        w32(ctx, p + pl::kCurrentDescriptor, nd);
+        w32(ctx, p + kNextDescriptor, 0);
+        if (failed) w8(ctx, nd + ds::kState, 3);
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (failed) {
+            if (r8(ctx, p + kStarts) == 0) close_stream(ctx, p, nd, c + 0x10, step(0xBC, c));
+            else stream_stop(ctx, p, nd, c + 0x10, 0, step(0xBD, c));
+            return true;
+        }
+        const bool later = sdk_after_22(ctx);
+        for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+            const u32 e = entry(ctx, nd, ds::kAudio, ds::kAudioStride, i), slot = audio_slot(ctx, p, i);
+            if (r8(ctx, e) != 1 || r8(ctx, slot + as::kState) != 2) continue;
+            if (later) dmux_es_add(ctx, dm, 0, e + 0xC, e + 0x1C, slot, slot + as::kDmuxEs, false);
+            w8(ctx, e, 2);
+            inc8(ctx, p + kAudioOpen);
+            if (ps_read16(gb(ctx), slot + as::kMode)) inc8(ctx, p + kAudioModeOpen);
+            notify_event(ctx, p, 9, 0, i);
+        }
+        for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+            const u32 e = entry(ctx, nd, ds::kVideo, ds::kVideoStride, i), slot = video_slot(ctx, p, i);
+            if (r8(ctx, e) != 1 || r8(ctx, slot + vs::kState) != 2) continue;
+            if (later) dmux_es_add(ctx, dm, 1, e + 0xC, e + 0x1C, slot, slot + vs::kDmuxEs, false);
+            w8(ctx, e, 2);
+            inc8(ctx, p + kVideoOpen);
+            if (ps_read16(gb(ctx), slot + vs::kMode)) inc8(ctx, p + kVideoModeOpen);
+            notify_event(ctx, p, 9, 1, i);
+        }
+        for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+            const u32 e = entry(ctx, nd, ds::kUser, ds::kUserStride, i), slot = user_slot(ctx, p, i);
+            if (r8(ctx, e) != 1 || r8(ctx, slot + us::kState) != 2) continue;
+            if (later) dmux_es_add(ctx, dm, 2, e + 0x3C, e + 0xC, slot, slot + us::kDmuxEs, false);
+            w8(ctx, e, 2);
+            notify_event(ctx, p, 9, 2, i);
+        }
+        notify_event(ctx, p, 4, nd, 0);
+        if (r32(ctx, c) & 0x1E) run_deferred(ctx, p, nd, c);
+        else streams_start(ctx, p, nd, c + 0x10, r64(ctx, c + 8));
+        return true;
+    }
+    case 0xB7: case 0xB8: case 0xB9: case 0xBA: case 0xBB: { // a slot's decoder, renderer or receiver reopened
+        const u32 kind = code <= 0xB8 ? 0 : code <= 0xBA ? 1 : 2;
+        if (result < 0) {
+            mark_failed(ctx, c);
+            notify_error(ctx, p, result);
+        }
+        if (count_down(ctx, c)) return true;
+        w8(ctx, c + (kind == 0 ? as::kState : kind == 1 ? vs::kState : us::kState), 2);
+        if (!(r32(ctx, c) & 1)) {
+            post_completion(ctx, p, 0, r64(ctx, c + 8));
+            return true;
+        }
+        if (kind == 0) es_close_audio(ctx, p, c, r64(ctx, c + 8), true);
+        else if (kind == 1) es_close_video(ctx, p, c, r64(ctx, c + 8), true);
+        else es_close_user(ctx, p, c, r64(ctx, c + 8), true);
+        return true;
+    }
+    case 0xBC: case 0xBD: // the next descriptor's stream taken down after a failed switch
+        post_completion(ctx, p, error(CELL_SAIL_ERROR_CANCEL), r64(ctx, c + 8));
+        return true;
+    // ---- a repeat into the next descriptor
+    case 0xCB: { // the next descriptor made ready
+        const u32 od = current(ctx, p), nd = r32(ctx, p + kNextDescriptor);
+        if (result < 0) {
+            mark_failed(ctx, c);
+            notify_error(ctx, p, result);
+            w8(ctx, nd + ds::kState, 2);
+            close_descriptor_for(ctx, nd);
+            stream_end(ctx, p, od, p + 0x110, 0, 0);
+            w32(ctx, p + kDeferredKind, 0);
+            w32(ctx, p + kDeferred, 0);
+            if (r32(ctx, c) & 0x1E) run_deferred(ctx, p, od, c);
+            return true;
+        }
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w8(ctx, nd + ds::kState, 3);
+            run_deferred(ctx, p, od, c);
+            return true;
+        }
+        start_info(ctx, nd, 0, p + kStartInfo, false);
+        next_out_formats(ctx, p, nd);
+        if (r32(ctx, od + ds::kSource) == r32(ctx, nd + ds::kSource) &&
+            (r32(ctx, od + ds::kHeader) != r32(ctx, nd + ds::kHeader) || seamless_next(ctx, p, od, nd))) {
+            seamless_swap(ctx, p, od, nd, c);
+            return true;
+        }
+        w32(ctx, p + kDeferredKind, 4);
+        w32(ctx, p + kDeferred, c);
+        stream_end(ctx, p, od, p + 0x110, step(0xCE, c), 0);
+        return true;
+    }
+    case 0xCC: { // the swapped-to descriptor's source told: its session started
+        const u32 d = current(ctx, p);
+        notify_event(ctx, p, 4, d, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w32(ctx, p + kDeferred, 0);
+            w32(ctx, p + kDeferredKind, 0);
+            run_deferred(ctx, p, d, c);
+            return true;
+        }
+        source_session(ctx, p, d, true, false, step(0xCD, c));
+        if (r8(ctx, p + kRepeatSet) && !(r32(ctx, p + kRepeatInfo + 0xC) & 0x10)) w8(ctx, p + kRepeatSet, 0);
+        return true;
+    }
+    case 0xCD: // the swapped-to descriptor's session started
+        w8(ctx, p + kPhase, 4);
+        notify_event(ctx, p, 6, r32(ctx, p + kSession) & 0x3FF, 0);
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) run_deferred(ctx, p, current(ctx, p), c);
+        return true;
+    case 0xCE: // the old stream ended: switched to the next descriptor
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w8(ctx, r32(ctx, p + kNextDescriptor) + ds::kState, 3);
+            run_deferred(ctx, p, current(ctx, p), c);
+            return true;
+        }
+        std::memset(gb(ctx) + c, 0, 0x40);
+        w32(ctx, c, r32(ctx, c) | 0x20);
+        w64(ctx, c + 0x18, step(0xCF, c));
+        descriptor_switch(ctx, p, c + 0x10);
+        return true;
+    case 0xCF: // the repeat into the next descriptor done
+        if (result < 0) {
+            w8(ctx, p + kPhase, 0);
+            w8(ctx, p + pl::kState, 4);
+            notify_event(ctx, p, 3, 4, 0);
+            w8(ctx, p + pl::kState, 2);
+            notify_event(ctx, p, 3, 2, 0);
+        } else if (r8(ctx, p + kRepeatSet) && !(r32(ctx, p + kRepeatInfo + 0xC) & 0x10)) {
+            w8(ctx, p + kRepeatSet, 0);
+        }
+        return true;
     case 0xD0: {
         const u32 d = current(ctx, p);
         const u32 type = r32(ctx, d + ds::kType);
@@ -1423,6 +2015,7 @@ s32 start_or_next(PPUContext& ctx, u32 p, u32 code, u32 cmd, u64 arg)
 }
 
 s32 cellSailPlayerStart(PPUContext& ctx, u32 p, u32 cmd, u64 arg) { return start_or_next(ctx, p, 0x6C, cmd, arg); }
+s32 cellSailPlayerNext(PPUContext& ctx, u32 p, u32 cmd, u64 arg) { return start_or_next(ctx, p, 0xA7, cmd, arg); }
 
 s32 cellSailPlayerStop(PPUContext& ctx, u32 p, u64 arg)
 {
@@ -1444,6 +2037,7 @@ void register_cellSailPlay(Registry& r)
 #define SAIL(f) ::pspocket::hle::Function{{}, #f, recomp::nid_of(#f), &detail::thunk<&f>, false}
     r.add("cellSail", {
         SAIL(cellSailPlayerStart),
+        SAIL(cellSailPlayerNext),
         SAIL(cellSailPlayerStop),
         SAIL(cellSailPlayerCancel),
     });

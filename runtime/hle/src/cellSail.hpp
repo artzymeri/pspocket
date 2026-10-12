@@ -368,6 +368,15 @@ void es_open_user(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 entry, u64 handle
 void es_close_audio(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
 void es_close_video(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
 void es_close_user(PPUContext& ctx, u32 p, u32 slot, u64 handle, bool failed);
+// The formats an elementary stream's renderer is given (the entry's +0x78 audio, +0x58 video) for its slot's renderer.
+void audio_out_format(PPUContext& ctx, u32 e, u32 slot);
+void video_out_format(PPUContext& ctx, u32 e, u32 slot);
+// OpenStream's steps (cellSailControl.cpp): a descriptor made ready for a stream (its streams chosen), a stream taken
+// down (its source closed, its open elementary streams closed, the dmux pipeline closed).
+void prepare_descriptor(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle);
+void close_stream(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle);
+// A descriptor's Close from the control thread (its stream closed, back to added or created).
+void close_descriptor_for(PPUContext& ctx, u32 d);
 // The control thread's messages of the elementary streams (their steps and the OpenEs, ReopenEs and CloseEs calls):
 // true when `code` was one of them.
 bool es_message(PPUContext& ctx, u32 p, u32 code, u32 a, u32 b, u32 c);

@@ -13044,6 +13044,124 @@ cellSailAuReceiverGet, cellSailSoundAdapterGetFrame and cellSailGraphicsAdapterG
   alone and its answers are checked against libsail's (`cellSail: the playback through an AU receiver on pspocket
   alone`).
 
+## D-919 · 2026-10-12 · cellSail's adapters' frames compared, as libsail (part 4)
+
+The adapters' frame calls of part 3 (cellSailSoundAdapterGetFrame, cellSailGraphicsAdapterGetFrame and GetFrame2)
+and the decoders' play side behind them (cellAdec and libvdec fed AU by AU, both copy threads filling the adapters'
+frames) compared with libsail running on pspocket, with no change to part 3's code:
+- **Part 17** (`[sail]`): a mode-1 player (no AV sync: the renderers' flag 4) with a sound adapter and a graphics adapter
+  (the game's pictures) over a synthetic PAMF stream (twelve AVC 96x64 I_PCM IDR pictures, 24 silent ATRAC3plus frames
+  after their ATS headers) fed through a game's source in guest code: GetFrame of each adapter before the stream is
+  open, open, started; the frames copied (the graphics adapter buffering until its four frames are full); sound
+  GetFrame of 100 to 2048 samples, GetFrame and GetFrame2 (each keep flag); the input's end drained through both until
+  each has ended (the graphics adapter only once the frames the game was given are past its delay), the stream open
+  again; CloseStream; Finalize.
+- **Part 18**: the same through a mode-0 player, the adapters synced to the clock the game's UpdateAvSync reports
+  drive: a tick of 256 samples with its report, a video frame every third tick (none for the first 30 ticks, so the
+  frames due by then are dropped but the latest; every ninth for a while) with its report, the audio reports jumping
+  ahead once, the input's end: frames due, early (12), not due (28), shown again (0x104, 0x10C), late with frames given
+  back (0x310, 0x410, 0x510), the output running out (0x205), the end (48).
+- 0 differences in three runs each (answers, each thread's lv2 calls, the script's memory, the allocator's memory, the
+  callback records); every `[sail]` test passes (27). The decoders' and copy threads' messages reach the control thread
+  as those threads run, so from part 17 on each thread's lv2 calls are compared in no order, and the script waits for
+  the player's queue to stay empty between calls. Without the firmware, both scripts run on pspocket's side alone and
+  their answers are checked against libsail's (`cellSail: the playback through the adapters on pspocket alone`).
+- libsail's sound adapter copies a GetFrame's samples into a buffer of 2048 (0x2000 bytes per channel): a game asking
+  for more overwrites what follows it (with SDKs before 4.0 the decoder's context after the adapter's block), kept.
+
+## D-919 · 2026-10-12 · cellSail's Next, the switch to the next descriptor, as libsail (part 5)
+
+cellSailPlayerNext (command 0xA7, call 12), the last of cellSail's 124 functions to be pspocket's (all registered now),
+with libsail's switch to the next descriptor (runtime/hle/src/cellSailPlay.cpp):
+- **Next** is refused (INVALID_STATE) unless the stream is open or started with no call running and a next descriptor
+  (+0x228), or with a deferred call other than an input's end; a command is the next descriptor's InquireCapability's
+  to refuse and is kept as the repeat information (with flag 0x10 it stays for later starts). Accepted: state 5, the
+  pause off; an open stream moves on at once, a started or ending one is stopped first (with start flag 1 ended,
+  flushed; 0xA9). A Next deferred behind a running step (the record's bit 4) runs when it is done.
+- **The switch** (records +0xD0, +0xE0): the next descriptor made ready as OpenStream does (0xAA), its start information
+  from the repeat command, the renderers' formats for it; a different source closed and the next one's opened, the
+  same one told of the descriptor (0xAB, 0xB2); the dmux pipeline reopened for a different kind (0xAC, 0xB3), else
+  kept with the new source. Each stream slot: kept when its next entry is chosen and compatible (the ES filter, for
+  PAMF the coding's fields; the decoder: coding, channels, rate, frame / coding, profile, specific bytes, picture and
+  format out; the renderer's format), its dmux part removed when it differs; otherwise the decoder or renderer (or both)
+  closed (0xAD-0xB1) and, the entry chosen, opened again with the new format (0xB7-0xBB), an AU receiver only closed
+  when its stream is not chosen; a slot not open completes its steps at once. Once all are in: the old descriptor's
+  open streams chosen again (event 10 each), it is closed for the player (state 1, event 5), the next one current
+  (the descriptor count one less), each stream kept or reopened open (its dmux part added again with the later SDKs,
+  event 9), event 4, and its streams start; Next completes (0xA8: state 6, the run type from the start type; a
+  failure: state 4). A failed switch takes the new stream down (closed, or stopped when streams had started) and
+  answers CANCEL (0xBC, 0xBD).
+- libsail's ways kept: an AU receiver's stop is answered only through the game's Get, and a graphics adapter's stop
+  waits for the frames the game holds to come back through GetFrame2, so a game must keep calling them for Next (and
+  Stop) to go on.
+- Still failing loudly: a repeat into the next descriptor (repeat mode 2, its seamless path and messages 0xCB-0xCF),
+  EP skipping, the elementary streams of a started stream, OpenStream or Next of a descriptor not opened (its header
+  read through the source), MP4 and AVI streams, libsail's sample rate converter.
+- **Compared** (tests/hle/test_sail.cpp, `[sail]`): part 19, an AU receiver: Next refused before a stream, without a next
+  descriptor and with a refused command; Next from the open stream (switched to and started), AUs; Next while playing
+  with a start command (stopped first, answered through Get) and refused while it runs; AUs; Stop. Part 20, a sound
+  and a graphics adapter: Next while playing from AVC 96x64 to AVC 128x64 on another channel (the audio stream kept,
+  the video decoder and the graphics adapter closed and opened again: the game's pictures given back and asked for
+  again), the new stream played to its end. 0 differences in three runs each; all 31 `[sail]` tests pass. A firmware-free
+  test checks part 19's answers on pspocket alone. The scripts' source now keeps its item table apart from the items
+  (from 14 items on, the table had overwritten the first items in parts 17 and 18; their firmware-free answers redone).
+
+## D-919 · 2026-10-12 · cellSail's descriptors the game never opened, as libsail (part 6)
+
+A descriptor added without cellSailDescriptorOpen (state 2) is opened by the player when OpenStream or Next makes it
+ready (runtime/hle/src/cellSailControl.cpp): opening (4), its stream opened on the control thread as Open's command
+does (the protocol's source found by the URI, made up by its first user, libpamf loaded), then its header read through
+the source's asynchronous Read: 2 KB into a buffer from the player's allocator, the read's handle kept at the
+source's +0x60 so the game's NotifyCallCompleted completes it (message 0x4A). The read done: a header longer than what
+was read is read again whole; else it is parsed (stream offset and size, cellPamfReader, a stream without entry points
+flagged (+0x18 bit 0), the mux rate, the duration), the streams chosen and the descriptor in use (5). A refused Read
+closes the descriptor's stream again and the preparation fails (the descriptor left opening, libsail's); a read that
+fails closes the descriptor (back to added) and the call fails; a failure after the read frees the buffer (when a second
+read was refused, the first buffer a second time, as libsail does). Its total size goes to a word on libsail's stack.
+- **Compared** (tests/hle/test_sail.cpp part 21, `[sail]`): a descriptor with a header of two units added unopened and
+  OpenStream (read in 2 KB, then whole), a start and AUs, Next to another unopened descriptor (made ready the same way,
+  switched to while playing), AUs, Stop, CloseStream, and a descriptor whose source's Read fails (OpenStream completes
+  with CANCEL after an error event): 0 differences in three runs; all 33 `[sail]` tests pass. A firmware-free test checks
+  its answers on pspocket alone. The test's source answers its Read at once (ReadSync's copy, then
+  NotifyCallCompleted from the control thread).
+
+## D-919 · 2026-10-12 · cellSail's elementary streams of a started stream, as libsail (part 7)
+
+OpenEs, ReopenEs and CloseEs while the stream plays (runtime/hle/src/cellSailEs.cpp): a stream not chosen is opened,
+then started (0x8D/0x93/0x99); a chosen one reopened is stopped first, a video renderer keeping its last frame,
+whether its format changed or not (0x90/0x96/0x9C: event 10), then started again with its entry as it now is (event 9)
+while the stream plays; CloseEs of a started stream stops it (keeping nothing) before closing it (0x9F/0xA2/0xA5). As
+libsail: a failed start of a reopened or newly opened stream closes it with a completion on record 0 (which libsail then
+reads at address 4), and a stopped stream's dmux part stays enabled, so with the later SDKs its start fails (the
+enable is refused), the stream is stopped and closed again and the ReopenEs call never completes, leaving the player's
+Stop and CloseStream refused until Finalize.
+- **Compared** (tests/hle/test_sail.cpp part 22, `[sail]`): an AU receiver's stream while playing: CloseEsUser (stopped
+  through Get, closed), OpenEsUser (opened, started), AUs, ReopenEsUser (stopped through Get, its start refused, closed;
+  the call left running), Stop and CloseStream refused, Finalize: 0 differences in three runs; all 35 `[sail]` tests
+  pass; a firmware-free test checks its answers on pspocket alone.
+
+## D-919 · 2026-10-12 · cellSail's repeat into the next descriptor, as libsail (part 8)
+
+Repeat mode 2 (SetRepeatMode 2) with a next descriptor (runtime/hle/src/cellSailPlay.cpp): at the source's end of
+input the next descriptor is made ready (as OpenStream does; the record at +0x120 running, kind 4; message 0xCB). A
+refused preparation marks the record, is an error event, takes the next descriptor back to added and closes it, and
+the stream ends as without a repeat. Ready: its start information (no command) and the renderers' formats; when it has
+the same source and either another dmux kind or every stream compatible (an open stream chosen again and its dmux
+part, decoder and renderer format the same; a stream not chosen staying unchosen; user streams only chosen), it is
+swapped to without stopping: the dmux pipeline given its source, each open or chosen stream's old entry chosen again
+(event 10, the old entry looked at again after the game's handler) and its new entry open (event 9; user entries take
+the old ones' values), the old descriptor closed for the player and the next one current (one descriptor fewer), then
+event 5, the source told of the descriptor (0xCC: event 4) and a new session started on it (0xCD: event 6). Otherwise
+the stream ends (0xCE) and the player switches to the next descriptor as Next does (0xCF; a failure leaves the player
+open: state 4, then 2). A call deferred meanwhile runs instead (the next descriptor left opened).
+- **Compared** (tests/hle/test_sail.cpp part 23, `[sail]`): an AU receiver with repeat mode 2: the input's end with a
+  compatible next descriptor (swapped to, a new session, AUs), then with a next descriptor that chooses no streams (the
+  stream ended through Get, switched to); Stop: 0 differences in three runs; all 37 `[sail]` tests pass; a
+  firmware-free test checks its answers on pspocket alone.
+- Still failing loudly with a log: EP skipping (start type 16, libsail's entry point walk), MP4 and AVI streams (the
+  firmware libraries libmp4 and libsail_avi behind their descriptors, demuxing and cancel), and the audio sample rate
+  converter (libapostsrc_mini, audio parameter 32).
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
