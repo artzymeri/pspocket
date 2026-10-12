@@ -217,6 +217,8 @@ bool place(const recomp::ElfFile& elf, std::span<const u8> bytes, hle::HleProces
                 const u32 nid = ps_read32(base, nids + 4 * i), descriptor = ps_read32(base, addrs + 4 * i);
                 if (nid == recomp::kNidModuleStart) out->start = descriptor;
                 if (nid == recomp::kNidModuleStop) out->stop = descriptor;
+                if (nid == recomp::kNidModulePrologue) out->prologue = descriptor;
+                if (nid == recomp::kNidModuleEpilogue) out->epilogue = descriptor;
             }
         }
         if (!library) continue;
@@ -835,7 +837,7 @@ const PrxModule* LleModules::load_file(const std::string& file, hle::HleProcess&
             if (const u32 v = from_module(library, nid, true)) return v;
             return chooses(library) ? 0u : hle.link_variable(library, nid); // the host's (D-503)
         });
-    if (m->start) starts_.push_back(m->start);
+    if (m->start || m->prologue) starts_.push_back(start_of(*m));
     if (on_load_) on_load_(*m);
     PS_LOG_INFO(kChan, "{} ({}): {} segments at {:#x}, {} relocations ({} bad), {} functions exported, module_start {:#x}",
         m->name, file, m->segments.size(), m->segments.empty() ? 0 : m->segments[0].first, m->relocations,
@@ -1042,13 +1044,13 @@ u32 RuntimeModules::load_at(std::string_view path, u64 offset, u32* id)
     return kOk;
 }
 
-u32 RuntimeModules::start(u32 id, u32* entry)
+u32 RuntimeModules::start(u32 id, hle::ModuleEntry* entry)
 {
     std::lock_guard lock(mutex_);
     Entry* e = find(id);
     if (!e) return kNoSuchObject;
     if (e->state == State::Started) return kPrxErrorAlreadyStarted;
-    *entry = 0;
+    *entry = {};
     if (!e->module) return kOk;
     // Its exports into the executable's imports of them (RPCS3 lv2_prx::load_exports): the slots held the host's
     // stubs, which log the call and fail.
@@ -1074,15 +1076,16 @@ u32 RuntimeModules::start(u32 id, u32* entry)
     PS_LOG_INFO(kChan, "{} starts: {} of the game's imported functions and {} variables now go to it", e->path, functions,
         variables);
     // A firmware module started already (at boot, or before a module that needed it, D-175) is not started again.
-    *entry = !e->owned && lle_ && lle_->started(e->module->start) ? 0 : e->module->start;
-    if (!e->owned && lle_ && *entry) lle_->mark_started(*entry);
+    const hle::ModuleEntry start = LleModules::start_of(*e->module);
+    *entry = !e->owned && lle_ && lle_->started(start) ? hle::ModuleEntry{} : start;
+    if (!e->owned && lle_ && !entry->empty()) lle_->mark_started(*entry);
     return kOk;
 }
 
-std::vector<u32> RuntimeModules::take_dependency_starts()
+std::vector<hle::ModuleEntry> RuntimeModules::take_dependency_starts()
 {
     std::lock_guard lock(mutex_);
-    return lle_ ? lle_->take_starts() : std::vector<u32>{};
+    return lle_ ? lle_->take_starts() : std::vector<hle::ModuleEntry>{};
 }
 
 void RuntimeModules::started(u32 id, s32 result)
@@ -1094,13 +1097,13 @@ void RuntimeModules::started(u32 id, s32 result)
     e->state = result == 0 ? State::Started : State::Unloaded;
 }
 
-u32 RuntimeModules::stop(u32 id, u32* entry)
+u32 RuntimeModules::stop(u32 id, hle::ModuleEntry* entry)
 {
     std::lock_guard lock(mutex_);
     Entry* e = find(id);
     if (!e) return kNoSuchObject;
     if (e->state != State::Started) return kPrxErrorNotStarted;
-    *entry = e->module ? e->module->stop : 0;
+    *entry = e->module ? hle::ModuleEntry{e->module->stop, e->module->epilogue} : hle::ModuleEntry{};
     return kOk;
 }
 

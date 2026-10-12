@@ -110,7 +110,7 @@ public:
             }
         }
         if (lle)
-            for (const u32 s : lle->take_starts()) call_guest(t.ctx, s, {0, 0});
+            for (const ModuleEntry& s : lle->take_starts()) run_module_entry(t.ctx, s, 0, 0);
         write_code();
         std::memset(b + kHeap, 0xCD, 0x200000);
         scratch_ = kScratch;

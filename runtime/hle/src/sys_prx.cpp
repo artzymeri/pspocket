@@ -96,7 +96,8 @@ s32 sys_prx_load_module_list(PPUContext& ctx, s32 count, u32 path_list, u64 flag
 }
 
 // sys_prx_start_module(id, args, argp, result, flags, pOpt): RPCS3's wrapper: the syscall links the module (cmd 1),
-// module_start(args, argp) runs here, its result goes to *result and back to the syscall (cmd 2).
+// its start runs here (module_prologue with module_start, or module_start, with args and argp: entryx, D-916 part 1),
+// its result goes to *result and back to the syscall (cmd 2).
 s32 sys_prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result, u64 /*flags*/, u32 /*opt*/)
 {
     lv2::PpuThread& t = thread_of(ctx);
@@ -104,17 +105,19 @@ s32 sys_prx_start_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result
     ModuleLoader* l = loader_of(ctx);
     if (!l) return code(kPrxNoLoader);
     std::lock_guard lock(HleProcess::current()->state<PrxCalls>().mutex);
-    u32 entry = 0;
+    ModuleEntry entry;
     if (const u32 r = l->start(id, &entry); r != lv2::CELL_OK) return code(r);
     // Firmware modules loaded for it start first, as at boot (D-175).
-    for (const u32 dep : l->take_dependency_starts()) {
-        const u32 r = static_cast<u32>(call_guest(ctx, dep, {0, 0}));
-        PS_LOG_INFO(kChan, "sys_prx_start_module({:#x}): firmware module_start {:#x} returned {:#x}", id, dep, r);
+    for (const ModuleEntry& dep : l->take_dependency_starts()) {
+        const u32 r = static_cast<u32>(run_module_entry(ctx, dep, 0, 0));
+        PS_LOG_INFO(kChan, "sys_prx_start_module({:#x}): firmware module_start {:#x} (prologue {:#x}) returned {:#x}", id,
+            dep.entry, dep.wrapper, r);
     }
-    const s32 res = entry ? static_cast<s32>(call_guest(ctx, entry, {args, argp})) : 0;
+    const s32 res = static_cast<s32>(run_module_entry(ctx, entry, args, argp));
     ps_write32(t.kernel.base(), result, static_cast<u32>(res));
     l->started(id, res);
-    PS_LOG_INFO(kChan, "sys_prx_start_module({:#x}): module_start {:#x} returned {:#x}", id, entry, static_cast<u32>(res));
+    PS_LOG_INFO(kChan, "sys_prx_start_module({:#x}): module_start {:#x} (prologue {:#x}) returned {:#x}", id,
+        entry.entry, entry.wrapper, static_cast<u32>(res));
     return lv2::CELL_OK;
 }
 
@@ -126,9 +129,9 @@ s32 sys_prx_stop_module(PPUContext& ctx, u32 id, u32 args, u32 argp, u32 result,
     ModuleLoader* l = loader_of(ctx);
     if (!l) return code(kPrxNoLoader);
     std::lock_guard lock(HleProcess::current()->state<PrxCalls>().mutex);
-    u32 entry = 0;
+    ModuleEntry entry;
     if (const u32 r = l->stop(id, &entry); r != lv2::CELL_OK) return code(r);
-    const s32 res = entry ? static_cast<s32>(call_guest(ctx, entry, {args, argp})) : 0;
+    const s32 res = static_cast<s32>(run_module_entry(ctx, entry, args, argp));
     ps_write32(t.kernel.base(), result, static_cast<u32>(res));
     l->stopped(id, res);
     return lv2::CELL_OK;
@@ -304,15 +307,19 @@ public:
         std::lock_guard lock(p_.state<PrxCalls>().mutex);
         return offset ? l->load_at(path, offset, id) : l->load(path, id);
     }
-    u32 start(lv2::PpuThread& t, u32 id, u32* entry) override
+    u32 start(lv2::PpuThread& t, u32 id, u32* entry, u32* entry2) override
     {
         ModuleLoader* l = p_.module_loader();
         if (!l) return kPrxNoLoader;
         std::lock_guard lock(p_.state<PrxCalls>().mutex);
-        if (const u32 r = l->start(id, entry); r != lv2::CELL_OK) return r;
-        for (const u32 dep : l->take_dependency_starts()) {
-            const u32 r = static_cast<u32>(call_guest(*t.ctx, dep, {0, 0}));
-            PS_LOG_INFO(kChan, "_sys_prx_start_module({:#x}): firmware module_start {:#x} returned {:#x}", id, dep, r);
+        ModuleEntry e;
+        if (const u32 r = l->start(id, &e); r != lv2::CELL_OK) return r;
+        *entry = e.entry;
+        *entry2 = e.wrapper;
+        for (const ModuleEntry& dep : l->take_dependency_starts()) {
+            const u32 r = static_cast<u32>(run_module_entry(*t.ctx, dep, 0, 0));
+            PS_LOG_INFO(kChan, "_sys_prx_start_module({:#x}): firmware module_start {:#x} (prologue {:#x}) returned {:#x}",
+                id, dep.entry, dep.wrapper, r);
         }
         return lv2::CELL_OK;
     }
@@ -323,12 +330,16 @@ public:
             l->started(id, result);
         }
     }
-    u32 stop(u32 id, u32* entry) override
+    u32 stop(u32 id, u32* entry, u32* entry2) override
     {
         ModuleLoader* l = p_.module_loader();
         if (!l) return kPrxNoLoader;
         std::lock_guard lock(p_.state<PrxCalls>().mutex);
-        return l->stop(id, entry);
+        ModuleEntry e;
+        const u32 r = l->stop(id, &e);
+        *entry = e.entry;
+        *entry2 = e.wrapper;
+        return r;
     }
     void stopped(u32 id, s32 result) override
     {

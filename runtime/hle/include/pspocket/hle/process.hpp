@@ -83,6 +83,17 @@ struct ModuleInfo {
     std::pair<u32, u32> exports{}, imports{};
 };
 
+// A module's start (or stop) as liblv2 makes it (RPCS3 sys_prx_.cpp entryx, D-916 part 1): a module with a
+// module_prologue (module_epilogue) has that called with module_start's (module_stop's) descriptor, all ones when it has
+// none, and the two arguments; the prologue runs the module's C++ static constructors, then module_start (the epilogue
+// module_stop, then the destructors). A module without one gets module_start (module_stop) with the arguments alone.
+struct ModuleEntry {
+    u32 entry = 0;   // module_start's or module_stop's descriptor (0: none)
+    u32 wrapper = 0; // module_prologue's or module_epilogue's (0: none)
+    bool empty() const { return !entry && !wrapper; }
+    bool operator==(const ModuleEntry&) const = default;
+};
+
 class ModuleLoader {
 public:
     virtual ~ModuleLoader() = default;
@@ -97,18 +108,18 @@ public:
     virtual std::vector<u32> list() { return {}; }
     // A loaded module's information; false for an unknown ID.
     virtual bool info(u32, ModuleInfo&) { return false; }
-    // Its exports linked into the imports waiting for them; *entry its module_start descriptor (0: none).
-    virtual u32 start(u32 id, u32* entry) = 0;
+    // Its exports linked into the imports waiting for them; *entry its start (empty: nothing to run).
+    virtual u32 start(u32 id, ModuleEntry* entry) = 0;
     // module_start returned `result` (SYS_PRX_RESIDENT 0: it stays; else it goes).
     virtual void started(u32 id, s32 result) = 0;
-    virtual u32 stop(u32 id, u32* entry) = 0;
+    virtual u32 stop(u32 id, ModuleEntry* entry) = 0;
     virtual void stopped(u32 id, s32 result) = 0;
     virtual u32 unload(u32 id) = 0;
     // By the name in its module info; 0 when none.
     virtual u32 id_by_name(std::string_view name) = 0;
-    // The module_start descriptors of firmware modules loaded for the modules loaded so far that have not run
-    // (dependencies first), each returned once: sys_prx_start_module runs them before the module's own (D-175).
-    virtual std::vector<u32> take_dependency_starts() { return {}; }
+    // The starts of firmware modules loaded for the modules loaded so far that have not run (dependencies first), each
+    // returned once: sys_prx_start_module runs them before the module's own (D-175).
+    virtual std::vector<ModuleEntry> take_dependency_starts() { return {}; }
 };
 
 struct ProcessConfig {

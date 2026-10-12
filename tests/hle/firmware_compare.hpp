@@ -43,8 +43,8 @@ struct FirmwareLibrary {
         module = lle.load(library, *f.hle, &why);
         INFO(why);
         REQUIRE(module);
-        for (const u32 s : lle.take_starts())
-            if (start) call_guest(t.ctx, s, {0, 0});
+        for (const ModuleEntry& s : lle.take_starts())
+            if (start) run_module_entry(t.ctx, s, 0, 0);
     }
 
     // Calls the module's export `nid` with up to eight arguments: r3's low word.

@@ -5,10 +5,11 @@
 // the system calls under them, for code that makes them itself (Sony's liblv2coredump and sys_audio, a game's own
 // `sc`); they reach the same loader through Kernel::module_host (the HLE layer's), with RPCS3's contract:
 // - _sys_prx_start_module(id, flags, opt {size, cmd, entry, res, entry2}): command 1 links the module (and starts the
-//   firmware modules loaded for it, D-175) and gives its module_start descriptor in entry (~0: none; entry2, the
-//   prologue, is ~0: pspocket's modules have none); command 2 hands back module_start's result: 0 (resident) keeps
-//   the module, another value in its low word unloads it and is returned. _sys_prx_stop_module likewise with
-//   module_stop (command 2: 0 stops it, 1 is CELL_PRX_ERROR_CAN_NOT_STOP); command 4 gives the entries, 8 is taken.
+//   firmware modules loaded for it, D-175) and gives its module_start descriptor in entry and its module_prologue's
+//   in entry2 (~0: none; liblv2 calls entry2 with entry when there is one, D-916 part 1); command 2 hands back
+//   module_start's result: 0 (resident) keeps the module, another value in its low word unloads it and is returned.
+//   _sys_prx_stop_module likewise with module_stop and module_epilogue (command 2: 0 stops it, 1 is
+//   CELL_PRX_ERROR_CAN_NOT_STOP); command 4 gives the entries, 8 is taken.
 // - The loads by path, by descriptor (the file's own path, `offset` bytes in), on a memory container (there are none
 //   for modules: as without), and by list (64-bit pointers to the paths; on a failure the ones loaded are unloaded and
 //   the ID list filled with -1).
@@ -176,10 +177,10 @@ Result _sys_prx_start_module(PpuThread& t, u32 id, u64, u32 opt)
     const u64 size = g.r64(opt);
     switch (g.r64(opt + 8) & 0xF) {
     case 1: {
-        u32 entry = 0;
-        if (const u32 r = h->start(t, id, &entry); r != CELL_OK) return prx_err(CELL_PRX_ERROR_ERROR);
+        u32 entry = 0, entry2 = 0;
+        if (const u32 r = h->start(t, id, &entry, &entry2); r != CELL_OK) return prx_err(CELL_PRX_ERROR_ERROR);
         g.w64(opt + 16, entry ? entry : ~u64{0});
-        if (size != 0x20) g.w64(opt + 32, ~u64{0});
+        if (size != 0x20) g.w64(opt + 32, entry2 ? entry2 : ~u64{0});
         return CELL_OK;
     }
     case 2: {
@@ -208,10 +209,10 @@ Result _sys_prx_stop_module(PpuThread& t, u32 id, u64, u32 opt)
     const u64 cmd = g.r64(opt + 8);
     switch (cmd & 0xF) {
     case 1: {
-        u32 entry = 0;
-        if (const u32 r = h->stop(id, &entry); r != CELL_OK) return static_cast<Result>(r);
+        u32 entry = 0, entry2 = 0;
+        if (const u32 r = h->stop(id, &entry, &entry2); r != CELL_OK) return static_cast<Result>(r);
         g.w64(opt + 16, entry ? entry : ~u64{0});
-        if (size != 0x20) g.w64(opt + 32, ~u64{0});
+        if (size != 0x20) g.w64(opt + 32, entry2 ? entry2 : ~u64{0});
         return CELL_OK;
     }
     case 2: {

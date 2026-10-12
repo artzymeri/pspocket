@@ -232,7 +232,7 @@ struct FirmwareCores {
     {
         REQUIRE(lle.index());
         lle.link_host_imports({{"cellAdec", {}, {}}}, *f.hle);
-        for (const u32 start : lle.take_starts()) hle::call_guest(t.ctx, start, {0, 0});
+        for (const hle::ModuleEntry& start : lle.take_starts()) hle::run_module_entry(t.ctx, start, 0, 0);
     }
 };
 

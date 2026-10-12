@@ -279,7 +279,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
     const loader::PrxModule* ssl = lle.load("cellSsl", *f.hle, &why);
     INFO(why);
     REQUIRE(ssl);
-    for (const u32 s : lle.take_starts()) call_guest(t.ctx, s, {0, 0});
+    for (const ModuleEntry& s : lle.take_starts()) run_module_entry(t.ctx, s, 0, 0);
     u8* b = f.base();
     std::memset(b + kOut, kFill, kOutSize);
     std::memset(b + kPool, kFill, kPoolSize);

@@ -126,19 +126,29 @@ void main_executor(void* user, PPUContext& ctx, u8* base, u32 entry)
         ps_write64(base, slot, 0);
         ctx.gpr[1] -= alloc;
 
-        // The firmware modules' module_start (D-157), dependencies first, as RPCS3 ppu_load_exec: { set_args 2: 0, 0 },
-        // lle_call. Each returns to kThreadReturnAddress like a callback; r1, r2 and LR come back.
+        // The firmware modules' starts (D-157), dependencies first, as RPCS3 ppu_load_exec: { set_args 2: 0, 0 },
+        // lle_call; a module with a module_prologue has that called with module_start's descriptor first, as
+        // liblv2's entryx does (D-916 part 1: the prologue runs the module's static constructors). Each returns to
+        // kThreadReturnAddress like a callback; r1, r2 and LR come back.
         const u64 toc = ctx.gpr[2], lr = ctx.lr;
-        for (const u32 start : st.module_starts) {
+        for (const hle::ModuleEntry& start : st.module_starts) {
+            const u32 opd = start.wrapper ? start.wrapper : start.entry;
             const u64 sp = ctx.gpr[1];
             ctx.gpr[1] = (sp - 0x80) & ~u64{15};
             ps_write64(base, static_cast<u32>(ctx.gpr[1]), sp);
-            ctx.gpr[2] = ps_read32(base, start + 4);
-            ctx.gpr[3] = 0;
-            ctx.gpr[4] = 0;
+            ctx.gpr[2] = ps_read32(base, opd + 4);
+            if (start.wrapper) {
+                ctx.gpr[3] = start.entry ? u64{start.entry} : ~u64{0};
+                ctx.gpr[4] = 0;
+                ctx.gpr[5] = 0;
+            } else {
+                ctx.gpr[3] = 0;
+                ctx.gpr[4] = 0;
+            }
             ctx.lr = lv2::kThreadReturnAddress;
-            st.inner(st.inner_user, ctx, base, ps_read32(base, start));
-            PS_LOG_INFO(kChan, "module_start {:#010x} returned {:#x}", start, static_cast<u32>(ctx.gpr[3]));
+            st.inner(st.inner_user, ctx, base, ps_read32(base, opd));
+            PS_LOG_INFO(kChan, "module_start {:#010x} (prologue {:#010x}) returned {:#x}", start.entry, start.wrapper,
+                static_cast<u32>(ctx.gpr[3]));
             ctx.gpr[1] = sp;
         }
         ctx.gpr[2] = toc;

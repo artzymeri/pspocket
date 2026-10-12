@@ -53,6 +53,17 @@ void mark_module_start(std::vector<u8>& bytes, u32 marker)
     for (u32 i = 0; i < 4; i++) ps_st32(bytes.data() + 0x100 + 4 * (3 + i), code[i]);
 }
 
+// The module's second management export (module_stop) made its module_prologue (D-916 part 1): its code (segment 0 +
+// 0x40) stores the descriptor it is given at `marker` + 4 and calls it with its own two arguments, returning its result,
+// as a firmware module's prologue runs the static constructors and then module_start.
+void add_module_prologue(std::vector<u8>& bytes, u32 marker)
+{
+    ps_st32(bytes.data() + 0x404, recomp::kNidModulePrologue);
+    const u32 code[] = {as::lis(6, static_cast<s32>(marker >> 16)), as::ori(6, 6, marker & 0xFFFF), as::stw(3, 4, 6),
+        as::lwz(0, 0, 3), as::mtctr(0), as::mr(3, 4), as::mr(4, 5), as::bctrl()};
+    for (u32 i = 0; i < 8; i++) ps_st32(bytes.data() + 0x140 + 4 * (3 + i), code[i]);
+}
+
 fs::path fresh_flash(const char* name)
 {
     const fs::path root = fs::temp_directory_path() / name;
@@ -497,6 +508,86 @@ TEST_CASE("LLE: a game's import served by a firmware module, its module_start ru
     CHECK(hle->unimplemented_calls() == 0);
     hle.reset();
     kernel.reset();
+    fs::remove_all(root);
+}
+
+TEST_CASE("LLE: a firmware module with a module_prologue is started through it, given module_start, as liblv2 does "
+          "(D-916)", "[hle][lle][loader]")
+{
+    // librudp creates its lock in a static constructor its module_prologue runs: started at module_start, its locks
+    // were never made.
+    const fs::path root = fresh_flash("pspocket-test-lle-prologue");
+    constexpr u32 kOut = 0x21000, kMarker = 0x21100; // the executable's bss
+    const auto prx = test::build_ppu_prx();
+    std::vector<u8> module = prx_exporting(prx, "synthLib", 0xDEADBEEF);
+    mark_module_start(module, kMarker);
+    add_module_prologue(module, kMarker);
+    write(root / "dev_flash" / "sys" / "external" / "libsynth.sprx", debug_self(module));
+
+    // _start: the marker and the descriptor the prologue was given, then exit.
+    const auto x = test::build_ppu_exec();
+    std::vector<u32> code = {as::lis(31, kOut >> 16), as::ori(31, 31, kOut & 0xFFFF), as::lwz(5, 0x100, 31),
+        as::std_(5, 0, 31), as::lwz(5, 0x104, 31), as::std_(5, 8, 31), as::li(3, 42), as::li(11, 22), as::sc()};
+    std::vector<u8> bytes = x.bytes;
+    for (usize i = 0; i < code.size(); i++) ps_st32(bytes.data() + 0x200 + 4 * i, code[i]);
+    auto exe = loader::Executable::parse(std::move(bytes));
+    REQUIRE(exe);
+
+    GuestMemory memory;
+    REQUIRE(memory.reserve());
+    ps_ppu_set_miss_policy(PS_PPU_MISS_INTERPRET);
+    lv2::Config cfg = (*exe)->kernel_config();
+    loader::BootState state;
+    loader::prepare_kernel_config(cfg, state);
+    auto kernel = std::make_unique<lv2::Kernel>(memory, cfg);
+    kernel->install();
+    auto hle = std::make_unique<hle::HleProcess>(*kernel, PS_MEM_MAIN_BASE, cfg.main_area_end);
+    hle->install();
+
+    loader::LleModules lle((root / "dev_flash").string());
+    REQUIRE(lle.index());
+    REQUIRE(loader::load(**exe, *kernel, *hle, nullptr, &lle) == lv2::CELL_OK);
+    REQUIRE(lle.loaded().size() == 1);
+    const loader::PrxModule& m = *lle.loaded()[0];
+    CHECK(m.prologue != 0);
+    CHECK(m.stop == 0); // its second export is the prologue now
+    REQUIRE(lle.starts().size() == 1);
+    CHECK(lle.starts()[0] == hle::ModuleEntry{m.start, m.prologue});
+    state.module_starts = lle.starts();
+    u32 main_id = 0;
+    REQUIRE(loader::start_main_thread(*exe, *kernel, state, {}, main_id) == lv2::CELL_OK);
+    REQUIRE(kernel->wait_for_exit(std::chrono::seconds(10)));
+    CHECK(kernel->exit_status() == 42);
+    u8* base = memory.base();
+    CHECK(ps_read64(base, kOut) == 0x77);    // module_start ran, called by the prologue
+    CHECK(ps_read64(base, kOut + 8) == m.start); // the prologue was given module_start's descriptor
+    hle.reset();
+    kernel.reset();
+
+    // The same module loaded by path while the game runs: sys_prx_start_module calls the prologue the same way.
+    fs::create_directories(root / "usrdir");
+    write(root / "usrdir" / "libsynth.sprx", debug_self(module));
+    const auto plain = test::build_ppu_exec();
+    auto exe2 = loader::Executable::parse(plain.bytes);
+    REQUIRE(exe2);
+    hle::test::Fixture f;
+    REQUIRE(f.kernel->vfs_mount("/app_home", (root / "usrdir").string(), true));
+    REQUIRE(loader::load(**exe2, *f.kernel, *f.hle) == lv2::CELL_OK);
+    loader::RuntimeModules modules(*f.hle, *exe2, nullptr);
+    f.hle->set_module_loader(&modules);
+    hle::test::GuestThread t(f, 0, "main");
+    u8* b = f.base();
+    const u32 path = hle::test::kData, result = hle::test::kData + 0x300;
+    const std::string p = "/app_home/libsynth.sprx";
+    std::memcpy(b + path, p.c_str(), p.size() + 1);
+    const u64 id = t.call("sys_prx_load_module", path, 0, 0);
+    REQUIRE(static_cast<s32>(id) > 0);
+    CHECK(t.call("sys_prx_start_module", id, 0, 0, result, 0, 0) == lv2::CELL_OK);
+    const loader::PrxModule* loaded = modules.module(static_cast<u32>(id));
+    REQUIRE(loaded != nullptr);
+    CHECK(ps_read32(b, kMarker) == 0x77);
+    CHECK(ps_read32(b, kMarker + 4) == loaded->start);
+    f.hle->set_module_loader(nullptr);
     fs::remove_all(root);
 }
 

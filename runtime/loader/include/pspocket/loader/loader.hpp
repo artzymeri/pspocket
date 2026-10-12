@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "pspocket/core/types.hpp"
+#include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/ppu_module.hpp"
@@ -78,8 +79,9 @@ struct BootState {
     // The executor every thread finally runs (default: lv2::default_executor).
     lv2::Executor inner = lv2::default_executor;
     void* inner_user = nullptr;
-    // Firmware modules' module_start descriptors (LleModules::starts()), run on the main thread before the entry.
-    std::vector<u32> module_starts;
+    // Firmware modules' starts (LleModules::starts(): module_prologue and module_start), run on the main thread
+    // before the entry.
+    std::vector<hle::ModuleEntry> module_starts;
 };
 
 // Wraps cfg.executor so the main thread runs sys_initialize_tls and receives its arguments before the entry.

@@ -324,7 +324,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
     const loader::PrxModule* ssl = lle.load("cellSsl", *f.hle, &why);
     INFO(why);
     REQUIRE(ssl);
-    for (const u32 s : lle.take_starts()) call_guest(t.ctx, s, {0, 0});
+    for (const ModuleEntry& s : lle.take_starts()) run_module_entry(t.ctx, s, 0, 0);
     if (sony && trace_path) {
         tracer.lo = ssl->segments[0].first;
         tracer.hi = tracer.lo + static_cast<u32>(ssl->segments[0].second);

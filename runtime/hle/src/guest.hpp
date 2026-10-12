@@ -14,6 +14,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/types.hpp"
+#include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/ppu/context.h"
 
@@ -100,6 +101,15 @@ inline u64 call_guest(PPUContext& ctx, u32 opd, std::initializer_list<u64> args)
     ctx.lr = saved_lr;
     ctx.cia = saved_cia;
     return result;
+}
+
+// Runs a module's start or stop (ModuleEntry, D-916 part 1) on `ctx` with its two arguments: the wrapper (prologue,
+// epilogue) given the entry's descriptor (all ones without one), else the entry; 0 when the module has neither.
+inline u64 run_module_entry(PPUContext& ctx, const ModuleEntry& e, u64 args, u64 argp)
+{
+    if (e.wrapper) return call_guest(ctx, e.wrapper, {e.entry ? u64{e.entry} : ~u64{0}, args, argp});
+    if (e.entry) return call_guest(ctx, e.entry, {args, argp});
+    return 0;
 }
 
 // Whether [addr, addr + size) is committed guest memory, for sizes up to one host page: a pointer argument checked

@@ -52,6 +52,7 @@ struct PrxModule {
     std::map<std::pair<std::string, u32>, u32> functions; // exported (library, NID) -> function descriptor
     std::map<std::pair<std::string, u32>, u32> variables; // exported (library, NID) -> variable address
     u32 start = 0, stop = 0;                              // module_start, module_stop descriptors (0: none)
+    u32 prologue = 0, epilogue = 0;                       // module_prologue, module_epilogue (0: none, D-916)
     u32 relocations = 0;                                  // applied
     u32 relocation_errors = 0;                            // out of their segments, or of a type RPCS3 lacks too
     u32 variables_linked = 0;                             // its imported variables found in other modules
@@ -120,18 +121,19 @@ public:
     // Module files that stay on the host whatever a game imports (D-175).
     static bool always_native(std::string_view file);
 
-    // The module_starts of the modules loaded since the last call that have not run (dependencies first), marked as
-    // run: the boot runs them before the game's entry, sys_prx_start_module before the module that needed them. A
-    // module started so and loaded again by its path (sys_prx_load_module) does not start twice (D-175).
-    std::vector<u32> take_starts()
+    // The starts (module_prologue and module_start, hle::ModuleEntry) of the modules loaded since the last call that
+    // have not run (dependencies first), marked as run: the boot runs them before the game's entry,
+    // sys_prx_start_module before the module that needed them. A module started so and loaded again by its path
+    // (sys_prx_load_module) does not start twice (D-175).
+    std::vector<hle::ModuleEntry> take_starts()
     {
-        std::vector<u32> out;
-        for (const u32 s : starts_)
-            if (started_.insert(s).second) out.push_back(s);
+        std::vector<hle::ModuleEntry> out;
+        for (const hle::ModuleEntry& s : starts_)
+            if (started_.insert(key_of(s)).second) out.push_back(s);
         return out;
     }
-    bool started(u32 start) const { return started_.contains(start); }
-    void mark_started(u32 start) { started_.insert(start); }
+    bool started(const hle::ModuleEntry& start) const { return started_.contains(key_of(start)); }
+    void mark_started(const hle::ModuleEntry& start) { started_.insert(key_of(start)); }
 
     // The firmware's modules have fixed addresses in the PRX region, the same for every game (D-178): `file`'s, per
     // PT_LOAD (empty when it is not indexed or the layout did not fit).
@@ -160,8 +162,10 @@ public:
     // Whether the host implements none of `file`'s libraries: the module can run as it is.
     bool runs_whole(std::string_view file) const;
     const std::vector<std::unique_ptr<PrxModule>>& loaded() const { return loaded_; }
-    // module_start descriptors in the order they run: a module after the modules it imports from.
-    const std::vector<u32>& starts() const { return starts_; }
+    // The modules' starts in the order they run: a module after the modules it imports from.
+    const std::vector<hle::ModuleEntry>& starts() const { return starts_; }
+    // A module's start: its module_prologue and module_start (empty when it has neither).
+    static hle::ModuleEntry start_of(const PrxModule& m) { return {m.start, m.prologue}; }
 
 private:
     // `imports` and what the host's modules for them import from the firmware's (D-197), for the libraries a firmware
@@ -193,9 +197,10 @@ private:
     std::map<std::string, std::string, std::less<>> refused_;           // file -> why it stays on the host
     std::map<std::string, std::vector<std::string>, std::less<>> gaps_; // chosen file -> what it lacks
     std::set<std::string, std::less<>> host_linked_;                    // libraries something linked to the host
+    static u32 key_of(const hle::ModuleEntry& s) { return s.entry ? s.entry : s.wrapper; }
     std::set<u32> started_;
     std::vector<std::unique_ptr<PrxModule>> loaded_;
-    std::vector<u32> starts_;
+    std::vector<hle::ModuleEntry> starts_;
     std::function<void(const PrxModule&)> on_load_;
 };
 
@@ -219,13 +224,13 @@ public:
     u32 id_by_address(u32 addr) override;
     std::vector<u32> list() override;
     bool info(u32 id, hle::ModuleInfo& out) override;
-    u32 start(u32 id, u32* entry) override;
+    u32 start(u32 id, hle::ModuleEntry* entry) override;
     void started(u32 id, s32 result) override;
-    u32 stop(u32 id, u32* entry) override;
+    u32 stop(u32 id, hle::ModuleEntry* entry) override;
     void stopped(u32 id, s32 result) override;
     u32 unload(u32 id) override;
     u32 id_by_name(std::string_view name) override;
-    std::vector<u32> take_dependency_starts() override;
+    std::vector<hle::ModuleEntry> take_dependency_starts() override;
 
     // The module behind `id` (null for an empty one or an unknown ID).
     const PrxModule* module(u32 id);

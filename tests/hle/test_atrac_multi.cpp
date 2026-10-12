@@ -331,7 +331,7 @@ TEST_CASE("cellAtracMulti against libatrac3multi: every answer, output, frame an
     loader::LleModules cores(*flash);
     REQUIRE(cores.index());
     cores.link_host_imports({{"cellAdec", {}, {}}}, *f.hle); // the ATRAC3 multichannel core, as the loader links it
-    for (const u32 start : cores.take_starts()) call_guest(t.ctx, start, {0, 0});
+    for (const ModuleEntry& start : cores.take_starts()) run_module_entry(t.ctx, start, 0, 0);
     FirmwareLibrary sony(f, t, *flash, "cellAtracMulti", false);
     const Call theirs = [&](const char* name, std::initializer_list<u64> args) {
         return static_cast<u32>(

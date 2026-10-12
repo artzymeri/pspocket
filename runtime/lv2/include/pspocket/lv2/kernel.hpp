@@ -188,10 +188,12 @@ public:
     // Places and links the module at `path` (`offset` bytes into the file); its ID in *id.
     virtual u32 load(std::string_view path, u64 offset, u32* id) = 0;
     // Links its exports and starts the firmware modules loaded for it (on the calling thread `t`); *entry its
-    // module_start descriptor (0: none).
-    virtual u32 start(PpuThread& t, u32 id, u32* entry) = 0;
+    // module_start descriptor, *entry2 its module_prologue's (0: none; liblv2 calls the prologue, when there is one,
+    // with the entry and the arguments, D-916 part 1).
+    virtual u32 start(PpuThread& t, u32 id, u32* entry, u32* entry2) = 0;
     virtual void started(u32 id, s32 result) = 0;
-    virtual u32 stop(u32 id, u32* entry) = 0;
+    // *entry its module_stop descriptor, *entry2 its module_epilogue's (0: none).
+    virtual u32 stop(u32 id, u32* entry, u32* entry2) = 0;
     virtual void stopped(u32 id, s32 result) = 0;
     virtual u32 unload(u32 id) = 0;
     virtual u32 id_by_name(std::string_view name) = 0;

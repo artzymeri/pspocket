@@ -12388,3 +12388,28 @@ D-644's comparison of libsnd3 with Sony's module, written in a session without t
 (compare_util.hpp require_firmware_module) and libsnd3 stays firmware-first. Of the comparisons with Sony's modules,
 every one now agrees or has nothing to compare with, but cellRudp's (D-633: 201 of 342 observations differ), which is
 next.
+
+## D-916 · 2026-10-12 · A firmware module starts through its module_prologue, as liblv2 starts it (part 1)
+
+cellRudp's comparison (D-633) found Sony's librudp spinning in its scheduler on sys_lwcond_wait answering CELL_EFAULT:
+the lwcond's lwmutex word was 0, because sys_lwcond_create had failed (CELL_ESRCH) on the library's global lwmutex,
+which had never been created. librudp makes that lwmutex in a C++ static constructor, and a module's static
+constructors run in its module_prologue (NID 0x0D10FD3F), which pspocket never called: the loader, the run-time
+module loader and the tests' firmware fixture all called module_start directly (RPCS3 ppu_load_exec's shortcut for the
+modules it preloads). liblv2 starts a module as RPCS3's sys_prx_.cpp entryx shows: _sys_prx_start_module gives
+module_start in `entry` and module_prologue in `entry2`; when entry2 is set it is called as prologue(entry, args,
+argp) (entry all ones without a module_start), and the prologue sets up the module's lock, runs the constructors and
+then calls module_start with the two arguments, returning its result. Stopping is the same with module_stop and
+module_epilogue (NID 0x330F7005: module_stop, then the destructors and atexit functions).
+
+Now: the LLE loader records each module's prologue and epilogue (PrxModule); a module's start is an hle::ModuleEntry
+{entry, wrapper} wherever starts travel (LleModules::take_starts and starts, BootState::module_starts, the module
+loader's start, stop and dependency starts); run_module_entry (guest.hpp) makes the call as entryx does; the boot
+(loader.cpp) sets r3 to module_start's descriptor (all ones without one) and the arguments to 0 when it calls a
+prologue; _sys_prx_start_module and _sys_prx_stop_module write entry2 (no longer always all ones); pspocket's
+sys_prx_start_module and sys_prx_stop_module run the wrapper. Every firmware module whose constructors do work was
+affected (static locks, tables, std objects): with this librudp's lock exists and its scheduler waits as it should, and
+the comparison's first run went from a spinning module to 5 of 649 observations differing.
+Test: test_lle.cpp "a firmware module with a module_prologue is started through it" (a synthetic PRX whose second
+management export is a prologue that records the descriptor it is given and calls it: started at boot and by
+sys_prx_start_module, module_start runs from the prologue, which was given module_start's descriptor).

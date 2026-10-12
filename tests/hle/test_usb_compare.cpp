@@ -122,7 +122,7 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
     const loader::PrxModule* pspcm = lle.load("cellUsbPspcm", *f.hle, &why);
     INFO(why);
     REQUIRE(pspcm);
-    for (const u32 start : lle.take_starts()) call_guest(t.ctx, start, {0, 0});
+    for (const ModuleEntry& start : lle.take_starts()) run_module_entry(t.ctx, start, 0, 0);
     u8* base = f.base();
     std::memset(base + kOut, kFill, kOutSize);
     std::strcpy(reinterpret_cast<char*>(base + kStr), "testldd");
