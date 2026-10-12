@@ -12617,3 +12617,13 @@ matches the rest of pspocket's NP (no PSN, D-059). Unverified (D-594) but the Co
 - **sceNpCommerce2DestroyGetProductInfoListResult**: Sony's answers 0 and does nothing; so here.
 - **sceNpAuthGetAuthorizationCode2**: GetAuthorizationCode's code with a request of its own (326): its answers.
 Test: tests/hle/test_np.cpp "NP's last stubs".
+
+## D-924 · 2026-10-12 · Each test process its own temporary directory
+
+Several tests make files under fixed names in the temporary directory (pspocket-test-pngenc, pspocket-pngenc-compare-
+ours, pspocket-rawspu, ...). Two test runs at the same time, the gate beside a library agent's run in its clone, then
+removed each other's files: cellPngEnc's comparison aborted in the gate (alone it agrees with Sony's module, 0 of 1,834
+observations). Every test executable now gets tests/own_temp_dir.cpp (pspocket_add_test adds it): at start it makes
+TMPDIR/pspocket-test-<pid> and points TMPDIR at it, so std::filesystem::temp_directory_path() answers it, and removes it
+at exit. A test's own fixed names stay as they are; processes no longer meet. (D-923's sceNpMatchingCancelRequest and
+SendRoomMessage were registered under each other's NIDs; the NID test caught it and they are swapped back.)

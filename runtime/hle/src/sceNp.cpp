@@ -4672,9 +4672,9 @@ void register_sceNp(Registry& r)
     // names, and so their NIDs, with sceNp's (RPCS3 registers its OLD_ functions under them); they do the same here.
     // sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage, RPCS3's stubs, are libsysutil_np's (D-923).
     r.add("sceNpMatchingInt", {
-        PS_HLE_UNVERIFIED(0xE61F7EE9, sceNpMatchingCancelRequest),
+        PS_HLE_UNVERIFIED(0x033D5BA0, sceNpMatchingCancelRequest),
         PS_HLE_UNVERIFIED(0xC4100412, sceNpMatchingCancelRequestGUI),
-        PS_HLE_UNVERIFIED(0x033D5BA0, sceNpMatchingSendRoomMessage),
+        PS_HLE_UNVERIFIED(0xE61F7EE9, sceNpMatchingSendRoomMessage),
         PS_HLE_FUNC(0x170829D3, sceNpMatchingGetRoomMemberList),
         PS_HLE_FUNC(0x31B2B978, sceNpMatchingJoinRoomWithoutGUI),
         PS_HLE_FUNC(0x474B7B13, sceNpMatchingJoinRoomGUI),
