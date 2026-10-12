@@ -307,6 +307,42 @@ void script_pesm(Script& s)
     sys.open(0);
 }
 
+// ------------------------------------------------------------------------------------------------- cellGamePs1Emu
+
+void script_game_ps1emu(Script& s)
+{
+    const char* const kFn = "cellGamePs1Emu_61CE2BCD";
+    // pspocket's console: the closed channel; the mode's check first.
+    s.call(kFn, {0});
+    s.call(kFn, {1});
+    s.call(kFn, {2});
+    s.call(kFn, {0xFFFFFFFF});
+    s.call(kFn, {0x100000000ull}); // the mode as 32 bits
+    // A system that answers (channel 1).
+    SystemSide& sys = s.system();
+    sys.open(1);
+    sys.reply(1, reply("setPadRumble", {{"elmResult", 0}}));
+    s.call(kFn, {1});
+    sys.reply(1, reply("setPadRumble", {{"elmResult", -7}}));
+    s.call(kFn, {0});
+    sys.reply(1, reply("other", {{"elmResult", 5}})); // the root's name is not looked at
+    s.call(kFn, {1});
+    sys.reply(1, reply("setPadRumble", {}));
+    s.call(kFn, {1}); // no result
+    {
+        Cxml c;
+        const int e = c.element("setPadRumble");
+        c.str(e, "elmResult", "0");
+        sys.reply(1, c);
+    }
+    s.call(kFn, {1}); // a result that is no int
+    s.call(kFn, {0}); // no reply: the system goes away
+    sys.open(1);
+    sys.reply(1, records(0x6100, 1, 0));
+    s.call(kFn, {1}); // truncated
+    sys.open(1);
+}
+
 } // namespace
 
 TEST_CASE("cellPrintUtility against libsysutil_print", "[hle][lle][sysutil]")
@@ -369,4 +405,18 @@ TEST_CASE("cellPesmUtility on pspocket's console: its requests read themselves b
     CHECK(t.call("cellPesmFinalize") == 100); // its request ID
     CHECK(t.call("cellPesmFinalize") == r3_of_code(0x80862001));
     CHECK(t.call("cellPesmEndMovieRec", 0, kOut + 0x40) == r3_of_code(0x80862001));
+}
+
+TEST_CASE("cellGamePs1Emu against libsysutil_game_ps1emu", "[hle][lle][sysutil]")
+{
+    compare_script("cellGamePs1Emu", {"cellGamePs1Emu"}, script_game_ps1emu);
+}
+
+TEST_CASE("cellGamePs1Emu on pspocket's console: the pad rumble request meets the closed channel", "[hle][sysutil]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    CHECK(t.call("cellGamePs1Emu_61CE2BCD", 1) == r3_of_code(CLOSED));
+    CHECK(t.call("cellGamePs1Emu_61CE2BCD", 0) == r3_of_code(CLOSED));
+    CHECK(t.call("cellGamePs1Emu_61CE2BCD", 2) == r3_of_code(0x8002CB07)); // before any request
 }

@@ -270,5 +270,6 @@ s32 with_request(PPUContext& ctx, std::string_view module, std::string_view what
 // The libraries' registrations (each file's), called by register_sysutil_more.
 void register_print(Registry& r);
 void register_pesm(Registry& r);
+void register_game_ps1emu(Registry& r);
 
 } // namespace pspocket::hle::sysutil::sub
