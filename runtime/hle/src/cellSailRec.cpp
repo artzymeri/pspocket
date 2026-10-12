@@ -759,6 +759,7 @@ s32 cellSailRecorderDumpImage(PPUContext& ctx, u32 rec, u32 buffer, u32 size)
 // The objects' functions (cellSailRecObjects.cpp) and the control thread's (cellSailRecControl.cpp).
 void register_objects(Registry& r);
 void register_control(Registry& r);
+void register_convert(Registry& r);
 
 } // namespace pspocket::hle::sailrec
 
@@ -793,6 +794,7 @@ void register_cellSailRec(Registry& r)
     });
     register_objects(r);
     register_control(r);
+    register_convert(r);
     // Until the control thread and the recording are pspocket's too (later parts of D-918), a game gets Sony's
     // libsail_rec where the system software is installed (D-563).
     r.firmware_first(kChan);

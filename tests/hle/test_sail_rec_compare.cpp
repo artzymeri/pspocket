@@ -19,6 +19,8 @@
 #include <vector>
 
 #include "compare_util.hpp"
+#include "jpeg_writer.hpp"
+#include "pspocket/loader/lle.hpp"
 #include "pspocket/recomp/ppu/asm.hpp"
 
 using namespace pspocket;
@@ -187,9 +189,30 @@ void observe(void* user, u32 n, const u64*)
 
 struct H : Half<> {
     Trace tr;
+    std::unique_ptr<loader::LleModules> imports; // pspocket's half: the firmware libraries cellSailRec imports
 
-    H(const Setup& s, bool sony) : Half<>(s, sony, "cellSailRec")
+    H(const Setup& s, bool sony, bool with_imports = false) : Half<>(s, sony, "cellSailRec")
     {
+        // libsail_rec's SPU programs and tables (pspocket's own reads them from the installed module).
+        if (const auto flash = test_dev_flash()) REQUIRE(f.kernel->vfs_mount("/dev_flash", *flash, true));
+        if (with_imports && !sony && s.mode == Mode::Firmware) {
+            // As the loader links a host module's imports (LleModules::link_host_imports, D-197), which passes over a
+            // firmware-first library's (its firmware module imports for itself): each module loaded, each export linked.
+            imports = std::make_unique<loader::LleModules>(s.flash);
+            REQUIRE(imports->index());
+            for (const hle::HostImport& i : hle::registry().imports()) {
+                if (i.module != "cellSailRec" || f.hle->imported(i.library, i.nid)) continue;
+                std::string why;
+                const loader::PrxModule* m = imports->load(i.library, *f.hle, &why);
+                INFO(why);
+                REQUIRE(m);
+                const auto& exports = i.variable ? m->variables : m->functions;
+                const auto it = exports.find({std::string(i.library), i.nid});
+                REQUIRE(it != exports.end());
+                f.hle->link_import(i.library, i.nid, it->second);
+            }
+            for (const hle::ModuleEntry& start : imports->take_starts()) hle::run_module_entry(t.ctx, start, 0, 0);
+        }
         std::memset(b + kData, 0, 0x100000);
         write_code(b);
         tr.caller = std::this_thread::get_id();
@@ -1019,6 +1042,19 @@ void booted(H& h, const std::string& key)
         {{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4}, {0x510, 4}, {0x518, 8}, {0x580, 4}, {0x5F0, 8}, {0x730, 4},
             {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3}, {0x870, 16}});
 }
+// The same once SPU tasks have sent messages: each message left in the SPURS queue's ring keeps its third word, which
+// for a 4:2:2 conversion is its SPU program's run time.
+void booted_after_tasks(H& h, const std::string& key)
+{
+    std::vector<u8> v(h.b + kRec, h.b + kRec + 0x2000);
+    for (const auto& [off, n] : std::vector<std::pair<u32, u32>>{{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4},
+             {0x510, 4}, {0x518, 8}, {0x580, 4}, {0x5F0, 8}, {0x730, 4}, {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3},
+             {0x870, 16}})
+        for (u32 i = 0; i < n; i++) v[off + i] = 0x5A;
+    for (u32 e = 0; e < 16; e++)
+        for (u32 i = 0; i < 4; i++) v[0x608 + 16 * e + i] = 0x5A;
+    h.o.bytes(key + ": the recorder", std::move(v));
+}
 void feeders(H& h, const std::string& key, u32 n)
 {
     for (u32 k = 0; k < n; k++) h.mem(std::format("{}: feeder {}", key, k), feeder_at(k), 0x200, {{0, 0x2C}});
@@ -1135,6 +1171,248 @@ void script_boot(H& h)
     finish_spurs(h);
 }
 
+
+// ------------------------------------------------------------------------------------------------- video converters
+
+constexpr u32 kPictures = kData + 0x100000;  // the converters' source pictures and results (960 KB)
+constexpr u32 kConvDesc = kBoot + 0x400;     // a converter's callback: the recording callback, named kBoot + 0x480
+
+// A booted recorder (1 audio, 1 video stream) for the converters.
+void boot_for_converters(H& h)
+{
+    tagged_feeders(h);
+    attribute(h, 0, 1, 1, 0);
+    REQUIRE(h.call("Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) == 0);
+    h.call("FeederAudioInitialize", "cellSailFeederAudioInitialize", {feeder_at(0), table_of(0), 0x100, 0});
+    h.call("SetFeederAudio", "cellSailRecorderSetFeederAudio", {kRec, 0, feeder_at(0)});
+    h.call("FeederVideoInitialize", "cellSailFeederVideoInitialize", {feeder_at(2), table_of(2), 0x102, 0});
+    h.call("SetFeederVideo", "cellSailRecorderSetFeederVideo", {kRec, 0, feeder_at(2)});
+    h.call("Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, "Boot");
+    wait_idle(h, "Boot");
+    h.logs("Boot");
+}
+
+// The conversion's kind by the codings (libsail_rec's): a 4:2:2 coding (2, 4, 9, 10) to ARGB or RGBA (0, 1) is kind 0,
+// raw Bayer (12) to ARGB or RGBA kind 1 and to a 4:2:2 coding kind 2 (each an SPU task of libsail_rec's), JPEG (11)
+// kind 3 (the firmware's cellAvchatJpgDec).
+int conversion_kind(s8 cin, s8 cout)
+{
+    if (cin == 11) return 3;
+    if (cin == 12) return cout == 0 || cout == 1 ? 1 : 2;
+    return 0;
+}
+
+// A converter's bytes, its work area's and its requests' (the sync objects' sleep queues and libsail_rec's own
+// callback masked). What is each run's own: kind 0's SPU program answers its own run time in decrementer ticks (its
+// results' words), and the SPU task a request gets has the ID of the previous one or the next by whether that task has
+// ended when the next request starts (each SPU kind's task ID in its work area). The JPEG decoder's work area is the
+// firmware decoder's own state (its pointers and its SPURS objects), compared by its first 0x40 bytes only.
+void converter(H& h, const std::string& key, u32 conv, u32 work_size, bool own_callback, int kind)
+{
+    std::initializer_list<std::pair<u32, u32>> mask = {{0x40, 4}, {0x4C, 4}, {0x54, 4}};
+    std::vector<std::pair<u32, u32>> m(mask);
+    if (own_callback) m.push_back({0x24, 4});
+    if (kind == 0) m.insert(m.end(), {{0xAC, 4}, {0xB4, 4}});
+    std::vector<u8> v(h.b + conv, h.b + conv + 0x100);
+    for (const auto& [off, n] : m)
+        for (u32 i = 0; i < n; i++) v[off + i] = 0x5A;
+    h.o.bytes(key + ": the converter", std::move(v));
+    if (!work_size) return;
+    if (kind == 3) {
+        h.mem(key + ": the work area's start", conv - work_size, std::min<u32>(work_size, 0x40));
+        return;
+    }
+    const u32 id = kind == 0 ? 0x140 : 0x50;
+    h.mem(key + ": the work area", conv - work_size, work_size, {{id, 8}});
+}
+
+void picture(H& h, u32 at, u32 size, u32 seed)
+{
+    for (u32 i = 0; i < size; i++) h.b[at + i] = static_cast<u8>((i * 7 + (i >> 8) * 13 + seed) & 0xFF);
+}
+
+// GetResult's two words: the result (kind 0's a time, a note) and the request's tag.
+void result_words(H& h, const std::string& key, int kind)
+{
+    if (kind == 0) {
+        h.o.note(std::format("{}: the result (the SPU program's run time) {:#x}", key, h.r32(kArgs + 0x3A0)));
+        h.mem(key + ": the tag", kArgs + 0x3A4, 4);
+        return;
+    }
+    h.mem(key, kArgs + 0x3A0, 8);
+}
+
+// One conversion pair: CreateVideoConverter, two pictures processed (queued together when the capacity allows),
+// their results, the converter's callback, DestroyVideoConverter. A JPEG's pictures are two JPEG files made here.
+void convert_round(H& h, const std::string& k, u32 capacity, s8 cin, s8 cout, s16 w, s16 hgt, s8 scan, s8 order,
+    bool callback)
+{
+    const int kind = conversion_kind(cin, cout);
+    const u32 in = kArgs + 0x300, out = kArgs + 0x340, convp = kArgs + 0x380;
+    std::memset(h.b + in, 0xFF, 0x20);
+    std::memset(h.b + out, 0xFF, 0x20);
+    h.b[in] = static_cast<u8>(cin);
+    ps_write16(h.b, in + 4, static_cast<u16>(w));
+    ps_write16(h.b, in + 6, static_cast<u16>(hgt));
+    h.b[in + 0x10] = static_cast<u8>(scan);
+    h.b[in + 0x12] = static_cast<u8>(order);
+    h.b[out] = static_cast<u8>(cout);
+    h.b[out + 0x10] = 1;
+    h.b[out + 0x12] = 2;
+    h.w32(convp, 0xEEEEEEEE);
+    h.w32(kConvDesc, kCode + 0x500);
+    h.w32(kConvDesc + 4, kBoot + 0x480);
+    h.w32(kBoot + 0x480, 0);
+    const u64 r = h.call(k + ": CreateVideoConverter", "cellSailRecorderCreateVideoConverter",
+        {kRec, capacity, in, out, 0, callback ? u64{kConvDesc} : 0, callback ? u64{0x4321} : 0, convp});
+    h.logs(k + ": CreateVideoConverter");
+    const u32 conv = h.r32(convp);
+    if (static_cast<u32>(r) != 0) return;
+    const u32 bytes = static_cast<u32>(w) * static_cast<u32>(hgt) * (cout == 0 || cout == 1 ? 4 : 2);
+    const u32 src0 = kPictures, src1 = kPictures + 0x40000, dst0 = kPictures + 0x80000, dst1 = kPictures + 0xC0000;
+    u32 in0 = static_cast<u32>(w) * static_cast<u32>(hgt) * 4, in1 = in0;
+    if (kind == 3) {
+        // Two JPEG files of the picture's size: 4:2:0 and 4:2:2 chroma.
+        namespace jpeg = pspocket::test::jpeg;
+        const std::vector<u8> j0 =
+            jpeg::encode(jpeg::pattern(static_cast<u32>(w), static_cast<u32>(hgt), false, 2, 2, 1));
+        const std::vector<u8> j1 =
+            jpeg::encode(jpeg::pattern(static_cast<u32>(w), static_cast<u32>(hgt), false, 2, 1, 7));
+        REQUIRE(j0.size() < 0x40000);
+        REQUIRE(j1.size() < 0x40000);
+        std::memcpy(h.b + src0, j0.data(), j0.size());
+        std::memcpy(h.b + src1, j1.data(), j1.size());
+        in0 = static_cast<u32>(j0.size());
+        in1 = static_cast<u32>(j1.size());
+    } else {
+        picture(h, src0, in0, 1);
+        picture(h, src1, in1, 77);
+    }
+    std::memset(h.b + dst0, 0xEE, bytes + 0x100);
+    std::memset(h.b + dst1, 0xEE, bytes + 0x100);
+    const u32 work = h.r32(conv + 0x1C);
+    converter(h, k + ": made", conv, conv - work, !callback, kind);
+    h.call(k + ": CanProcess", "cellSailVideoConverterCanProcess", {conv});
+    const u32 before = h.r32(kEvents);
+    h.call(k + ": Process 1", "cellSailVideoConverterProcess", {conv, src0, in0, dst0, bytes, 0, 0x71});
+    const bool both = capacity >= 2;
+    if (both) h.call(k + ": Process 2", "cellSailVideoConverterProcess", {conv, src1, in1, dst1, bytes, 0, 0x72});
+    for (u32 n = 1; n <= (both ? 2u : 1u); n++) {
+        for (int i = 0; i < 20000 && h.r32(conv + 0x64) < (both ? 2u : n); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!both) break;
+    }
+    const u32 results = h.r32(conv + 0x64);
+    h.o.line(k + ": results", std::format("{}", results));
+    for (u32 n = 0; n < results; n++) {
+        h.w32(kArgs + 0x3A0, 0xEEEEEEEE);
+        h.w32(kArgs + 0x3A4, 0xEEEEEEEE);
+        h.call(std::format("{}: GetResult {}", k, n), "cellSailVideoConverterGetResult",
+            {conv, 0, kArgs + 0x3A0, kArgs + 0x3A4});
+        result_words(h, std::format("{}: GetResult {}: the words", k, n), kind);
+    }
+    if (!both) {
+        h.call(k + ": Process 2", "cellSailVideoConverterProcess", {conv, src1, in1, dst1, bytes, 0, 0x72});
+        for (int i = 0; i < 20000 && h.r32(conv + 0x64) < 1; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        h.call(k + ": GetResult 2", "cellSailVideoConverterGetResult", {conv, 0, kArgs + 0x3A0, kArgs + 0x3A4});
+        result_words(h, k + ": GetResult 2: the words", kind);
+    }
+    if (callback) wait_records(h, before + 2, k + ": the callbacks");
+    else wait_idle(h, k + ": the callbacks");
+    h.call(k + ": GetResult with none", "cellSailVideoConverterGetResult", {conv, 0, kArgs + 0x3A0, kArgs + 0x3A4});
+    h.mem(k + ": picture 1", dst0, bytes + 0x100);
+    h.mem(k + ": picture 2", dst1, bytes + 0x100);
+    converter(h, k + ": done", conv, conv - work, !callback, kind);
+    h.logs(k + ": converted");
+    h.call(k + ": DestroyVideoConverter", "cellSailRecorderDestroyVideoConverter", {kRec, conv});
+    h.logs(k + ": DestroyVideoConverter");
+}
+
+// Video converters on a booted recorder: each SPU kind (the 4:2:2 codings to ARGB and RGBA with the scans, raw Bayer to
+// ARGB, RGBA and the 4:2:2 codings), the JPEG decoder's (JPEG to RGBA, YUYV and VYUY), one or two requests queued, with
+// and without a callback; converters refused (the allocator failing, nothing queued with a capacity of 0), one
+// destroyed that is not there; the end of a recorder holding converters.
+void script_converters(H& h)
+{
+    h.tr.lightweight = false;
+    std::memset(h.b + kPictures, 0, 0x100000);
+    make_spurs(h);
+    boot_for_converters(h);
+    convert_round(h, "4 to 1", 2, 4, 1, 64, 32, 1, 2, true);
+    convert_round(h, "9 to 1, interlaced", 1, 9, 1, 64, 32, 0, 1, false);
+    convert_round(h, "4 to 1, interlaced other field", 2, 4, 1, 64, 32, 0, 0, true);
+    convert_round(h, "4 to 1, 720 lines", 1, 4, 1, 32, 720, 2, 2, true);
+    convert_round(h, "2 to 0", 2, 2, 0, 64, 32, 1, 2, false);
+    convert_round(h, "10 to 0, interlaced", 1, 10, 0, 64, 32, 0, 1, true);
+    convert_round(h, "12 to 1", 2, 12, 1, 64, 32, 1, 2, true);
+    convert_round(h, "12 to 0", 1, 12, 0, 64, 32, 1, 2, false);
+    convert_round(h, "12 to 4", 2, 12, 4, 64, 32, 1, 2, false);
+    convert_round(h, "12 to 9", 1, 12, 9, 64, 32, 1, 2, true);
+    convert_round(h, "12 to 2", 1, 12, 2, 64, 32, 1, 2, true);
+    convert_round(h, "12 to 10", 2, 12, 10, 64, 32, 1, 2, false);
+    convert_round(h, "11 to 1", 2, 11, 1, 64, 32, 1, 2, true);
+    convert_round(h, "11 to 4", 1, 11, 4, 64, 32, 1, 2, false);
+    convert_round(h, "11 to 9", 2, 11, 9, 48, 16, 1, 2, true);
+    // Refusals: the allocator failing for an SPU kind (the common taskset refused; the taskset made and the block
+    // refused, the taskset then kept with its user counted, as libsail_rec leaves it) and for a JPEG one (the decoder's
+    // module loaded for its size and unloaded again); a converter with no room (capacity 0).
+    for (const auto& [name, cin, cout, fail] : std::vector<std::tuple<std::string, s8, s8, u32>>{
+             {"12 to 1, the taskset refused", 12, 1, 1}, {"11 to 1, the block refused", 11, 1, 1},
+             {"12 to 1, the block refused", 12, 1, 2}}) {
+        const u32 in = kArgs + 0x300, out = kArgs + 0x340;
+        std::memset(h.b + in, 0xFF, 0x20);
+        std::memset(h.b + out, 0xFF, 0x20);
+        h.b[in] = static_cast<u8>(cin);
+        ps_write16(h.b, in + 4, 64);
+        ps_write16(h.b, in + 6, 32);
+        h.b[out] = static_cast<u8>(cout);
+        h.w32(kArgs + 0x380, 0xEEEEEEEE);
+        h.w32(kHeapState + 4, fail);
+        h.call(name, "cellSailRecorderCreateVideoConverter", {kRec, 1, in, out, 0, 0, 0, kArgs + 0x380});
+        h.w32(kHeapState + 4, 0);
+        h.mem(name + ": the out word", kArgs + 0x380, 4);
+        h.logs(name);
+        booted_after_tasks(h, name);
+    }
+    {
+        const u32 in = kArgs + 0x300, out = kArgs + 0x340;
+        std::memset(h.b + in, 0xFF, 0x20);
+        std::memset(h.b + out, 0xFF, 0x20);
+        h.b[in] = 4;
+        ps_write16(h.b, in + 4, 64);
+        ps_write16(h.b, in + 6, 32);
+        h.b[out] = 1;
+        h.call("capacity 0", "cellSailRecorderCreateVideoConverter", {kRec, 0, in, out, 0, 0, 0, kArgs + 0x380});
+        const u32 conv = h.r32(kArgs + 0x380);
+        h.call("capacity 0: CanProcess", "cellSailVideoConverterCanProcess", {conv});
+        h.call("capacity 0: Process", "cellSailVideoConverterProcess", {conv, kPictures, 0x100, kPictures + 0x80000,
+            0x100, 0, 1});
+        h.call("capacity 0: CanGetResult", "cellSailVideoConverterCanGetResult", {conv});
+        h.logs("capacity 0");
+        h.call("capacity 0: DestroyVideoConverter", "cellSailRecorderDestroyVideoConverter", {kRec, conv});
+        h.call("capacity 0: DestroyVideoConverter again", "cellSailRecorderDestroyVideoConverter", {kRec, conv});
+        h.logs("capacity 0: DestroyVideoConverter");
+    }
+    // Two converters left for the recorder's end.
+    const u32 in = kArgs + 0x300, out = kArgs + 0x340;
+    for (const u32 p : {kArgs + 0x3C0u, kArgs + 0x3C4u}) {
+        std::memset(h.b + in, 0xFF, 0x20);
+        std::memset(h.b + out, 0xFF, 0x20);
+        h.b[in] = 12;
+        ps_write16(h.b, in + 4, 64);
+        ps_write16(h.b, in + 6, 32);
+        h.b[out] = 1;
+        h.call("CreateVideoConverter left for the end", "cellSailRecorderCreateVideoConverter",
+            {kRec, 2, in, out, 0, 0, 0, p});
+    }
+    h.logs("two converters left");
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -1174,6 +1452,13 @@ Observed half_converter(const Setup& s, bool sony)
 {
     H h(s, sony);
     script_converter(h);
+    return std::move(h.o);
+}
+
+Observed half_converters(const Setup& s, bool sony)
+{
+    H h(s, sony, true);
+    script_converters(h);
     return std::move(h.o);
 }
 
@@ -1256,5 +1541,15 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: the booted recorder", "[hle][
             CHECK(o.value("Finalize") == "0x0");
             CHECK(o.value("audio 1's makeup failing: Boot: the state") == "10");
             CHECK(o.value("mode 1: Boot: the state") == "2");
+        });
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: video converters' conversions", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: conversions", [&](bool sony) { return half_converters(s, sony); },
+        [](const Observed& o) {
+            CHECK(o.value("4 to 1: CreateVideoConverter") == "0x0");
+            CHECK(o.value("4 to 1: results") == "2");
         });
 }

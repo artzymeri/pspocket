@@ -620,26 +620,14 @@ s32 cellSailProfileSetEsVideoParameter(PPUContext& ctx, u32 p, u32 index, u32 pa
 // for a request, a result), +0x58 1 while a request is being converted, +0x5C its capacity, +0x60 the requests queued,
 // +0x64 the results ready, +0x68, +0x6C, +0x70, +0x74 where the next request goes, which runs next, where its result
 // goes, which result is read next; requests of 0x18 bytes from +0x78, results of 8 from +0xA8.
-namespace vc {
-constexpr u32 kLock = 0x30, kRoom = 0x48, kReady = 0x50, kBusy = 0x58, kCapacity = 0x5C, kQueued = 0x60,
-              kResults = 0x64, kWrite = 0x68, kRead = 0x74, kRequests = 0x78, kResultTable = 0xA8;
-}
-
-s32 conv_lock(PPUContext& ctx, u32 v) { return static_cast<s32>(sail::lv2_lib(ctx, "sys_lwmutex_lock", {v + vc::kLock, 0})); }
-void conv_unlock(PPUContext& ctx, u32 v) { sail::lv2_lib(ctx, "sys_lwmutex_unlock", {v + vc::kLock}); }
-
-// The next queued request started when none is being converted (libsail_rec's): on the converter's SPU task or the
-// firmware's JPEG decoder.
-void conv_start_next(PPUContext& ctx, u32 v)
-{
-    if (r32(ctx, v + vc::kQueued) && !r32(ctx, v + vc::kBusy)) later(ctx, "a video converter's conversion");
-}
+s32 conv_lock(PPUContext& ctx, u32 v) { return static_cast<s32>(sail::lv2_lib(ctx, "sys_lwmutex_lock", {v + cv::kLock, 0})); }
+void conv_unlock(PPUContext& ctx, u32 v) { sail::lv2_lib(ctx, "sys_lwmutex_unlock", {v + cv::kLock}); }
 
 s32 cellSailVideoConverterCanGetResult(PPUContext& ctx, u32 v)
 {
     s32 r = conv_lock(ctx, v);
     if (r < 0) return r;
-    r = static_cast<s32>(r32(ctx, v + vc::kResults));
+    r = static_cast<s32>(r32(ctx, v + cv::kResults));
     conv_unlock(ctx, v);
     return r;
 }
@@ -648,9 +636,9 @@ s32 cellSailVideoConverterCanProcess(PPUContext& ctx, u32 v)
 {
     s32 r = conv_lock(ctx, v);
     if (r < 0) return r;
-    const u32 queued = r32(ctx, v + vc::kQueued);
+    const u32 queued = r32(ctx, v + cv::kQueued);
     conv_unlock(ctx, v);
-    return static_cast<s32>(r32(ctx, v + vc::kCapacity) - queued);
+    return static_cast<s32>(r32(ctx, v + cv::kCapacity) - queued);
 }
 
 // cellSailVideoConverterGetResult(converter, timeout, out a, out b): the next result; with none, EMPTY at once (a
@@ -660,19 +648,19 @@ s32 cellSailVideoConverterGetResult(PPUContext& ctx, u32 v, u64 timeout, u32 out
 {
     s32 r = conv_lock(ctx, v);
     if (r < 0) return r;
-    const u32 results = r32(ctx, v + vc::kResults);
+    const u32 results = r32(ctx, v + cv::kResults);
     r = 0;
     if (!results) {
-        if (timeout) r = static_cast<s32>(sail::lv2_lib(ctx, "sys_lwcond_wait", {v + vc::kReady, timeout}));
+        if (timeout) r = static_cast<s32>(sail::lv2_lib(ctx, "sys_lwcond_wait", {v + cv::kReady, timeout}));
         if (r >= 0) r = error(CELL_SAIL_ERROR_EMPTY);
     } else {
-        const u32 i = r32(ctx, v + vc::kRead), at = v + vc::kResultTable + 8 * i;
+        const u32 i = r32(ctx, v + cv::kRead), at = v + cv::kResultTable + 8 * i;
         w32(ctx, out_a, r32(ctx, at + 4));
         w32(ctx, out_b, r32(ctx, at));
-        const u32 cap = r32(ctx, v + vc::kCapacity);
-        w32(ctx, v + vc::kResults, results - 1);
-        w32(ctx, v + vc::kRead, cap ? (i + 1) % cap : 0);
-        conv_start_next(ctx, v);
+        const u32 cap = r32(ctx, v + cv::kCapacity);
+        w32(ctx, v + cv::kResults, results - 1);
+        w32(ctx, v + cv::kRead, cap ? (i + 1) % cap : 0);
+        converter_start_next(ctx, v);
     }
     conv_unlock(ctx, v);
     return r;
@@ -685,20 +673,20 @@ s32 cellSailVideoConverterProcess(PPUContext& ctx, u32 v, u32 a, u32 b, u32 c, u
 {
     s32 r = conv_lock(ctx, v);
     if (r < 0) return r;
-    const u32 queued = r32(ctx, v + vc::kQueued);
+    const u32 queued = r32(ctx, v + cv::kQueued);
     for (;;) {
-        if (queued < r32(ctx, v + vc::kCapacity)) {
-            const u32 w = r32(ctx, v + vc::kWrite), at = v + vc::kRequests + 0x18 * w;
+        if (queued < r32(ctx, v + cv::kCapacity)) {
+            const u32 w = r32(ctx, v + cv::kWrite), at = v + cv::kRequests + 0x18 * w;
             w32(ctx, at + 0x14, 0);
             w32(ctx, at + 4, b);
             w32(ctx, at + 0x10, tag);
-            const u32 cap = r32(ctx, v + vc::kCapacity);
+            const u32 cap = r32(ctx, v + cv::kCapacity);
             w32(ctx, at, a);
             w32(ctx, at + 8, c);
             w32(ctx, at + 12, d);
-            w32(ctx, v + vc::kQueued, queued + 1);
-            w32(ctx, v + vc::kWrite, cap ? (w + 1) % cap : 0);
-            conv_start_next(ctx, v);
+            w32(ctx, v + cv::kQueued, queued + 1);
+            w32(ctx, v + cv::kWrite, cap ? (w + 1) % cap : 0);
+            converter_start_next(ctx, v);
             r = 0;
             break;
         }
@@ -706,7 +694,7 @@ s32 cellSailVideoConverterProcess(PPUContext& ctx, u32 v, u32 a, u32 b, u32 c, u
             r = error(CELL_SAIL_ERROR_FULLED);
             break;
         }
-        r = static_cast<s32>(sail::lv2_lib(ctx, "sys_lwcond_wait", {v + vc::kRoom, timeout}));
+        r = static_cast<s32>(sail::lv2_lib(ctx, "sys_lwcond_wait", {v + cv::kRoom, timeout}));
         timeout = 0;
         if (r < 0) break;
     }

@@ -118,6 +118,7 @@ add_library(pspocket_hle STATIC
     src/cellSailRec.cpp
     src/cellSailRecObjects.cpp
     src/cellSailRecControl.cpp
+    src/cellSailRecConvert.cpp
     src/cellSysconfPs1emu.cpp
     src/module_management.cpp
     src/cellSpursJq.cpp

@@ -12690,3 +12690,43 @@ observations differ (the feeders' callbacks are one recording function told apar
 the script sets; the threads' IDs, the message the control thread is at, the SPURS queue's pop index and event queue
 and the clock's lwmutex's sleep queue masked as each process's own or timing; the lwmutex and lwcond calls left out of
 the script thread's lv2 calls, since contention decides them). The earlier scripts still 0 of 3,091.
+
+### D-918, part 5: cellSailRec's video converters, as libsail_rec makes and runs them
+
+libsail_rec's video converters, natively (runtime/hle/src/cellSailRecConvert.cpp), as fw 4.92's module makes them:
+- **CreateVideoConverter** (the control thread's message 3; its "mode" is the queue's capacity, 0 to 2): INVALID_STATE in
+  state 0; the conversion's work area by the codings (cellSail.h's): a YUV 4:2:2 coding (2, 4, 9, 10) to ARGB or RGBA
+  (0, 1) is kind 0, raw Bayer (12) to ARGB or RGBA kind 1 and to a 4:2:2 coding kind 2 (0x200 bytes each, the common
+  taskset "_libsail-common-taskset" made at its first user and counted), JPEG (11) to RGBA, YUYV or VYUY (1, 4, 9) kind
+  3 (the firmware decoder's work size, its module 0xF009 loaded for the question and unloaded again); one block from the
+  game's allocator (boundary 0x80: the work area, then the converter's 0x100 bytes); the converter's lwmutex
+  "_sailf0" and lwconds "_sailf0" and "_sailf1"; each kind's set-up (the sizes and pitches, all ones taking the coding's
+  default, the fill byte capped at 0xFF, the message the SPU program or decoder sends the recorder's SPURS queue: 0x34
+  for kind 0, 0x35 for kinds 1 and 2, 0x33 for JPEG; kind 0's scan from the input's scan byte, a height above 719 being
+  progressive, and its field order); the callback, or libsail_rec's own doing nothing with the converter as its
+  argument; first on the recorder's list. Every failure answers MEMORY. libsail_rec's slips are kept: a refused set-up
+  frees the block from the converter's address, not the block's; a converter refused after its sync objects were made
+  keeps them; a block refused after the common taskset was made leaves the taskset counted (never shut down).
+- **The conversions**: a request starts when none is being converted (Process, GetResult, a result): kinds 0 to 2 one
+  task of libsail_rec's SPU program for the kind in the common taskset, the source and destination kept in the work
+  area, the task's ID too; the argument's first doubleword the work area, its second 0, but kind 2's program gets the
+  work area there as well (its message carries that word back); JPEG a cellAvchatJpgDec decode of {source, size, sub-kind,
+  destination, fill}. The task handler takes the message (a converter's codes above 0x32), stores the result (the
+  decoder's for JPEG), signals both lwconds, starts the next request and posts the message, on which the control
+  thread calls the converter's callback. DestroyVideoConverter (message 4) and the recorder's end take converters down:
+  the JPEG decoder closed and its module unloaded, the sync objects, the block, the common taskset released by an SPU
+  kind (shut down, joined and freed after its last user).
+- **From the installed system software at run time** (as cellSpursJq's policy module, D-537): libsail_rec's three SPU
+  programs for the converters and their coefficient tables, read from /dev_flash/sys/external/libsail_rec.sprx when it
+  is fw 4.92's (firmware_data.hpp); nothing of them is in the repository. The JPEG decoder is the firmware's
+  libavchatjpgdec, imported as D-197's host imports.
+Compared (a new script on a booted recorder: every SPU kind with the scans, the JPEG kind from 4:2:0 and 4:2:2 files
+made in the test, one or two requests queued, with and without a callback, the taskset or block refused, a capacity of
+0, a converter destroyed twice, two left for the recorder's end): the answers, the converters' bytes and work areas, the
+pictures, the callbacks, the allocator's calls, the lv2 calls: 0 of 368 observations differ. Not compared, by nature:
+kind 0's SPU program answers its own run time in decrementer ticks as the result (notes), the SPU task IDs (whether the
+previous task has ended when the next starts), the JPEG decoder's own state past its work area's first 0x40 bytes.
+Found by the comparison: kind 2's argument (above). The comparison's pspocket half links cellSailRec's host imports
+itself: the loader's link_host_imports passes over a firmware-first library's, whose firmware module imports for
+itself. The streams (OpenStream, CloseStream, Start, Stop and their messages, the pipelines, encoders and composers)
+are the later parts, so cellSailRec stays firmware-first.

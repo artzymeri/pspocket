@@ -59,6 +59,8 @@ void state_event(PPUContext& ctx, u32 rec, u32 state)
     if (r64(ctx, rec + rc::kEventMask) & 8) event(ctx, rec, 3, 0, state, 0);
 }
 
+} // namespace
+
 // An error (event 1): "error 0x%X" printed first, as libsail_rec does, when subscribed.
 void error_event(PPUContext& ctx, u32 rec, s32 err)
 {
@@ -68,6 +70,8 @@ void error_event(PPUContext& ctx, u32 rec, s32 err)
     sail::lv2_lib(ctx, "_sys_printf", {text.addr(), static_cast<u64>(static_cast<s64>(err))});
     event(ctx, rec, 1, 0, static_cast<u64>(static_cast<s64>(err)), 0);
 }
+
+namespace {
 
 // ------------------------------------------------------------------------------------------------- the feeders
 
@@ -155,6 +159,9 @@ void composers_init(PPUContext& ctx, u32 rec)
 
 // ------------------------------------------------------------------------------------------------- replies
 
+} // namespace
+
+
 // The control thread's side of a command: the answer stored at the record's address, the waiting thread signalled
 // (sys_lwcond_signal_to), the lwmutex released.
 void reply(PPUContext& ctx, u32 rec, u32 record, s32 answer)
@@ -163,6 +170,8 @@ void reply(PPUContext& ctx, u32 rec, u32 record, s32 answer)
     lv2(ctx, "sys_lwcond_signal_to", {rec + rc::kCond, r64(ctx, record + 8)});
     unlock(ctx, rec);
 }
+
+namespace {
 
 // ------------------------------------------------------------------------------------------------- profiles
 
@@ -302,6 +311,8 @@ void message_loop(PPUContext& ctx, u32 rec)
         case 0: completion(ctx, rec, static_cast<s32>(m1), m2, m3); break;
         case 1: create_profile(ctx, rec, m2, m3); break;
         case 2: destroy_profile(ctx, rec, m2, m3); break;
+        case 3: create_converter(ctx, rec, m2, m3); break;
+        case 4: destroy_converter(ctx, rec, m2, m3); break;
         case 0xE:
             // Cancel: each feeder's cancel call (the game's callback 6).
             for (u32 i = 0; i < r32(ctx, rec + rc::kAudioCount); i++)
@@ -321,12 +332,7 @@ void message_loop(PPUContext& ctx, u32 rec)
             break;
         }
         case 0x31: return;
-        case 0x32: case 0x33: case 0x34: case 0x35: {
-            // A converter's notification: its callback (+0x24) with its argument (+0x28).
-            const u32 obj = m2;
-            call_guest(ctx, r32(ctx, obj + 0x24), {r32(ctx, obj + 0x28)});
-            break;
-        }
+        case 0x32: case 0x33: case 0x34: case 0x35: converter_notified(ctx, m2); break;
         // Messages libsail_rec's loop passes over.
         case 6: case 8: case 0xA: case 0xD: case 0x12: case 0x13: case 0x1C: case 0x1D: case 0x24: case 0x25:
         case 0x26: case 0x27: case 0x28: case 0x29: case 0x2A: case 0x2D: case 0x2F: break;
@@ -433,7 +439,7 @@ void control_thread(PPUContext& ctx, u64 recorder)
             p = next;
         }
         w32(ctx, rec + rc::kProfiles, 0);
-        if (r32(ctx, rec + rc::kConverters)) later(ctx, "the end of a recorder with video converters");
+        destroy_converters(ctx, rec);
         w32(ctx, rec + rc::kTaskRunning, 0);
         w32(ctx, rec + rc::kConverters, 0);
         if (join) {
@@ -538,7 +544,7 @@ void task_thread(PPUContext& ctx, u64 recorder)
             break;
         }
         const u32 code = r32(ctx, msg.addr()), a = r32(ctx, msg.addr() + 4), b = r32(ctx, msg.addr() + 8);
-        if (code > 0x32) later(ctx, "a video converter's result");
+        if (code > 0x32) converter_done(ctx, a, b);
         post(ctx, rec, code, a, b);
     }
     lv2(ctx, "sys_ppu_thread_exit", {0});

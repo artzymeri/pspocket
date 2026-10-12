@@ -116,6 +116,19 @@ constexpr u32 kRecorder = 0, kFuncs = 4, kArg = 0x48, kTable = 0x4C, kState = 0x
               kDiagArg = 0xF8, kSize = 0x140;
 }
 
+// A video converter (0x100 bytes from the game's allocator, after the conversion's work area): the next converter of
+// the recorder's list (+0x83C), the kind (0: a YUV 4:2:2 coding to ARGB or RGBA, 1: raw Bayer to ARGB or RGBA, 2: raw
+// Bayer to a 4:2:2 coding, each on an SPU task; 3: JPEG through the firmware's cellAvchatJpgDec), the two codings, the
+// fill byte, the sub-kind, the recorder, the work area, the module it loaded, the callback and its argument, an lwmutex
+// ("_sailf0") with two lwconds ("_sailf1": room, results), the queue of requests (capacity, queued, results, the
+// indices) and of results, and the conversion's handle (its work area, or the JPEG decoder's handle).
+namespace cv {
+constexpr u32 kNext = 0, kKind = 4, kIn = 8, kOut = 0xC, kFill = 0x10, kSub = 0x14, kRecorder = 0x18, kWork = 0x1C,
+              kModule = 0x20, kCallback = 0x24, kArg = 0x28, kLock = 0x30, kRoom = 0x48, kReady = 0x50, kBusy = 0x58,
+              kCapacity = 0x5C, kQueued = 0x60, kResults = 0x64, kWrite = 0x68, kStart = 0x6C, kDone = 0x70,
+              kRead = 0x74, kRequests = 0x78, kResultTable = 0xA8, kHandle = 0xB8, kSize = 0x100;
+}
+
 // ------------------------------------------------------------------------------------------------- shared helpers
 
 // The game's allocator: alloc(arg, boundary, size), free(arg, boundary, pointer).
@@ -148,5 +161,40 @@ void task_thread(PPUContext& ctx, u64 rec);
 
 // A part of libsail_rec this part of D-918 does not make yet: the call site logged, the process stopped.
 [[noreturn]] void later(PPUContext& ctx, std::string_view what);
+
+// The control thread's answer to a command (the answer stored, the caller signalled, the lwmutex released), and an
+// error event ("error 0x%X" printed first), as libsail_rec makes them.
+void reply(PPUContext& ctx, u32 rec, u32 record, s32 answer);
+void error_event(PPUContext& ctx, u32 rec, s32 err);
+
+// What libsail_rec.sprx holds that pspocket's own reads from the installed system software (D-918 part 5, as
+// cellSpursJq's policy module, D-537): an SPU program's guest copy (made once per process; 0 without the module,
+// logged) and bytes of its tables (false without the module).
+u32 spu_program(PPUContext& ctx, u32 vaddr);
+bool module_bytes(u32 vaddr, u32 size, u8* out);
+
+// A firmware library's function the recorder calls (cellAvchatJpgDec, the encoders, cellMp4...): the export the
+// loader linked for this process (Registry::add_imports); without one, logged and CELL_SAIL_ERROR_FATAL.
+u64 firmware_call(PPUContext& ctx, std::string_view library, u32 nid, std::initializer_list<u64> args);
+
+// libsail_rec's module loads (cellSysmodule; the Internal calls for IDs from 0xF000; nothing when the modules are the
+// process's, modules_flag).
+s32 load_module(PPUContext& ctx, u32 id);
+s32 unload_module(PPUContext& ctx, u32 id);
+
+// The common taskset ("_libsail-common-taskset", made at its first user, one more user each call; 0 when it cannot be
+// made) and one user less (shut down, joined and freed after the last).
+u32 common_taskset(PPUContext& ctx, u32 rec);
+void release_taskset(PPUContext& ctx, u32 rec);
+
+// Video converters (cellSailRecConvert.cpp): the control thread's CreateVideoConverter (message 3) and
+// DestroyVideoConverter (4), the end's, a conversion's result from the task handler, the converter's notification
+// (messages 0x32 to 0x35), and the next request started (Process, GetResult, a result).
+void create_converter(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void destroy_converter(PPUContext& ctx, u32 rec, u32 converter, u32 record);
+void destroy_converters(PPUContext& ctx, u32 rec);
+void converter_done(PPUContext& ctx, u32 converter, u32 result);
+void converter_notified(PPUContext& ctx, u32 converter);
+s32 converter_start_next(PPUContext& ctx, u32 converter);
 
 } // namespace pspocket::hle::sailrec
