@@ -9246,6 +9246,92 @@ sys_ss_get_console_id(buffer) (870), both refusing a null buffer with CELL_EINVA
 a game, not a root process, gets ENOSYS for the console ID, as on a PS3). RPCS3 has them as todos answering CELL_OK.
 Test: tests/hle/test_sysPrxForUser.cpp, the calls lv2 sees and the answers.
 
+## D-901 · 2026-10-10 · cellSail's built-in file source (x-cell-fs), as libsail
+
+Every cellSail player registers libsail's own source for the "x-cell-fs" protocol at Initialize. Part 2 of D-562 laid it
+out and left its callbacks and file calls failing loudly; they are now pspocket's own (runtime/hle/src/
+cellSailFileSource.cpp), read from libsail.sprx (fw 4.92, its fn_1bf24..fn_1d0e0 and the reader thread's entry) and
+compared with it running on pspocket (tests/hle/test_sail_source.cpp).
+
+- **The source** (0x138 bytes in the player's block): +0 the command for the reader (-1 none), +1 the items ready, +2 the
+  next to check out, +3 the next to fill, +4 the reader's state (0 ended, 1 closed, 2 open, 3 started), +8 the open
+  file's descriptor, +0x10 the reader's thread ID, +0x18 its path (287 bytes on the reader's stack), +0x1C the path
+  changed, +0x20 two items {buffer, size, session, 0}, +0x40 the CellSailSource it registers (its argument the source
+  itself), +0xC0 an lwmutex and +0xD8 an lwcond (both "_saifs0"), +0xE0 the read size (1 MB), +0xE8 and +0xF0 a Start's
+  length and position, +0xF8 its session (0 once the reader took it), +0xFC Read's arguments (on the reader's stack),
+  +0x100 the file calls.
+- **The file calls** are fourteen words: -1, open, a call after open (none of libsail's), close, fstat, read, lseek,
+  cancel (libsail's answers 0), then none. pspocket's table had read, lseek and fstat in the wrong words; player
+  parameter 33 (the game's 0x28 bytes, D-562 part 5) takes them in libsail's order. libsail's are cellFs's, the
+  registers passed on as they are. A file is opened {path, 0 (read-only), &fd, 0, 0}, then the call after open, when
+  the game gave one, {path, 0, fd, 0, 0}; a descriptor of 0 is CELL_SAIL_ERROR_INVALID_FD.
+- **At once**: ReadSync opens the URI from its 13th character on (past "x-cell-fs://", whatever is there), stats the
+  file for its size (fstat's failure ignored), seeks when the offset is not 0, reads and closes it; a short read
+  answers the read's 0. GetCapabilities answers 0x71 for any stream. InquireCapability refuses start flags 1 (from a
+  byte position, the only start Start takes) and takes every other: libsail's test is inverted.
+- **Playing**: Makeup loads cellFs (cellSysmodule 0xE, when libsail loads modules), makes the lwmutex and lwcond and
+  starts "_libsail-source_fs" (the player's file source priority and stack, 1200 and 4 KB when 0; parameters 7 and 34)
+  and waits for it to run; Cleanup cancels the open file's calls, tells the reader to end (10), joins it
+  (sys_ppu_thread_join, 44), frees the buffer, destroys the lwmutex and lwcond and unloads cellFs. The callbacks hand
+  the reader one command at a time under the lwmutex (each waits for the last to be taken): Open (0; once taken, the
+  path copied, marked changed when it is not the reader's, and the 2 MB buffer allocated from the player's allocator
+  (boundary 0x80): two items of 1 MB), Start (1; only from a byte position, its position, length and session kept until
+  the reader took the last start), Checkin (2), Stop (4), Close (5; the buffer freed at once), Read (7; its arguments
+  written once taken), Clear (8). The open file's calls are cancelled before Stop, Close and Cleanup; Checkout takes
+  the items in turn under the lock (CELL_SAIL_ERROR_FATAL with none ready); Cancel does nothing.
+- **The reader** (libsail's state machine, each answer a cellSailSourceNotify*): closed, Open opens the path (or keeps
+  the file a Read left open when the path did not change) and answers, open; open, Start seeks unless the position is
+  the one it thinks it is at, answers 0 and starts; started, it fills an item while one is free (one read of up to 1 MB
+  or the length left: the item's size and session, StreamOut) and at the length's or the file's end says InputEos and
+  is open again. Stop of a started source answers 0 (open again), of an open one 1, of a closed one nothing; Close
+  answers the close's result (closed), 1 when closed; Start when closed is taken without an answer; Read reads as
+  ReadSync and answers. Waiting, an open source polls each second (fstat's EBADF: media state 2, the file closed, five
+  seconds on opened again: media state 0); a started one without its file opens it again five seconds on (seeking to
+  where it was; ENOTMOUNTED waits again); a read's EIO with fstat's EBADF is the medium gone (media state 2, the file
+  closed, a session error), another read error media state 1 and a session error, read again half a second on. A
+  failed lock, wait or signal ends the reader with a terminating session error.
+- **Stack variables where libsail has them.** libsail hands the file calls stack variables (the descriptor, the stat
+  buffer, the read count, the seek position) and keeps two of its reader's in the source (the path, Read's arguments).
+  pspocket takes each from a frame of the size libsail's function makes (Frame), so they are at libsail's addresses:
+  a game's file calls see the same pointers, the source the same words, and a reader started again on a reused stack
+  finds what libsail's would (the path below).
+- **libsail's slips, kept.** Read in the closed state keeps the file open for an Open of the same path and takes the
+  position after it as the size read, not the offset and the size, so a Start from that position skips the seek and
+  reads from the wrong place. Checkout does not count an item out (Checkin counts one fewer, whichever it is): a third
+  checkout of two ready items gives the first again. Close frees the buffer before the reader has taken the close.
+  Cleanup leaves the descriptor of a file still open in the source (the reader closed it), so the next reader's first
+  Open either reuses it, closed, when the path in its stack frame is still the same, or closes it again first. A
+  failing call after open leaves the file open. Without the buffer, Open clears the path and points the second item
+  at 1 MB; the reader then ignores the Open (Open itself answers CELL_SAIL_ERROR_MEMORY). Closing an open source
+  without a file answers the last lwcond signal's result. Stop goes on when its lock fails.
+- **Where libsail would fault** (a NULL or unmapped URI, start command, capabilities or item pointer, or Read's size
+  pointer), pspocket logs the call site and refuses the call with CELL_SAIL_ERROR_INVALID_ARG (D-042).
+- Calls go where libsail's go: sysPrxForUser's lwmutex, lwcond, thread and string functions through `sail::lv2_lib`,
+  lv2's join through `sail::sc`, cellFs, cellSysmodule and the notifications through `sail::module_call`. The file
+  calls go through their descriptors (libsail's own too, as libsail calls them through its table): the cost is a
+  guest call per file operation, next to a read of up to 1 MB.
+- **Compared** in tests/hle/test_sail_source.cpp (`[sail]`): each script in two fresh processes with libsail loaded,
+  one calling libsail's exports and one pspocket's, the source's callbacks called through the descriptors the source
+  holds; a synthetic /dev_hdd0 (a PAMF header and 2.5 MB of a pattern, a file shorter than its header). Compared: the
+  answers, the script's memory (the player and its source, the messages the source posted, drained from the ring of a
+  player that has not booted, the items' data, a log of the game's file calls and of the allocator's frees), the
+  allocator's memory (the player's block, the read-ahead buffers with what was read into them) and each thread's lv2
+  calls in order. Masked: the callbacks' and libsail's file calls' words (each side's code); with a booted player the
+  control thread's stack words, the handler's r7 and the commands' records in the ring (D-562's); the registers past a
+  file call's arguments in its log (whatever the caller left there); and, where libsail's DescriptorOpen calls ReadSync,
+  the stack variables handed to the game's calls (that caller's stack differs; called directly, they are equal).
+  Scripts: DescriptorOpen through the source (makeup, ReadSync of a missing file, the header read twice, a short file,
+  the capabilities, a shared source, cleanup on the last close, by the game's thread and the control thread at the
+  player's end), the same through the game's file calls (one call after open failing), the reader called directly
+  (every callback in every state, items across chunks to the file's end, a range, the buffer refused, Cleanup while
+  started, Makeup again over the descriptor Cleanup left), the reader through the game's calls, the reader's failures
+  and timeouts (the poll finding the medium gone, the file opened again five seconds on, seeks and reads failing, the
+  retry half a second on), and OpenStream and CloseStream (D-562 part 13) through the source, opening and closing the
+  file, and through the game's calls with the file gone (the stream not opened, CANCEL). Before the merge of D-562
+  parts 9-13 the first five scripts compared with 0 differences (576 checks), the same in five runs. A test without the
+  firmware runs the direct script on pspocket's side alone and checks its answers, messages and the items' data
+  against the file.
+
 ## D-903 · 2026-10-10 · The loader links every host module's internal functions, whatever the game imports
 
 Internal functions (`Function::internal`) are what pspocket's own modules hand out by address: a thread's entry (cellDmux's
@@ -12522,6 +12608,577 @@ installed runs about six minutes (cellRudp's comparison alone about 110 s), past
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
 
+## D-918 · 2026-10-12 · cellSysconfPs1emu as Sony's libsysutil_sysconf_ps1emu requests it (part 1)
+
+The PS1 emulator's settings library (four exports known only by their NIDs, in libsysutil_sysconf_ps1emu.sprx, a
+libsysutil module pspocket always serves itself, so the four failed when called) is pspocket's own
+(runtime/hle/src/cellSysconfPs1emu.cpp), read from the module (fw 4.92) in a scratch area. The module is a client of
+libsysutil's: each export builds a request as libsysutil's own requests are built (D-534: the packet begun on channel 0
+with ID 0x110, FixedMemory 0, a document with the magic "SYSC"), sends it to the system software and reads the reply
+into the same document, its root's "result" first (a negative one is the answer):
+- 0x83E79A23 (port, u8 out[2]): "getBattery" {portNo}; "status" to out[0], "level" to out[1]; a level out of the
+  status's range (status 0: 1-2, 1: 1-5, 2 and 3 any; a status above 3) is CELL_SYSUTIL_ERROR_VALUE, the bytes written
+  all the same.
+- 0x6A12D11F (port1, port2): "swapGamePad" {port1, port2}; only the same port twice is refused (the low words
+  compared), no range.
+- 0x639ABBDE (port): "disconGamePad" {portNo}.
+- 0xEFDDAF6C (port, u16 out[2]): "getPower" {portNo}; "status" and "reserved" to the two halfwords.
+Ports above 6 (the low word, unsigned) and a null output answer 0x8002BB01 before anything is sent; a reply larger than
+the module's 0x6000-byte buffer is libsysutil's TRUNCATED; a missing attribute is cxml's NO_ATTRIBUTE (with what was
+read before it written). On pspocket's console the channels are closed (D-534), so each request answers 0x8002b007,
+as Sony's module does on pspocket.
+Compared (tests/hle/test_sysconf_ps1emu_compare.cpp): every export's checks on closed channels, then channel 0 opened
+with a ring and the test answering as the system software in another process would (the request taken out of the
+ring, the reply put in, under the channel's mutex): results above and below zero, every battery status with levels in
+and out of range, power words, missing attributes, replies of 0x5000, 0x6000, 0x6001 and more bytes; the answers, the
+outputs, each request's bytes as the system reads them and the lv2 calls of each call: 0 of 293 observations differ.
+
+## D-918 · 2026-10-12 · The module-management entries of the modules pspocket serves itself (part 2)
+
+The chart's "(module management)" (nids.txt's nameless library "[]": RPCS3's names for the NIDs every PRX exports in
+it, module_start, module_stop, module_prologue, module_epilogue, module_exit and the variable module_info) had nothing
+of pspocket's: no game imports them, and a firmware module pspocket replaces never runs. Decided: they are the entries
+of the modules pspocket serves itself. A game that loads a firmware module by its path whose libraries are the host's
+gets a module with no code from the loader (RuntimeModules, D-159), which until now had no entries at all
+(sys_prx_get_module_info reported none, starting and stopping ran nothing). It now has the host's, registered under
+the nameless library (runtime/hle/src/module_management.cpp) and reached as a firmware module's are (D-916 part 1):
+- module_prologue(entry, args, argp) and module_epilogue: as the SDK's start-up code (read from librudp.sprx and other
+  fw 4.92 modules) they call the entry with the arguments' low words unless it is all ones and answer its result (0
+  without one). The SDK's also make the module's lock and run its C++ constructors (the epilogue its destructors and
+  atexit functions): the host's libraries have none, their state being the host's. The SDK's refuse a second start
+  with 0x8001000A by a counter in the module's data; the loader refuses one first (ALREADY_STARTED), so none is kept.
+- module_start: SYS_PRX_RESIDENT (0), as Sony's modules answer; module_stop and module_exit: 0.
+- module_info: the module's description as a PRX carries it (ppu_prx_module_info, 0x34 bytes): attributes 0,
+  version 1.1, the name "pspocket", no TOC or tables.
+sys_prx_start_module on such a module now runs the prologue with module_start (the result word 0, as before), and
+sys_prx_get_module_info reports module_start and module_stop. pspocket-boot --hle-list prints the library's lines with
+its empty name first; scripts/progress.py counts them as "(module management)" (and test_hle's NID check takes the
+names the NID database gives these fixed NIDs).
+Compared (tests/hle/test_module_management.cpp) with librudp's prologue and epilogue on a fresh module: the entry
+called with the low words of 64-bit arguments, its answer passed through, nothing called for an entry of all ones:
+0 of 7 observations differ. A firmware-free test loads a host-served module by path and checks the reported entries,
+the start's and stop's results and the second start's refusal.
+
+## D-918 · 2026-10-12 · cellSailRec pspocket's own, from libsail_rec (part 3: the recorder before Boot and the game's objects)
+
+cellSailRec is the recorder side of libsail (libsail_rec.sprx, fw 4.92: 58 exports, all with RPCS3's names, none of
+them pspocket's until now). It is read from the module in a scratch area (nothing of it committed) and made pspocket's
+own part by part (runtime/hle/src/cellSailRec.cpp, cellSailRecObjects.cpp, cellSailRecControl.cpp, cellSailRec.hpp;
+compared in tests/hle/test_sail_rec_compare.cpp: the same script in two fresh processes, libsail_rec loaded in Sony's).
+What it is: the game's feeders (CellSailFeederAudio/Video, its callbacks, which libsail_rec drives) give frames; the
+recorder converts and encodes them on the game's SPURS (its own SPU programs, among them an AAC encoder, and the
+firmware's AVC, MPEG-4 and M4HD encoders) and gives the streams to a composer: the game's (CellSailComposer, type 3) or
+its MP4 writer (type 1, through the firmware's MP4 library). A control thread runs it from a message queue laid out
+as libsail's (D-562), with a second thread bringing the SPU tasks' messages from a SPURS queue. It has no camera or
+microphone of its own: a console without them records what the game's feeders give it, like any other.
+
+This part, everything up to Boot and the objects the game owns:
+- **Initialize** (recorder, allocator, handler, argument, attribute {0x1C, mode 0/1, audio, video and user streams,
+  messages, timescale}, resource {0xC, SPURS, 0}): the recorder (0x2000 bytes) cleared once both sizes are right,
+  then the allocator, SPURS and the resource's last word checked (so a NULL allocator leaves it cleared); SPURS's SPU
+  count asked; one block from the allocator (boundary 8: the slots, 0x2B8 bytes an audio stream, 0x460 a video one,
+  0x28 a user one, and the ring, 16 bytes a message, 50 per stream and 50 when the game gives 0); the queue's lv2
+  pair ("_saiqu0") and the recorder's lwmutex and lwcond ("_saicx0"); the defaults (control thread 900 with 0x3000
+  bytes of stack, task handler 0x370 with 0x8000, the common taskset's eight SPU priorities, the MP4 composer's 600
+  and 0x2000, each audio slot's and video slot's parameters, a video stream's SPU count one less than SPURS's but at
+  least 1), the timescale 1000000 when 0, the MP4 composer's file calls (libsail_rec's own: internal functions here).
+  The allocator failing is MEMORY with the state 9.
+- **Finalize**: INVALID_STATE once finalized; a booted recorder is told to end and its thread joined; then the lwcond,
+  the lwmutex, the queue's pair (skipped when the queue's count reads -1, as libsail_rec checks) and the block.
+- **Set/GetParameter** (before Boot): the recorder's own (2, 29, 64 to 67, 82, 83: set from param0 only with a nonzero
+  param1, read back with param1 NULL, some sign-extended) and the per-stream ones by index (audio 68 to 72, video 73
+  to 77 and 79 to 81; 78 refused; an unknown recorder parameter accepted and kept nowhere).
+- **SetFeederAudio/Video, Register/UnregisterComposer** (type 3 only, once; Unregister also once booted),
+  **Subscribe/UnsubscribeEvent** (events below 12, a subscription's parameter 0), **ReplaceEventHandler** (EDEADLK
+  taken as the lock held), **Boot**'s refusal when a stream has no feeder (INVALID_STATE).
+- **The commands' sending side**: CreateProfile (1), DestroyProfile (2), CreateVideoConverter (3: the two formats'
+  fields checked as libsail_rec does, the conversions 4 and 9 to 1, 11 and 12 to 1, 4 and 9), DestroyVideoConverter
+  (4), OpenStream (5), CloseStream (7), Start (9), Stop (0xB) and Cancel (0xE at the queue's head): each argument
+  check, then INVALID_STATE before Boot (the recorder not running); once running, libsail's command protocol (a
+  reply record posted at the queue's head, one lwcond wait).
+- **DumpImage**: the version (0x492000), the "modules are the process's" flag, the recorder's first 0x880 bytes, the
+  profile in use with its parameters, the MP4 composer and its streams, each slot with its feeder (and a video slot's
+  converter), each block at the next 64-byte boundary, the padding counted only when it fits.
+- **Feeders**: Initialize (four of the game's eleven callbacks required, the attribute NULL; libsail_rec's own eleven
+  callbacks put in front, their argument the feeder), Finalize, the notifications as messages to the recorder (audio
+  0x0F to 0x12, video 0x19 to 0x1C; an error's terminated flag in bit 31 cleared) or to a diagnostic handler the
+  feeder may hold (its value sign-extended); r3 afterwards is what libsail_rec leaves (the queue's unlock).
+- **The composer**: Initialize (the game's 17 callbacks, the last three words 0; its two lwmutex and lwcond pairs
+  "_saimx0", "_saimx1"), Finalize (state 1 only), GetStreamParameter (0 or INVALID_STATE: libsail_rec writes nothing),
+  GetEsUserParameter (0), GetEsVideo/AudioParameter (an open stream's 0x50 and 0x48 bytes; the index checked only
+  against 3, a negative one read before the table), NotifyCallCompleted (the pending call's completion once, or the
+  diagnostic handler), NotifySessionError, Get/TryGet/Release of access units on a stream's ring: times in 90 kHz
+  (the product wrapping in 64 bits, a signed quotient), the number taken n whenever any are there, *remaining the
+  units less that, a Get's failed wait answered 0 (user and video) or its error (audio), Release giving back at most
+  those there (the user stream's message carrying n). libsail_rec's user stream copies the game's first entry over
+  the rest (its units are never read): kept.
+- **Profiles' setters**: SetStreamParameter (the buffer size, all ones for 1 MB, less refused; the stream parameters
+  by the composer type), SetEsAudioParameter (AAC: channels, layout, the five sample rates, equal bit rates within
+  half and six times the rate; the extension copied in before its checks, so a refused one stays; its float 0.0 or
+  -0.0), SetEsVideoParameter (MPEG-4, AVC and M4HD; the frame rate codes; up to 32 encoder options, each ID one the
+  encoder knows: the four and seventeen IDs libsail_rec accepts, interface constants of the encoders).
+- **Video converters' queue**: CanProcess, CanGetResult, Process (FULLED, or one wait for room with the count read
+  once before it), GetResult (EMPTY at once, or after a wait even when woken).
+Registered: all 58 (and the internal functions the objects carry: the feeders' and composer's tables, the file
+calls, the two threads). The control thread, profiles' and converters' making, the streams and the recording are later
+parts: they stop the process with the call site (rule 5). So cellSailRec is marked firmware-first (D-563): where the
+system software is installed a game gets libsail_rec until the rest is compared too.
+Compared: Initialize and Finalize (82 observations), every parameter (1,456), the recorder's API before Boot with
+DumpImage at 26 sizes into aligned and unaligned buffers (390), feeders (119), the composer (388), profiles (612),
+video converters (44): 0 of 3,091 observations differ (each half's code addresses, the lv2 objects' IDs and stack
+words masked; the profiles, converters and composer streams laid out by the script as the control thread lays them
+out).
+
+### D-918, part 4: cellSailRec's control thread, task handler, profiles, Cancel and Finalize once booted
+
+libsail_rec's own threads, natively (runtime/hle/src/cellSailRecControl.cpp), as fw 4.92's module runs them:
+- **The control thread** ("_libsail-control-ex", from Boot): the command it answers is 0x20 (Boot's); its stack's top
+  less 2000 kept for the event handler; under the recorder's lwmutex a SPURS queue of 16 messages of 16 bytes (SPU to
+  PPU) at +0x580 with an lv2 event queue attached, the task handler started ("_libsail-task-handler", its priority and
+  stack from +0x858), the clock in mode 0 (0x58 bytes, its lwmutex "_saisr0", priority protocol, recursive), the
+  composers' table (none in use, the recorder), each audio and video stream's pipeline (cleared, state 1, the
+  recorder and the clock) and its feeder's makeup (the recorder, the index, the state 1, the game's makeup through
+  libsail_rec's table). Then running (+0x700), the state 2, the state event, Boot's completion event, the lwcond
+  signalled, the lwmutex released, the messages taken. At the end, in the reverse order: the video and then audio
+  feeders' cleanups and pipelines, the clock (also when its making failed, as libsail_rec does), the profiles freed
+  (each one's first 4 KB cleared), the task handler stopped (+0x514) and joined, the event queue detached, the state
+  10; a failure ends with the state event 9 and Boot's completion with the error (sign-extended). Which steps are
+  undone follows libsail_rec's flags exactly (no detach when the attach failed, no join when the thread was not made).
+- **The message loop**: 200 at +0x510 while waiting (the queue's condition, 3 s at a time), then the message's first
+  word; codes above 0x35 passed over, as are 6, 8, 0xA, 0xD, 0x12, 0x13, 0x1C, 0x1D, 0x24 to 0x2A, 0x2D, 0x2F.
+  Completions drive the continuation engine (a failed step marks its record and is an error event, "error 0x%X"
+  printed first, unless it is a cancellation; the record's last step runs its continuation with 0 or CANCEL; an
+  answer above 0 is the steps sent out again, else the record's own completion goes to the step it belongs to).
+  CreateProfile (INVALID_STATE in state 0; one block of (2 video + audio + user) * 512 + 4096 bytes, boundary 8, or
+  MEMORY; the profile's 0x118 bytes from +0x438 all ones, the type, state 1, the recorder; each stream's parameter
+  entry {1, index, profile} and the rest all ones; first on the recorder's list), DestroyProfile (taken off the list
+  and freed; 0 also for one not there), Cancel (each audio and video feeder's callback 6), Finalize's message 0x30
+  (the stop record in use, the recorder no longer running, every event unsubscribed; a booted recorder told to end
+  with 0x31), the converters' notifications 0x32 to 0x35 (their callback).
+- **The task handler** pops the SPURS queue as libsail_rec does inline (not through libsre): its pop index marked while
+  it waits on the event queue 10 ms at a time and unmarked when a wait times out, so it sees +0x514 go to 0; a pop
+  already marked (BUSY), a queue without its port (STAT) or the recorder's end stop it; a full queue's oldest push
+  waiter signalled through its taskset (looked up by workload ID without one); each message posted to the control
+  thread's queue as {code, 0, a, b}.
+- **The feeders' internal callbacks** (libsail_rec's eleven in front of the game's): makeup and cleanup (0 without the
+  game's), open (the format kept: audio 0x18 bytes at +0xA8, video 0x20 at +0xB0), start, stop, cancel (each with 0;
+  without the game's callback the call completed at once, through the diagnostic handler or the feeder's message),
+  callback 6, the format (the kept one without the game's), and the last three always the game's; each passes on the
+  registers it does not set, and sign-extends where libsail_rec does.
+The streams (OpenStream, CloseStream, Start, Stop and their messages), the video converters' making and conversions,
+the composer's and the MP4 composer's internals stay later parts: they stop the process with the call site (rule 5),
+so cellSailRec stays firmware-first.
+Compared (a new script: the booted recorder): Boot with four feeders and a registered composer, CreateProfile 1 and 3,
+the allocator failing, DestroyProfile of a profile, the same again and one not there, Cancel twice (the second with
+two feeders without callback 6), Finalize; Boot failing at audio feeder 1's makeup, at video feeder 0's (feeders 1
+and 3 without cleanup) and at audio 0's in mode 1; a mode 1 recorder booted, a profile made, finalized: 0 of 246
+observations differ (the feeders' callbacks are one recording function told apart by its TOC, each answering a word
+the script sets; the threads' IDs, the message the control thread is at, the SPURS queue's pop index and event queue
+and the clock's lwmutex's sleep queue masked as each process's own or timing; the lwmutex and lwcond calls left out of
+the script thread's lv2 calls, since contention decides them). The earlier scripts still 0 of 3,091.
+
+### D-918, part 5: cellSailRec's video converters, as libsail_rec makes and runs them
+
+libsail_rec's video converters, natively (runtime/hle/src/cellSailRecConvert.cpp), as fw 4.92's module makes them:
+- **CreateVideoConverter** (the control thread's message 3; its "mode" is the queue's capacity, 0 to 2): INVALID_STATE in
+  state 0; the conversion's work area by the codings (cellSail.h's): a YUV 4:2:2 coding (2, 4, 9, 10) to ARGB or RGBA
+  (0, 1) is kind 0, raw Bayer (12) to ARGB or RGBA kind 1 and to a 4:2:2 coding kind 2 (0x200 bytes each, the common
+  taskset "_libsail-common-taskset" made at its first user and counted), JPEG (11) to RGBA, YUYV or VYUY (1, 4, 9) kind
+  3 (the firmware decoder's work size, its module 0xF009 loaded for the question and unloaded again); one block from the
+  game's allocator (boundary 0x80: the work area, then the converter's 0x100 bytes); the converter's lwmutex
+  "_sailf0" and lwconds "_sailf0" and "_sailf1"; each kind's set-up (the sizes and pitches, all ones taking the coding's
+  default, the fill byte capped at 0xFF, the message the SPU program or decoder sends the recorder's SPURS queue: 0x34
+  for kind 0, 0x35 for kinds 1 and 2, 0x33 for JPEG; kind 0's scan from the input's scan byte, a height above 719 being
+  progressive, and its field order); the callback, or libsail_rec's own doing nothing with the converter as its
+  argument; first on the recorder's list. Every failure answers MEMORY. libsail_rec's slips are kept: a refused set-up
+  frees the block from the converter's address, not the block's; a converter refused after its sync objects were made
+  keeps them; a block refused after the common taskset was made leaves the taskset counted (never shut down).
+- **The conversions**: a request starts when none is being converted (Process, GetResult, a result): kinds 0 to 2 one
+  task of libsail_rec's SPU program for the kind in the common taskset, the source and destination kept in the work
+  area, the task's ID too; the argument's first doubleword the work area, its second 0, but kind 2's program gets the
+  work area there as well (its message carries that word back); JPEG a cellAvchatJpgDec decode of {source, size, sub-kind,
+  destination, fill}. The task handler takes the message (a converter's codes above 0x32), stores the result (the
+  decoder's for JPEG), signals both lwconds, starts the next request and posts the message, on which the control
+  thread calls the converter's callback. DestroyVideoConverter (message 4) and the recorder's end take converters down:
+  the JPEG decoder closed and its module unloaded, the sync objects, the block, the common taskset released by an SPU
+  kind (shut down, joined and freed after its last user).
+- **From the installed system software at run time** (as cellSpursJq's policy module, D-537): libsail_rec's three SPU
+  programs for the converters and their coefficient tables, read from /dev_flash/sys/external/libsail_rec.sprx when it
+  is fw 4.92's (firmware_data.hpp); nothing of them is in the repository. The JPEG decoder is the firmware's
+  libavchatjpgdec, imported as D-197's host imports.
+Compared (a new script on a booted recorder: every SPU kind with the scans, the JPEG kind from 4:2:0 and 4:2:2 files
+made in the test, one or two requests queued, with and without a callback, the taskset or block refused, a capacity of
+0, a converter destroyed twice, two left for the recorder's end): the answers, the converters' bytes and work areas, the
+pictures, the callbacks, the allocator's calls, the lv2 calls: 0 of 368 observations differ. Not compared, by nature:
+kind 0's SPU program answers its own run time in decrementer ticks as the result (notes), the SPU task IDs (whether the
+previous task has ended when the next starts), the JPEG decoder's own state past its work area's first 0x40 bytes.
+Found by the comparison: kind 2's argument (above). The comparison's pspocket half links cellSailRec's host imports
+itself: the loader's link_host_imports passes over a firmware-first library's, whose firmware module imports for
+itself. The streams (OpenStream, CloseStream, Start, Stop and their messages, the pipelines, encoders and composers)
+are the later parts, so cellSailRec stays firmware-first.
+
+### D-918, part 6: cellSailRec's streams over the composers: OpenStream, CloseStream, Start, Stop, Finalize's stops
+
+libsail_rec's stream control and composers, natively (runtime/hle/src/cellSailRecStream.cpp, cellSailRecCompose.cpp),
+as fw 4.92's module runs them on its control thread:
+- **The steps**: each command is a tree of asynchronous steps over the composer in use, each stream's feeder and its
+  pipeline; a step's record {flags, steps out, its parent's handle} at the recorder's +0x400 (the command), +0x410 (its
+  streams' step, +0x420 the next), +0x450 (Finalize, +0x460), +0x470 (a session error, +0x480), each slot's start (its
+  own record) and +0x30 (its stop), the handles' continuations libsail_rec's internal functions (pspocket's own here).
+- **OpenStream** (message 5): booted, no command pending, the profile free; the path kept in the profile with a '/'
+  after it (0x421 bytes at most; none added past 0x41F), the command 0x21 pending, the state 3, answered at once; then
+  the profile in use, its composer attached (the game's: its makeup callback with the recorder and the composers table,
+  registered under its type) and its stream parameters' defaults (90000 and half of it, the buffer at least 1 MB), the
+  composer opened (its instance of the size its table asks; the game's open callback with the path); its continuation
+  opens every closed slot, video first, each its own record, the feeder asked to open with the profile's format (the
+  defaults for the game's and the MP4 composer: video coding 3 with MPEG-4, audio coding 1, 1024 samples a frame, 48
+  kHz, AAC); the first stream marked as the one the composer follows. A composer that cannot be had is an error event
+  and everything closed (the completion carries CANCEL).
+- **CloseStream** (7): open, no command; closing, answered; each slot out of the composer and its pipeline and feeder
+  closed, the composer closed (its close callback gets the step's handle in r5), its instance freed, the game's composer
+  detached (unregistered, its cleanup callback), the profile free again, event 5.
+- **Start** (9): open, no command; the start parameter {0x18, 0, start, duration} (its second word set to 0x100 in the
+  game's copy; another size or a word set: INVALID_ARG), the end time (all ones without a duration), the file name
+  after the profile's path (a leading '/' dropped when there is a path); starting, answered; a new session, the clock
+  reset, the composer started (its start callback with the path and the session) and each open slot's pipeline, then
+  each slot's feeder with the session and the times. **Stop** (0xB): recording, no command; the stop parameter {0x10,
+  0, the end time} or none (0); each slot's feeder stopped at the end time, then its pipeline, then its composer stream
+  ended; the composer's stop completes when its last stream ends and has given back its units, which completes Stop.
+  The flushing stop (0xC, posted by libmp4) and a composer's session error (0x2E: an error event; a terminating one
+  while recording stops everything) stop every slot and the composer at once.
+- **Finalize** by the state: recording stopped and closed, an open stream closed, then the loop's end.
+- **The game's composer** (the table libsail_rec gives it): the states (1 closed, 2 open, 3 recording, 4 opening, 5
+  closing, 6 starting, 7 stopping) moved on by the recorder's continuations; its streams (10 added, 12 recording, 11
+  ended, 13 done, 9 removed) with their parameters copied for the game, their ring sized from the stream parameters
+  (the units for the parameters' time, and 4), the game told by its callbacks (add, end, an access unit arrived with
+  1); an access unit kept in the ring while the stream records and the game has its callback, else given straight back
+  (a release message); the game's callbacks find in their registers what libsail_rec leaves there (the makeup the
+  recorder and the composers table, the cleanup zeros, close and end the step's handle, the stop its caller's word).
+User streams: libsail_rec never gives them to a composer (its user-stream functions are unreachable); only their
+parameters' "first stream" flag is set. Not reproduced, by nature: libsail_rec's faults, where pspocket stops the
+process with the call site (rule 5): a composer whose instance cannot be allocated or whose makeup refuses leaves the
+type in use at -1, and libsail_rec then reads its composer table at the session counter. A recorder without audio and
+video streams can start but never stop (no stream ends to end the composer's stop), as libsail_rec.
+Compared (tests/hle/test_sail_rec_compare.cpp, a recorder without audio and video streams and the game's composer,
+its callbacks recording r2 to r5): OpenStream and CloseStream with the callbacks answered by the script, with an open
+that fails, without callbacks, with paths of 0, 0x41F, 0x420 and 0x430 bytes and one ending in '/'; the commands
+refused around them (Start's parameter checks, Stop, a second OpenStream, CloseStream when closed); DumpImage of an
+open stream; Finalize with the stream open; the same with every event unsubscribed: 0 of 229 and 0 of 52 observations
+differ (each half's continuations' descriptors masked in the records and the callbacks' handles). The feeders'
+stream side, the pipelines and the MP4 composer stop the process with the call site until their parts.
+
+### D-918, part 7: cellSailRec's audio streams: the feeders' stream side, the audio pipeline, libsail_rec's AAC encoder
+
+libsail_rec's audio recording, natively (runtime/hle/src/cellSailRecFeed.cpp, cellSailRecAudio.cpp), as fw 4.92's
+module runs it on its control thread:
+- **The feeders**: the eleven callbacks libsail_rec puts in front of the game's (moved from cellSailRecControl.cpp and
+  named by what they do: makeup, cleanup, open, close, start, stop, cancel, the format, checkout, checkin, clear), each
+  passing on the registers it does not set (the game's makeup sees the recorder and the stream's index, open the format
+  and 0, close, start and stop 0 and what follows); open, close, start and stop without the game's callback complete
+  at once. The stream's side (states 1 made to 11 ended): open with the slot and pipeline kept; start with the session
+  and the recording's window; a frame taken through the game's checkout given straight back when before the window's
+  start or not after the last frame's time, a kept one given the session (its +0xC) and held; the window's end ends a
+  recording session (the session-end notification); stop by the state (up to the end time, or forced; the end time
+  reached drains the frames still out, which the pipeline takes); the session's step completes once the pipeline gives
+  its last frame back (the frames still out taken and given back, the game's clear); frames out while nothing records
+  are taken and given back at once.
+- **A stream's configuration** once its feeder is open (libsail_rec's continuation of the open): the format the feeder
+  gives (its format callback into the parameters' +0x50) against the profile's: the channels (6 or 8 mixed down to 2)
+  and their layout (derived from the channels when unset; 1, 2, 8, 9, 11 and 12 taken), the rate (resampled to 24 or
+  48 kHz from 8 to 48 kHz when parameter 68 allows and the profile asks), the timescale (a multiple of the rate), AAC's
+  configuration (64000 bit/s a channel by default, the profile's within half to six times the samples a second; the
+  channel tables libsail_rec's, read from the installed module); anything else UNSUPPORTED_STREAM, an error event, the
+  slot closed again — and the stream opens without it (OpenStream's continuation ignores the slots' results, as
+  libsail_rec's). Then the pipeline opened and the stream added to the composer.
+- **The pipeline** (0x228 bytes in the slot): the encoder (a 1 MB work area from the game's allocator), libapostsrc_mini
+  (cellApostSrcMini, module 0xF03B, through the firmware as the D-197 imports) when resampling, an intermediate buffer
+  of one encoder frame unless the feeder's frames are already that, and one block for it, the ring of units (room for
+  the composer's delay at the bit rate, 32-bit arithmetic as the PPU's) and the units' records. Started: silence
+  aligning the encoder's delay to whole units, the delay's units skipped; frames in (the clock told each, mode 0), the
+  mix-down with the PPU's rounding (0.707 front, half the rest, a soft limit above 0.5, clipped), resampled blocks
+  (message 0x15), units out (0x16) into the ring with their times, handed to the composer as it has room (0x18) and
+  given back (0x2B); stop pads the last frame and flushes the encoder; a forced stop empties the ring.
+- **libaacenc**, libsail_rec's own AAC library: a taskset "_libaacenc_<the encoder>" on the game's SPURS (or a SPURS of
+  its own), its SPU program (libsail_rec's, read from the installed module), overlays (cellOvis), heap (cellSheap), two
+  SPURS queues of one message; commands {code, a, b} answered {.., .., b, result}: open (0x15, the notification's
+  queue), configure (0x10), sizes (0x12), delay (0x13), encode (0x104) and flush (0x105) answered later, finish
+  (0x11), end (1).
+- **The clock** (mode 0): the first stream to tell it owns it; each later time predicts the source's, kept at most three
+  times running while the source's lies outside a step of it.
+- **Messages**: 0xE the feeders' cancel, 0xF a feeder's call completed, 0x10 frames out, 0x11 a session's end (a
+  recording slot stopped outside Stop), 0x14 to 0x18 and 0x2B the pipeline's; the pump takes a frame whenever the
+  streams record (or Stop runs), frames wait and the pipeline has none.
+Compared (tests/hle/test_sail_rec_compare.cpp, one audio stream through the game's composer, the feeder's callbacks
+guest code recording their registers, the frames tones): stereo at 48 kHz in the encoder's frames, 6 and 8 channels
+mixed down (quiet and loud enough for the limiter), frames of 480 samples, 44.1 kHz resampled to 48 kHz, a composer
+ring of four units (the rest waiting in the pipeline's): OpenStream, Start, the frames encoded, the units' records and
+bytes, Stop with the encoder flushed, CloseStream, Finalize: 0 differences in 164, 160, 156, 152, 174, 168 and 172
+observations; a feeder answering its own calls: frames before Start, Cancel, Start in a window (frames before it given
+back, its end ending the session and draining), Start again, Finalize while recording: 0 of 175; refusals (the feeder's
+open failing, its format failing, 3 or 4 channels, a layout of 5, 37.8 kHz asked to be resampled): 0 of 214. libaacenc's
+SPU program and the resampler run under pspocket's SPURS in both halves. The video pipeline and the MP4 composer stop the
+process with the call site until their parts.
+
+### D-918, part 10: cellSailRec no longer firmware-first
+
+cellSailRec matches Sony's libsail_rec call for call (parts 3 to 9: 0 differences in every comparison of
+tests/hle/test_sail_rec_compare.cpp: the recorder before Boot, its parameters and API, feeders, the game's composer,
+profiles, video converters and their conversions, the booted recorder, streams through the game's composer, seven
+audio recordings, an audio stream's steps and refusals, 20 video recordings and the video refusals, four recordings
+through the MP4 composer: 12 test cases, 6077 assertions, 163 s on the Mac with the firmware), all 58 functions and
+libsail_rec's internal paths natively, nothing left stopping the process for a later part, so its firmware-first
+marker goes (D-563): where the system software is installed, a game importing cellSailRec now gets pspocket's, not
+libsail_rec.sprx, and the loader links its imports (the encoders, cellVpost2, cellApostSrcMini, cellAvchatJpgDec,
+cellMp4: link_host_imports) for it. What pspocket reads from libsail_rec.sprx at run time stays read from the installed
+module (its SPU programs, the conversions' coefficients, the option and channel tables: D-918 parts 5, 7, 8); without
+the system software those paths log and stop. Not reproduced, by nature, and bounded (parts 6 to 8): libsail_rec's
+faults (a composer table it reads at the session counter, a composer's list walked past its end), where pspocket stops
+with the call site; the stack bytes it copies or leaves unwritten (zeros here). The name check now asserts the library
+is pspocket's and unmarked. The whole of test_hle with the firmware: 902 test cases pass, 27 skip, in 546 s.
+
+## D-919 · 2026-10-12 · cellSail's playback engine from libsail (part 1: the file source merged)
+
+cellSail's last 17 functions (Start, Stop, Next, Cancel, OpenEs/ReopenEs/CloseEs of each kind, the adapters' GetFrame
+and GetFrame2, cellSailAuReceiverGet) need libsail's playback engine behind them: the elementary streams opened and
+closed, the data flow through the source, cellDmux, the decoders' pipelines and their copy threads to the renderers
+and AU receivers, the clock. It is made pspocket's own part by part, read from libsail.sprx (fw 4.92) and compared with
+it running on pspocket in tests/hle/test_sail.cpp (parts 14 on).
+
+Part 1: the built-in x-cell-fs file source (D-901; its first commit message says D-564) merged. Its OpenStream scripts
+had not run since the merge of D-562 parts 9-13 and differed only in the test: cellDmux keeps the pipeline's callback
+(each side's own code) in its memory, which the source's 2 MB buffer now comes before, so the fixed place the script
+masked missed it (masked now by value wherever it is in the allocator's memory); and the player's message ring held
+the reader thread's answer and the control thread's own completions in whatever order the threads ran (compared in no
+order now). The eight file source comparisons and the D-562 parts pass, three runs.
+
+## D-919 · 2026-10-12 · cellSail's elementary streams opened and closed, as libsail (part 2)
+
+The elementary streams of the current descriptor (runtime/hle/src/cellSailEs.cpp, cellSailDmux.cpp,
+cellSailRenderers.cpp, cellSailPipelines.cpp, cellSailAdapters.cpp): OpenEsAudio/Video/User, ReopenEs* and CloseEs*
+(9 of the 17), and the streams OpenStream opens and CloseStream closes.
+- **A stream's open** (state 1 at the slot's +0x155/+0x185/+0x85, its descriptor entry 2): with SDKs past 0x21FFFF its
+  part of the dmux pipeline is added (the slot's +0x10, 0x70 bytes: cellDmuxQueryEsAttr's memory from the player's
+  allocator, not enabled until it starts; a pipeline not open answers CANCEL); then at once the renderer's open
+  (audio: a sixth of a second of frames; video: the stream's frames by its rate, at least the extra frames + 1, which
+  it is also given) and the decoders' pipeline (audio, video) or the AU receiver (user), the slot's record counting them
+  (messages 0x54-0x56, 0x57-0x59, 0x5A-0x5B). The renderer is given its format: audio the stream's (ATRAC3plus folded
+  to stereo for a renderer that wants two channels; 48 kHz with audio parameter 32), video the picture's with the
+  renderer's pitch and alpha, its coding without post-processing, with it (video parameter 0) progressive pictures, its
+  aspect code and the size scaled by the two pixel aspect ratios (libsail's two small tables: the BT.601 ratios and the
+  doubled frame rates); SDKs 3.1 and 3.2 flag the audio renderer (0x40) for PAMF. All in: open (2), counted in +0x164 /
+  +0x165 (and +0x1CA/+0x1CB in mode 1), event 9 {kind, index}; failed (an error event, but not CANCEL with the later
+  SDKs) it is closed again with the open's handle and the record marked.
+- **The decoders**: audio by codec, its cellAdec parameters completed (LPCM's channel code by layout, AC3's mode, LFE,
+  output order and 1.0 gains, ATRAC3plus's output, the 0xF01D codec's rate index; module 38, 39, 40, 0xF01E, 0xF01B,
+  0xF01D), the parameters kept, cellAdecQueryAttr, the memory, cellAdecOpenExt with the slot's resource (+0x15C) on the
+  player's SPURS and libsail's callback (AU done 6, PCM out 7, sequence done 0x30, an error 0xD2 {error, 4, index}).
+  Video: MPEG-2 (36), AVC (37; the slot's SPU count by level), 0xF021, VC-1 (60), 0xF036; cellVdecQueryAttrEx and
+  cellVdecOpenEx with the slot's resource (+0x1F0) and libsail's callback (0xC, 0xD, 0x32, 0x24), the profile raised to
+  the codec's highest when refused; a refused open frees the memory and queries the original type again, so a decoder
+  that keeps refusing loops as libsail's does. cellVpost first with video parameter 0. libsail's sample rate converter
+  (audio parameter 32) is the firmware's libapostsrc_mini, which pspocket does not have: that path stops the process.
+- **A stream's close** (7): the pipeline closed (decoder, converter, cellVpost; an error message for each failure),
+  the renderer's close, the dmux part removed (a failure one more step at once; messages 0x64-0x66, 0x67-0x69,
+  0x6A-0x6B); all in: closed (0), the entry chosen again (1) or, after a failed open, cleared, uncounted, event 10
+  {kind, index} (libsail names a user stream's kind 1 here, its slip, kept).
+- **The calls** need an open stream (player state 4 or 6) with no call running and nothing deferred (+0x260); OpenEs a
+  stream not chosen (else USING), chosen through select_es with the game's reader (its answer the call's refusal);
+  ReopenEs one chosen: unchanged and not started, its dmux part set again (events 10 and 9) and the call completes with
+  that answer; changed, closed (0x8F) and opened again (0x8E). CloseEs an open stream (entry 2) closed (0xA0, 0xA3, 0xA6:
+  the entry cleared, the call completed with the close's answer). A failed open completes the call with 0 (the stream
+  closed again first); an open's step failing leaves only a ClearEs of the entry (2: refused), libsail's. The streams
+  of a started stream (stopped first, started after) are part 3's and stop the process until then.
+- The renderers' answers (0x33, 0x34): opening with frames is open with them, without closed; starting started (the
+  free frames announced: 0x11, 0x13); stopping waits for the frames out (8), a video renderer keeping its last frame
+  open; closing closed. The AU receiver answers 0x35 (opened), 0x36 (closed), 0x37, 0x38. The sound adapter's open
+  makes its frame buffers, records and a silent buffer in one block (the silence after them before SDK 4.0, first
+  since), the graphics adapter's asks the game for the pictures (fewer than asked, not fewer than the least) and keeps
+  0x28-byte records from the player's allocator; both tell the game of the format; their closes give them back.
+- The shared machinery moved where the parts can reach it: the player's lock and allocator, the events, the command
+  protocol, the modules, the SDK version (cellSail.hpp, sail namespace); the dmux pipeline to cellSailDmux.cpp with
+  its elementary streams and both cellDmux callbacks; cellSailDescriptorClearEs's body (clear_es) without its
+  descriptor check, as the player uses it. libvdec is the module pspocket registers cellVdec's functions under.
+- **Compared** (tests/hle/test_sail.cpp parts 14 and 15, `[sail]`): a mode-0 player with the game's audio renderer, a
+  graphics adapter (the game's pictures) and an AU receiver over AVC 96x64, ATRAC3plus and user data: OpenStream
+  opening all three, each call's refusals, CloseEs/OpenEs/ReopenEs of each kind, CloseStream; a mode-1 player with a
+  sound adapter, the game's video renderer and an AU receiver over five streams: ReopenEs to LPCM and to a 128x64
+  picture (closed and opened again with the new decoders), an open the renderer refuses, OpenEs again, CloseStream, a
+  second stream left open at Finalize. The answers, each thread's lv2 calls, the script's memory, the allocator's
+  memory (the player's block, descriptors, the decoders' and dmux memory) and a records area of every callback and
+  event with tags for what they are: 0 differences, three runs. The parts' harness gives them a 64 MB heap, links the
+  decoders' internal functions as the loader does, masks each side's own code by value (pspocket's descriptors,
+  anything in libsail's segments) and compares the message rings in no order.
+
+## D-919 · 2026-10-12 · cellSail's playback: Start, Stop, Cancel, the data path and the AU receiver (part 3)
+
+libsail's playback engine (runtime/hle/src/cellSailPlay.cpp; the clock's sync engine in cellSailClock.cpp; the dmux
+pipeline's data path in cellSailDmux.cpp; the decoders' play side and both copy threads in cellSailPipelines.cpp; the
+renderers' and AU receivers' play calls in cellSailRenderers.cpp; the adapters' and the AU receiver's play callbacks
+and frame calls in cellSailAdapters.cpp), read from libsail.sprx (fw 4.92). cellSailPlayerStart, Stop, Cancel,
+cellSailAuReceiverGet, cellSailSoundAdapterGetFrame and cellSailGraphicsAdapterGetFrame/GetFrame2 are registered.
+- **Start** (command 0x6C, call 10): refused (INVALID_STATE) unless the stream is open or started (player state 4 or 6)
+  with no call running and nothing deferred but an input's end; a frame-step command (its +4 64) while not playing is
+  refused, any other command is the descriptor's InquireCapability's to refuse; a command with flag 0x10 is kept as the
+  repeat information (once). The start information (+0x1D0) comes from the command or its defaults. Every open
+  elementary stream is started (its dmux part added and enabled or enabled; the renderer started, told whether the
+  stream was only open; the decoder's sequence started; or the AU receiver started; steps 0x70-0x7B on the record at
+  +0xE0), then the source with its start command (the byte past the header, the length to the end) and the session
+  word at the player's +4 (the low 10 bits count sessions, by 128 then by one; flags for the start type, the
+  complete-stream flag, a frame step, the end pause, the streams open, the rate in bits 22-31); Start completes when
+  the source answers (state 6, event 3 and the call's completion event). Start while started stops the stream first.
+- **Stop** (0x7D, call 11; INVALID_STATE unless started): the source stopped, the dmux pipeline reset, every started
+  stream stopped (its decoder flushed, its renderer or receiver stopped), state 4 when all answered. **The input's
+  end** (0x17; event 8 without an EP walk): the source drains, the pipeline drains, each decoder ends its sequence and
+  each renderer or receiver plays out what it holds; then state 4. A call made while another runs is deferred (the
+  record's bits: 2 start, 4 next, 8 stop, 0x10 the input's end). **Cancel** is posted at the queue's head (0xD0): the
+  source's cancel, every open stream's renderer's or receiver's cancel; it answers 0.
+- **The data**: StreamOut items are checked out and fed to cellDmux while it wants them; each AU found goes to the
+  decoder while it takes AUs, or to the AU receiver; the copy threads ("_libsail-adec_copy", "_libsail-vdec_copy")
+  copy PCM and pictures (through cellVpost where asked) into the renderers' frames.
+- **The AU receiver** (cellSailAuReceiverGet and its callbacks): a queue of four AU records (+0x100, the dmux's user AU)
+  filled one at a time while AUs are found and records free; Get hands them out double buffered (two slots, the AU
+  handed out held until the next Get gives it back: message 0x16), by the game's session (16-bit compare), time and
+  flags (bit 0 the AU before, bit 1 the latest due, bit 2 only AUs marked as bit 3 says); its answers 28, 1, 12, 257,
+  260, 268, 276, 516, 528, 532, 784, 788 and 0x200 + those given back << 8 | 4 or 8. A receiver's stop (flushed: the
+  queued AUs given back; draining) is answered only through the game's next Get once nothing is queued, libsail's:
+  a game that stops calling Get holds the player's Stop, Start-while-started and the stream's end.
+- libsail's quirks kept: a failed start of a stream never completes Start's step; the video copy thread unlocks a
+  mutex it does not hold for a picture's further fields; the feeding does not check the source's checkout answer; the
+  decoders' 0xD2 errors are not acted on; the AU receiver's checkin counts a free record also for an AU given straight
+  back while not started, so its free count can pass four. The video copy thread's small tables (fields shown and
+  cellVpost's picture structure per H.264 pic_struct, the field order swapped, the frame time per frame rate code in
+  90 kHz ticks) are the standards' values as libsail uses them.
+- Later parts, failing loudly until then: cellSailPlayerNext (not registered yet), a deferred Next, a repeat into the
+  next descriptor, EP skipping (start type 16), the elementary streams of a started stream opened, reopened or closed,
+  OpenStream of a descriptor not yet opened, MP4 and AVI streams, libsail's sample rate converter (libapostsrc_mini).
+  The adapters' frame calls are compared in part 4.
+- **Compared** (tests/hle/test_sail.cpp part 16, `[sail]`): a player with one AU receiver over a PAMF stream of user
+  data AUs (synthetic packs) through a game's source in guest code (its start and stop answering at once, its checkout
+  handing out items, the rest recorded): Start's and Stop's refusals, a start, a start while started (its stop
+  answered through Get), five items fed and the AUs queued, Get in each way with the input's end coming meanwhile and
+  the stream drained through Get, a second start stopped with AUs queued, Cancel, CloseStream, Finalize: 0 differences
+  in three runs; every earlier `[sail]` test passes. Without the firmware, the same script runs on pspocket's side
+  alone and its answers are checked against libsail's (`cellSail: the playback through an AU receiver on pspocket
+  alone`).
+
+## D-919 · 2026-10-12 · cellSail's adapters' frames compared, as libsail (part 4)
+
+The adapters' frame calls of part 3 (cellSailSoundAdapterGetFrame, cellSailGraphicsAdapterGetFrame and GetFrame2)
+and the decoders' play side behind them (cellAdec and libvdec fed AU by AU, both copy threads filling the adapters'
+frames) compared with libsail running on pspocket, with no change to part 3's code:
+- **Part 17** (`[sail]`): a mode-1 player (no AV sync: the renderers' flag 4) with a sound adapter and a graphics adapter
+  (the game's pictures) over a synthetic PAMF stream (twelve AVC 96x64 I_PCM IDR pictures, 24 silent ATRAC3plus frames
+  after their ATS headers) fed through a game's source in guest code: GetFrame of each adapter before the stream is
+  open, open, started; the frames copied (the graphics adapter buffering until its four frames are full); sound
+  GetFrame of 100 to 2048 samples, GetFrame and GetFrame2 (each keep flag); the input's end drained through both until
+  each has ended (the graphics adapter only once the frames the game was given are past its delay), the stream open
+  again; CloseStream; Finalize.
+- **Part 18**: the same through a mode-0 player, the adapters synced to the clock the game's UpdateAvSync reports
+  drive: a tick of 256 samples with its report, a video frame every third tick (none for the first 30 ticks, so the
+  frames due by then are dropped but the latest; every ninth for a while) with its report, the audio reports jumping
+  ahead once, the input's end: frames due, early (12), not due (28), shown again (0x104, 0x10C), late with frames given
+  back (0x310, 0x410, 0x510), the output running out (0x205), the end (48).
+- 0 differences in three runs each (answers, each thread's lv2 calls, the script's memory, the allocator's memory, the
+  callback records); every `[sail]` test passes (27). The decoders' and copy threads' messages reach the control thread
+  as those threads run, so from part 17 on each thread's lv2 calls are compared in no order, and the script waits for
+  the player's queue to stay empty between calls. Without the firmware, both scripts run on pspocket's side alone and
+  their answers are checked against libsail's (`cellSail: the playback through the adapters on pspocket alone`).
+- libsail's sound adapter copies a GetFrame's samples into a buffer of 2048 (0x2000 bytes per channel): a game asking
+  for more overwrites what follows it (with SDKs before 4.0 the decoder's context after the adapter's block), kept.
+
+## D-919 · 2026-10-12 · cellSail's Next, the switch to the next descriptor, as libsail (part 5)
+
+cellSailPlayerNext (command 0xA7, call 12), the last of cellSail's 124 functions to be pspocket's (all registered now),
+with libsail's switch to the next descriptor (runtime/hle/src/cellSailPlay.cpp):
+- **Next** is refused (INVALID_STATE) unless the stream is open or started with no call running and a next descriptor
+  (+0x228), or with a deferred call other than an input's end; a command is the next descriptor's InquireCapability's
+  to refuse and is kept as the repeat information (with flag 0x10 it stays for later starts). Accepted: state 5, the
+  pause off; an open stream moves on at once, a started or ending one is stopped first (with start flag 1 ended,
+  flushed; 0xA9). A Next deferred behind a running step (the record's bit 4) runs when it is done.
+- **The switch** (records +0xD0, +0xE0): the next descriptor made ready as OpenStream does (0xAA), its start information
+  from the repeat command, the renderers' formats for it; a different source closed and the next one's opened, the
+  same one told of the descriptor (0xAB, 0xB2); the dmux pipeline reopened for a different kind (0xAC, 0xB3), else
+  kept with the new source. Each stream slot: kept when its next entry is chosen and compatible (the ES filter, for
+  PAMF the coding's fields; the decoder: coding, channels, rate, frame / coding, profile, specific bytes, picture and
+  format out; the renderer's format), its dmux part removed when it differs; otherwise the decoder or renderer (or both)
+  closed (0xAD-0xB1) and, the entry chosen, opened again with the new format (0xB7-0xBB), an AU receiver only closed
+  when its stream is not chosen; a slot not open completes its steps at once. Once all are in: the old descriptor's
+  open streams chosen again (event 10 each), it is closed for the player (state 1, event 5), the next one current
+  (the descriptor count one less), each stream kept or reopened open (its dmux part added again with the later SDKs,
+  event 9), event 4, and its streams start; Next completes (0xA8: state 6, the run type from the start type; a
+  failure: state 4). A failed switch takes the new stream down (closed, or stopped when streams had started) and
+  answers CANCEL (0xBC, 0xBD).
+- libsail's ways kept: an AU receiver's stop is answered only through the game's Get, and a graphics adapter's stop
+  waits for the frames the game holds to come back through GetFrame2, so a game must keep calling them for Next (and
+  Stop) to go on.
+- Still failing loudly: a repeat into the next descriptor (repeat mode 2, its seamless path and messages 0xCB-0xCF),
+  EP skipping, the elementary streams of a started stream, OpenStream or Next of a descriptor not opened (its header
+  read through the source), MP4 and AVI streams, libsail's sample rate converter.
+- **Compared** (tests/hle/test_sail.cpp, `[sail]`): part 19, an AU receiver: Next refused before a stream, without a next
+  descriptor and with a refused command; Next from the open stream (switched to and started), AUs; Next while playing
+  with a start command (stopped first, answered through Get) and refused while it runs; AUs; Stop. Part 20, a sound
+  and a graphics adapter: Next while playing from AVC 96x64 to AVC 128x64 on another channel (the audio stream kept,
+  the video decoder and the graphics adapter closed and opened again: the game's pictures given back and asked for
+  again), the new stream played to its end. 0 differences in three runs each; all 31 `[sail]` tests pass. A firmware-free
+  test checks part 19's answers on pspocket alone. The scripts' source now keeps its item table apart from the items
+  (from 14 items on, the table had overwritten the first items in parts 17 and 18; their firmware-free answers redone).
+
+## D-919 · 2026-10-12 · cellSail's descriptors the game never opened, as libsail (part 6)
+
+A descriptor added without cellSailDescriptorOpen (state 2) is opened by the player when OpenStream or Next makes it
+ready (runtime/hle/src/cellSailControl.cpp): opening (4), its stream opened on the control thread as Open's command
+does (the protocol's source found by the URI, made up by its first user, libpamf loaded), then its header read through
+the source's asynchronous Read: 2 KB into a buffer from the player's allocator, the read's handle kept at the
+source's +0x60 so the game's NotifyCallCompleted completes it (message 0x4A). The read done: a header longer than what
+was read is read again whole; else it is parsed (stream offset and size, cellPamfReader, a stream without entry points
+flagged (+0x18 bit 0), the mux rate, the duration), the streams chosen and the descriptor in use (5). A refused Read
+closes the descriptor's stream again and the preparation fails (the descriptor left opening, libsail's); a read that
+fails closes the descriptor (back to added) and the call fails; a failure after the read frees the buffer (when a second
+read was refused, the first buffer a second time, as libsail does). Its total size goes to a word on libsail's stack.
+- **Compared** (tests/hle/test_sail.cpp part 21, `[sail]`): a descriptor with a header of two units added unopened and
+  OpenStream (read in 2 KB, then whole), a start and AUs, Next to another unopened descriptor (made ready the same way,
+  switched to while playing), AUs, Stop, CloseStream, and a descriptor whose source's Read fails (OpenStream completes
+  with CANCEL after an error event): 0 differences in three runs; all 33 `[sail]` tests pass. A firmware-free test checks
+  its answers on pspocket alone. The test's source answers its Read at once (ReadSync's copy, then
+  NotifyCallCompleted from the control thread).
+
+## D-919 · 2026-10-12 · cellSail's elementary streams of a started stream, as libsail (part 7)
+
+OpenEs, ReopenEs and CloseEs while the stream plays (runtime/hle/src/cellSailEs.cpp): a stream not chosen is opened,
+then started (0x8D/0x93/0x99); a chosen one reopened is stopped first, a video renderer keeping its last frame,
+whether its format changed or not (0x90/0x96/0x9C: event 10), then started again with its entry as it now is (event 9)
+while the stream plays; CloseEs of a started stream stops it (keeping nothing) before closing it (0x9F/0xA2/0xA5). As
+libsail: a failed start of a reopened or newly opened stream closes it with a completion on record 0 (which libsail then
+reads at address 4), and a stopped stream's dmux part stays enabled, so with the later SDKs its start fails (the
+enable is refused), the stream is stopped and closed again and the ReopenEs call never completes, leaving the player's
+Stop and CloseStream refused until Finalize.
+- **Compared** (tests/hle/test_sail.cpp part 22, `[sail]`): an AU receiver's stream while playing: CloseEsUser (stopped
+  through Get, closed), OpenEsUser (opened, started), AUs, ReopenEsUser (stopped through Get, its start refused, closed;
+  the call left running), Stop and CloseStream refused, Finalize: 0 differences in three runs; all 35 `[sail]` tests
+  pass; a firmware-free test checks its answers on pspocket alone.
+
+## D-919 · 2026-10-12 · cellSail's repeat into the next descriptor, as libsail (part 8)
+
+Repeat mode 2 (SetRepeatMode 2) with a next descriptor (runtime/hle/src/cellSailPlay.cpp): at the source's end of
+input the next descriptor is made ready (as OpenStream does; the record at +0x120 running, kind 4; message 0xCB). A
+refused preparation marks the record, is an error event, takes the next descriptor back to added and closes it, and
+the stream ends as without a repeat. Ready: its start information (no command) and the renderers' formats; when it has
+the same source and either another dmux kind or every stream compatible (an open stream chosen again and its dmux
+part, decoder and renderer format the same; a stream not chosen staying unchosen; user streams only chosen), it is
+swapped to without stopping: the dmux pipeline given its source, each open or chosen stream's old entry chosen again
+(event 10, the old entry looked at again after the game's handler) and its new entry open (event 9; user entries take
+the old ones' values), the old descriptor closed for the player and the next one current (one descriptor fewer), then
+event 5, the source told of the descriptor (0xCC: event 4) and a new session started on it (0xCD: event 6). Otherwise
+the stream ends (0xCE) and the player switches to the next descriptor as Next does (0xCF; a failure leaves the player
+open: state 4, then 2). A call deferred meanwhile runs instead (the next descriptor left opened).
+- **Compared** (tests/hle/test_sail.cpp part 23, `[sail]`): an AU receiver with repeat mode 2: the input's end with a
+  compatible next descriptor (swapped to, a new session, AUs), then with a next descriptor that chooses no streams (the
+  stream ended through Get, switched to); Stop: 0 differences in three runs; all 37 `[sail]` tests pass; a
+  firmware-free test checks its answers on pspocket alone.
+- Still failing loudly with a log: EP skipping (start type 16, libsail's entry point walk), MP4 and AVI streams (the
+  firmware libraries libmp4 and libsail_avi behind their descriptors, demuxing and cancel), and the audio sample rate
+  converter (libapostsrc_mini, audio parameter 32).
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
@@ -12966,3 +13623,174 @@ worker is a host thread calling RunFibers; one that started after the six fibers
 met the shutdown, so the observation depended on when the machine let the thread start. The script now waits (at most
 a minute) until libfiber counts both workers in its word's top byte before it finalizes and shuts the control down;
 both runs then see the same. Alone the comparison agreed every time (0 of 31 observations).
+
+## D-928 · 2026-10-12 · sys_fs's attribute comparison leaves the ctimes out
+
+The gate under load failed sys_fs's comparison with libfs once ("attributes": output differs at +0x123, the low byte
+of the first CellFsStat's ctime). Both runs share one tree of host files: the first run's cellFsSetAttribute sets the
+file's ctime to the host's clock, which the second run's first cellFsStat then reads, so the two first stats agree
+only when no second boundary falls between the tree's making and the first run's change. The two stats' ctimes (the
+host's clock, not libfs's doing) are no longer compared; their other fields still are. Alone it agreed every time.
+Two more sections read times their runs set from the host's clock, and a later gate failed one ("symbolic links": the
+link's times at +0x113): the link's stat and the "sizes" section's stats after the files' changes leave their three
+times out; the times the "attributes" section sets itself (SetAttribute's atime and mtime) are still compared.
+
+## D-929 · 2026-10-12 · cellGamePs1Emu's one function: the PS1 emulator's pad rumble request
+
+libsysutil_game_ps1emu.sprx (4.92, sys/internal) exports one function nothing names, 0x61CE2BCD; RPCS3 does not know
+it. Read from the module: a request "setPadRumble" with "elmMode" (0 or 1, else 0x8002CB07 before any request) on
+libsysutil's channel 1, packet 0x129, magic "GPS1", in FixedMemory 1. Each step's failure is the answer (the element,
+the attribute, the write: on pspocket's console the closed channel's 0x8002b007, D-534; the reply's read); the reply
+is made a document from FixedMemory's whole 0x6000 bytes and its "elmResult" read through the request's element (the
+module keeps it: the reply's tree at the same offset, the root, whose name is not looked at). pspocket's,
+runtime/hle/src/cellGamePs1Emu.cpp, makes the same calls through sysutil_sub.hpp (D-925), its libsysutil calls answered
+as the exports answer them (as_export, D-926). Compared with Sony's module (tests/hle/test_sysutil_more.cpp): the
+closed channel, the mode's check, a system answering with results, another root, no result, a result that is a string,
+no reply, a truncated one: 13 calls, 209 lv2 calls, 6 requests answered, 0 differences. The module's start and stop do
+nothing a game sees.
+
+## D-930 · 2026-10-12 · cellDtcpIpUtility from libsysutil_dtcp_ip: twenty-nine functions and the system's events
+
+The front end of the system software's DTCP-IP client (protected streams from a DLNA server), read from
+libsysutil_dtcp_ip.sprx (4.92): runtime/hle/src/cellDtcpIpUtility.cpp. RPCS3 names thirteen of its functions and leaves
+them stubs; the module exports sixteen more in cellDtcpIpUtilityClearTextByte (InitializeEx, the authentication calls,
+CloseContent, OpenContentEx, SetByteSeekRange, GetHttpStatusCode), cellDtcpIpUtilityMove (MoveOpen, MoveOpenEx, MoveRead,
+MoveCommitment, MoveClose) and cellDtcpIpUtilityEx (SetEncryptedDataEx, OpenEx), named here from the module's own
+diagnostics and registered under their NIDs.
+
+- **The module's state** lives in its data: the game's callback and argument, the memory container, the 64-bit function
+  flags (bit 0 buffering: the game writes the encrypted stream into a 1 MB ring; bit 62 the move mode), the system's
+  shared memory (two 128 KB buffers of decrypted data, the ring at +256 KB), the ring's positions and use, three slots of
+  decrypted data, the user's read buffer and size, an lwmutex "_vppdrl", the cancel and seek flags. pspocket keeps it in
+  a block of main memory laid out as the module's data from 0x87E0 (its initial values too), so the lwmutex's and the
+  shared memory pointer's addresses passed to lv2 sit at the same offsets.
+- **Requests** on channel 0, packet 0x140, magic "DTCP", in FixedMemory 0: each call's checks (shared memory there, the
+  mode, its arguments, the cancel and busy flags under the lwmutex), the element and its attributes (ints, the game's
+  strings, 8- and 28-byte files: the seek positions, the open option block: a first byte 0 for Open and 1 for the others,
+  option 1, options 2 to 5 in KB, option 20000's 1 else -1; its three bytes after the first are never written by the
+  module), the write, then receiveResponsePacket: the reply over FixedMemory's whole 0x6000 bytes, "result" negative the
+  answer, else 0 (and "param" read into the game's word for GetHttpStatusCode). Every failure printed through liblv2's
+  printf as the module prints it: its file "sysutil_dtcp_ip.cpp", function and line. What each call does around its
+  request is the module's: Read and MoveRead keep their buffer for the system's event 9 and forget it on a failure; Seek
+  and SetByteSeekRange hold the seek flag until the system's event 8 or 0x2000002; StopSequence marks the slots stopped
+  and sets the cancel; OpenEx and MoveOpenEx clear it, MoveClose sets it; Finalize finalizes itself only when refused.
+- **Initialize** (and InitializeEx, which keeps the move bit Initialize clears): the container checked through
+  sys_memory_container_get_size (6 MB, 5 in the move mode, all available), the lwmutex made, the dispatcher of event
+  0x14A registered, then "dtcpIpInitialize" with the container, the priority and the flags as a file. On pspocket's
+  console the write meets the closed channel (0x8002b007, D-534): the dispatcher, the lwmutex and the state are undone and
+  that is the answer; the other calls then find no shared memory (0x80024E02).
+- **The system's events** (cellDtcpIpCallbackHandler, pspocket's internal function): 1 makes the shared memory through
+  cellSysutilSharedMemoryAlloc (key 0x8006040000000A10, 0x180000 bytes, 0xD0000 in the move mode), 2 finalizes, 6
+  resets the ring, 8 and 0x2000002 end a seek, 9 ends a read (the data copied to the user's buffer, or a read error), 10
+  frees ring space, 11 fills a slot; each passes on to the game's callback as (argument, kind, status, values). Nothing
+  sends them on pspocket's console. libsysutil keeps registered dispatchers without calling them (as RPCS3); a new host
+  accessor, sysutil_dispatcher(event), gives the comparisons' system side the function to call.
+- **The comparisons' harness** (tests/hle/sysutil_sub_compare.hpp) now names memory each run has at its own address
+  (the module's data: Sony's in its data segment, pspocket's block) in the lv2 calls' arguments, zeroes the 32 KB below
+  the script's stack pointer before each call (so stack bytes a module never writes read alike), delivers a system event
+  to the registered dispatcher (Script::dispatch), and counts sys_memory_container_create's two arguments.
+- **Compared** with Sony's module (tests/hle/test_sysutil_more.cpp): every call uninitialized, Initialize's checks and
+  the closed channel, then a system answering with the system software's shared memory made: results, missing and
+  mistyped results, no document, truncated, the system gone; opening with every option and limit, authentication, the
+  HTTP status, reads and their events, seeks, moving, cancels, finalizing by event and by refusal; the buffering mode's
+  ring filled, consumed and wrapped, its slots of decrypted data; a move-mode making refused (the other mode's size).
+  216 calls, 1,656 lv2 calls, 58 requests answered; the move mode (its own run: the smaller memory made, Open
+  unavailable, the data connection's buffer required): 16 calls, 151 lv2 calls, 5 requests; 0 differences. Without the
+  firmware: "cellDtcpIpUtility on pspocket's console".
+
+### D-918, part 8: cellSailRec's video streams: the configuration, the video pipeline, the firmware's encoders and scaler
+
+libsail_rec's video recording, natively (runtime/hle/src/cellSailRecVideo.cpp), as fw 4.92's module runs it on its
+control thread:
+- **A stream's configuration** once its feeder is open (libsail_rec's continuation of the open, now
+  `_pspocket_cellSailRec_VideoFeederOpened`): the format the feeder gives (its format callback into the parameters'
+  +0x60) against the profile's (+0x40): the frame rate's code (0 to 7, the profile's or unspecified: the timescale and a
+  frame's duration, doubled for H.264, the profile's timescale when it gives one), the rows within the pitch (a larger
+  pitch a multiple of 32), the encoder's size (the feeder's, or the profile's when parameter 73 lets the slot scale), the
+  pixel aspect (the profile's unspecified or the feeder's: its aspect ratio information by MPEG-4's or H.264's indices),
+  the color matrix (the feeder's when the profile has none, but for RGB and Bayer pictures). Then the encoder's
+  configuration (+0xA8) by the codec: MPEG-4 (0x21) and H.264 (0x22, 0x23) from the firmware's defaults for the profile
+  (0x111 by default) and the level (from the size, the macroblocks a second and the bit rate, estimated when the profile
+  gives none), through cellM4vEnc's and cellAvcEnc's configuration queries (their modules loaded for the question), the
+  GOP, the bit rates and the game's own configuration's settings over them; H.264's video usability information (the
+  color description by the matrix, BT.601 or BT.709, or left out); MPEG-4 HD (0x24) its own (no profile, level 2 by
+  default, a bit rate from the pixels a second). The option IDs are libsail_rec's tables, read from the installed
+  module. Anything else UNSUPPORTED_STREAM (FATAL for another codec): an error event, the slot closed again.
+- **The pipeline** (0x3C0 bytes in the slot): by the feeder's coding and the codec a conversion on an SPU task of
+  libsail_rec's in the common taskset (five kinds: ARGB or RGBA, YUV 4:2:2 or YUV 4:2:0 to the encoder's layout, ARGB
+  or RGBA and YUV 4:2:2 to YUV 4:2:0 planar for the scaler or MPEG-4 HD; the programs and their coefficients
+  libsail_rec's, read from the installed module; messages 0x1F with the scaler to follow, else 0x20), the firmware's
+  scaler cellVpost2 (module 0xF043, message 0x20) when the slot scales, or the feeder's picture straight to the encoder;
+  the encoder (cellM4vEnc 0xF013, cellAvcEnc 0xF03A or 0xF02D, cellM4hdEnc 0xF046, through the firmware as the D-197
+  imports: 44 more) with its work area and the units' records for the composer's delay at the frame rate, its
+  notifications (0x21) on the recorder's SPURS queue; the ring of units (the largest unit; doubled and at least the
+  delay's bytes at the bit rate unless the stream is the composer's first). Started: the pump asked (0x1E); each frame
+  scheduled against the stream's time (the frames so far at the frame's duration, or the shared clock's time for it,
+  libsail_rec's video side of the clock: the stream that sets it follows it, another maps its time through it): earlier
+  than half a frame given back, later encoded as a repeat and again; its options (the pixel aspect: a change drains the
+  encoder and opens it again before the frame; MPEG-4's and H.264's option types, a picture's kind, MPEG-4's repeat);
+  encoded with its time and tag; the output (0x21) taken: units' records with their times, their bytes into the ring,
+  the composer told (0x23) and given them as it has room, given back (0x2C); the frames given back to the feeder
+  (0x22). Stop drains and flushes the encoder, a forced stop empties the ring, the end closes it (MPEG-4 HD's opened
+  again); close frees everything.
+- **Messages**: 0x19 a video feeder's call completed, 0x1A frames out, 0x1B a session's end, 0x1E to 0x23 and 0x2C the
+  pipeline's (0x1C, 0x1D and 0x24 passed over, as libsail_rec's loop does).
+- **Sony's slips, kept or bounded**: libsail_rec copies 0x100 bytes of its stack as the encoder's option list into the
+  stream's parameters (7 or 22 options' worth meaningful: the rest its stack's bytes; pspocket's are zeros), and leaves
+  the third word of H.264's resources unwritten (pspocket's 0). The H.264 encoder leaves two of an access unit's four
+  times unwritten (its own stack frame's bytes), which libsail_rec turns into the unit's second and third times;
+  pspocket clears the stack an encoder's call takes first, so its encoders see what they see on a thread's fresh stack
+  (as in Sony's half here). A slot whose configuration is refused after the slot had a stream frees the slot's old
+  stream object again and walks the composer's list past its end: Sony's module reads guest address 0x14 and the
+  process faults (seen in the comparison); pspocket stops the process there with the call site (composer_free_stream).
+Compared (tests/hle/test_sail_rec_compare.cpp, one video stream through the game's composer, the frames test pictures
+given one at a time, each one's units taken as they come; the encoders' work areas from a 64 MB region both halves
+reserve at the same address): YUV 4:2:0, ARGB, RGBA and UYVY to MPEG-4, YUV 4:2:0 and VYUY to H.264 (with and without a
+color matrix), YUV 4:2:0 scaled, ARGB converted and scaled, YUV 4:2:0 and ARGB to MPEG-4 HD, frames late and early
+without the clock (a repeat, a drop), a frame's options (an aspect ratio change reopening the encoder, a picture's kind,
+a repeat; H.264's pixel aspect and kind), the profile's level, bit rates, timescale and GOP (MPEG-4 and H.264); the
+scaler refusing 32 by 32, the pipeline refusing YUYV, MPEG-4 refusing a 90 kHz timescale, H.264 a bit rate past its
+level's: every call's answer, the slot, pipeline, conversion, feeder and stream parameters, the units' records and
+bytes, the encoders' information of each unit (H.264's two unwritten times masked), the allocator, the events, the lv2
+calls: 0 differences in each of the 20 runs (58 to 249 observations each, 3187 in all); the configuration's refusals
+(the format failing, a frame rate's code of 8 or another than the profile's, pitches, no aspect ratio, another aspect
+ratio, another size without parameter 73, MPEG-4 HD with a profile; raw Bayer refused by the pipeline; the feeder's own
+pixel aspect; a pitch past the rows): 0 of 365. The conversions', encoders' and scaler's SPU programs run under
+pspocket's SPURS in both halves. The recorder's dumps mask the SPURS queue's messages' third words (an SPU program's
+run time). The MP4 composer still stops the process with the call site until its part.
+
+### D-918, part 9: cellSailRec's MP4 composer: libmp4's composer made and ended by the recorder, the file calls
+
+A profile of type 1 records into an MP4 file through libmp4's composer (cellMp4, module 0xF031, with cellFs's 0xE),
+now driven by pspocket's libsail_rec as Sony's drives it (runtime/hle/src/cellSailRecCompose.cpp):
+- **OpenStream** loads both modules and asks cellMp4's export 0x0B1E4B8F for the descriptors of the composer's maker
+  and its end (into two words of the process's, where libsail_rec has them in its data); the first OpenStream makes the
+  composer in a block of 0x800 bytes from the game's allocator: the maker gets the recorder, the four recorder
+  functions it calls (a step's completion, a message, the game's allocator's alloc and free: libsail_rec's own, here
+  internal functions of cellSailRec), the file calls (the recorder's +0x7A8), the composers table with libsail_rec's
+  register function (the composer registers its own table as type 1), and parameters 82 and 83 (its writer thread's
+  priority and stack). A refused maker frees the block and unloads both modules (OpenStream's error event, everything
+  closed); an allocator that cannot give the block leaves the stream without a composer, as libsail_rec does (its
+  composer open then faults on the empty table: pspocket stops there). Each OpenStream counts one more user
+  (the block's +0x58); the stream's close counts one less, the last one ends the composer (libmp4's end with the
+  composers table and libsail_rec's unregister function) and frees the block; every close unloads the two modules.
+- **The file calls** (the recorder's table of 14: open, close, fstat, read, lseek, a call answering 0, write, rename,
+  unlink) are cellFs's, the registers passed on as they are and the answer sign-extended, as libsail_rec's wrappers.
+- What libmp4 posts to the recorder (units released 0x2B and 0x2C, a session's error 0x2E) goes through the message
+  loop as before. The loop's flushing stop (0xC, part 6) has no poster that a comparison reaches: none of libmp4's
+  calls through the recorder's functions posts it.
+Compared (tests/hle/test_sail_rec_compare.cpp, the halves' own writable /dev_hdd0, the encoders' work areas from the
+64 MB region): audio (AAC) and video (MPEG-4) into an MP4 file, H.264 video alone, audio alone, two recordings one
+after the other (the composer made and ended twice): every call's answer, the recorder, the composer's block (libmp4's
+three words holding each half's function addresses masked), the slots and pipelines, the allocator, the events, the
+lv2 calls and the file libmp4 wrote byte for byte (the mvhd, tkhd and mdhd boxes' creation and modification times, the
+wall clock's, masked): 0 of 157, 113, 99 and 259 observations differ. With the MP4 composer every one of cellSailRec's
+58 functions and libsail_rec's internal paths are pspocket's own; nothing stops the process for a later part.
+
+## D-931 · 2026-10-12 · A test's temporary directory is removed only by the process that made it
+
+D-924 gave each test process its own temporary directory, removed when the process ends. A comparison's two halves run
+in forked children of the test process; they inherit the directory and its removal, and the first half to end removed
+it while the other half (or the parent) still used it: the gate after merging the agents' cellSail and cellSailRec
+parts aborted cellPngEnc's comparison (SIGABRT in its file output, std::filesystem throwing on the missing directory).
+tests/own_temp_dir.cpp now records the process that made the directory and removes it only from that process.

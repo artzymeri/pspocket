@@ -114,8 +114,24 @@ add_library(pspocket_hle STATIC
     src/cellSailDescriptor.cpp
     src/cellSailAdapters.cpp
     src/cellSailControl.cpp
+    src/cellSailFileSource.cpp
     src/cellSailPipelines.cpp
+    src/cellSailDmux.cpp
+    src/cellSailEs.cpp
+    src/cellSailRenderers.cpp
+    src/cellSailPlay.cpp
+    src/cellSailClock.cpp
     src/cellSailRec.cpp
+    src/cellSailRecObjects.cpp
+    src/cellSailRecControl.cpp
+    src/cellSailRecConvert.cpp
+    src/cellSailRecCompose.cpp
+    src/cellSailRecStream.cpp
+    src/cellSailRecFeed.cpp
+    src/cellSailRecAudio.cpp
+    src/cellSailRecVideo.cpp
+    src/cellSysconfPs1emu.cpp
+    src/module_management.cpp
     src/cellSpursJq.cpp
     src/cellFiber.cpp
     src/cellSync2.cpp
@@ -147,6 +163,8 @@ add_library(pspocket_hle STATIC
     src/sysutil_more.cpp
     src/cellPrintUtility.cpp
     src/cellPesmUtility.cpp
+    src/cellGamePs1Emu.cpp
+    src/cellDtcpIpUtility.cpp
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp
