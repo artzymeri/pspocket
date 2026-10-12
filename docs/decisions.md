@@ -12627,3 +12627,9 @@ observations). Every test executable now gets tests/own_temp_dir.cpp (pspocket_a
 TMPDIR/pspocket-test-<pid> and points TMPDIR at it, so std::filesystem::temp_directory_path() answers it, and removes it
 at exit. A test's own fixed names stay as they are; processes no longer meet. (D-923's sceNpMatchingCancelRequest and
 SendRoomMessage were registered under each other's NIDs; the NID test caught it and they are swapped back.)
+
+The gate under load also showed cellRudp's comparison (D-916) depending on time: its refused client went on sending
+its SYN on librudp's real-time timer through the next clients' connections, and whether one of those SYNs shared a
+datagram with a client's own depended on the machine's load (19 of 2,652 observations then, the status counters after it
+one datagram apart). The refused client now ends once its refusal is seen; three runs under the same load agree with
+Sony's module (0 of 2,648).
