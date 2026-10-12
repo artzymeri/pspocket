@@ -134,6 +134,120 @@ void video_renderer_close(PPUContext& ctx, u32 r, u64 handle) { audio_renderer_c
 void audio_renderer_completed(PPUContext& ctx, u32 r, s32 result) { renderer_completed(ctx, r, result, false); }
 void video_renderer_completed(PPUContext& ctx, u32 r, s32 result) { renderer_completed(ctx, r, result, true); }
 
+// ------------------------------------------------------------------------------------------------- playing
+
+namespace {
+constexpr u32 kStart = 4, kStop = 5, kCancel = 6, kCheckout = 7, kCheckin = 8;
+constexpr u32 kFlagPaused = 8;
+} // namespace
+
+bool renderer_has_free(PPUContext& ctx, u32 r) { return static_cast<s32>(r32(ctx, r + rd::kFree)) > 0; }
+
+// A frame to fill: the renderer's checkout(arg, out) (counted out when it gave one); its answer.
+s32 renderer_checkout(PPUContext& ctx, u32 r, u32 out)
+{
+    const s32 e = static_cast<s32>(call_guest(ctx, rfunc(ctx, r, kCheckout), {r32(ctx, r + rd::kArg), out}));
+    if (e >= 0) w32(ctx, r + rd::kOut, r32(ctx, r + rd::kOut) + 1);
+    return e;
+}
+
+// A filled frame back: the renderer's checkin(arg, frame) (one fewer free when it took it, one fewer out either way);
+// its answer (1 from a video renderer: the frame was not shown, the next is skipped).
+s32 renderer_checkin(PPUContext& ctx, u32 r, u32 frame)
+{
+    const s32 e = static_cast<s32>(call_guest(ctx, rfunc(ctx, r, kCheckin), {r32(ctx, r + rd::kArg), frame}));
+    if (e >= 0) w32(ctx, r + rd::kFree, r32(ctx, r + rd::kFree) - 1);
+    w32(ctx, r + rd::kOut, r32(ctx, r + rd::kOut) - 1);
+    return e;
+}
+
+// Start: starting (3), unpaused, the renderer's start(arg, flag) (the flag: the stream was only open, phase 2); a video
+// renderer forgets the frames it had out.
+void audio_renderer_start(PPUContext& ctx, u32 r, u32 flag, u64 handle)
+{
+    w64(ctx, r + rd::kHandle, handle);
+    w32(ctx, r + rd::kState, 3);
+    w32(ctx, r + 0x34, r32(ctx, r + 0x34) & ~kFlagPaused);
+    call_guest(ctx, rfunc(ctx, r, kStart), {r32(ctx, r + rd::kArg), flag});
+}
+
+void video_renderer_start(PPUContext& ctx, u32 r, u32 flag, u64 handle)
+{
+    w32(ctx, r + rd::kState, 3);
+    w64(ctx, r + rd::kHandle, handle);
+    w32(ctx, r + 0x34, r32(ctx, r + 0x34) & ~kFlagPaused);
+    w32(ctx, r + rd::kOut, 0);
+    call_guest(ctx, rfunc(ctx, r, kStart), {r32(ctx, r + rd::kArg), flag});
+}
+
+// Stop (libsail's): unpaused; started or ending, stopping (5) with the renderer's stop(arg, 1[, keep the last frame]);
+// open, the stop completes with 1; otherwise nothing.
+void audio_renderer_stop(PPUContext& ctx, u32 r, u64 handle)
+{
+    w32(ctx, r + 0x34, r32(ctx, r + 0x34) & ~kFlagPaused);
+    const u32 st = r32(ctx, r + rd::kState);
+    if (st == 4 || st == 7) {
+        w64(ctx, r + rd::kHandle, handle);
+        w32(ctx, r + rd::kState, 5);
+        call_guest(ctx, rfunc(ctx, r, kStop), {r32(ctx, r + rd::kArg), 1});
+    } else if (st == 2) {
+        post_completion(ctx, r32(ctx, r + rd::kPlayer), 1, handle);
+    }
+}
+
+void video_renderer_stop(PPUContext& ctx, u32 r, u32 keep, u64 handle)
+{
+    const u32 st = r32(ctx, r + rd::kState);
+    w64(ctx, r + rd::kHandle, handle);
+    w32(ctx, r + 0x34, r32(ctx, r + 0x34) & ~kFlagPaused);
+    if (st == 4 || st == 7) {
+        w8(ctx, r + rd::kKeep, static_cast<u8>(keep));
+        w32(ctx, r + rd::kState, 5);
+        call_guest(ctx, rfunc(ctx, r, kStop), {r32(ctx, r + rd::kArg), 1, keep != 0 ? 1u : 0u});
+    } else if (st == 2) {
+        post_completion(ctx, r32(ctx, r + rd::kPlayer), 1, handle);
+    }
+}
+
+// The stream's end (libsail's): a started renderer ends (7) with the renderer's stop(arg, 0[, keep the last frame]),
+// the frames it holds still played.
+void audio_renderer_end(PPUContext& ctx, u32 r, u64 handle)
+{
+    w64(ctx, r + rd::kHandle, handle);
+    if (r32(ctx, r + rd::kState) != 4) return;
+    w32(ctx, r + rd::kState, 7);
+    call_guest(ctx, rfunc(ctx, r, kStop), {r32(ctx, r + rd::kArg), 0});
+}
+
+void video_renderer_end(PPUContext& ctx, u32 r, u32 keep, u64 handle)
+{
+    w64(ctx, r + rd::kHandle, handle);
+    if (r32(ctx, r + rd::kState) != 4) return;
+    w8(ctx, r + rd::kKeep, static_cast<u8>(keep));
+    w32(ctx, r + rd::kState, 7);
+    call_guest(ctx, rfunc(ctx, r, kStop), {r32(ctx, r + rd::kArg), 0, keep != 0 ? 1u : 0u});
+}
+
+// A frame played (messages 0x12, 0x14): one more free; a stopping renderer with every frame back is open again.
+void renderer_frame_done(PPUContext& ctx, u32 r)
+{
+    w32(ctx, r + rd::kFree, r32(ctx, r + rd::kFree) + 1);
+    if (r32(ctx, r + rd::kState) == 8) stopped_if_idle(ctx, r);
+}
+
+void renderer_cancel(PPUContext& ctx, u32 r) { call_guest(ctx, rfunc(ctx, r, kCancel), {r32(ctx, r + rd::kArg)}); }
+
+// A video renderer asked to pause at its first frame (+0x34 bit 0x100): paused instead, the player told (message 0x3A
+// {renderer, 1}). 1 when it was asked.
+bool video_renderer_first_frame(PPUContext& ctx, u32 r)
+{
+    const u32 flags = r32(ctx, r + 0x34);
+    if (!(flags & 0x100)) return false;
+    w32(ctx, r + 0x34, (flags & ~0x100u) | kFlagPaused);
+    post(ctx, r32(ctx, r + rd::kPlayer), 0x3A, r, 1);
+    return true;
+}
+
 // ------------------------------------------------------------------------------------------------- AU receivers
 
 // The AU receiver's object (+0x20 of the receiver): +0 its 9 callbacks, +0x24 their argument (the receiver), +0x28 the
@@ -189,5 +303,45 @@ void receiver_answered(PPUContext& ctx, u32 t, u32 code, s32 result)
     w32(ctx, t + ar::kState, st);
     post_completion(ctx, r32(ctx, t + ar::kPlayer), result, r64(ctx, t + ar::kHandle));
 }
+
+// Start: starting (3), not muted or paused, the receiver's start(arg, 0, flag).
+void receiver_start(PPUContext& ctx, u32 t, u32 flag, u64 handle)
+{
+    w64(ctx, t + ar::kHandle, handle);
+    w32(ctx, t + ar::kState, 3);
+    w8(ctx, t + 0x49, 0);
+    w8(ctx, t + 0x48, 0);
+    receiver_call(ctx, t, 4, {0, flag});
+}
+
+// The stream's end: a started receiver ends (7) with its stop(arg, 0).
+void receiver_end(PPUContext& ctx, u32 t, u64 handle)
+{
+    w64(ctx, t + ar::kHandle, handle);
+    if (r32(ctx, t + ar::kState) != 4) return;
+    w32(ctx, t + ar::kState, 7);
+    receiver_call(ctx, t, 5, {0});
+}
+
+// Stop: unpaused; started or ending, stopping (5) with its stop(arg, 1); open, the stop completes with 1.
+void receiver_stop(PPUContext& ctx, u32 t, u64 handle)
+{
+    const u32 st = r32(ctx, t + ar::kState);
+    w64(ctx, t + ar::kHandle, handle);
+    w8(ctx, t + 0x48, 0);
+    if (st == 4 || st == 7) {
+        w32(ctx, t + ar::kState, 5);
+        receiver_call(ctx, t, 5, {1});
+    } else if (st == 2) {
+        post_completion(ctx, r32(ctx, t + ar::kPlayer), 1, handle);
+    }
+}
+
+void receiver_cancel(PPUContext& ctx, u32 t) { receiver_call(ctx, t, 6, {}); }
+
+// An AU found for the receiver's stream (its checkout(arg, the stream's dmux part)), one taken from it (its
+// checkin(arg, the part)).
+void receiver_au_found(PPUContext& ctx, u32 t, u32 es) { receiver_call(ctx, t, 7, {es}); }
+void receiver_au_taken(PPUContext& ctx, u32 t, u32 es) { receiver_call(ctx, t, 8, {es}); }
 
 } // namespace pspocket::hle::sail

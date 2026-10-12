@@ -307,6 +307,371 @@ s32 dmux_es_readd(PPUContext& ctx, u32 dm, u32 kind, u32 filter, u32 specific, u
     return dmux_es_add(ctx, dm, kind, filter, specific, slot, es, false);
 }
 
+
+// ------------------------------------------------------------------------------------------------- the data path
+
+namespace {
+
+// An elementary stream with nothing left to take while the pipeline drains (message 0x1A).
+void es_drained(PPUContext& ctx, u32 es)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    post(ctx, player_of(ctx, dm), 0x1A, dm, es);
+}
+
+// The pipeline's call completes once no stream holds an AU any more (draining or resetting: back to 1).
+void complete_if_idle(PPUContext& ctx, u32 dm)
+{
+    if (r32(ctx, dm + dmx::kPending) != 0) return;
+    post_completion(ctx, player_of(ctx, dm), 0, r64(ctx, dm + dmx::kHandleCall));
+    w32(ctx, dm + dmx::kState, 1);
+}
+
+// With every item in (one wanted): mode 0 drains the streams (those with nothing found say so; the call completes once
+// none holds an AU), 1 and 2 flush them (the call completes as they answer). 1 when it went ahead, 0 when items are out.
+bool flush_all(PPUContext& ctx, u32 dm, u32 mode)
+{
+    if (r32(ctx, dm + dmx::kWanted) != 1) return false;
+    u32 n = 0;
+    for (u32 es = r32(ctx, dm + dmx::kEsList); es; es = r32(ctx, es + des::kNext)) {
+        if (mode != 0) {
+            n++;
+            module_call(ctx, "cellDmux", "cellDmuxFlushEs", {r32(ctx, es + des::kHandle)});
+        } else {
+            if (r32(ctx, es + des::kFound) == 0) es_drained(ctx, es);
+            if (static_cast<s32>(r32(ctx, es + des::kHeld)) > 0) n++;
+        }
+    }
+    if (mode == 0) {
+        w32(ctx, dm + dmx::kState, 4);
+        w32(ctx, dm + dmx::kPending, n);
+        complete_if_idle(ctx, dm);
+        return true;
+    }
+    if (mode == 1) w32(ctx, dm + dmx::kState, 8);
+    else w32(ctx, dm + dmx::kState, r32(ctx, dm + dmx::kState) == 10 ? 11 : 9);
+    w32(ctx, dm + dmx::kPending, n);
+    return true;
+}
+
+// The item a new session word held back, handed back when the pipeline stops or resets: libsail posts message 3 with
+// the record's high word, which its 32-bit pointer leaves 0 (the source is told of item 0), kept.
+void held_item_done(PPUContext& ctx, u32 dm) { post(ctx, player_of(ctx, dm), 3, dm, 0); }
+
+// The streams reset once every item is in and none holds an AU: cellDmuxResetEs of each, the call completes (1).
+void reset_done(PPUContext& ctx, u32 dm)
+{
+    if (r32(ctx, dm + dmx::kWanted) != 1 || r32(ctx, dm + dmx::kPending) != 0) return;
+    for (u32 es = r32(ctx, dm + dmx::kEsList); es; es = r32(ctx, es + des::kNext))
+        module_call(ctx, "cellDmux", "cellDmuxResetEs", {r32(ctx, es + des::kHandle)});
+    post_completion(ctx, player_of(ctx, dm), 0, r64(ctx, dm + dmx::kHandleCall));
+    w32(ctx, dm + dmx::kState, 1);
+}
+
+// Every AU found taken and released.
+s32 es_flush(PPUContext& ctx, u32 es)
+{
+    const s32 n = static_cast<s32>(r32(ctx, es + des::kFound));
+    if (n > 0) {
+        StackVar tmp(ctx, gb(ctx), 16);
+        for (s32 i = 0; i < n; i++) {
+            s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxGetAu",
+                {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+            if (r < 0) return r;
+            r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxReleaseAu", {r32(ctx, es + des::kHandle)}));
+            if (r < 0) return r;
+        }
+    }
+    w32(ctx, es + des::kFound, 0);
+    w32(ctx, es + des::kHeld, 0);
+    return lv2::CELL_OK;
+}
+
+} // namespace
+
+bool dmux_wants(PPUContext& ctx, u32 dm)
+{
+    return r32(ctx, dm + dmx::kState) == 2 && r32(ctx, dm + dmx::kWanted) != 0;
+}
+
+bool dmux_es_has_au(PPUContext& ctx, u32 es) { return static_cast<s32>(r32(ctx, es + des::kFound)) > 0; }
+
+// Stop (mode 0 drain, 1 flush, 2 a new session word): the call (its handle kept) completes when the streams are done.
+// An item a new word holds back is handed back first unless that word is why.
+void dmux_stop(PPUContext& ctx, u32 dm, u32 mode, u64 handle)
+{
+    if (container(ctx, dm)) container_part(ctx, dm, "stopping the stream");
+    w64(ctx, dm + dmx::kHandleCall, handle);
+    const u32 st = r32(ctx, dm + dmx::kState);
+    if (st == 7) {
+        w32(ctx, dm + dmx::kState, 10);
+        return;
+    }
+    if (st == 9) {
+        w32(ctx, dm + dmx::kState, 11);
+        return;
+    }
+    if (r32(ctx, dm + dmx::kDeferred) != 0 && mode != 2) {
+        w32(ctx, dm + dmx::kDeferred, 0);
+        held_item_done(ctx, dm);
+    }
+    if (flush_all(ctx, dm, mode)) return;
+    if (mode == 0) w32(ctx, dm + dmx::kState, 3);
+    else if (mode == 2) w32(ctx, dm + dmx::kState, 7);
+    else w32(ctx, dm + dmx::kState, 6);
+}
+
+// Stop by the session word's flush bit (17).
+void dmux_stop_by_word(PPUContext& ctx, u32 dm, u64 handle)
+{
+    dmux_stop(ctx, dm, (r32(ctx, dm + dmx::kWord) >> 17) & 1, handle);
+}
+
+// Start: started already answers 1; else one item wanted (unless items are out), the call completes and the player is
+// told how many it wants (message 2).
+void dmux_start(PPUContext& ctx, u32 dm, u64 handle)
+{
+    if (container(ctx, dm)) container_part(ctx, dm, "starting the stream");
+    const u32 p = player_of(ctx, dm), st = r32(ctx, dm + dmx::kState);
+    if (st == 2) {
+        post_completion(ctx, p, 1, handle);
+        return;
+    }
+    if (st != 3 && st != 6 && st != 4) w32(ctx, dm + dmx::kWanted, 1);
+    w32(ctx, dm + dmx::kPending, 0);
+    w32(ctx, dm + dmx::kWord, 0);
+    w32(ctx, dm + dmx::kField20, 0);
+    post_completion(ctx, p, 0, handle);
+    post(ctx, p, 2, dm, r32(ctx, dm + dmx::kWanted));
+    w32(ctx, dm + dmx::kState, 2);
+}
+
+// An item demultiplexed (message 3): one more wanted; a stopping or resetting pipeline goes on.
+void dmux_item_done(PPUContext& ctx, u32 dm)
+{
+    if (container(ctx, dm)) container_part(ctx, dm, "an item demultiplexed");
+    const u32 st = r32(ctx, dm + dmx::kState);
+    w32(ctx, dm + dmx::kWanted, r32(ctx, dm + dmx::kWanted) + 1);
+    if (st == 3) flush_all(ctx, dm, 0);
+    else if (st == 6) flush_all(ctx, dm, 1);
+    else if (st == 7 || st == 10) flush_all(ctx, dm, 2);
+    else if (st == 5) reset_done(ctx, dm);
+}
+
+// An AU taken and dropped (the AUs of a stream skipped).
+s32 dmux_es_skip_au(PPUContext& ctx, u32 es)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "skipping an AU");
+    StackVar tmp(ctx, gb(ctx), 16);
+    const s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxGetAu",
+        {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+    if (r >= 0) {
+        const u32 n = r32(ctx, es + des::kFound) - 1;
+        w32(ctx, es + des::kFound, n);
+        if (n == 0 && r32(ctx, dm + dmx::kState) == 4) es_drained(ctx, es);
+    }
+    return r;
+}
+
+// An AU given back to cellDmux; the last one held of a draining or resetting pipeline moves it on.
+s32 dmux_es_release_au(PPUContext& ctx, u32 es)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "releasing an AU");
+    s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxReleaseAu", {r32(ctx, es + des::kHandle)}));
+    if (r < 0) return r;
+    const u32 held = r32(ctx, es + des::kHeld) - 1;
+    w32(ctx, es + des::kHeld, held);
+    const u32 st = r32(ctx, dm + dmx::kState);
+    if (st == 4) {
+        if (held == 0) {
+            w32(ctx, dm + dmx::kPending, r32(ctx, dm + dmx::kPending) - 1);
+            complete_if_idle(ctx, dm);
+        }
+    } else if (st == 5 && r32(ctx, es + des::kFound) == held) {
+        r = es_flush(ctx, es);
+        w32(ctx, dm + dmx::kPending, r32(ctx, dm + dmx::kPending) - 1);
+        reset_done(ctx, dm);
+    }
+    return r;
+}
+
+// A user stream's AU (0x28 bytes: its address, size, cellDmuxGetAu's answer, the user data's low 10 bits, PTS, DTS, 0),
+// or the one put back.
+s32 dmux_es_get_au_user(PPUContext& ctx, u32 es, u32 out)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "taking a user AU");
+    if (r8(ctx, es + des::kHasSaved)) {
+        std::memmove(gb(ctx) + out, gb(ctx) + es + des::kSaved, 0x28);
+        w8(ctx, es + des::kHasSaved, 0);
+        return 0;
+    }
+    StackVar tmp(ctx, gb(ctx), 16);
+    const s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxGetAu",
+        {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+    if (r < 0) return r;
+    const u32 info = r32(ctx, tmp.addr());
+    w32(ctx, out + 4, r32(ctx, info + 4));
+    w32(ctx, out + 8, static_cast<u32>(r));
+    w32(ctx, out + 0xC, static_cast<u32>(r64(ctx, info + 0x10)) & 0x3FF);
+    w32(ctx, out, r32(ctx, info));
+    w64(ctx, out + 0x20, 0);
+    w64(ctx, out + 0x10, u64{r32(ctx, info + 0x18)} << 32 | r32(ctx, info + 0x1C));
+    w64(ctx, out + 0x18, u64{r32(ctx, info + 0x20)} << 32 | r32(ctx, info + 0x24));
+    const u32 n = r32(ctx, es + des::kFound) - 1;
+    w32(ctx, es + des::kFound, n);
+    if (n == 0 && r32(ctx, dm + dmx::kState) == 4) es_drained(ctx, es);
+    return r;
+}
+
+// An audio stream's AU (0x18 bytes: its address, size, PTS's two words, the user data's low word as a u64), or the one
+// put back.
+s32 dmux_es_get_au_audio(PPUContext& ctx, u32 es, u32 out)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "taking an audio AU");
+    s32 r = 0;
+    if (r8(ctx, es + des::kHasSaved)) {
+        std::memmove(gb(ctx) + out, gb(ctx) + es + des::kSaved, 0x18);
+        w8(ctx, es + des::kHasSaved, 0);
+    } else {
+        StackVar tmp(ctx, gb(ctx), 16);
+        r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxGetAu",
+            {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+        if (r < 0) return r;
+        const u32 info = r32(ctx, tmp.addr());
+        w32(ctx, out + 0xC, r32(ctx, info + 0x1C));
+        w32(ctx, out + 8, r32(ctx, info + 0x18));
+        w64(ctx, out + 0x10, r32(ctx, info + 0x14));
+        w32(ctx, out, r32(ctx, info));
+        w32(ctx, out + 4, r32(ctx, info + 4));
+    }
+    const u32 n = r32(ctx, es + des::kFound) - 1;
+    w32(ctx, es + des::kFound, n);
+    if (n == 0 && r32(ctx, dm + dmx::kState) == 4) es_drained(ctx, es);
+    return r;
+}
+
+// An audio AU put back (taken again next).
+void dmux_es_unget(PPUContext& ctx, u32 es, u32 rec)
+{
+    std::memmove(gb(ctx) + es + des::kSaved, gb(ctx) + rec, 0x18);
+    w8(ctx, es + des::kHasSaved, 1);
+    w32(ctx, es + des::kFound, r32(ctx, es + des::kFound) + 1);
+}
+
+// The next AU without taking it (0x28 bytes: address, size, PTS, DTS (two words each), the user data's low word as a
+// u64, 0).
+s32 dmux_es_peek(PPUContext& ctx, u32 es, u32 out)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "peeking at an AU");
+    StackVar tmp(ctx, gb(ctx), 16);
+    const s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxPeekAu",
+        {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+    if (r < 0) return r;
+    const u32 info = r32(ctx, tmp.addr());
+    w32(ctx, out + 0xC, r32(ctx, info + 0x1C));
+    w32(ctx, out + 8, r32(ctx, info + 0x18));
+    w64(ctx, out + 0x20, 0);
+    w32(ctx, out + 0x14, r32(ctx, info + 0x24));
+    w32(ctx, out, r32(ctx, info));
+    w32(ctx, out + 0x10, r32(ctx, info + 0x20));
+    w64(ctx, out + 0x18, r32(ctx, info + 0x14));
+    w32(ctx, out + 4, r32(ctx, info + 4));
+    return r;
+}
+
+// A source item {address, size, session word} to cellDmux; one fewer wanted.
+s32 dmux_set_stream(PPUContext& ctx, u32 dm, u32 addr, u32 size, u32 discontinuity, u64 user)
+{
+    const s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxSetStream",
+        {r32(ctx, dm + dmx::kHandle), addr, size, discontinuity, user}));
+    if (r >= 0) w32(ctx, dm + dmx::kWanted, r32(ctx, dm + dmx::kWanted) - 1);
+    return r;
+}
+
+// An item fed (libsail's): the same session word goes on; a new one is a discontinuity, or, when the old word asked for
+// a flush (bit 17), flushes the streams first, the item held until they answer. The word's bit 19 is not kept.
+s32 dmux_feed(PPUContext& ctx, u32 dm, u32 rec)
+{
+    const u32 word = r32(ctx, rec + 8) & ~0x80000u, old = r32(ctx, dm + dmx::kWord);
+    const u64 user = u64{rec} << 32 | word;
+    if (word == old) return dmux_set_stream(ctx, dm, r32(ctx, rec), r32(ctx, rec + 4), 0, user);
+    w32(ctx, dm + dmx::kWord, word);
+    if (!(old & 0x20000)) return dmux_set_stream(ctx, dm, r32(ctx, rec), r32(ctx, rec + 4), 1, user);
+    w32(ctx, dm + dmx::kDeferred, rec);
+    dmux_stop(ctx, dm, 2, 0);
+    return 0;
+}
+
+// A stream flushed (message 0x2F): the last of a new word's flush hands the held item over (and, where a stop came
+// meanwhile, stops); else the drain goes on.
+void dmux_es_flushed(PPUContext& ctx, u32 dm)
+{
+    const u32 left = r32(ctx, dm + dmx::kPending) - 1;
+    w32(ctx, dm + dmx::kPending, left);
+    if (left != 0) return;
+    const u32 st = r32(ctx, dm + dmx::kState);
+    if (st == 9 || st == 11) {
+        const u32 rec = r32(ctx, dm + dmx::kDeferred);
+        w32(ctx, dm + dmx::kDeferred, 0);
+        w32(ctx, dm + dmx::kState, 2);
+        dmux_set_stream(ctx, dm, r32(ctx, rec), r32(ctx, rec + 4), 1, u64{rec} << 32 | r32(ctx, rec + 8));
+        if (st == 11) dmux_stop_by_word(ctx, dm, r64(ctx, dm + dmx::kHandleCall));
+        return;
+    }
+    flush_all(ctx, dm, 0);
+}
+
+// An AU found (message 4): counted; a resetting pipeline drops it at once (a failure an error message).
+void dmux_es_au_found(PPUContext& ctx, u32 es)
+{
+    const u32 dm = r32(ctx, es + des::kPipeline);
+    if (container(ctx, dm)) container_part(ctx, dm, "an AU found");
+    if (r32(ctx, dm + dmx::kState) == 5 && r32(ctx, es + des::kHeld) == 0) {
+        StackVar tmp(ctx, gb(ctx), 16);
+        s32 r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxGetAu",
+            {r32(ctx, es + des::kHandle), tmp.addr(), tmp.addr() + 4}));
+        if (r >= 0) r = static_cast<s32>(module_call(ctx, "cellDmux", "cellDmuxReleaseAu", {r32(ctx, es + des::kHandle)}));
+        if (r >= 0) return;
+        post_error(ctx, player_of(ctx, dm), r, 3, 0);
+        return;
+    }
+    w32(ctx, es + des::kHeld, r32(ctx, es + des::kHeld) + 1);
+    w32(ctx, es + des::kFound, r32(ctx, es + des::kFound) + 1);
+}
+
+// Reset: started already answers 1; else the held item handed back, the streams with nothing taken flushed (a failure
+// an error message), those holding AUs counted, and cellDmuxResetStream unless every item is in (then done at once).
+void dmux_reset(PPUContext& ctx, u32 dm, u64 handle)
+{
+    if (container(ctx, dm)) container_part(ctx, dm, "resetting the stream");
+    if (r32(ctx, dm + dmx::kState) == 1) {
+        post_completion(ctx, player_of(ctx, dm), 1, handle);
+        return;
+    }
+    const u32 rec = r32(ctx, dm + dmx::kDeferred);
+    w64(ctx, dm + dmx::kHandleCall, handle);
+    if (rec) {
+        w32(ctx, dm + dmx::kDeferred, 0);
+        held_item_done(ctx, dm);
+    }
+    u32 n = 0;
+    for (u32 es = r32(ctx, dm + dmx::kEsList); es; es = r32(ctx, es + des::kNext)) {
+        if (static_cast<s32>(r32(ctx, es + des::kHeld) - r32(ctx, es + des::kFound)) > 0) n++;
+        else if (const s32 r = es_flush(ctx, es); r < 0) post_error(ctx, player_of(ctx, dm), r, 3, 0);
+    }
+    w32(ctx, dm + dmx::kPending, n);
+    w32(ctx, dm + dmx::kState, 5);
+    if (r32(ctx, dm + dmx::kWanted) == 1) reset_done(ctx, dm);
+    else module_call(ctx, "cellDmux", "cellDmuxResetStream", {r32(ctx, dm + dmx::kHandle)});
+}
+
+// Enabled for a start (the stream's own enable, once its part is added).
+s32 dmux_es_enable(PPUContext& ctx, u32 es) { return es_enable(ctx, es); }
 } // namespace sail
 
 void register_cellSailDmux(Registry& r)

@@ -9,6 +9,7 @@
 // and boot completed with the error. The descriptors' and streams' messages are here, the elementary streams' in
 // cellSailEs.cpp; a message whose handler is not here yet stops the process with its code.
 
+#include <cmath>
 #include <cstring>
 #include <format>
 
@@ -288,16 +289,6 @@ void destroy_descriptor(PPUContext& ctx, u32 p, u32 d)
 
 // ------------------------------------------------------------------------------------------------- sources
 
-// A source (CellSailSource): +0 the player using it, +4 its argument, +8 its 14 callbacks, +0x70 the descriptors
-// open through it.
-namespace src {
-constexpr u32 kPlayer = 0, kArg = 4, kFuncs = 8, kWaiting = 0x44, kState = 0x48, kSession = 0x4C, kResult = 0x50,
-              kHandle = 0x58, kUsers = 0x70;
-constexpr u32 kMakeup = 0, kCleanup = 1, kOpen = 2, kClose = 3, kClear = 9, kReadSync = 11;
-} // namespace src
-
-u32 source_func(PPUContext& ctx, u32 source, u32 index) { return r32(ctx, source + src::kFuncs + 4 * index); }
-
 // Makeup(arg, protocol) when the source has one, the player kept first.
 s32 source_makeup(PPUContext& ctx, u32 source, u32 protocol, u32 p)
 {
@@ -496,6 +487,10 @@ void set_muted(PPUContext& ctx, u32 renderer, u8 muted)
     w32(ctx, renderer + 0x34, (r32(ctx, renderer + 0x34) & ~1u) | muted);
 }
 
+} // namespace
+
+namespace sail {
+
 // ------------------------------------------------------------------------------------------------- source sessions
 
 // Open (libsail's): the source told the stream (type, media info, URI and a profile: 2 items, the mux rate bound, the
@@ -503,7 +498,7 @@ void set_muted(PPUContext& ctx, u32 renderer, u8 muted)
 void source_open(PPUContext& ctx, u32 s, u32 d, u64 handle)
 {
     w64(ctx, s + src::kHandle, handle);
-    w32(ctx, s + src::kSession, 0);
+    w32(ctx, s + src::kDrain, 0);
     StackVar profile(ctx, gb(ctx), 0x20);
     w32(ctx, profile.addr() + 4, 2);
     w32(ctx, profile.addr() + 8, r32(ctx, d + ds::kMuxRate));
@@ -536,7 +531,7 @@ void source_call_completed(PPUContext& ctx, u32 s, s32 r)
     case 4: w32(ctx, s + src::kState, r < 0 ? 3 : 5); break;
     case 3:
     case 6:
-        if (st != 6 || r32(ctx, s + src::kWaiting)) {
+        if (st != 6 || r32(ctx, s + src::kOut)) {
             w32(ctx, s + src::kResult, static_cast<u32>(r));
             if (st == 6) w32(ctx, s + src::kState, 10);
             return;
@@ -569,6 +564,44 @@ void clock_reset(PPUContext& ctx, u32 c)
     w16(ctx, c + 0x8C, 0);
 }
 
+// Its play state reset (libsail's): the frames counted, the times and sessions forgotten.
+void clock_reset_play(PPUContext& ctx, u32 c)
+{
+    w16(ctx, c + 0x8A, 0);
+    w32(ctx, c + 0xA0, 0xFFFFFFFF);
+    w64(ctx, c + 0x78, ~u64{0});
+    w32(ctx, c + 0xA4, 0);
+    w32(ctx, c + 0xA8, 0);
+    w32(ctx, c + 0x94, 0xFFFFFFFF);
+    w32(ctx, c + 0x98, 0xFFFFFFFF);
+    w32(ctx, c + 0x9C, 0xFFFFFFFF);
+    w64(ctx, c + 0x70, ~u64{0});
+    w16(ctx, c + 0x8C, 0);
+}
+
+// Its ticks per millisecond from the play rate (libsail's): |rate| x 90 in double precision, truncated (from 2^63 on
+// through the sign bit, as the PPU converts), 1 when that is 0.
+void clock_set_rate(PPUContext& ctx, u32 c, float rate)
+{
+    const double v = std::fabs(static_cast<double>(rate)) * 90.0;
+    u64 t;
+    if (std::isnan(v)) t = 0x8000000000000000ull; // fctidz of a NaN
+    else if (v >= 9223372036854775808.0) {
+        const double w = v - 9223372036854775808.0;
+        t = (w >= 9223372036854775808.0 ? 0x7FFFFFFFFFFFFFFFull : static_cast<u64>(static_cast<s64>(w))) ^
+            0x8000000000000000ull;
+    } else {
+        t = static_cast<u64>(static_cast<s64>(v));
+    }
+    w64(ctx, c, t != 0 ? t : 1);
+}
+
+// The time it holds (libsail's): the video half's once a video frame was counted, else the audio half's.
+u64 clock_time(PPUContext& ctx, u32 c)
+{
+    return static_cast<s16>(ps_read16(gb(ctx), c + 0x8E)) > 0 ? r64(ctx, c + 0x68) : r64(ctx, c + 0x58);
+}
+
 // The clock running or not (+0x90), under its lwmutex; running needs a frame seen (+0x8E) and forgets the last time.
 u32 clock_run(PPUContext& ctx, u32 c, u32 run)
 {
@@ -590,6 +623,10 @@ u32 clock_run(PPUContext& ctx, u32 c, u32 run)
     lv2_lib(ctx, "sys_lwmutex_unlock", {c + 0xB0});
     return now;
 }
+
+} // namespace sail
+
+namespace {
 
 // ------------------------------------------------------------------------------------------------- streams
 
@@ -619,13 +656,17 @@ void stream_prepare(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
     post_completion(ctx, p, 0, handle);
 }
 
-// The stream shown or not (+0x162, libsail's): a change is event 11 (the value, the descriptor) and tells each chosen
-// stream's renderer (flag 0x10) or AU receiver (+0x4A of its object).
-void set_rate_shown(PPUContext& ctx, u32 p, u32 value, u32 d)
+} // namespace
+
+namespace sail {
+
+// The media state (+0x162, libsail's): a change is event 11 (the value, the descriptor) and tells each chosen stream's
+// renderer (flag 0x10) or AU receiver (+0x4A of its object).
+void set_media_state(PPUContext& ctx, u32 p, u32 value, u32 d)
 {
-    if (r8(ctx, p + kRateShown) == value) return;
+    if (r8(ctx, p + 0x162) == value) return;
     notify_event(ctx, p, 11, value, d);
-    w8(ctx, p + kRateShown, static_cast<u8>(value));
+    w8(ctx, p + 0x162, static_cast<u8>(value));
     const u32 on = value != 0 ? 0x10 : 0;
     for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
         if (!r8(ctx, r32(ctx, d + ds::kAudio) + i * ds::kAudioStride)) continue;
@@ -643,6 +684,10 @@ void set_rate_shown(PPUContext& ctx, u32 p, u32 value, u32 d)
     }
 }
 
+} // namespace sail
+
+namespace {
+
 // The stream taken down (libsail's): its source closed (message 0x5F), its open elementary streams (0x61-0x63) and the
 // dmux pipeline (0x60), the record counting them.
 void stream_close(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
@@ -651,7 +696,7 @@ void stream_close(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
     w32(ctx, rec, r32(ctx, rec) | 0x20);
     w64(ctx, rec + 8, handle);
     w8(ctx, p + kStreamPhase, 7);
-    set_rate_shown(ctx, p, 0, d);
+    set_media_state(ctx, p, 0, d);
     u32 steps = 0;
     if (const u32 s = r32(ctx, d + ds::kSource)) {
         const u32 type = r32(ctx, d + ds::kType);
@@ -846,6 +891,7 @@ void message_loop(PPUContext& ctx, u32 p)
             continue;
         }
         if (es_message(ctx, p, code, m.a, m.b, m.c)) continue;
+        if (play_message(ctx, p, code, static_cast<s32>(m.a), m.b, m.c)) continue;
         if (code == 0x3C || code == 0x3E || code == 0x3F) {
             if (const s32 r = lock(ctx, p); r < 0) {
                 notify_error(ctx, p, r);

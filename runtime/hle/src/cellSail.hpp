@@ -210,6 +210,28 @@ void dmux_fini(PPUContext& ctx, u32 dm);
 s32 dmux_es_add(PPUContext& ctx, u32 dm, u32 kind, u32 filter, u32 specific, u32 slot, u32 es, bool enable);
 s32 dmux_es_remove(PPUContext& ctx, u32 dm, u32 es);
 s32 dmux_es_readd(PPUContext& ctx, u32 dm, u32 kind, u32 filter, u32 specific, u32 slot, u32 es);
+// The data path: whether the pipeline takes an item (started, items wanted), whether a stream has an AU found; stop
+// (mode 0 drain, 1 flush, 2 a new session word) and start (the call's handle), an item demultiplexed (message 3), an AU
+// found (4), a stream flushed (0x2F), reset; an item fed {address, size, session word}; a stream's AUs taken (audio
+// 0x18 bytes, user 0x28), peeked at, put back, skipped and released.
+bool dmux_wants(PPUContext& ctx, u32 dm);
+bool dmux_es_has_au(PPUContext& ctx, u32 es);
+void dmux_stop(PPUContext& ctx, u32 dm, u32 mode, u64 handle);
+void dmux_stop_by_word(PPUContext& ctx, u32 dm, u64 handle);
+void dmux_start(PPUContext& ctx, u32 dm, u64 handle);
+void dmux_item_done(PPUContext& ctx, u32 dm);
+void dmux_es_au_found(PPUContext& ctx, u32 es);
+void dmux_es_flushed(PPUContext& ctx, u32 dm);
+void dmux_reset(PPUContext& ctx, u32 dm, u64 handle);
+s32 dmux_feed(PPUContext& ctx, u32 dm, u32 rec);
+s32 dmux_set_stream(PPUContext& ctx, u32 dm, u32 addr, u32 size, u32 discontinuity, u64 user);
+s32 dmux_es_enable(PPUContext& ctx, u32 es);
+s32 dmux_es_get_au_audio(PPUContext& ctx, u32 es, u32 out);
+s32 dmux_es_get_au_user(PPUContext& ctx, u32 es, u32 out);
+s32 dmux_es_peek(PPUContext& ctx, u32 es, u32 out);
+void dmux_es_unget(PPUContext& ctx, u32 es, u32 rec);
+s32 dmux_es_skip_au(PPUContext& ctx, u32 es);
+s32 dmux_es_release_au(PPUContext& ctx, u32 es);
 
 // The renderers as the player drives them (cellSailRenderers.cpp), and the user streams' AU receivers (their object at
 // the receiver's +0x20): each step completes the handle given.
@@ -222,6 +244,112 @@ void video_renderer_completed(PPUContext& ctx, u32 r, s32 result);
 void receiver_open(PPUContext& ctx, u32 t, u32 type, u32 filter, u32 slot, u64 handle);
 void receiver_close(PPUContext& ctx, u32 t, u64 handle);
 void receiver_answered(PPUContext& ctx, u32 t, u32 code, s32 result);
+// Playing: a renderer's free frames, a frame checked out to fill and back in, start, stop, the stream's end, a frame
+// played, cancel, a video renderer's pause at its first frame; the AU receivers' start, end, stop, cancel and AUs.
+bool renderer_has_free(PPUContext& ctx, u32 r);
+s32 renderer_checkout(PPUContext& ctx, u32 r, u32 out);
+s32 renderer_checkin(PPUContext& ctx, u32 r, u32 frame);
+void audio_renderer_start(PPUContext& ctx, u32 r, u32 flag, u64 handle);
+void video_renderer_start(PPUContext& ctx, u32 r, u32 flag, u64 handle);
+void audio_renderer_stop(PPUContext& ctx, u32 r, u64 handle);
+void video_renderer_stop(PPUContext& ctx, u32 r, u32 keep, u64 handle);
+void audio_renderer_end(PPUContext& ctx, u32 r, u64 handle);
+void video_renderer_end(PPUContext& ctx, u32 r, u32 keep, u64 handle);
+void renderer_frame_done(PPUContext& ctx, u32 r);
+void renderer_cancel(PPUContext& ctx, u32 r);
+bool video_renderer_first_frame(PPUContext& ctx, u32 r);
+void receiver_start(PPUContext& ctx, u32 t, u32 flag, u64 handle);
+void receiver_end(PPUContext& ctx, u32 t, u64 handle);
+void receiver_stop(PPUContext& ctx, u32 t, u64 handle);
+void receiver_cancel(PPUContext& ctx, u32 t);
+void receiver_au_found(PPUContext& ctx, u32 t, u32 es);
+void receiver_au_taken(PPUContext& ctx, u32 t, u32 es);
+
+// The source (CellSailSource, 0x80 bytes) as the player drives it: +0 the player using it, +4 its argument, +8 its 14
+// callbacks, +0x40 the items ready, +0x44 the items checked out, +0x48 its state (1 closed, 2 opening, 3 open, 4
+// starting, 5 started, 6 stopping, 7 closing, 8 draining, 9 drained with items out, 10 stopped with items out), +0x4C
+// the items still to drain, +0x50 a result kept, +0x58 the call's handle, +0x70 the descriptors open through it.
+namespace src {
+constexpr u32 kPlayer = 0, kArg = 4, kFuncs = 8, kReady = 0x40, kOut = 0x44, kState = 0x48, kDrain = 0x4C,
+              kResult = 0x50, kHandle = 0x58, kUsers = 0x70;
+constexpr u32 kMakeup = 0, kCleanup = 1, kOpen = 2, kClose = 3, kStart = 4, kStop = 5, kCancel = 6, kCheckout = 7,
+              kCheckin = 8, kClear = 9, kRead = 10, kReadSync = 11;
+} // namespace src
+inline u32 source_func(PPUContext& ctx, u32 s, u32 index) { return r32(ctx, s + src::kFuncs + 4 * index); }
+void source_open(PPUContext& ctx, u32 s, u32 d, u64 handle);
+void source_close(PPUContext& ctx, u32 s, u64 handle);
+void source_call_completed(PPUContext& ctx, u32 s, s32 r);
+void source_item_ready(PPUContext& ctx, u32 s);
+bool source_has_items(PPUContext& ctx, u32 s);
+s32 source_checkout(PPUContext& ctx, u32 s, u32 out);
+s32 source_checkin(PPUContext& ctx, u32 s, u32 item);
+void source_end(PPUContext& ctx, u32 s, u64 handle, u32 flush);
+void source_stop(PPUContext& ctx, u32 s, u64 handle);
+void source_start(PPUContext& ctx, u32 s, u32 cmd, u32 word, u64 handle);
+void source_cancel(PPUContext& ctx, u32 s);
+
+// The AV clock (200 bytes at the player's +8, cellSailControl.cpp): reset when a stream opens, its play state reset,
+// running or not, its ticks per millisecond from the play rate, the time it holds.
+void clock_reset(PPUContext& ctx, u32 c);
+void clock_reset_play(PPUContext& ctx, u32 c);
+u32 clock_run(PPUContext& ctx, u32 c, u32 run);
+void clock_set_rate(PPUContext& ctx, u32 c, float rate);
+u64 clock_time(PPUContext& ctx, u32 c);
+// Its sync engine (cellSailClock.cpp): the frames of the sound and graphics adapters (synced: whether due, the times
+// covered; outside the sync: counted), a stream's end, a session's sync.
+u32 clock_run_locked(PPUContext& ctx, u32 c, u32 run);
+u32 clock_sync(PPUContext& ctx, u32 c);
+void clock_session(PPUContext& ctx, u32 c, u32 word);
+u32 clock_audio_frame(PPUContext& ctx, u32 c, u64 pts, u32 session, u32 current, u32 tag, u32 samples, u32 out,
+    u32 drop, u32 phase, u32 index);
+u32 clock_video_frame(PPUContext& ctx, u32 c, u64 pts, u32 session, u32 current, u32 tag, u32 from, u32 to, u32 hold,
+    u32 phase, u32 index);
+u32 clock_audio_tick(PPUContext& ctx, u32 c, u32 tag, u32 samples, u32 index, u32 out, u32 hold);
+u32 clock_video_tick(PPUContext& ctx, u32 c, u32 tag, u32 index, u32 from, u32 to, u32 hold);
+void clock_audio_end(PPUContext& ctx, u32 c, u32 index, u32 seen_at, u32 word);
+void clock_video_end(PPUContext& ctx, u32 c, u32 index, u32 seen_at, u32 word);
+
+// The stream's media state (the source's, message 0x2D): a change is event 11 and sets the 0x10 flag of each chosen
+// stream's renderer or AU receiver.
+void set_media_state(PPUContext& ctx, u32 p, u32 value, u32 d);
+
+// The decoders' pipelines while playing (cellSailPipelines.cpp): whether the decoder takes AUs and wants frames, a
+// frame given, the decoder's and the copy thread's messages, an AU decoded, the stream's end, stop and start.
+bool adec_takes(PPUContext& ctx, u32 a);
+bool adec_wants_frame(PPUContext& ctx, u32 a);
+void adec_frame(PPUContext& ctx, u32 a, u32 frame);
+void adec_seq_done(PPUContext& ctx, u32 a);
+void adec_frame_back(PPUContext& ctx, u32 a);
+void adec_pcm_taken(PPUContext& ctx, u32 a);
+void adec_au_done(PPUContext& ctx, u32 a);
+s32 adec_decode(PPUContext& ctx, u32 a, u32 au);
+void adec_end(PPUContext& ctx, u32 a, u64 handle);
+void adec_stop(PPUContext& ctx, u32 a, u64 handle);
+void adec_start(PPUContext& ctx, u32 a, u64 handle);
+void adec_pcm_out(PPUContext& ctx, u32 a);
+bool vdec_takes(PPUContext& ctx, u32 v);
+void vdec_frame_wanted(PPUContext& ctx, u32 v);
+bool vdec_has_picture(PPUContext& ctx, u32 v);
+void vdec_frame(PPUContext& ctx, u32 v, u32 frame);
+void vdec_picture_out(PPUContext& ctx, u32 v);
+void vdec_frame_back(PPUContext& ctx, u32 v, u32 keep, u32 out);
+void vdec_seq_done(PPUContext& ctx, u32 v);
+void vdec_au_done(PPUContext& ctx, u32 v, s32 result);
+s32 vdec_decode(PPUContext& ctx, u32 v, u32 au);
+void vdec_end(PPUContext& ctx, u32 v, u64 handle);
+void vdec_stop(PPUContext& ctx, u32 v, u64 handle);
+void vdec_start(PPUContext& ctx, u32 v, u8 rate, u64 handle);
+
+// The playback engine (cellSailPlay.cpp): the control thread's messages of the playback (the data path, Start, Stop,
+// the stream's end, Cancel): true when `code` was one of them. The elementary streams of a stream started and stopped.
+bool play_message(PPUContext& ctx, u32 p, u32 code, s32 result, u32 b, u32 c);
+void es_start_audio(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u64 handle);
+void es_start_video(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u64 handle);
+void es_start_user(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u64 handle);
+// Stopped: `keep` is the video renderer's "keep the last frame" (the others' stops ignore it).
+void es_stop_audio(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u32 keep, u64 handle, bool failed);
+void es_stop_video(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u32 keep, u64 handle, bool failed);
+void es_stop_user(PPUContext& ctx, u32 p, u32 d, u32 slot, u32 index, u32 keep, u64 handle, bool failed);
 
 // The decoders' pipelines (cellSailPipelines.cpp): opened for an elementary stream's entry, closed; each completes the
 // handle given.

@@ -12680,3 +12680,55 @@ cellSailRenderers.cpp, cellSailPipelines.cpp, cellSailAdapters.cpp): OpenEsAudio
   event with tags for what they are: 0 differences, three runs. The parts' harness gives them a 64 MB heap, links the
   decoders' internal functions as the loader does, masks each side's own code by value (pspocket's descriptors,
   anything in libsail's segments) and compares the message rings in no order.
+
+## D-919 · 2026-10-12 · cellSail's playback: Start, Stop, Cancel, the data path and the AU receiver (part 3)
+
+libsail's playback engine (runtime/hle/src/cellSailPlay.cpp; the clock's sync engine in cellSailClock.cpp; the dmux
+pipeline's data path in cellSailDmux.cpp; the decoders' play side and both copy threads in cellSailPipelines.cpp; the
+renderers' and AU receivers' play calls in cellSailRenderers.cpp; the adapters' and the AU receiver's play callbacks
+and frame calls in cellSailAdapters.cpp), read from libsail.sprx (fw 4.92). cellSailPlayerStart, Stop, Cancel,
+cellSailAuReceiverGet, cellSailSoundAdapterGetFrame and cellSailGraphicsAdapterGetFrame/GetFrame2 are registered.
+- **Start** (command 0x6C, call 10): refused (INVALID_STATE) unless the stream is open or started (player state 4 or 6)
+  with no call running and nothing deferred but an input's end; a frame-step command (its +4 64) while not playing is
+  refused, any other command is the descriptor's InquireCapability's to refuse; a command with flag 0x10 is kept as the
+  repeat information (once). The start information (+0x1D0) comes from the command or its defaults. Every open
+  elementary stream is started (its dmux part added and enabled or enabled; the renderer started, told whether the
+  stream was only open; the decoder's sequence started; or the AU receiver started; steps 0x70-0x7B on the record at
+  +0xE0), then the source with its start command (the byte past the header, the length to the end) and the session
+  word at the player's +4 (the low 10 bits count sessions, by 128 then by one; flags for the start type, the
+  complete-stream flag, a frame step, the end pause, the streams open, the rate in bits 22-31); Start completes when
+  the source answers (state 6, event 3 and the call's completion event). Start while started stops the stream first.
+- **Stop** (0x7D, call 11; INVALID_STATE unless started): the source stopped, the dmux pipeline reset, every started
+  stream stopped (its decoder flushed, its renderer or receiver stopped), state 4 when all answered. **The input's
+  end** (0x17; event 8 without an EP walk): the source drains, the pipeline drains, each decoder ends its sequence and
+  each renderer or receiver plays out what it holds; then state 4. A call made while another runs is deferred (the
+  record's bits: 2 start, 4 next, 8 stop, 0x10 the input's end). **Cancel** is posted at the queue's head (0xD0): the
+  source's cancel, every open stream's renderer's or receiver's cancel; it answers 0.
+- **The data**: StreamOut items are checked out and fed to cellDmux while it wants them; each AU found goes to the
+  decoder while it takes AUs, or to the AU receiver; the copy threads ("_libsail-adec_copy", "_libsail-vdec_copy")
+  copy PCM and pictures (through cellVpost where asked) into the renderers' frames.
+- **The AU receiver** (cellSailAuReceiverGet and its callbacks): a queue of four AU records (+0x100, the dmux's user AU)
+  filled one at a time while AUs are found and records free; Get hands them out double buffered (two slots, the AU
+  handed out held until the next Get gives it back: message 0x16), by the game's session (16-bit compare), time and
+  flags (bit 0 the AU before, bit 1 the latest due, bit 2 only AUs marked as bit 3 says); its answers 28, 1, 12, 257,
+  260, 268, 276, 516, 528, 532, 784, 788 and 0x200 + those given back << 8 | 4 or 8. A receiver's stop (flushed: the
+  queued AUs given back; draining) is answered only through the game's next Get once nothing is queued, libsail's:
+  a game that stops calling Get holds the player's Stop, Start-while-started and the stream's end.
+- libsail's quirks kept: a failed start of a stream never completes Start's step; the video copy thread unlocks a
+  mutex it does not hold for a picture's further fields; the feeding does not check the source's checkout answer; the
+  decoders' 0xD2 errors are not acted on; the AU receiver's checkin counts a free record also for an AU given straight
+  back while not started, so its free count can pass four. The video copy thread's small tables (fields shown and
+  cellVpost's picture structure per H.264 pic_struct, the field order swapped, the frame time per frame rate code in
+  90 kHz ticks) are the standards' values as libsail uses them.
+- Later parts, failing loudly until then: cellSailPlayerNext (not registered yet), a deferred Next, a repeat into the
+  next descriptor, EP skipping (start type 16), the elementary streams of a started stream opened, reopened or closed,
+  OpenStream of a descriptor not yet opened, MP4 and AVI streams, libsail's sample rate converter (libapostsrc_mini).
+  The adapters' frame calls are compared in part 4.
+- **Compared** (tests/hle/test_sail.cpp part 16, `[sail]`): a player with one AU receiver over a PAMF stream of user
+  data AUs (synthetic packs) through a game's source in guest code (its start and stop answering at once, its checkout
+  handing out items, the rest recorded): Start's and Stop's refusals, a start, a start while started (its stop
+  answered through Get), five items fed and the AUs queued, Get in each way with the input's end coming meanwhile and
+  the stream drained through Get, a second start stopped with AUs queued, Cancel, CloseStream, Finalize: 0 differences
+  in three runs; every earlier `[sail]` test passes. Without the firmware, the same script runs on pspocket's side
+  alone and its answers are checked against libsail's (`cellSail: the playback through an AU receiver on pspocket
+  alone`).

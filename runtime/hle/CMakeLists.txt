@@ -119,6 +119,8 @@ add_library(pspocket_hle STATIC
     src/cellSailDmux.cpp
     src/cellSailEs.cpp
     src/cellSailRenderers.cpp
+    src/cellSailPlay.cpp
+    src/cellSailClock.cpp
     src/cellSailRec.cpp
     src/cellSpursJq.cpp
     src/cellFiber.cpp
