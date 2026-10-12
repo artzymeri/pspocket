@@ -13424,3 +13424,11 @@ worker is a host thread calling RunFibers; one that started after the six fibers
 met the shutdown, so the observation depended on when the machine let the thread start. The script now waits (at most
 a minute) until libfiber counts both workers in its word's top byte before it finalizes and shuts the control down;
 both runs then see the same. Alone the comparison agreed every time (0 of 31 observations).
+
+## D-928 · 2026-10-12 · sys_fs's attribute comparison leaves the ctimes out
+
+The gate under load failed sys_fs's comparison with libfs once ("attributes": output differs at +0x123, the low byte
+of the first CellFsStat's ctime). Both runs share one tree of host files: the first run's cellFsSetAttribute sets the
+file's ctime to the host's clock, which the second run's first cellFsStat then reads, so the two first stats agree
+only when no second boundary falls between the tree's making and the first run's change. The two stats' ctimes (the
+host's clock, not libfs's doing) are no longer compared; their other fields still are. Alone it agreed every time.

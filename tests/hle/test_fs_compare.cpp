@@ -413,7 +413,9 @@ TEST_CASE("sys_fs against libfs", "[hle][lle][fs]")
         }
         ops.push_back({"cellFsSetAttribute", {0, O(st)}});
         ops.push_back({"cellFsStat", {S(0), O(st + 0x40)}});
-        compare(fl, tree, ops, "attributes");
+        // The ctimes not compared: the host's clock when a run last changed the file (the first run's SetAttribute
+        // is what the second run's first Stat sees), which a second boundary between them makes differ (D-928).
+        compare(fl, tree, ops, "attributes", 0, {{st + 0x1C, 8}, {st + 0x40 + 0x1C, 8}});
     }
 
     SECTION("I/O buffers and the default container")
