@@ -12522,6 +12522,188 @@ installed runs about six minutes (cellRudp's comparison alone about 110 s), past
 set, so the gate failed on time alone. Its ctest call now allows 1200 s a suite; without the firmware the comparisons
 skip and the suites take as long as before.
 
+## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
+
+libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
+Sony's libvdec 4.92 and compared with it (tests/hle/test_vdec_ext_compare.cpp: DivX 3.11, DivX, MPEG-4 part 2, VC-1 and
+H.264, each a process of its own per half; 0 of 954, 961, 958, 1,036 and 1,004 observations differ).
+
+- **cellVdecGetPicItemExt** (and **GetPicItemEx**, the same code in Sony's module; GetPicItem is it with no third
+  argument): the next item, then the codec part's extra: H.264 and MVC write the address of the picture information's
+  part past 0x138 bytes to the third argument when it is given; the other codecs write nothing.
+- **cellVdecSetFrameRateExt(handle, rate, scale)**: scale 0: `rate` is the codec's code (H.264 and MVC 0 to 7, the
+  others 1 to 8; else ARG), kept with its frame duration in 27 MHz ticks (24000/1001 1126125 ... 60 450000); else the
+  duration is scale x (27000000 / rate) in the PPU's 32-bit arithmetic (a division by 0 gives 0), and the code the one
+  of its whole frames a second (23, 24, 25, 29, 30, 50, 59, 60), none for another. Set at once on the game's thread (it
+  was queued in order with the access units); a closed decoder SEQ. **cellVdecSetFrameRate** is it with the code less
+  0x80, plus one but for H.264, MVC and JVT: JVT's codes start at 1, so its 0x80 is ARG, as Sony's.
+- **StartSeq** forgets the frame rate for every codec (it did for DivX only), the PTS base and the VOP time.
+  **cellVdecStartSeqExt(handle, arg)**: StartSeq with the codec part's argument (H.264's low byte 1 and top four bits,
+  MVC's top bits, the SMVD codecs' low byte), kept; pspocket's decoders do nothing different with it (logged when not 0).
+- **cellVdecGetInputStatus(handle, status)**: libvdec's input queue (access units and EndSeq's flush not yet done by its
+  decoder thread) as two bytes and a half word: full (four or more: DecodeAu would be BUSY) 1 0, empty 0 1, else 0 0;
+  no state checked. MVC: Sony's reads a word its MVC part never writes: FATAL here. A closed H.264 decoder: libavcdec
+  refuses the query and libvdec reads its stack word, 0 in the runs: full.
+- **cellVdecSetPts** sets the ring's PTS base (33 bits) and loses its unverified mark (D-594).
+- **cellVdecDecodeAuEx2** is the form Sony's libvdec decodes in (its DecodeAu converts its CellVdecAuInfo to it, with
+  the two words RPCS3 calls unknown 0); **libvdec_652B7BC0** is it again (Sony's export runs the same code). Compared
+  with the two words 0: as DecodeAu. Given (a probe with them set), Sony's libvdec hands them to its codec part: the
+  DivX, DivX 3.11 and MPEG-4 parts leave them, the H.264 and VC-1 parts take them as a second piece of the access unit
+  (its address and size: libavcdec's access unit call takes two pieces, and refuses one past its limits, FATAL).
+  pspocket decodes the first piece alone, so the two stay unverified for now, as OpenExt (it takes the game's SPURS,
+  which pspocket's decoder does not use) and **libvdec_20DA0CFA**, MVC's decode of an access unit in its two views
+  ({base view address, size, 2 words, dependent view address, size, 2 words, PTS, DTS, user data, codec specific data}):
+  its checks (MVC only, ARG; mode past 2 ARG) and a ring element per view; pspocket decodes the base view (D-590) and
+  frees the dependent view's element when the access unit is done.
+- **_cell_vdec_prx_ver**: 0x00492000.
+
+What they act on, missing in pspocket's libvdec until now:
+- **A picture whose access unit had no PTS gets one** (Sony's ring, when it announces the picture): the last PTS's time
+  plus the frame duration, kept in 27 MHz ticks (33-bit PTSs, wrapping at 2^33 x 300), once a PTS is known (an access
+  unit's or SetPts'). The duration is the rate set, else the stream's: DivX 3.11 none (Sony's word is its stack's: 0
+  here); DivX 0 (libdivxdec reports the same VOP time for every picture); MPEG-4 part 2 a fixed VOP rate's increment,
+  else the VOP time since the previous picture (modulo time base and increment; then added before the picture's time);
+  VC-1 the sequence header's FRAMERATENR/DR (libvdec's table, 48000/1001 rounded up) or FRAMERATEEXP; H.264 the VUI
+  timing (two ticks a frame: the eight rates by their whole frames a second, else 27 x 10^9 / (fps x 1000)).
+- **Frame rate codes**: DivX's information block takes the code set, else the one of the duration's whole frames a
+  second (0 for none); VC-1's the code set (the stream's when none is set; a rate set that names none leaves the byte);
+  H.264's the code set, else the VUI timing's (0xFF for an unnamed rate), else the byte as it was.
+- **VC-1's frame buffers** (D-912 had them in turn): libsvc1d takes, when it decodes the access unit, the first frame
+  buffer neither holding a picture not yet released (decoded, announced or not, or of an access unit still in the
+  decoder) nor a reference (the last anchor; for a B picture the one before); a skipped picture shows the frame before.
+  The choice is made when the access unit is given to FFmpeg (which hands the picture over later).
+
+The comparisons with Sony's libvdec now force Sony's codec cores too (tests/hle/firmware_compare.hpp FirmwareLibrary's
+`also`, compare_util.hpp Setup::forced, vdec_test_util.hpp kVideoCores): as pspocket gets cores of its own (part 2 on),
+Sony's libvdec loaded in a test would otherwise be linked to them, and the comparisons would no longer be with Sony's
+cores. Setup::ours_on_firmware runs Sony's module in pspocket's half too, over pspocket's libraries: the codec cores
+driven by Sony's libvdec (part 2).
+
+Tests: test_vdec_ext_compare.cpp (hidden, [compare][vdec-ext]; each life: PTSs missing, SetPts first, SetFrameRate's
+codes, SetFrameRateExt's codes and rate/scale forms, a rate before the sequence, StartSeqExt, DecodeAuEx2 and its twin,
+the refusals, the input queue held until DecodeAu is BUSY; the input status right after EndSeq is a note, the threads'
+timing); test_vdec_codecs_compare.cpp's VC-1 comparison (its held pictures now in Sony's frame buffers); test_vdec.cpp
+(the unverified marks).
+
+## D-920 · 2026-10-12 · libdivx311dec, the DivX 3.11 core, pspocket's own (part 2)
+
+The codec cores Sony's libvdec drives had only their version queries (D-575); their decoding APIs were Sony's modules'
+alone. libdivx311dec's nine functions are now pspocket's own (runtime/hle/src/vdec_cores.cpp, over vdec_ffmpeg.hpp: an
+FFmpeg decoder for the cores), compared with Sony's module two ways, samples within one step (D-912's IDCT rounding):
+- called directly, as libvdec calls it and past what libvdec ever sends (tests/hle/test_vdec_cores_compare.cpp: each
+  half makes a SPURS instance and a taskset with pspocket's cellSpurs and gives it to the core): 0 of 419 observations
+  differ;
+- driven by Sony's libvdec, as a game importing one of libvdec's unverified functions gets it (D-594): D-912's DivX 3.11
+  lives with Sony's libvdec in both halves, over pspocket's core and over Sony's (test_vdec_codecs_compare.cpp, part 1's
+  Setup::ours_on_firmware): 0 of 542 differ.
+libdivx311dec is not firmware-first: Sony's libvdec loaded for a game links to pspocket's core.
+
+The core's PPU side is reproduced as Sony's module runs it; its SPU program's part (decoding an access unit into the
+frame buffer the PPU side picked and reporting what it did) is done on FFmpeg:
+- **QueryAttr(param {type, width, height, frame buffers}, *size, *version)**: two frame buffers only; type 15 sizes for
+  1920x1088 (0x68EC00), else 16 to 1920 by 16 to 1088 (two frames plus 0x4D800); version 0x103; else ARG (0x80615502).
+- **Open(param, memory, size, taskset)**: the frame buffers past the decoder's 0x3D77F bytes (128-byte aligned at
+  +0x3D700); no memory, memory holding an open decoder (its mark 0xBABEFACE at +0x3D64C), no taskset or other than two
+  frame buffers ARG; the taskset's cellSpurs errors as they are. **Close** leaves the mark 0x88888888 (a second Close ARG).
+- **DecodeAu(handle, au {address, size, width, height, four words}, mode 0x20/0x21/0x22, *status)**: the first frame
+  buffer neither held by the game nor the reference to come; none, or no picture entry free (two), BUSY (0x80615510).
+  A picture is shown one access unit late (the next DecodeAu or FlushPicture makes it ready, with the frame decoded
+  before); mode 0x21 skips all but I pictures, shown at once with no frame (GetPicture's frame 0, its skip byte 1); a P
+  picture with no reference: AU (0x80615520), status 0x40020000; the status word from the SPU side's error bits (a
+  picture FFmpeg concealed errors in: 0x11, as D-912).
+- **GetNumOfPictures, GetPicture** (its frame, the frame's size, the access unit's four words, width and height, type,
+  0x30, status, skip byte; PIC 0x80615540 when the status has errors), **ReleasePicture** (the frame held longest),
+  **FlushPicture** (the waiting picture ready; Sony's counts its entry once more, kept), **Reset** (every frame and entry
+  free, the references gone): their states and answers as Sony's, including GetPicture's taking the head entry off when
+  none is ready.
+
+Different, and a note in the comparison: a core opened for one size and given access units of another (libvdec always
+gives both the same) — Sony's SPU program decodes the first picture otherwise (up to three steps off); pspocket decodes
+at the access units' size.
+
+Tests: test_vdec_cores_compare.cpp: the comparison (hidden, [compare][vdec-cores]) and a firmware-free test of
+pspocket's core against the values Sony's gave; test_vdec_codecs_compare.cpp "The DivX 3.11 core under Sony's libvdec"
+(hidden, [compare][vdec-cores]).
+
+## D-920 · 2026-10-12 · DecodeAuEx2's access unit in two pieces, as Sony's libvdec's codec parts take it (part 3)
+
+Part 1 left cellVdecDecodeAuEx2 and its twin unverified: compared with the two words of CellVdecAuInfoEx2 that RPCS3
+calls unknown set to 0 only. Those words are the second piece of an access unit (a ring buffer's wrap): the structure
+is the two pieces' addresses, then their sizes, then the PTS, DTS, user data and codec specific data (Sony's DecodeAu
+converts its CellVdecAuInfo to it with no second piece). Read in libvdec's codec parts and compared:
+- **H.264**: libvdec hands both pieces to libavcdec's access unit call, on the game's thread. libavcdec refuses a second
+  piece of no address, and, for a game of SDK 2.4 or later (or of none: libvdec gives libavcdec all ones for a version
+  of 0), pieces past 0x1FFFFF80 bytes together: DecodeAuEx2 answers FATAL and the ring element stays free.
+- **VC-1**: libsvc1d's DecodePicture2 takes the pieces when libvdec's decoder thread decodes the access unit; a second
+  piece needs a first of whole 128-byte blocks and a 16-byte boundary, else it refuses the access unit: ERROR with
+  FATAL and the decoder does nothing more (as D-912's decode mode 3).
+- **MPEG-2** takes both too (libsmvd2's DecodePicture2: not compared, as the rest of MPEG-2); **DivX, DivX 3.11,
+  MPEG-4 part 2 and JVT** give their core the first piece alone.
+pspocket decodes the two pieces as one access unit where Sony's codec part takes them (H.264, VC-1, MPEG-2), with
+libavcdec's and libsvc1d's refusals, and the first piece alone for the others.
+
+Found with it: a decoder stopped by a fatal error (VC-1's) keeps every access unit and flush given to it in its input
+queue, so GetInputStatus shows them (full after four); pspocket dropped them.
+
+Compared (test_vdec_ext_compare.cpp, DecodeAuEx2 now giving odd access units in two pieces, and lives with a second
+piece of no address, a first piece not of whole 128-byte blocks and a second piece off a 16-byte boundary): 0 of 1,115
+(H.264), 1,117 (VC-1), 1,004 (DivX), 1,001 (MPEG-4) and 997 (DivX 3.11) observations differ. DecodeAuEx2 and
+libvdec_652B7BC0 lose their unverified marks (D-594); OpenExt and libvdec_20DA0CFA keep theirs.
+Tests: test_vdec.cpp (the unverified marks; DecodeAuEx2 in two pieces decodes as DecodeAu, and libavcdec's refusals).
+
+## D-920 · 2026-10-12 · libdivxdec, the DivX core, pspocket's own (part 4)
+
+libdivxdec's nine functions (divxDecQueryAttr, Open, Close, DecodeAu, GetNumOfPictures, GetPicture, ReleasePicture,
+FlushPicture, Reset) are pspocket's own (runtime/hle/src/vdec_cores.cpp), its PPU side as Sony's module runs it, its
+SPU program's part on FFmpeg. Compared with Sony's module called directly (test_vdec_cores_compare.cpp: 0 of 2,040
+observations differ, samples within one step) and driven by Sony's libvdec (D-912's MPEG-4 family lives over pspocket's
+core and over Sony's: 0 of 1,088 differ).
+
+What libdivxdec does, read in the module and checked against it:
+- **QueryAttr {type, width, height, frame buffers}**: 2 to 4 buffers; types 10 to 14 size for their level's largest
+  frame (176x144 to 1920x1088), else the size given (16 to 1920 by 16 to 1088, or 1408x1152); the frames plus 0.5% plus
+  0x9E86B, to 16 bytes; version 0x30806. **Open** needs its own 0x31B7C bytes, its two SPU tasks' context save areas
+  and overlay table (0x23C00, 0x9C00 and 0x174D0 as Sony's SPU programs give them to cellSpurs and cellOvis) and the
+  frames; the frame buffers start at the 128-byte boundary past those, 0x20000 on (+0x76680 from 128-byte aligned
+  memory); as many picture entries as buffers.
+- **Picture entries** (free, a packed P picture still without its words, waiting, ready) in a ring with a free head, an
+  output head and the current picture; frame buffers with their reference state and the game's holds. A frame buffer
+  is taken when neither held nor a reference (with two buffers the backward reference may be); DecodeAu is BUSY while
+  the game holds all it may (three or more buffers: one kept back) or all entries but one are in use. An I or P picture
+  waits until the next is decoded (or the flush) and is then ready with the frame shown: the previous anchor picture;
+  a B picture, and one skipped by the decode mode (0x21 all but I, 0x22 B), is ready at once (a skipped one with frame
+  0). GetPicture takes the output head off even when it is not ready (SEQ): with B pictures the head is often a waiting
+  P picture, so a game asking for a B picture right after its access unit loses that P picture, as on a PS3.
+- **DivX's packed bitstream**: an access unit with a P VOP then a B VOP is decoded VOP by VOP; the P picture waits
+  without its access unit's words, the B picture is ready with them, and the next access unit, an N-VOP (vop_coded 0),
+  gives the P picture its words (mark 0x31). An N-VOP otherwise is a picture of the previous one's frame (mark 0x32); a
+  second VOP after anything but a P picture is left (status 0x400). B pictures with two frame buffers: ERROR,
+  0x80000200.
+- **What the SPU program reports**, as pspocket's does: the layer's size (the frames' layout follows it, whatever the
+  size opened for), aspect ratio code and pixel sizes, time increment resolution, fixed VOP increment, interlacing and
+  each VOP's top field first, type, time and modulo seconds; a word libvdec reads as "fixed rate" set for every stream;
+  no colour description (the visual object's is not read: cellVdec's DivX information now writes 0s there too, the D-912
+  life with one checks it); a P, B or N-VOP with nothing to predict from: AU, status 0x20.
+- **Frame buffers**: each picture's samples as decoded; a reference picture's edges padded when its next command comes
+  (a VOP's decoding, the flush or Reset; FFmpeg's delayed anchor pictures written when it gives them); a B picture's
+  edges never (they keep what the buffer held). FFmpeg decodes with its floating point AAN IDCT (FF_IDCT_FAAN), the
+  nearest to Sony's: the pictures driven by libvdec are exact, the core's own lives within one step.
+
+Notes in the comparison, not differences: the chroma edges of the picture a flush makes ready (Sony's SPU program pads
+them as it answers, so what the game sees of them is the threads' timing), and the pictures after a refused anchor
+access unit (Sony's decodes the B pictures that then predict from the wrong pictures, FFmpeg leaves them; a game that
+drops an anchor gets garbage either way). Libvdec's answers are 32-bit (Sony's core zero-extends r3; pspocket's
+sign-extends, as every HLE error code).
+
+Not yet in cellVdec (found with these lives): its own DivX and MPEG-4 decoding of streams with B pictures is not Sony's
+libvdec's with libdivxdec and libsmvd4 (frame buffers, the lost pictures above), and libsmvd4 reports MPEG-4's interlaced
+pictures in error, undecoded (to be read with libsmvd4).
+
+Tests: test_vdec_cores_compare.cpp (the comparison, hidden, and a firmware-free test against Sony's values: I and P
+pictures, B pictures, the decode modes, packed bitstreams, N-VOPs, layers of other kinds, two and four buffers, a
+smaller stream); test_vdec_codecs_compare.cpp ("The DivX core under Sony's libvdec", hidden, and DivX lives with an
+interlaced layer and a colour description).
+
 ## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
 
 sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole

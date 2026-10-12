@@ -345,9 +345,45 @@ inline u32 strip_cb(const Plan& p, u32 width, u32 height)
     return strip_luma_bytes(p, width, height) + chroma_lines * 16 + p.edge_c * 16;
 }
 
+// The edges of a picture already in a frame laid out in strips (its samples where write_strips puts them): every
+// sample past the picture repeats its nearest one, read back from the frame (a decoder pads a reference picture's edges
+// so, D-920).
+inline void pad_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h)
+{
+    const u32 hl = p.lines32 ? align(h, 32) : align(h, 16);
+    const u32 strips = align(w, 16) / 16 + 2, lines = hl + 2 * p.edge_y, clines = hl / 2 + 2 * p.edge_c;
+    const u32 cw = w / 2, ch = h / 2;
+    u8* luma = base + frame;
+    u8* chroma = luma + strips * lines * 16;
+    const auto y_at = [&](u32 x, u32 row) -> u8& { return luma[((x / 16 + 1) * lines + row + p.edge_y) * 16 + x % 16]; };
+    const auto c_at = [&](u32 x, u32 row, u32 plane) -> u8& {
+        return chroma[((x / 8 + 1) * clines + row + p.edge_c) * 16 + plane * 8 + x % 8];
+    };
+    for (u32 s = 0; s < strips; s++)
+        for (u32 r = 0; r < lines; r++)
+            for (u32 k = 0; k < 16; k++) {
+                const s32 x = static_cast<s32>(s * 16 + k) - 16, row = static_cast<s32>(r) - static_cast<s32>(p.edge_y);
+                if (x >= 0 && x < static_cast<s32>(w) && row >= 0 && row < static_cast<s32>(h)) continue;
+                luma[(s * lines + r) * 16 + k] = y_at(static_cast<u32>(std::clamp<s32>(x, 0, static_cast<s32>(w) - 1)),
+                    static_cast<u32>(std::clamp<s32>(row, 0, static_cast<s32>(h) - 1)));
+            }
+    for (u32 s = 0; s < strips; s++)
+        for (u32 r = 0; r < clines; r++)
+            for (u32 k = 0; k < 8; k++) {
+                const s32 x = static_cast<s32>(s * 8 + k) - 8, row = static_cast<s32>(r) - static_cast<s32>(p.edge_c);
+                if (x >= 0 && x < static_cast<s32>(cw) && row >= 0 && row < static_cast<s32>(ch)) continue;
+                const u32 sx = static_cast<u32>(std::clamp<s32>(x, 0, static_cast<s32>(cw) - 1));
+                const u32 sr = static_cast<u32>(std::clamp<s32>(row, 0, static_cast<s32>(ch) - 1));
+                chroma[(s * clines + r) * 16 + k] = c_at(sx, sr, 0);
+                chroma[(s * clines + r) * 16 + 8 + k] = c_at(sx, sr, 1);
+            }
+}
+
 // A picture (planar 4:2:0, no padding) in a frame laid out in strips with edges: every sample past the picture repeats
-// its nearest one.
-inline void write_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h, const u8* y, const u8* u, const u8* v)
+// its nearest one; with `edges` false the picture's samples alone (a picture no other is predicted from, whose edges a
+// decoder leaves as they were, D-920).
+inline void write_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h, const u8* y, const u8* u, const u8* v,
+    bool edges = true)
 {
     const u32 hl = p.lines32 ? align(h, 32) : align(h, 16);
     const u32 strips = align(w, 16) / 16 + 2, lines = hl + 2 * p.edge_y, clines = hl / 2 + 2 * p.edge_c;
@@ -355,21 +391,22 @@ inline void write_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h, const
     u8* out = base + frame;
     for (u32 s = 0; s < strips; s++)
         for (u32 r = 0; r < lines; r++) {
-            const u32 row = static_cast<u32>(std::clamp<s32>(static_cast<s32>(r) - static_cast<s32>(p.edge_y), 0,
-                static_cast<s32>(h) - 1));
-            for (u32 k = 0; k < 16; k++) {
-                const u32 x =
-                    static_cast<u32>(std::clamp<s32>(static_cast<s32>(s * 16 + k) - 16, 0, static_cast<s32>(w) - 1));
-                *out++ = y[row * w + x];
+            const s32 rr = static_cast<s32>(r) - static_cast<s32>(p.edge_y);
+            const u32 row = static_cast<u32>(std::clamp<s32>(rr, 0, static_cast<s32>(h) - 1));
+            for (u32 k = 0; k < 16; k++, out++) {
+                const s32 xx = static_cast<s32>(s * 16 + k) - 16;
+                if (!edges && (xx < 0 || xx >= static_cast<s32>(w) || rr < 0 || rr >= static_cast<s32>(h))) continue;
+                *out = y[row * w + static_cast<u32>(std::clamp<s32>(xx, 0, static_cast<s32>(w) - 1))];
             }
         }
     for (u32 s = 0; s < strips; s++)
         for (u32 r = 0; r < clines; r++) {
-            const u32 row = static_cast<u32>(std::clamp<s32>(static_cast<s32>(r) - static_cast<s32>(p.edge_c), 0,
-                static_cast<s32>(ch) - 1));
+            const s32 rr = static_cast<s32>(r) - static_cast<s32>(p.edge_c);
+            const u32 row = static_cast<u32>(std::clamp<s32>(rr, 0, static_cast<s32>(ch) - 1));
             for (u32 k = 0; k < 8; k++) {
-                const u32 x =
-                    static_cast<u32>(std::clamp<s32>(static_cast<s32>(s * 8 + k) - 8, 0, static_cast<s32>(cw) - 1));
+                const s32 xx = static_cast<s32>(s * 8 + k) - 8;
+                if (!edges && (xx < 0 || xx >= static_cast<s32>(cw) || rr < 0 || rr >= static_cast<s32>(ch))) continue;
+                const u32 x = static_cast<u32>(std::clamp<s32>(xx, 0, static_cast<s32>(cw) - 1));
                 out[k] = u[row * cw + x];
                 out[8 + k] = v[row * cw + x];
             }

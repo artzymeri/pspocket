@@ -509,6 +509,28 @@ Observed divx311(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// The first packet of FFmpeg's MPEG-4 stream with its visual object header replaced by one with a video signal type and
+// colour description (FFmpeg's encoder writes none).
+std::vector<u8> with_colour(const std::vector<u8>& packet, u8 primaries, u8 transfer, u8 matrix)
+{
+    const auto code_at = [&](u8 code, usize from) {
+        for (usize i = from; i + 3 < packet.size(); i++)
+            if (packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1 && packet[i + 3] == code) return i;
+        return packet.size();
+    };
+    const usize at = code_at(0xB5, 0), next = code_at(0x00, at + 4);
+    REQUIRE(next < packet.size());
+    // is_visual_object_identifier 1, verid 1, priority 1, type video, video_signal_type 1, format 5, range 0,
+    // colour_description 1, the three codes, then a 0 and 1s to the byte.
+    const u64 bits = (u64{1} << 47) | (u64{1} << 43) | (u64{1} << 40) | (u64{1} << 36) | (u64{1} << 35) |
+                     (u64{5} << 32) | (u64{1} << 30) | (u64{primaries} << 22) | (u64{transfer} << 14) |
+                     (u64{matrix} << 6) | 0x1F;
+    std::vector<u8> out(packet.begin(), packet.begin() + static_cast<std::ptrdiff_t>(at + 4));
+    for (int k = 5; k >= 0; k--) out.push_back(static_cast<u8>(bits >> (8 * k)));
+    out.insert(out.end(), packet.begin() + static_cast<std::ptrdiff_t>(next), packet.end());
+    return out;
+}
+
 Observed mpeg4(const Setup& s, bool sony_half)
 {
     Run r(s, sony_half, "libvdec");
@@ -563,6 +585,17 @@ Observed mpeg4(const Setup& s, bool sony_half)
     const std::vector<std::vector<u8>> small = encode(AV_CODEC_ID_MPEG4, 80, 48, 3, 3);
     decode(r, "DivX 80x48", stream(CODEC_DIVX, 10, small), 80, 48, Rule::within(1));
     decode(r, "MPEG-4 80x48", stream(CODEC_MPEG4, 0, small), 80, 48, Rule::within(1));
+    // D-920: an interlaced layer (DivX), a visual object with a colour description (libdivxdec reports none). Not yet
+    // here: B pictures (cellVdec's own frame buffer and picture handling is not libvdec's with libdivxdec's and
+    // libsmvd4's then), MPEG-4's interlaced pictures (libsmvd4 reports them in error, undecoded).
+    const std::vector<std::vector<u8>> interlaced = encode(AV_CODEC_ID_MPEG4, 96, 64, 4, 4,
+        [](AVCodecContext* av) { av->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME; });
+    std::vector<std::vector<u8>> coloured = encode(AV_CODEC_ID_MPEG4, 96, 64, 4, 4);
+    coloured[0] = with_colour(coloured[0], 1, 6, 5);
+    decode(r, "DivX 96x64 interlaced", stream(CODEC_DIVX, 10, interlaced), 96, 64, Rule::within(1));
+    for (const u32 codec : {CODEC_DIVX, CODEC_MPEG4})
+        decode(r, std::format("{} 96x64 with a colour description", codec == CODEC_DIVX ? "DivX" : "MPEG-4"),
+            stream(codec, codec == CODEC_DIVX ? 10 : 0, coloured), 96, 64, Rule::within(1));
     return std::move(r.o);
 }
 
@@ -712,12 +745,30 @@ Observed mvc(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// The comparison's setup: Sony's libvdec over Sony's codec cores, which pspocket now has its own of (D-920).
+Setup libvdec_setup()
+{
+    Setup s = setup();
+    s.forced = kVideoCores;
+    return s;
+}
+
+// pspocket's codec cores driven by Sony's libvdec, as a game gets them when it imports one of libvdec's unverified
+// functions and so Sony's libvdec (D-594): the same lives with Sony's libvdec in both halves, over pspocket's cores in
+// the first and Sony's in the second (D-920).
+Setup cores_setup()
+{
+    Setup s = libvdec_setup();
+    s.ours_on_firmware = true;
+    return s;
+}
+
 } // namespace
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: DivX 3.11", "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_encoder(AV_CODEC_ID_MSMPEG4V3)) SKIP(kNoDivx);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's DivX 3.11 against Sony's libvdec", [&](bool sony) { return divx311(s, sony); },
         [](const Observed& o) {
             // pspocket's own half: the values Sony's gave (D-912).
@@ -741,11 +792,25 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: DivX 3.11", "[.][hle][l
         });
 }
 
+TEST_CASE("The DivX 3.11 core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    if (!avcodec_find_encoder(AV_CODEC_ID_MSMPEG4V3)) SKIP(kNoDivx);
+    const Setup s = cores_setup();
+    run(s, "libdivx311dec under Sony's libvdec", [&](bool sony) { return divx311(s, sony); }, [](const Observed&) {});
+}
+
+TEST_CASE("The DivX core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP(kNoDivx);
+    const Setup s = cores_setup();
+    run(s, "libdivxdec under Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); }, [](const Observed&) {});
+}
+
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX and as MPEG-4",
     "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP(kNoDivx);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's MPEG-4 part 2 against Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("QueryAttrEx MPEG-4 SP L1 96x64: the attribute").starts_with("hex:0006ac0b"));
@@ -767,7 +832,7 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX a
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: VC-1's advanced profile", "[.][hle][lle][compare][vdec]")
 {
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's VC-1 against Sony's libvdec", [&](bool sony) { return vc1_family(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("OpenEx VC-1 level 0") == "0x0"); // the simple and main profiles open, as Sony's
@@ -791,7 +856,7 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: VC-1's advanced profile
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MVC", "[.][hle][lle][compare][vdec]")
 {
-    const Setup s = setup();
+    const Setup s = libvdec_setup();
     run(s, "cellVdec's MVC against Sony's libvdec", [&](bool sony) { return mvc(s, sony); },
         [](const Observed& o) {
             CHECK(o.value("QueryAttrEx codec 11 level 21 64x64: the attribute").starts_with("hex:00a4117d"));

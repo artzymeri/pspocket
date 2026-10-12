@@ -242,7 +242,7 @@ TEST_CASE("cellVdec: the same as Sony's libvdec (the user's firmware): sizes, an
     {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
-        FirmwareLibrary sony(f, t, *flash, "libvdec");
+        FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
         theirs = vdec_run(f.base(),
             [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); });
         sizes(f.base(), [&](u32 type, u32 attr) { return sony.call(t, 0xFF6F6EBE, {type, attr}); }, their_sizes);
@@ -389,13 +389,13 @@ TEST_CASE("cellVdec tests: the synthetic H.264 decodes to its own samples (FFmpe
     avcodec_free_context(&ctx);
 }
 
-// ---- cellVdecOpenExt, cellVdecSetPts, cellVdecDecodeAuEx2 (D-596): RPCS3's, unverified (D-594).
+// ---- cellVdecOpenExt (D-596: RPCS3's, unverified, D-594), cellVdecSetPts and cellVdecDecodeAuEx2 (compared, D-920).
 
 namespace {
 
 // A decoder's life over four 64x64 H.264 access units, opened by Open and fed by DecodeAu, or opened by OpenExt on its
-// CellVdecResourceExt and fed by DecodeAuEx2 (the two words RPCS3 does not know set on odd access units): what it
-// shows, as vdec_test::decode_stream records it.
+// CellVdecResourceExt and fed by DecodeAuEx2 (the odd access units in two pieces, D-920): what it shows, as
+// vdec_test::decode_stream records it.
 Decoded ext_life(u8* b, const Call& call, bool ext)
 {
     Decoded d;
@@ -434,8 +434,11 @@ Decoded ext_life(u8* b, const Call& call, bool ext)
         std::memcpy(b + at, au.data(), au.size());
         const u32 pts = 0x1000 + 3003 * i, dts = 0x800 + 3003 * i;
         if (ext) {
-            // CellVdecAuInfoEx2: startAddr, a word, size, a word, pts, dts, userData, codecSpecificData.
-            const u32 words[8] = {at, (i & 1) ? 0x11111111u : 0, size, (i & 1) ? 0x22222222u : 0, 0, pts, 0, dts};
+            // CellVdecAuInfoEx2: the two pieces' addresses and sizes, pts, dts, userData, codecSpecificData; an odd
+            // access unit's rest 0x8000 bytes on.
+            const u32 first = (i & 1) ? (size / 2) & ~0x7Fu : size;
+            if (first < size) std::memcpy(b + at + 0x8000, au.data() + first, size - first);
+            const u32 words[8] = {at, first < size ? at + 0x8000 : 0, first, size - first, 0, pts, 0, dts};
             for (u32 k = 0; k < 8; k++) ps_write32(b, kAu + 4 * k, words[k]);
             ps_write64(b, kAu + 0x20, 0xABCD0000 + u64{i});
             ps_write64(b, kAu + 0x28, 0);
@@ -481,16 +484,17 @@ Decoded ext_life(u8* b, const Call& call, bool ext)
 
 } // namespace
 
-TEST_CASE("cellVdec: OpenExt opens on its resource, SetPts' answers, DecodeAuEx2 decodes as DecodeAu does (D-596)",
+TEST_CASE("cellVdec: OpenExt opens on its resource, SetPts' answers, DecodeAuEx2 decodes as DecodeAu does (D-596, D-920)",
     "[hle][vdec]")
 {
     const std::pair<const char*, u32> kExtFunctions[] = {{"cellVdecOpenExt", 0xEF4D8AD7}, {"cellVdecSetPts", 0x3CE2E4F8},
         {"cellVdecDecodeAuEx2", 0x1533C6A9}};
-    for (const auto& [name, nid] : kExtFunctions) {
-        CHECK(recomp::nid_of(name) == nid);
-        CHECK(hle::registry().is_unverified("libvdec", nid));
-    }
-    for (const u32 nid : {0xB6BBCD5Du, 0x0053E2D8u, 0x2BF4DDD2u, 0x807C861Au, 0x17C702B9u, 0xE13EF6FCu})
+    for (const auto& [name, nid] : kExtFunctions) CHECK(recomp::nid_of(name) == nid);
+    // OpenExt and MVC's two-view decode stay unverified (D-594); SetPts and DecodeAuEx2 with its twin are compared with
+    // Sony's (D-920).
+    for (const u32 nid : {0xEF4D8AD7u, 0x20DA0CFAu}) CHECK(hle::registry().is_unverified("libvdec", nid));
+    for (const u32 nid : {0xB6BBCD5Du, 0x0053E2D8u, 0x2BF4DDD2u, 0x807C861Au, 0x17C702B9u, 0xE13EF6FCu, 0x3CE2E4F8u,
+             0x1533C6A9u, 0x652B7BC0u})
         CHECK_FALSE(hle::registry().is_unverified("libvdec", nid));
     InterpretMisses interpret;
     BigFixture f;
@@ -561,6 +565,14 @@ TEST_CASE("cellVdec: OpenExt opens on its resource, SetPts' answers, DecodeAuEx2
     ps_write32(b, kAu + 8, static_cast<u32>(au.size()));
     ps_write32(b, kAu + 0, 0);
     CHECK(decode_ex2(0, kAu) == kArg); // no start
+    ps_write32(b, kAu + 0, kStream);
+    ps_write32(b, kAu + 12, 0x10);
+    CHECK(decode_ex2(0, kAu) == 0x80610180); // a second piece with no address: libavcdec refuses it (D-920)
+    ps_write32(b, kAu + 4, kStream + 0x8000);
+    ps_write32(b, kAu + 12, 0x1FFFFF80);
+    CHECK(decode_ex2(0, kAu) == 0x80610180); // the two pieces past 0x1FFFFF80 bytes
+    ps_write32(b, kAu + 4, 0);
+    ps_write32(b, kAu + 12, 0);
     REQUIRE(call("cellVdecClose", 0x16698E83, {handle}) == 0);
     CHECK(set_pts(handle, kSpec) == kSeq);
     ps_write32(b, kAu + 0, kStream);
@@ -578,7 +590,7 @@ TEST_CASE("cellVdec: Sony's libvdec pictures, items and frame buffers dumped (pr
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
     u8* b = f.base();
     const auto call = [&](u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); };
     const auto save = [&](const std::string& name, u32 addr, u32 size) {
@@ -651,7 +663,7 @@ TEST_CASE("cellVdec: Sony's sizes for every codec and level (probe)", "[hle][vde
     InterpretMisses interpret;
     BigFixture f;
     GuestThread t(f, 0, "ppu");
-    FirmwareLibrary sony(f, t, *flash, "libvdec");
+    FirmwareLibrary sony(f, t, *flash, "libvdec", true, kVideoCores);
     u8* b = f.base();
     for (const u32 codec : {0u, 1u, 2u, 3u, 5u, 7u, 9u, 11u, 13u}) {
         for (u32 level = 0; level < 1100; level++) {
