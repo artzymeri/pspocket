@@ -13730,3 +13730,24 @@ in forked children of the test process; they inherit the directory and its remov
 it while the other half (or the parent) still used it: the gate after merging the agents' cellSail and cellSailRec
 parts aborted cellPngEnc's comparison (SIGABRT in its file output, std::filesystem throwing on the missing directory).
 tests/own_temp_dir.cpp now records the process that made the directory and removes it only from that process.
+Withdrawn by D-934: no test forks (a comparison's halves run one after the other in the test's own process), and the
+abort was a guest race in the comparison itself; tests/own_temp_dir.cpp is D-924's again.
+
+## D-934 · 2026-10-12 · cellPngEnc's comparison reopens an encoder only once its thread sleeps
+
+The gate aborted cellPngEnc's comparison one run in a few (also one in three alone), with
+`[fatal] sysPrxForUser: sys_lwmutex_lock(0x015002f8): owner 0xfffffffe, expected reserved` (or 0xfffffffc) in the 16:07,
+19:02 and 19:23 gates of 2026-10-12; D-931 put it down to the temporary directory, which was wrong (no filesystem error
+in those logs, and nothing forks). 0x015002f8 is the lwmutex of the encoder in work memory slot 5, which only the
+comparison's last step uses: an encoder opened again over its own work memory. Sony's Open builds the new encoder over
+the first without looking at it, while the first one's thread still runs, and its sys_lwmutex_create writes the new
+lwmutex where the thread's is: owner free, waiter count 0. When that thread is still in the middle of a
+sys_lwmutex_lock (just back from the first Open's handshake, before it sleeps on its lwcond for work), the waiter it
+counted on the old lwmutex is taken off the new one: the count was 0, so the 64-bit decrement borrows from the owner
+word, free (0xffffffff) becoming 0xfffffffe or reserved (0xfffffffd) 0xfffffffc, and the lock that the kernel granted
+finds no reserved owner. pspocket's lwmutex is right (its counts balance on every path, as RPCS3's, whose lock throws
+on the same owner); the step is a race in the guest, the comparison's own doing, and only Sony's half has the thread.
+- The step now waits (two seconds at most, then fails) until Sony's first encoder's thread (its ID at the handle's
+  +0x10) sleeps on the encoder's lwcond. Asleep there, nothing wakes it again: the second Open makes a new lwcond and
+  every later signal goes to that one; the thread ends with the process.
+- tests/own_temp_dir.cpp is D-924's again (D-931's check of the creating process answered a fork that does not happen).

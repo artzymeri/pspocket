@@ -1196,9 +1196,24 @@ Observed half(const Setup& s, bool sony_half)
         h.r("cellPngEncClose", {e}, std::format("Close of the {}-wide SPU encoder", w));
     }
 
-    // An encoder opened again over its own work memory: a new encoder there.
+    // An encoder opened again over its own work memory: a new encoder there. Sony's Open builds it over the first one,
+    // whose thread still runs, and creates its lwmutex where that thread's is: the waiter count starts again at 0.
+    // Until the thread sleeps on its lwcond, a lock it is in the middle of counts a waiter on the old lwmutex and takes
+    // it off the new one, which borrows from the owner (sys_lwmutex_lock finds 0xfffffffe or 0xfffffffc where it
+    // expects its turn: a fatal one run in a few, D-934). Asleep there, nothing wakes it again (the next lwcond is a
+    // new one). Its thread's ID is the handle's +0x10.
     const u32 again = h.open("an encoder to open twice", 5, 16, 16, 8, false);
     if (again) {
+        if (h.side.sony()) {
+            const u32 thread = static_cast<u32>(ps_read64(b, again + 0x10));
+            bool asleep = false;
+            for (int tries = 0; tries < 400 && !asleep; tries++) {
+                const auto t = h.f.kernel->thread(thread);
+                asleep = t && t->waiter.waiting_on().kind == lv2::WaitKind::LwCond;
+                if (!asleep) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            REQUIRE(asleep);
+        }
         h.write_resource(kWork + 5 * kEncoderMem + 0x10, kEncoderMem - 0x10);
         ps_write32(b, kHandle, 0xEEEEEEEE);
         h.r("cellPngEncOpen", {kCfg, kRsrc, kHandle}, "Open of the memory already open");
