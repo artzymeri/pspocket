@@ -12463,3 +12463,34 @@ malformed datagrams, the internal I/O thread over lv2's loopback with blocking c
 contexts to go. Before: 201 of 342 observations differ; now 0 of 1,808, and the same twice running. Tests: test_rudp.cpp
 (the checks and defaults, the handshake with its cookie, data both ways with its read information, a loss, the reset
 and its end, packets for nobody, the I/O thread with blocking contexts and libnet).
+
+## D-916 · 2026-10-12 · cellRudp's comparison widened: failures, reordering, windows, keep-alive, the game's allocator, small segments (part 3)
+
+Part 2's comparison left whole areas unseen: its P2P connection never came about in either half (both sides
+Activated: Activate waits for the peer's SYN, so a P2P connection is one side Activated and the other Initiating; both
+Activated, nothing is sent, and that case stays as a step of its own), and nothing failed, reordered, filled a window
+or ran through the game's allocator. Added, each matched against the module:
+- Connections that do not come about: a peer that never answers (a 3 s connection timeout: the SYN sent again, a RST
+  with reason 3 at the end, CLOSED with CONN_TIMEOUT; the context stays, closed); a SYN to a context that does not
+  listen (no answer: the client keeps trying); clients whose stream, delivery or order modes differ from the
+  listener's (a RST with the mismatch's reason, CLOSED with CONN_RESET), and whose SACK or payload differ (accepted;
+  the accepted context's options).
+- A datagram held back behind the next (selective acknowledgements), a burst with one lost.
+- A receiver that does not read, with a 4 KB receive buffer: the window closes, the sender holds its segments, the
+  window opens as it reads.
+- Keep-alive (300 ms probes, a 1.2 s timeout): probes answered, then the peer silent: CLOSED with
+  KEEP_ALIVE_FAILURE on the prober, CONN_RESET on the other.
+- The game's allocator (cellRudpInit with one): every allocation's size and every release, in order up to the
+  contexts' end (from there sorted: which context lingers longer follows the clock).
+- A 600-byte segment size set before any context: the payload stays 0x542, a payload of 0x219 is too large; a
+  1000-byte message does not fit a datagram.
+That last one found a difference: librudp writes a packet into the destination's datagram piece by piece (the prefix's
+place, the vports, the header, the payload), each only when it fits, and stops at the first that does not with what it
+wrote kept and the prefix left 0; those bytes go out with the datagram (an 8-byte datagram a peer reads as malformed)
+and the message is never sent. pspocket rolled the packet back; it now writes as librudp does (a header that does not
+fit is dropped whole, where librudp keeps the fields that fitted: not reached with a segment size of 0x40 or more).
+Times the halves need not share are kept out of the comparison: the read information's retransmission delay is a
+note, how many SYNs and probes fit in a time is compared for the first ones only, and each part ends by waiting until
+nothing more is freed for 1.5 s (the timers of contexts that went are freed when they come due, up to a retransmission
+timeout later). The comparison: 0 of 2,631 observations differ, three runs in a row (about 110 s a run).
+Test: test_rudp.cpp "a packet larger than the datagram leaves its start in it".

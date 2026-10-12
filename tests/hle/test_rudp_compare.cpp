@@ -22,6 +22,7 @@
 #include <cstring>
 #include <format>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -51,6 +52,11 @@ constexpr u32 kStage = kData + 0x30000;            // a datagram handed to NetRe
 constexpr u32 kNetRing = kData + 0x40000;          // event handler calls: count, then records from +16
 constexpr u32 kRec = 0x640, kRecs = 128, kRecData = 0x600; // {event, soc, len, addrlen, addr[16], data[0x600]}
 constexpr u32 kNetParam = kData + 0x7F000, kNetPool = kData + 0x80000; // libnet's parameters and pool (128 KB)
+// The game's allocator (CellRudpAllocator): its code, descriptors, the structure, a log of its calls ({kind 1 malloc
+// or 2 free, r3, r4, the answer}, 16 bytes each from +16, the count at +0, the next free address at +4) and its heap.
+constexpr u32 kAllocCode = kData + 0x3000, kMallocOpd = kData + 0x3400, kFreeOpd = kData + 0x3408,
+              kAllocator = kData + 0x3410, kAllocLog = kData + 0x4000, kAllocRecs = 2048, kHeap = kData + 0xC0000,
+              kHeapEnd = kData + 0x1F0000;
 
 
 // The context handler (ctx_id, event_id, error_code, arg = ring) and the event handler (event_id, soc, data, datalen,
@@ -127,6 +133,57 @@ void write_handlers(u8* b)
     ps_write32(b, kNetOpd + 4, 0);
     ps_write32(b, kCtxRing, 0);
     ps_write32(b, kNetRing, 0);
+}
+
+// The game's allocator: malloc hands out its heap in 16-byte steps from the next free address (nothing is reused, so
+// each block is told apart by its address), free only records; both log their calls.
+void write_allocator(u8* b)
+{
+    as::Assembler c(kAllocCode);
+    const auto log = [&] {
+        c.emit(as::lis(11, static_cast<s32>(kAllocLog >> 16)));
+        c.emit(as::ori(11, 11, kAllocLog & 0xFFFF));
+        c.emit(as::lwz(5, 0, 11));
+        c.emit(as::andi_(9, 5, kAllocRecs - 1));
+        c.emit(as::slwi(9, 9, 4));
+        c.emit(as::add(9, 9, 11));
+        c.emit(as::addi(5, 5, 1));
+        c.emit(as::stw(5, 0, 11));
+    };
+    // malloc(size): the record {1, size, r4, block}.
+    log();
+    c.emit(as::lwz(6, 4, 11));
+    c.emit(as::addi(7, 3, 15));
+    c.emit(as::rlwinm(7, 7, 0, 0, 27));
+    c.emit(as::add(8, 6, 7));
+    c.emit(as::stw(8, 4, 11));
+    c.emit(as::li(10, 1));
+    c.emit(as::stw(10, 16, 9));
+    c.emit(as::stw(3, 20, 9));
+    c.emit(as::stw(4, 24, 9));
+    c.emit(as::stw(6, 28, 9));
+    c.emit(as::mr(3, 6));
+    c.emit(as::blr());
+    const u32 free_at = c.pc();
+    // free(block): the record {2, block, r4, 0}.
+    log();
+    c.emit(as::li(10, 2));
+    c.emit(as::stw(10, 16, 9));
+    c.emit(as::stw(3, 20, 9));
+    c.emit(as::stw(4, 24, 9));
+    c.emit(as::li(10, 0));
+    c.emit(as::stw(10, 28, 9));
+    c.emit(as::blr());
+    const std::vector<u8> code = c.finish();
+    std::memcpy(b + kAllocCode, code.data(), code.size());
+    ps_write32(b, kMallocOpd, kAllocCode);
+    ps_write32(b, kMallocOpd + 4, 0);
+    ps_write32(b, kFreeOpd, free_at);
+    ps_write32(b, kFreeOpd + 4, 0);
+    ps_write32(b, kAllocator, kMallocOpd);
+    ps_write32(b, kAllocator + 4, kFreeOpd);
+    ps_write32(b, kAllocLog, 0);
+    ps_write32(b, kAllocLog + 4, kHeap);
 }
 
 // lv2's call `number` on the half's thread.
@@ -334,6 +391,11 @@ struct Run : Half<> {
     std::map<std::pair<u16, u16>, std::vector<std::pair<std::string, std::string>>> step_lines; // their lines
     bool pump_events = true;    // ProcessEvents in the pump (no internal I/O thread)
     std::vector<u32> drop;      // datagrams of the step (by number) the network loses
+    using Nth = std::tuple<u16, u16, u32>; // source port, destination port, the step's datagram in that direction
+    std::set<Nth> lose, hold;   // lost, or held back until the direction's next datagram has been delivered
+    std::set<u16> mute;         // ports whose datagrams are all lost
+    std::map<std::pair<u16, u16>, std::vector<u8>> held;
+    u32 lines_per_direction = ~0u; // datagrams past these in a direction are notes (counts that follow the clock)
 
     Run(const Setup& s, bool sony_half) : Half(s, sony_half, "cellRudp") {}
 
@@ -438,7 +500,10 @@ struct Run : Half<> {
             const u32 ev = ps_read32(b, at), soc = ps_read32(b, at + 4), len = ps_read32(b, at + 8),
                       addrlen = ps_read32(b, at + 12);
             const u16 dport = ps_read16(b, at + 18);
-            if (ev == 101) continue; // the I/O thread's receivings: the datagrams of its sendings
+            if (ev == 101) { // the I/O thread's receivings: the datagrams of its sendings
+                std::memset(b + at, 0, 32);
+                continue;
+            }
             const auto sp = port_of.find(static_cast<s32>(soc));
             const u16 sport = sp == port_of.end() ? 0 : sp->second;
             const u32 copied = std::min(len, kRecData);
@@ -448,30 +513,42 @@ struct Run : Half<> {
             line += wire.describe(sport, dport, b + at + 32, copied);
             const u32 number = datagram++;
             const u32 nth = per_direction[{sport, dport}]++;
-            const bool lost = std::find(drop.begin(), drop.end(), number) != drop.end();
+            const bool lost = std::find(drop.begin(), drop.end(), number) != drop.end() ||
+                              lose.contains({sport, dport, nth}) || mute.contains(sport);
+            const bool kept = !lost && hold.contains({sport, dport, nth});
             if (lost) line += " (lost)";
-            if (ev == 1 && !lost) {
-                const auto dst = by_port.find(dport);
-                if (dst == by_port.end()) {
-                    line += " (nobody there)";
-                } else {
-                    std::memcpy(b + kStage, b + at + 32, copied);
-                    sockaddr(b, kFrom, sport);
-                    const u64 a = side.call("cellRudpNetReceived",
-                                          {static_cast<u64>(dst->second), kStage, copied, kFrom, 16})
-                                      .value_or(~0ull);
-                    if (a) line += " NetReceived " + answer(a);
+            if (kept) line += " (held back)";
+            if (ev == 1 && !lost && !kept) {
+                line += deliver(sport, dport, std::vector<u8>(b + at + 32, b + at + 32 + copied));
+                if (const auto h = held.find({sport, dport}); h != held.end()) {
+                    line += " then the one held back" + deliver(sport, dport, h->second);
+                    held.erase(h);
                 }
             }
+            if (ev == 1 && kept) held[{sport, dport}] = std::vector<u8>(b + at + 32, b + at + 32 + copied);
             // Numbered in each direction: the two ends' timers interleave their datagrams as the times fall, which the
             // halves need not share; each direction's sequence is compared, the order of all of them is a note.
-            step_lines[{sport, dport}].emplace_back(step + std::format(": from port {} to port {}: datagram {}", sport,
-                                                        dport, nth),
-                line);
+            const std::string key = step + std::format(": from port {} to port {}: datagram {}", sport, dport, nth);
+            if (nth < lines_per_direction) step_lines[{sport, dport}].emplace_back(key, line);
+            else o.note(key + ": " + line);
             o.note(step + std::format(": datagram {} is from port {} to port {}", number, sport, dport));
             if (!wire.masked.empty()) o.note(step + std::format(": datagram {}:{}", number, wire.masked));
             o.note(step + std::format(": datagram {} bytes ", number) + hex(b + at + 32, copied).substr(4));
+            std::memset(b + at, 0, 32); // a later call without an address finds none here
+
         }
+    }
+
+    // A datagram to the socket at `dport` from the one at `sport` with NetReceived: what the line says of it.
+    std::string deliver(u16 sport, u16 dport, const std::vector<u8>& d)
+    {
+        const auto dst = by_port.find(dport);
+        if (dst == by_port.end()) return " (nobody there)";
+        std::memcpy(b + kStage, d.data(), d.size());
+        sockaddr(b, kFrom, sport);
+        const u64 a = side.call("cellRudpNetReceived", {static_cast<u64>(dst->second), kStage, d.size(), kFrom, 16})
+                          .value_or(~0ull);
+        return a ? " NetReceived " + answer(a) : std::string();
     }
 
     // Runs the library for `time` (ProcessEvents(0) every millisecond, or the I/O thread on its own), the network
@@ -507,11 +584,23 @@ struct Run : Half<> {
             }
             std::this_thread::sleep_for(1ms);
         }
-        // The timers of what went stay until they come due (each then freed): 300 ms more.
-        const auto until = std::chrono::steady_clock::now() + 300ms;
-        while (std::chrono::steady_clock::now() < until) {
+        // The timers of what went stay until they come due (each then freed, up to a retransmission timeout later):
+        // until nothing has been freed for 1.5 s (20 s at most).
+        u32 frees = ~0u;
+        auto quiet_since = std::chrono::steady_clock::now();
+        const auto give_up = quiet_since + 20s;
+        while (std::chrono::steady_clock::now() < give_up) {
             if (pump_events) side.call("cellRudpProcessEvents", {0});
             drain(step);
+            side.call("cellRudpGetStatus", {kStatus + 0x200, 0x128});
+            const u32 f = ps_read32(b, kStatus + 0x200 + 0xF8);
+            const auto now = std::chrono::steady_clock::now();
+            if (f != frees) {
+                frees = f;
+                quiet_since = now;
+            } else if (now - quiet_since >= 1500ms) {
+                break;
+            }
             std::this_thread::sleep_for(1ms);
         }
         finish_step(step);
@@ -535,8 +624,12 @@ struct Run : Half<> {
         step_lines.clear();
         std::string counts;
         for (const auto& [dir, n] : per_direction) counts += std::format(" {}>{}: {}", dir.first, dir.second, n);
-        o.line(step + ": datagrams", counts.empty() ? std::string("none") : counts.substr(1));
+        if (lines_per_direction == ~0u) o.line(step + ": datagrams", counts.empty() ? std::string("none") : counts.substr(1));
+        else o.note(step + ": datagrams " + counts);
         drop.clear();
+        lose.clear();
+        hold.clear();
+        held.clear();
     }
 
     s32 write(s32 ctx, u32 size, u32 seed, const std::string& key, u32 flags = 0)
@@ -559,8 +652,11 @@ struct Run : Half<> {
             if (n > 32) o.line(key + ": the data's end", hex(b + kIn + 0x100 + n - 16, 16));
             o.line(key + ": past the data", hex(b + kIn + 0x100 + n, 4));
         }
-        o.line(key + ": the read information", hex(b + kIn, 6) + " " + hex(b + kIn + 12, 4));
-        o.note(key + ": the read information's sequence number and time stamp " + hex(b + kIn + 6, 6));
+        // Its size byte, the retransmissions, the flags and what is past it; the retransmission delay (ms), the
+        // sequence number and the time stamp are notes.
+        o.line(key + ": the read information", hex(b + kIn, 2) + " " + hex(b + kIn + 5, 1) + " " + hex(b + kIn + 12, 4));
+        o.note(key + ": the read information's retransmission delay, sequence number and time stamp " +
+               hex(b + kIn + 2, 3) + " " + hex(b + kIn + 6, 6));
         return n;
     }
 
@@ -978,23 +1074,38 @@ void stream_connection(Run& h, const std::string& w, u16 port, bool cookies, boo
     h.close(sb);
 }
 
-// Two P2P contexts (mux mode 1, one vport) opening at once with Activate.
+// Two P2P contexts (mux mode 1, one vport): both Activated first (each waits for the other's SYN: nothing happens),
+// then two others where one waits (Activate) and the other initiates.
 void p2p_connection(Run& h, const std::string& w, u16 port)
 {
     u8* b = h.b;
     const s32 sa = h.socket(port), sb = h.socket(static_cast<u16>(port + 1));
+    const s32 ax = h.create(w + "a waiting one"), ay = h.create(w + "another waiting one");
+    h.r("cellRudpBind", {static_cast<u64>(ax), static_cast<u64>(sa), 6, 1}, w + "Bind a waiting one");
+    h.r("cellRudpBind", {static_cast<u64>(ay), static_cast<u64>(sb), 6, 1}, w + "Bind another waiting one");
+    sockaddr(b, kPeer, static_cast<u16>(port + 1));
+    h.r("cellRudpActivate", {static_cast<u64>(ax), kPeer, 16}, w + "Activate a waiting one");
+    sockaddr(b, kPeer, port);
+    h.r("cellRudpActivate", {static_cast<u64>(ay), kPeer, 16}, w + "Activate another waiting one");
+    h.r("cellRudpActivate", {static_cast<u64>(ay), kPeer, 16}, w + "Activate another waiting one again");
+    h.ctx_status(ax, w + "a waiting one after Activate");
+    h.pump(w + "both waiting", 200ms);
+    h.events(w + "both waiting");
+    for (const s32 c : {ax, ay}) h.r("cellRudpTerminate", {static_cast<u64>(c)}, w + "Terminate a waiting one");
+
     const s32 x = h.create(w + "the first"), y = h.create(w + "the second");
     for (const s32 c : {x, y}) h.set(c, 4, 1, w + "NODELAY");
     h.r("cellRudpBind", {static_cast<u64>(x), static_cast<u64>(sa), 7, 1}, w + "Bind the first");
     h.r("cellRudpBind", {static_cast<u64>(y), static_cast<u64>(sb), 7, 1}, w + "Bind the second");
-    sockaddr(b, kPeer, static_cast<u16>(port + 1));
-    h.r("cellRudpActivate", {static_cast<u64>(x), kPeer, 16}, w + "Activate the first");
-    h.ctx_status(x, w + "the first after Activate");
-    h.pump(w + "one side", 200ms);
-    h.events(w + "one side");
     sockaddr(b, kPeer, port);
     h.r("cellRudpActivate", {static_cast<u64>(y), kPeer, 16}, w + "Activate the second");
-    h.r("cellRudpActivate", {static_cast<u64>(y), kPeer, 16}, w + "Activate the second again");
+    h.ctx_status(y, w + "the second after Activate");
+    h.pump(w + "one side", 200ms);
+    h.events(w + "one side");
+    sockaddr(b, kPeer, static_cast<u16>(port + 1));
+    h.r("cellRudpInitiate", {static_cast<u64>(x), kPeer, 16, 7}, w + "Initiate the first");
+    h.r("cellRudpInitiate", {static_cast<u64>(x), kPeer, 16, 7}, w + "Initiate the first again");
+    h.ctx_status(x, w + "the first after Initiate");
     h.pump(w + "the handshake", 400ms);
     h.events(w + "the handshake");
     h.ctx_status(x, w + "the first");
@@ -1081,6 +1192,263 @@ void malformed(Run& h, u16 port)
     h.close(sa);
 }
 
+// Two P2P contexts on sockets at `port` and `port + 1` (vport 7), `options` set on both before they open each other.
+struct Pair {
+    s32 sa = -1, sb = -1, x = -1, y = -1;
+};
+Pair p2p_pair(Run& h, const std::string& w, u16 port, const std::vector<std::pair<s32, u32>>& options,
+    const std::vector<std::pair<s32, u32>>& y_options = {})
+{
+    u8* b = h.b;
+    Pair p;
+    p.sa = h.socket(port);
+    p.sb = h.socket(static_cast<u16>(port + 1));
+    p.x = h.create(w + "the first");
+    p.y = h.create(w + "the second");
+    for (const s32 c : {p.x, p.y})
+        for (const auto& [opt, v] : options) h.set(c, opt, v, w + std::format("SetOption({}, {:#x})", opt, v));
+    for (const auto& [opt, v] : y_options) h.set(p.y, opt, v, w + std::format("the second: SetOption({}, {:#x})", opt, v));
+    h.r("cellRudpBind", {static_cast<u64>(p.x), static_cast<u64>(p.sa), 7, 1}, w + "Bind the first");
+    h.r("cellRudpBind", {static_cast<u64>(p.y), static_cast<u64>(p.sb), 7, 1}, w + "Bind the second");
+    sockaddr(b, kPeer, port);
+    h.r("cellRudpActivate", {static_cast<u64>(p.y), kPeer, 16}, w + "Activate the second");
+    sockaddr(b, kPeer, static_cast<u16>(port + 1));
+    h.r("cellRudpInitiate", {static_cast<u64>(p.x), kPeer, 16, 7}, w + "Initiate the first");
+    h.pump(w + "the handshake", 400ms);
+    h.events(w + "the handshake");
+    return p;
+}
+
+void end_pair(Run& h, const std::string& w, const Pair& p)
+{
+    for (const s32 c : {p.x, p.y}) h.r("cellRudpTerminate", {static_cast<u64>(c)}, w + "Terminate");
+    h.settle(w + "lingering");
+    h.events(w + "lingering");
+    h.status(w + "the end");
+    h.close(p.sa);
+    h.close(p.sb);
+}
+
+// Connections that do not come about: a peer that never answers (a 3 s connection timeout: the SYNs sent again, then
+// the end), a SYN to a context that does not listen, clients whose stream, delivery or order modes are not the
+// listener's.
+void failures(Run& h, u16 port)
+{
+    u8* b = h.b;
+    const std::string w = "failures: ";
+    const s32 sa = h.socket(port), sb = h.socket(static_cast<u16>(port + 1)), sc2 = h.socket(static_cast<u16>(port + 2));
+    const s32 lone = h.create(w + "the lone client");
+    h.set(lone, 9, 3000, w + "CONNECTION_TIMEOUT 3 s");
+    h.r("cellRudpBind", {static_cast<u64>(lone), static_cast<u64>(sa), 20, 2}, w + "Bind the lone client");
+    sockaddr(b, kPeer, static_cast<u16>(port + 9));
+    h.r("cellRudpInitiate", {static_cast<u64>(lone), kPeer, 16, 10}, w + "Initiate to nobody");
+    h.lines_per_direction = 3; // how many SYNs fit in the time follows the clock
+    h.pump(w + "nobody answers", 4000ms);
+    h.lines_per_direction = ~0u;
+    h.events(w + "nobody answers");
+    h.ctx_status(lone, w + "the lone client after its timeout");
+    h.option(lone, 14, 4, w + "LAST_ERROR after the timeout");
+    h.r("cellRudpInitiate", {static_cast<u64>(lone), kPeer, 16, 10}, w + "Initiate again after the timeout");
+    h.r("cellRudpTerminate", {static_cast<u64>(lone)}, w + "Terminate the lone client");
+
+    const s32 idle = h.create(w + "a context that does not listen");
+    h.r("cellRudpBind", {static_cast<u64>(idle), static_cast<u64>(sb), 10, 2}, w + "Bind the context that does not listen");
+    const s32 knocker = h.create(w + "a client");
+    h.r("cellRudpBind", {static_cast<u64>(knocker), static_cast<u64>(sc2), 21, 2}, w + "Bind the client");
+    sockaddr(b, kPeer, static_cast<u16>(port + 1));
+    h.r("cellRudpInitiate", {static_cast<u64>(knocker), kPeer, 16, 10}, w + "Initiate to the context that does not listen");
+    h.pump(w + "a context that does not listen", 600ms);
+    h.events(w + "a context that does not listen");
+    h.ctx_status(knocker, w + "the client refused");
+    h.ctx_status(idle, w + "the context that does not listen");
+    h.option(knocker, 14, 4, w + "LAST_ERROR after the refusal");
+
+    const s32 lis = h.create(w + "a listener");
+    h.set(lis, 13, 0, w + "the listener: no cookies");
+    h.r("cellRudpBind", {static_cast<u64>(lis), static_cast<u64>(sb), 11, 2}, w + "Bind the listener");
+    h.r("cellRudpListen", {static_cast<u64>(lis), 4}, w + "Listen");
+    u16 vport = 22;
+    for (const auto& [name, opt, value] : std::vector<std::tuple<std::string, s32, u32>>{
+             {"a stream client", 8, 1}, {"a client without delivery", 5, 0}, {"a client without order", 6, 0},
+             {"a client with SACK off", 12, 0}, {"a client with a smaller payload", 1, 0x200}}) {
+        const std::string k = w + name;
+        const s32 c = h.create(k);
+        h.set(c, opt, value, k + ": its option");
+        h.r("cellRudpBind", {static_cast<u64>(c), static_cast<u64>(sc2), vport++, 2}, k + ": Bind");
+        sockaddr(b, kPeer, static_cast<u16>(port + 1));
+        h.r("cellRudpInitiate", {static_cast<u64>(c), kPeer, 16, 11}, k + ": Initiate");
+        h.pump(k, 600ms);
+        h.events(k);
+        h.ctx_status(c, k);
+        h.option(c, 14, 4, k + ": LAST_ERROR");
+        const s32 child = h.accept(lis, k + ": Accept");
+        if (child >= 0) {
+            for (s32 opt2 = 1; opt2 <= 12; opt2++) h.option(child, opt2, 4, k + std::format(": the accepted context's option {}", opt2));
+            h.r("cellRudpTerminate", {static_cast<u64>(child)}, k + ": Terminate the accepted context");
+        }
+        h.r("cellRudpTerminate", {static_cast<u64>(c)}, k + ": Terminate");
+    }
+    for (const s32 c : {idle, knocker, lis}) h.r("cellRudpTerminate", {static_cast<u64>(c)}, w + "Terminate");
+    h.settle(w + "lingering");
+    h.events(w + "lingering");
+    h.status(w + "the end");
+    h.close(sa);
+    h.close(sb);
+    h.close(sc2);
+}
+
+// Datagrams out of order and lost in a burst: selective acknowledgements, the fast retransmission, the counters.
+void reordering(Run& h, u16 port)
+{
+    const std::string w = "reordering: ";
+    const Pair p = p2p_pair(h, w, port, {{4, 1}, {11, 0}});
+    const u16 a = port, bport = static_cast<u16>(port + 1);
+    for (u32 i = 0; i < 5; i++) h.write(p.x, 100, 40 + i, w + std::format("Write message {}", i));
+    h.hold = {{a, bport, 0}};
+    h.pump(w + "the first held back", 500ms);
+    h.events(w + "the first held back");
+    for (u32 i = 0; i < 6; i++) h.read(p.y, 0x1000, w + std::format("Read {}", i));
+    for (u32 i = 0; i < 8; i++) h.write(p.x, 200, 60 + i, w + std::format("Write burst message {}", i));
+    h.lose = {{a, bport, 1}};
+    h.pump(w + "the second of a burst lost", 800ms);
+    h.events(w + "the second of a burst lost");
+    for (u32 i = 0; i < 9; i++) h.read(p.y, 0x1000, w + std::format("Read burst {}", i));
+    h.ctx_status(p.x, w + "the sender");
+    h.ctx_status(p.y, w + "the receiver");
+    h.status(w + "after the data");
+    end_pair(h, w, p);
+}
+
+// A receiver that does not read: its window closes (the sender holds its segments), opens as it reads.
+void full_window(Run& h, u16 port)
+{
+    const std::string w = "a full window: ";
+    const Pair p = p2p_pair(h, w, port, {{11, 0}}, {{3, 0x1000}});
+    for (u32 i = 0; i < 8; i++) h.write(p.x, 1000, 80 + i, w + std::format("Write message {}", i));
+    h.sizes(p.x, w + "the sender, written");
+    h.pump(w + "the window fills", 500ms);
+    h.events(w + "the window fills");
+    h.sizes(p.x, w + "the sender, the window full");
+    h.sizes(p.y, w + "the receiver, the window full");
+    h.ctx_status(p.x, w + "the sender, the window full");
+    for (u32 i = 0; i < 2; i++) h.read(p.y, 0x1000, w + std::format("Read {}", i));
+    h.pump(w + "the window opens", 500ms);
+    h.events(w + "the window opens");
+    for (u32 i = 2; i < 9; i++) {
+        h.read(p.y, 0x1000, w + std::format("Read {}", i));
+        h.pump(w + std::format("after read {}", i), 200ms);
+    }
+    h.ctx_status(p.x, w + "the sender at the end");
+    h.ctx_status(p.y, w + "the receiver at the end");
+    end_pair(h, w, p);
+}
+
+// Keep-alive: probes on an idle connection every 300 ms, answered; then the peer silent past the 1.2 s timeout.
+void keep_alive(Run& h, u16 port)
+{
+    const std::string w = "keep-alive: ";
+    const Pair p = p2p_pair(h, w, port, {});
+    h.set(p.x, 18, 300, w + "KEEP_ALIVE_INTERVAL 300 ms");
+    h.set(p.x, 19, 1200, w + "KEEP_ALIVE_TIMEOUT 1.2 s");
+    h.option(p.x, 18, 4, w + "KEEP_ALIVE_INTERVAL");
+    h.lines_per_direction = 2; // how many probes fit in the time follows the clock
+    h.pump(w + "idle", 1000ms);
+    h.events(w + "idle");
+    h.mute = {static_cast<u16>(port + 1)};
+    h.pump(w + "the peer silent", 2500ms);
+    h.lines_per_direction = ~0u;
+    h.mute.clear();
+    h.events(w + "the peer silent");
+    h.ctx_status(p.x, w + "the first after the silence");
+    h.option(p.x, 14, 4, w + "LAST_ERROR after the silence");
+    h.read(p.x, 0x1000, w + "Read after the silence");
+    end_pair(h, w, p);
+}
+
+// The game's allocator: every allocation and release the library makes through it, in order, for a library brought
+// up, a P2P connection with data, its end and the library's end.
+void allocator(Run& h, u16 port)
+{
+    u8* b = h.b;
+    const std::string w = "the game's allocator: ";
+    write_allocator(b);
+    h.r("cellRudpInit", {kAllocator}, w + "Init");
+    h.status(w + "after Init");
+    h.r("cellRudpSetEventHandler", {kNetOpd, kNetRing}, w + "SetEventHandler");
+    const Pair p = p2p_pair(h, w, port, {{11, 0}});
+    h.write(p.x, 500, 90, w + "Write");
+    h.write(p.y, 300, 91, w + "Write back");
+    h.pump(w + "data", 300ms);
+    h.read(p.y, 0x1000, w + "Read");
+    h.read(p.x, 0x1000, w + "Read back");
+    h.status(w + "connected");
+    const u32 before_end = std::min(ps_read32(b, kAllocLog), kAllocRecs);
+    end_pair(h, w, p);
+    h.r("cellRudpEnd", {}, w + "End");
+    // The log: m<size> for an allocation (its second argument when not 0), f<n> for the release of allocation n. Up
+    // to the contexts' end in order; from there sorted (which context lingers longer follows the clock), the order a
+    // note.
+    const u32 n = std::min(ps_read32(b, kAllocLog), kAllocRecs);
+    std::map<u32, u32> block_of;
+    std::vector<std::string> calls;
+    for (u32 i = 0; i < n; i++) {
+        const u32 at = kAllocLog + 16 + 16 * i;
+        const u32 kind = ps_read32(b, at), a = ps_read32(b, at + 4), r4 = ps_read32(b, at + 8),
+                  result = ps_read32(b, at + 12);
+        if (kind == 1) {
+            calls.push_back(std::format("m{:#x}", a));
+            if (r4) h.o.note(w + std::format("allocation {} had a second argument {:#x}", block_of.size(), r4));
+            block_of[result] = static_cast<u32>(block_of.size());
+        } else {
+            const auto it = block_of.find(a);
+            calls.push_back(it == block_of.end() ? std::format("f({:#x})", a) : std::format("f{}", it->second));
+        }
+    }
+    const auto show = [&](const std::string& what, std::vector<std::string> list, bool line) {
+        for (usize i = 0; i < list.size(); i += 16) {
+            std::string text;
+            for (usize k = i; k < std::min(list.size(), i + 16); k++) text += (text.empty() ? "" : " ") + list[k];
+            if (line) h.o.line(w + std::format("{} {}", what, i / 16), text);
+            else h.o.note(w + std::format("{} {}: {}", what, i / 16, text));
+        }
+    };
+    show("calls", std::vector<std::string>(calls.begin(), calls.begin() + before_end), true);
+    std::vector<std::string> ending(calls.begin() + before_end, calls.end());
+    show("calls from the end, in order", ending, false);
+    std::sort(ending.begin(), ending.end());
+    show("calls from the end, sorted", ending, true);
+    h.o.line(w + "calls", std::format("{}, {} from the end", n, n - before_end));
+    h.o.line(w + "within the heap", ps_read32(b, kAllocLog + 4) <= kHeapEnd ? "yes" : "no");
+}
+
+// A smaller segment size (600 bytes) set before any context: the payload's limit, the SYN's segment size, a message
+// as large as one payload.
+void small_segments(Run& h, u16 port)
+{
+    u8* b = h.b;
+    const std::string w = "600-byte segments: ";
+    h.r("cellRudpInit", {0}, w + "Init");
+    h.r("cellRudpSetEventHandler", {kNetOpd, kNetRing}, w + "SetEventHandler");
+    h.r("cellRudpSetMaxSegmentSize", {600}, w + "SetMaxSegmentSize(600)");
+    std::memset(b + kArgs, 0xEE, 4);
+    h.r("cellRudpGetMaxSegmentSize", {kArgs}, w + "GetMaxSegmentSize");
+    h.o.line(w + "GetMaxSegmentSize: the size", hex(b + kArgs, 4));
+    const s32 probe = h.create(w + "a context");
+    h.option(probe, 1, 4, w + "MAX_PAYLOAD");
+    h.set(probe, 1, 600 - 0x40, w + "SetOption(MAX_PAYLOAD, 0x218)");
+    h.set(probe, 1, 600 - 0x3F, w + "SetOption(MAX_PAYLOAD, 0x219)");
+    h.r("cellRudpTerminate", {static_cast<u64>(probe)}, w + "Terminate the context");
+    const Pair p = p2p_pair(h, w, port, {{11, 0}});
+    h.option(p.x, 1, 4, w + "MAX_PAYLOAD after the handshake");
+    h.write(p.x, 1000, 95, w + "Write 1000 bytes");
+    h.write(p.x, 600 - 0x40, 96, w + "Write 0x218 bytes");
+    h.write(p.x, 0x542, 97, w + "Write 0x542 bytes");
+    h.pump(w + "data", 400ms);
+    for (u32 i = 0; i < 4; i++) h.read(p.y, 0x1000, w + std::format("Read {}", i));
+    end_pair(h, w, p);
+    h.r("cellRudpEnd", {}, w + "End");
+}
+
 // Over the internal I/O thread, lv2's loopback sockets between the contexts: blocking contexts, timeouts, the hooks.
 void io_thread(Run& h, u16 port)
 {
@@ -1159,7 +1527,8 @@ Observed half(const Setup& s, bool sony_half)
     Run h(s, sony_half);
     write_handlers(h.b);
     sockaddr(h.b, kPeer, 7001);
-    // PSPOCKET_COMPARE_ONLY=<part> (before, basics, cookies, stream, p2p, malformed, io): that part alone.
+    // PSPOCKET_COMPARE_ONLY=<part> (before, basics, cookies, stream, p2p, malformed, failures, reordering, window,
+    // keepalive, allocator, small, io): that part alone.
     if (selected("before")) before_init(h);
     if (selected("basics")) basics(h);
     // The connections' sockets go through libnet in Sony's librudp: the network comes up first, as a game's does.
@@ -1173,8 +1542,14 @@ Observed half(const Setup& s, bool sony_half)
     if (selected("stream")) stream_connection(h, "a listener without cookies, stream, no aggregation: ", 7200, false, true, 0);
     if (selected("p2p")) p2p_connection(h, "P2P: ", 7300);
     if (selected("malformed")) malformed(h, 7400);
+    if (selected("failures")) failures(h, 7600);
+    if (selected("reordering")) reordering(h, 7700);
+    if (selected("window")) full_window(h, 7800);
+    if (selected("keepalive")) keep_alive(h, 7900);
     h.status("before End");
     h.r("cellRudpEnd", {}, "End after the connections");
+    if (selected("allocator")) allocator(h, 8000);
+    if (selected("small")) small_segments(h, 8100);
     if (selected("io")) io_thread(h, 7500);
     h.o.line("sys_net_finalize_network", answer(h.t.call("sys_net_finalize_network")));
     return std::move(h.o);

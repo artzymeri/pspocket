@@ -584,3 +584,38 @@ TEST_CASE("cellRudp: over the internal I/O thread with blocking contexts; its so
     REQUIRE(r.call("cellRudpEnd") == 0);
     CHECK(r.call("sys_net_finalize_network") == 0);
 }
+
+TEST_CASE("cellRudp: a packet larger than the datagram leaves its start in it, its prefix 0, as librudp's (D-916)",
+    "[hle][rudp]")
+{
+    // A segment size of 600 with the default payload of 0x542: a 1000-byte message does not fit a datagram. librudp
+    // writes the packet's prefix place, its vport and header, then stops at the payload: those 8 bytes go out with the
+    // datagram (its prefix 0), the message never does.
+    Rudp r;
+    REQUIRE(r.call("cellRudpInit", 0) == 0);
+    REQUIRE(r.call("cellRudpSetEventHandler", kNetOpd, kNetRing) == 0);
+    REQUIRE(r.call("cellRudpSetMaxSegmentSize", 600) == 0);
+    const s32 sa = r.socket(8100), sb = r.socket(8101);
+    const s32 x = r.create(), y = r.create();
+    for (const s32 c : {x, y}) REQUIRE(r.set(c, 11, 0) == 0);
+    REQUIRE(r.call("cellRudpBind", x, sa, 7, 1) == 0);
+    REQUIRE(r.call("cellRudpBind", y, sb, 7, 1) == 0);
+    sockaddr(r.b, kPeer, 8100);
+    REQUIRE(r.call("cellRudpActivate", y, kPeer, 16) == 0);
+    sockaddr(r.b, kPeer, 8101);
+    REQUIRE(r.call("cellRudpInitiate", x, kPeer, 16, 7) == 0);
+    REQUIRE(r.pump(2000ms, [&] { return r.heard(x, kEvEstablished) && r.heard(y, kEvEstablished); }));
+    const usize before = r.sent.size();
+    CHECK(r.write(x, 1000, 7) == 1000);
+    r.pump(300ms);
+    REQUIRE(r.sent.size() == before + 1);
+    const std::vector<u8>& d = r.sent[before].bytes;
+    REQUIRE(d.size() == 8);
+    CHECK(d[0] == 0);
+    CHECK(d[1] == 0);
+    CHECK(d[2] == 0);
+    CHECK(d[3] == 7);    // the vport
+    CHECK(d[4] == 0x00); // a USR header without flags
+    CHECK(r.call("cellRudpGetSizeReadable", y) == 0);
+    REQUIRE(r.call("cellRudpEnd") == 0);
+}

@@ -3399,34 +3399,41 @@ s32 agg_flush(Lib& lib, Net& net, const AggKey& key, AggDest& d, u64 now)
     return r;
 }
 
+// A packet into the destination's datagram, written piece by piece as librudp writes it: the prefix's place, the
+// vports, the header, the payload, each only when it fits. A piece that does not fit ends the packet there with what
+// was written kept and the prefix left 0 (librudp's: it goes out so with the datagram; the segment is not sent). A
+// header that does not fit is dropped whole (librudp keeps the fields that fitted).
 bool agg_append(AggDest& d, u8 mux, u16 src, u16 dst, const Header& h, const u8* payload, u32 len, u32 now_ms,
     Seg* stamp)
 {
-    const usize start = d.bytes.size();
     std::vector<u8>& v = d.bytes;
-    v.push_back(0);
-    v.push_back(0);
+    const usize start = v.size();
+    const auto fits = [&](usize n) { return v.size() + n <= d.cap; };
+    const auto put = [&](u16 x) {
+        if (!fits(2)) return false;
+        v.push_back(static_cast<u8>(x >> 8));
+        v.push_back(static_cast<u8>(x));
+        return true;
+    };
+    if (!put(0)) return false;
     u16 prefix = 0x4000;
     if (mux == 1) {
         prefix = 0x8000;
-        v.push_back(static_cast<u8>(src >> 8));
-        v.push_back(static_cast<u8>(src));
+        if (!put(src)) return false;
     } else if (mux == 2) {
         prefix = 0xC000;
-        v.push_back(static_cast<u8>(src >> 8));
-        v.push_back(static_cast<u8>(src));
-        v.push_back(static_cast<u8>(dst >> 8));
-        v.push_back(static_cast<u8>(dst));
+        if (!put(src) || !put(dst)) return false;
     } else if (mux) {
-        v.resize(start);
         return false;
     }
+    const usize header = v.size();
     rudp::encode(h, v);
-    v.insert(v.end(), payload, payload + len);
     if (v.size() > d.cap) {
-        v.resize(start);
+        v.resize(header);
         return false;
     }
+    if (!fits(len)) return false;
+    v.insert(v.end(), payload, payload + len);
     put16(v, start, static_cast<u16>(prefix | (v.size() - start)));
     d.packets.push_back({now_ms, stamp});
     return true;
