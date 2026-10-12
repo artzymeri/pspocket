@@ -249,6 +249,10 @@ public:
     const std::shared_ptr<MemoryContainer> container; // null: the default container
     u32 mappings = 0;           // guarded by the memory manager's mutex
     u64 handle = 0;             // host memory object (created on first map), guarded by the memory manager's mutex
+    // The system software's (Kernel::create_system_shared_memory; RPCS3 lv2_memory::system_handle): kept by the kernel
+    // under its key, charged to none of the process's containers. A process opens it by its key, one handle at a
+    // time: `id` is that handle (0 while the process has none), guarded by the memory manager's mutex.
+    bool system = false;
 };
 
 // sys_vm block (RPCS3 sys_vm.h sys_vm_t): IDs 1..16 in their own table, one block per 256 MB area.
@@ -501,6 +505,7 @@ struct Kernel::Impl {
 
     std::mutex ipc_mutex;
     std::map<std::pair<u32, u64>, std::weak_ptr<Object>> ipc; // (type, key) -> object
+    std::vector<std::shared_ptr<SharedMemory>> system_memories; // the system software's, kept here; under ipc_mutex
 
     std::mutex join_mutex; // PpuThread join state transitions
     std::shared_ptr<HostThreads> host_threads = std::make_shared<HostThreads>();

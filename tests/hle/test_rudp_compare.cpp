@@ -1262,6 +1262,9 @@ void failures(Run& h, u16 port)
     h.ctx_status(knocker, w + "the client refused");
     h.ctx_status(idle, w + "the context that does not listen");
     h.option(knocker, 14, 4, w + "LAST_ERROR after the refusal");
+    // Ended here: the refused client goes on sending its SYN on a real-time timer, and whether one of those shares a
+    // datagram with a later client's SYN depends on the machine's load (D-924).
+    h.r("cellRudpTerminate", {static_cast<u64>(knocker)}, w + "Terminate the refused client");
 
     const s32 lis = h.create(w + "a listener");
     h.set(lis, 13, 0, w + "the listener: no cookies");
@@ -1288,7 +1291,7 @@ void failures(Run& h, u16 port)
         }
         h.r("cellRudpTerminate", {static_cast<u64>(c)}, k + ": Terminate");
     }
-    for (const s32 c : {idle, knocker, lis}) h.r("cellRudpTerminate", {static_cast<u64>(c)}, w + "Terminate");
+    for (const s32 c : {idle, lis}) h.r("cellRudpTerminate", {static_cast<u64>(c)}, w + "Terminate");
     h.settle(w + "lingering");
     h.events(w + "lingering");
     h.status(w + "the end");

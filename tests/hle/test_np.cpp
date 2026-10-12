@@ -2046,7 +2046,7 @@ TEST_CASE("sceNpMatching offline: one context; dialogs answered as cancelled aft
     CHECK(g.call("sceNpMatchingJoinRoomGUI", ctx, kRoom, kGuiOpd, kArg) == kMatchCtxNotFound);
 }
 
-TEST_CASE("sceNpCommerce (version 1): RPCS3's checks and TODO answers; product categories as RPCS3 fills them",
+TEST_CASE("sceNpCommerce (version 1): RPCS3's checks and TODO answers; product categories as libsysutil_np parses them",
     "[hle][np]")
 {
     constexpr u64 kComUnsupported = 0xFFFFFFFF80029404ull, kComInsufficientBuffer = 0xFFFFFFFF8002940Eull,
@@ -2075,54 +2075,90 @@ TEST_CASE("sceNpCommerce (version 1): RPCS3's checks and TODO answers; product c
     CHECK(g.call("sceNpCommerceGetProductCategoryAbort", 1) == 0);
     CHECK(g.call("sceNpCommerceDestroyCtx", 1) == 0);
 
-    // A product category: the data and its size are recorded, then the version, then the currency (16 bytes).
+    // A product category, as libsysutil_np parses it (D-921, compared in test_np_commerce_compare.cpp): the data and
+    // size kept first, then the version (1), the status and the currency, whose decimals make dval.
+    constexpr u64 kComGpcVersion = 0xFFFFFFFF8002942Aull, kComServer = 0xFFFFFFFF80029600ull;
     std::memset(b + kPc, 0xEE, 32);
-    CHECK(g.call("sceNpCommerceInitProductCategory", 0, kData0, 100) == kComParse);
+    std::memset(b + kData0, 0, 0x2000);
+    CHECK(g.call("sceNpCommerceInitProductCategory", 0, kData0, 100) == kComParse); // pspocket refuses (logged)
     CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 3) == kComParse);
     CHECK(ps_read32(b, kPc + 4) == kData0);
     CHECK(ps_read32(b, kPc + 8) == 3);
     CHECK(ps_read32(b, kPc) == 0xEEEEEEEEu);
-    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 15) == kComParse);
-    CHECK(ps_read32(b, kPc) == 1);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 16) == kComGpcVersion);
+    CHECK(ps_read32(b, kPc) == 0);
+    ps_write32(b, kData0, 1);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 7) == kComParse);
+    ps_write32(b, kData0 + 4, 7);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 16) == (kComServer | 7));
+    ps_write32(b, kData0 + 4, 0x1234);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 16) == kComServer);
+    ps_write32(b, kData0 + 4, 0);
+    CHECK(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 15) == kComParse); // no room for the currency
+    std::memcpy(b + kData0 + 8, "EURx", 4);
+    ps_write32(b, kData0 + 12, 2);
     REQUIRE(g.call("sceNpCommerceInitProductCategory", kPc, kData0, 16) == 0);
-    CHECK(ps_read32(b, kPc + 12) == 0); // dval
+    CHECK(ps_read32(b, kPc + 12) == 100); // dval: 10 to the decimals
+    CHECK(b[kData0 + 11] == 0);           // the currency code NUL-terminated in the data
 
-    // The infos and counts need data of a size; the info points at the category.
+    // The infos point at their records in the data, with each record's strings NUL-terminated; counts need their
+    // place in the data.
     std::memset(b + kInfo, 0, 16);
-    CHECK(g.call("sceNpCommerceGetCurrencyInfo", 0, kInfo) == kComCurrencyNotFound);
+    ps_write32(b, kPc + 8, 15);
+    CHECK(g.call("sceNpCommerceGetCurrencyInfo", kPc, kInfo) == kComCurrencyNotFound);
+    ps_write32(b, kPc + 8, 16);
     REQUIRE(g.call("sceNpCommerceGetCurrencyInfo", kPc, kInfo) == 0);
     CHECK(ps_read32(b, kInfo) == kPc);
-    CHECK(g.call("sceNpCommerceGetCurrencyInfo", kPc, 0) == 0);
+    CHECK(ps_read32(b, kInfo + 4) == kData0 + 8);
+    CHECK(g.call("sceNpCommerceGetCurrencyCode", kInfo) == kData0 + 8);
+    CHECK(g.call("sceNpCommerceGetCurrencyDecimals", kInfo) == 2);
     CHECK(g.call("sceNpCommerceGetCategoryInfo", kPc, kInfo) == kComCategoryNotFound);
     CHECK(g.call("sceNpCommerceGetNumOfChildCategory", kPc, kOut) == kComChildCountNotFound);
     CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == kComSkuCountNotFound);
-    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == 0); // RPCS3: at most 780 bytes
     ps_write32(b, kPc + 8, 776);
-    CHECK(g.call("sceNpCommerceGetCategoryInfo", kPc, kInfo) == 0);
-    ps_write32(b, kPc + 8, 780);
-    CHECK(g.call("sceNpCommerceGetNumOfChildCategory", kPc, kOut) == 0);
-    CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == 0);
-    CHECK(ps_read32(b, kOut) == 0); // not written (the result above left 0)
-    ps_write32(b, kPc + 8, 781);
-    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == kComSkuInfoNotFound);
-    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, 0) == kComSkuInfoNotFound);
+    std::memset(b + kData0 + 16, 'x', 760);
+    REQUIRE(g.call("sceNpCommerceGetCategoryInfo", kPc, kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 4) == kData0 + 16);
+    for (const u32 nul : {55u, 247u, 631u, 759u}) CHECK(b[kData0 + 16 + nul] == 0);
+    CHECK(g.call("sceNpCommerceGetCategoryName", kInfo) == kData0 + 16 + 56);
+    CHECK(g.call("sceNpCommerceGetCategoryDescription", kInfo) == kData0 + 16 + 248);
+    CHECK(g.call("sceNpCommerceGetCategoryImageURL", kInfo) == kData0 + 16 + 632);
+    // One child category, then two SKUs.
+    ps_write32(b, kData0 + 776, 1);
+    ps_write32(b, kData0 + 780 + 760, 2);
     ps_write32(b, kPc + 8, 1539);
+    CHECK(g.call("sceNpCommerceGetNumOfChildCategory", kPc, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 1);
     CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, kInfo) == kComChildInfoNotFound);
-    ps_write32(b, kPc + 8, 1540);
+    CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == kComSkuCountNotFound);
+    ps_write32(b, kPc + 8, 1544);
     CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, kInfo) == 0);
-    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 1, kInfo) == kComChildInfoNotFound);
-    CHECK(g.call("sceNpCommerceGetChildCategoryInfo", kPc, 0, 0) == kComChildInfoNotFound);
-    CHECK(g.call("sceNpCommerceGetCurrencyDecimals", kInfo) == 0);
+    CHECK(ps_read32(b, kInfo + 4) == kData0 + 780);
+    CHECK(g.call("sceNpCommerceGetNumOfChildProductSku", kPc, kOut) == 0);
+    CHECK(ps_read32(b, kOut) == 2);
+    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == kComSkuInfoNotFound);
+    ps_write32(b, kPc + 8, 1548);
+    REQUIRE(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 0, kInfo) == 0);
+    const u32 sku = kData0 + 784 + 760;
+    CHECK(ps_read32(b, kInfo + 4) == sku);
+    CHECK(g.call("sceNpCommerceGetSkuId", kInfo) == sku);
+    CHECK(g.call("sceNpCommerceGetProductId", kInfo) == sku + 56);
+    CHECK(g.call("sceNpCommerceGetProductName", kInfo) == sku + 104);
+    CHECK(g.call("sceNpCommerceGetSkuName", kInfo) == sku + 296);
+    CHECK(g.call("sceNpCommerceGetSkuDescription", kInfo) == sku + 360);
+    CHECK(g.call("sceNpCommerceGetSkuImageURL", kInfo) == sku + 744);
+    CHECK(g.call("sceNpCommerceGetSkuUserData", kInfo) == sku + 872);
+    CHECK(g.call("sceNpCommerceGetChildProductSkuInfo", kPc, 1, kInfo) == kComSkuInfoNotFound);
 
-    // A price: the fraction is 0 without a dval; with one, nothing is written.
-    ps_write32(b, kPrice + 4, 0x55);
-    ps_write32(b, kInfo, kPc);
+    // A price: the SKU's word at +1000 split by dval (whole, fraction), or whole as it is without one.
+    ps_write32(b, sku + 1000, 1999);
     g.call("sceNpCommerceGetSkuPrice", kInfo, kPrice);
+    CHECK(ps_read32(b, kPrice) == 19);
+    CHECK(ps_read32(b, kPrice + 4) == 99);
+    ps_write32(b, kPc + 12, 0);
+    g.call("sceNpCommerceGetSkuPrice", kInfo, kPrice);
+    CHECK(ps_read32(b, kPrice) == 1999);
     CHECK(ps_read32(b, kPrice + 4) == 0);
-    ps_write32(b, kPrice + 4, 0x55);
-    ps_write32(b, kPc + 12, 100);
-    g.call("sceNpCommerceGetSkuPrice", kInfo, kPrice);
-    CHECK(ps_read32(b, kPrice + 4) == 0x55);
 
     // Destroying the category forgets its data.
     g.call("sceNpCommerceDestroyProductCategory", kPc);
@@ -2332,4 +2368,85 @@ TEST_CASE("sceNpUtil's bandwidth test: a fake of about 100 ms, as RPCS3; one at 
     REQUIRE(g.call("sceNpUtilBandwidthTestShutdown", 0) == 0);
     CHECK(ps_read32(b, kResult) == 0xAAAAAAAAu);
     CHECK(g.call("sceNpUtilBandwidthTestGetStatus") == kNotInit);
+}
+
+TEST_CASE("libsysutil_np's requests to the system's NP service: the client heap on NP's pool, the channels closed (D-921)",
+    "[hle][np]")
+{
+    constexpr u64 kDrmInternal = 0xFFFFFFFF80029517ull;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtxOut = kData + 0x200;
+    write_nop(b);
+    // Before sceNpInit there is no client heap (Sony's is 0: liblv2 says so) and no purchase.
+    CHECK(g.call("_sceNpSysutilClientMalloc", 64) == 0);
+    CHECK(g.call("sceNpDrmExecuteGamePurchase") == kDrmInternal);
+    REQUIRE(g.call("sceNpInit", 0x20000, kPool) == 0);
+    // The heap is the pool, 0x18000 bytes of it the receive buffer.
+    const u32 p = static_cast<u32>(g.call("_sceNpSysutilClientMalloc", 64));
+    CHECK(p >= kPool);
+    CHECK(p < kPool + 0x20000);
+    CHECK(g.call("_sceNpSysutilClientMalloc", 0x10000) == 0);
+    CHECK(g.call("_sceNpSysutilClientFree", p) == 0);
+    // pspocket's console has no system software: a request ends with its closed channel's error.
+    const u64 purchase = g.call("sceNpDrmExecuteGamePurchase");
+    INFO(std::format("purchase {:#x}", purchase));
+    CHECK(static_cast<s32>(purchase) < 0);
+    CHECK(purchase != kDrmInternal);
+    // While matching 2 runs the older matching library refuses.
+    put_np_id(b, kNpId, "");
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 1);
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == kMatchUnavailable);
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 0x100); // the low byte only
+    CHECK(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) != kMatchUnavailable);
+    REQUIRE(g.call("sceNpTerm") == 0);
+    CHECK(g.call("_sceNpSysutilClientMalloc", 64) == 0);
+}
+
+TEST_CASE("NP's last stubs: matching's cancels and room messages, Plus, TSS without a limit, a product list's result, "
+          "the second authorization code (D-923)",
+    "[hle][np]")
+{
+    constexpr u64 kMatchTooBig = 0xFFFFFFFF8002A70Dull, kMatchNoRequest = 0xFFFFFFFF8002A727ull;
+    Fixture f;
+    GuestThread g(f, 0, "np");
+    u8* b = f.base();
+    constexpr u32 kNpId = kData + 0x100, kCtxOut = kData + 0x200, kMsg = kData + 0x300, kRoom = kData + 0x400;
+    write_nop(b);
+    CHECK(g.call("sceNpManagerIsSP") == 0);
+    CHECK(g.call("sceNpMatchingCancelRequest", 0x9001, 6u << 23) == kMatchNotInit);
+    CHECK(g.call("sceNpMatchingCancelRequestGUI", 0x9001) == 0);
+    np_up(g); // sceNp2Init brings NP up too
+    CHECK(g.call("sceNpManagerIsSP") == 0);
+    CHECK(g.call("sceNpMatchingCancelRequest", 0x9001, 6u << 23) == kMatchCtxNotFound);
+    put_np_id(b, kNpId, "");
+    REQUIRE(g.call("sceNpMatchingCreateCtx", kNpId, kNopOpd, 0, kCtxOut) == 0);
+    const u32 ctx = ps_read32(b, kCtxOut);
+    CHECK(g.call("sceNpMatchingCancelRequest", ctx, 5u << 23) == kMatchInvalReqId);
+    for (const u32 kind : {6u, 15u, 23u}) CHECK(g.call("sceNpMatchingCancelRequest", ctx, kind << 23) == kMatchNoRequest);
+    // A room message: its words, its size (1 to 256), then the context; no room offline.
+    std::memset(b + kMsg, 0, 16);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, 0, kRoom) == kMatchInval);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchInval);
+    ps_write32(b, kMsg, 1);
+    ps_write32(b, kMsg + 8, kData + 0x800);
+    ps_write32(b, kMsg + 12, 257);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchTooBig);
+    ps_write32(b, kMsg + 12, 256);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", 0x9002, kMsg, kRoom) == kMatchCtxNotFound);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchRoomNotFound);
+    // Matching 2 running: the older library's calls refuse first.
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 1);
+    CHECK(g.call("sceNpMatchingCancelRequestGUI", ctx) == kMatchUnavailable);
+    CHECK(g.call("sceNpMatchingSendRoomMessage", ctx, kMsg, kRoom) == kMatchUnavailable);
+    g.call("_Z37sce_np_matching_set_matching2_runningb", 0);
+    CHECK(g.call("sceNpCommerce2DestroyGetProductInfoListResult", kData) == 0);
+    // TSS without a limit and the second authorization code answer as their neighbours do.
+    CHECK(g.call("sceNpTssGetDataNoLimit", 0x8001, 1, 0, 16, kData, 16, 0) ==
+          g.call("sceNpTssGetData", 0x8001, 1, 0, 16, kData, 16, 0));
+    CHECK(g.call("sceNpTssGetDataNoLimitAsync", 0x8001, 1, 0, 16, kData, 16, 0) ==
+          g.call("sceNpTssGetDataAsync", 0x8001, 1, 0, 16, kData, 16, 0));
+    CHECK(g.call("sceNpAuthGetAuthorizationCode2", 1, kData, kData, kData) ==
+          g.call("sceNpAuthGetAuthorizationCode", 1, kData, kData, kData));
 }

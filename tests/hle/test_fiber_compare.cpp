@@ -384,6 +384,15 @@ void workers(Run& h)
         h.r("cellFiberPpuUtilWorkerControlJoinFiber", {kControl, fiber_at(i), out(i)}, key);
         h.word_at(key + ": the status", out(i));
     }
+    // Both workers inside RunFibers (libfiber counts them in its word's top byte) before the control goes: a worker
+    // whose thread started late would meet the shutdown instead, which depends on the machine's load (D-927).
+    if (run_fibers) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (ps_read8(h.b, kControl + 0x200) < 2) {
+            REQUIRE(std::chrono::steady_clock::now() < until);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
     h.r("cellFiberPpuUtilWorkerControlFinalize", {kControl}, "WorkerControlFinalize with the workers running");
     h.r("cellFiberPpuUtilWorkerControlShutdown", {kControl}, "WorkerControlShutdown");
     for (std::thread& t : threads) t.join();

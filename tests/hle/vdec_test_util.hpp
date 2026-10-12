@@ -44,6 +44,12 @@ struct InterpretMisses {
     InterpretMisses& operator=(const InterpretMisses&) = delete;
 };
 
+// The codec cores Sony's libvdec imports. pspocket has its own (D-920), so Sony's libvdec loaded in a test gets
+// pspocket's unless these are forced to their firmware modules too: the comparisons with Sony's libvdec force them, so
+// they compare with Sony's cores (FirmwareLibrary's `also`, compare::Setup::forced).
+inline const std::vector<std::string> kVideoCores = {"libavcdec", "libdivx311dec", "libdivxdec", "libmvcdec", "libsjvtd",
+    "libsmvd2", "libsmvd4", "libsvc1d"};
+
 // Guest memory: the scratch area for the callback, its log and the arguments; a larger area for the decoder.
 constexpr u32 kCode = kData, kOpd = kData + 0x400, kLog = kData + 0x1000;
 constexpr u32 kArgs = kData + 0x4000, kType = kArgs, kAttr = kArgs + 0x20, kRes = kArgs + 0x40, kCb = kArgs + 0x60,

@@ -576,6 +576,24 @@ s32 sceNpTssGetDataAsync(PPUContext&, s32 trans_id, s32 slot, u32 status, u32 st
     return tss_get_data("sceNpTssGetDataAsync", trans_id);
 }
 
+// sceNpTssGetDataNoLimit / ...Async (D-923): libsysutil_np_tus runs GetData's code with the data's size limit off;
+// offline they answer as GetData does.
+s32 sceNpTssGetDataNoLimit(PPUContext&, s32 trans_id, s32 slot, u32 status, u32 status_size, u32 data, u32 recv_size,
+    u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpTssGetDataNoLimit: slot {}, status {:#x} ({}), {} bytes into {:#x}, option {:#x}", slot,
+        status, status_size, recv_size, data, option);
+    return tss_get_data("sceNpTssGetDataNoLimit", trans_id);
+}
+
+s32 sceNpTssGetDataNoLimitAsync(PPUContext&, s32 trans_id, s32 slot, u32 status, u32 status_size, u32 data,
+    u32 recv_size, u32 option)
+{
+    PS_LOG_DEBUG(kChan, "sceNpTssGetDataNoLimitAsync: slot {}, status {:#x} ({}), {} bytes into {:#x}, option {:#x}",
+        slot, status, status_size, recv_size, data, option);
+    return tss_get_data("sceNpTssGetDataNoLimitAsync", trans_id);
+}
+
 } // namespace
 
 void register_sceNpTus(Registry& r)
@@ -641,6 +659,8 @@ void register_sceNpTus(Registry& r)
         PS_HLE_FUNC(0x3E4A2075, sceNpTusGetFriendsDataStatusAsync),
         PS_HLE_FUNC(0x56D3A5AB, sceNpTssGetData),
         PS_HLE_FUNC(0x1E0870D1, sceNpTssGetDataAsync),
+        PS_HLE_FUNC(0xF46D8AE5, sceNpTssGetDataNoLimit),
+        PS_HLE_FUNC(0x7240C64D, sceNpTssGetDataNoLimitAsync),
     });
 }
 

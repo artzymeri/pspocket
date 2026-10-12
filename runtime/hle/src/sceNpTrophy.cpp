@@ -917,6 +917,201 @@ s32 sceNpTrophyUnlockTrophy(PPUContext& ctx, u32 context, u32 handle, s32 trophy
                                   : std::string(": unlocked"));
 }
 
+// ---------------------------------------------------------------------------- the later queries (D-922)
+//
+// Sony's libsysutil_np_trophy (4.92) asks the system software's trophy service for these as for the others (request
+// 295 on channel 1, a cxml document: "2" game info, "3" trophy info, "k" latest trophies, "j" user info, "a" network
+// sync). pspocket's trophy service is this module, so they answer from the installed sets as GetGameInfo and
+// GetTrophyInfo do; Sony's own checks come first, in its order. Unverified (D-594): the system's side is in no module.
+
+// sceNpTrophyGetGameDetails(context, handle, SceNpTrophyGameDetails* details, u64 options): GetGameInfo's details
+// alone. No details: INVALID_ARGUMENT before anything; options: NOT_SUPPORTED once the context and handle are known.
+s32 sceNpTrophyGetGameDetails(PPUContext& ctx, u32 context, u32 handle, u32 details, u64 options)
+{
+    if (!details) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    if (options) {
+        TrophyState& s = trophy();
+        std::lock_guard lock(s.mutex);
+        if (!s.initialized) return error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+        const Lookup l = get_context(s, context, handle);
+        if (l.error) return l.error;
+        return error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED);
+    }
+    return sceNpTrophyGetGameInfo(ctx, context, handle, details, 0);
+}
+
+// sceNpTrophyGetTrophyDetails(context, handle, SceNpTrophyFlagArray* flags, SceNpTrophyDetails* details, u32* count,
+// u64 options): the details of the trophies whose bits are set, *count of them at most; *count is set to 0 first, then
+// to those written. Sony's asks in requests of up to 12 trophies: from bit position p it takes the next set bits (up to
+// *count - p of them) and writes their details from details[p], p being where that request's scan began, so a set that
+// is not one run from trophy 0 spreads over the array as Sony's spreads it. A request for an empty batch is made too
+// (none written). Sony's goes on asking while *count is past the position, without end when it is past 128: here the
+// loop stops at 128 (logged).
+s32 sceNpTrophyGetTrophyDetails(PPUContext& ctx, u32 context, u32 handle, u32 flags, u32 details, u32 count, u64 options)
+{
+    if (!flags || !details || !count) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, count, 4, "sceNpTrophyGetTrophyDetails: count")) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    u8* base = guest_base(ctx);
+    const u32 room = ps_read32(base, count);
+    ps_write32(base, count, 0);
+    if (!room) return lv2::CELL_OK;
+    if (!usable(ctx, flags, kFlagArraySize, "sceNpTrophyGetTrophyDetails: flags")) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    const auto flag = [&](u32 id) { return (ps_read32(base, flags + 4 * (id / 32)) >> (id % 32)) & 1; };
+    u32 pos = 0;
+    s32 r = lv2::CELL_OK;
+    for (;;) {
+        std::vector<u32> batch;
+        u32 next = pos;
+        if (pos <= kFlagSetSize - 1) {
+            const u32 want = std::min(room - pos, 12u);
+            for (; next < kFlagSetSize && batch.size() < want; next++)
+                if (flag(next)) batch.push_back(next);
+        }
+        // The request: the context's checks, then each trophy's details as GetTrophyInfo gives them.
+        {
+            TrophyState& s = trophy();
+            std::lock_guard lock(s.mutex);
+            if (!s.initialized) return error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+            const Lookup l = get_context(s, context, handle);
+            if (l.error) return l.error;
+            if (options) return error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED);
+        }
+        for (usize k = 0; k < batch.size(); k++) {
+            r = sceNpTrophyGetTrophyInfo(ctx, context, handle, static_cast<s32>(batch[k]),
+                details + (pos + static_cast<u32>(k)) * kDetailsSize, 0);
+            if (r < 0) return r;
+        }
+        ps_write32(base, count, ps_read32(base, count) + static_cast<u32>(batch.size()));
+        if (room <= next) return r;
+        if (next >= kFlagSetSize && batch.empty()) {
+            PS_LOG_WARN(kChan, "sceNpTrophyGetTrophyDetails: *count {} past the 128 flags; Sony's would ask without end",
+                room);
+            return r;
+        }
+        pos = next;
+    }
+}
+
+// The trophies unlocked in the user's installed sets, newest first: {communication ID directory, trophy ID, tick}.
+struct LatestTrophy {
+    std::string set;
+    u32 id = 0;
+    u64 tick = 0;
+};
+
+std::vector<LatestTrophy> latest_trophies(PPUContext& ctx)
+{
+    std::vector<LatestTrophy> out;
+    const std::string home = thread_of(ctx).kernel.vfs_host_path(std::string(kTrophyHome));
+    std::error_code ec;
+    if (home.empty() || !fs::is_directory(home, ec)) return out;
+    for (const auto& entry : fs::directory_iterator(home, ec)) {
+        const fs::path usr = entry.path() / "TROPUSR.DAT", conf = entry.path() / "TROPCONF.SFM";
+        if (!fs::is_regular_file(usr, ec) || !fs::is_regular_file(conf, ec)) continue;
+        trophy::TropUsr t;
+        if (!t.load(usr, conf).success) continue;
+        for (u32 id = 0; id < t.trophy_count(); id++)
+            if (t.unlocked(id)) out.push_back({entry.path().filename().string(), id, t.timestamp(id)});
+    }
+    std::stable_sort(out.begin(), out.end(), [](const LatestTrophy& a, const LatestTrophy& b) { return a.tick > b.tick; });
+    return out;
+}
+
+// sceNpTrophyGetLatestTrophies(handle, SceNpId* npId, u32 max, entries, u32* count, u64 options): the user's latest
+// unlocked trophies over every set of the system's, newest first, max of them: 32-byte entries, the trophy's data
+// (be64 tick, be32 ID, be32 1: the reply's word, as Sony's parser stores it) then its communication ID (nine
+// characters, NUL, the number). No npId, entries or count: INVALID_ARGUMENT; options: NOT_SUPPORTED; then the handle.
+// pspocket's console has one user: any npId is taken as that user's.
+s32 sceNpTrophyGetLatestTrophies(PPUContext& ctx, u32 handle, u32 np_id, u32 max, u32 entries, u32 count, u64 options)
+{
+    if (!np_id || !entries || !count) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    if (options) return error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED);
+    {
+        TrophyState& s = trophy();
+        std::lock_guard lock(s.mutex);
+        if (!s.initialized) return error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+        if (!in_range(handle)) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+        const TrophyHandle* h = s.handles.find(handle);
+        if (!h) return error(SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE);
+        if (h->aborted) return error(SCE_NP_TROPHY_ERROR_ABORT);
+    }
+    const std::vector<LatestTrophy> latest = latest_trophies(ctx);
+    const u32 n = static_cast<u32>(std::min<usize>(latest.size(), max));
+    if (!usable(ctx, count, 4, "sceNpTrophyGetLatestTrophies: count") ||
+        (n && !usable(ctx, entries, n * 32, "sceNpTrophyGetLatestTrophies: entries"))) {
+        return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    }
+    u8* base = guest_base(ctx);
+    for (u32 i = 0; i < n; i++) {
+        const u32 e = entries + 32 * i;
+        std::memset(base + e, 0, 32);
+        ps_write64(base, e, latest[i].tick);
+        ps_write32(base, e + 8, latest[i].id);
+        ps_write32(base, e + 12, 1);
+        const std::string& set = latest[i].set; // "NPWR01234_00"
+        std::memcpy(base + e + 16, set.data(), std::min<usize>(set.size(), 9));
+        if (set.size() >= 12) ps_write8(base, e + 26, static_cast<u8>(std::atoi(set.c_str() + 10)));
+    }
+    ps_write32(base, count, n);
+    return logged(lv2::CELL_OK, "sceNpTrophyGetLatestTrophies(handle {}, max {}): {} of {}", handle, max, n,
+        latest.size());
+}
+
+// The user's name: /dev_hdd0/home/00000001/localusername, as cellUserInfoGetStat reads it; "User" without it.
+std::string local_user_name(PPUContext& ctx)
+{
+    const std::string path = thread_of(ctx).kernel.vfs_host_path("/dev_hdd0/home/00000001/localusername");
+    std::ifstream in(path, std::ios::binary);
+    std::string name;
+    if (!path.empty() && in) std::getline(in, name, '\0');
+    while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+    return name.empty() ? std::string("User") : name;
+}
+
+// sceNpTrophyGetUserInfo(handle, SceNpId* npId, user_info, u64 options): the system's 48-byte user information string
+// ("user_info"): pspocket's user's name as cellUserInfo has it. No npId or user_info: INVALID_ARGUMENT; options:
+// NOT_SUPPORTED; then the handle.
+s32 sceNpTrophyGetUserInfo(PPUContext& ctx, u32 handle, u32 np_id, u32 user_info, u64 options)
+{
+    if (!np_id || !user_info) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    if (options) return error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED);
+    {
+        TrophyState& s = trophy();
+        std::lock_guard lock(s.mutex);
+        if (!s.initialized) return error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+        if (!in_range(handle)) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+        const TrophyHandle* h = s.handles.find(handle);
+        if (!h) return error(SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE);
+        if (h->aborted) return error(SCE_NP_TROPHY_ERROR_ABORT);
+    }
+    if (!usable(ctx, user_info, 48, "sceNpTrophyGetUserInfo: user_info")) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    put_string(guest_base(ctx), user_info, 48, local_user_name(ctx));
+    return logged(lv2::CELL_OK, "sceNpTrophyGetUserInfo(handle {})", handle);
+}
+
+// sceNpTrophyNetworkSync(handle, callback, arg, u64 options): Sony's keeps the callback, asks the system to synchronise
+// the user's trophies with the server and calls callback(12, 0, 0, arg) when the reply's "reqsync" is 0, (10, 0, 0, arg)
+// otherwise, before it returns. pspocket's console is offline: the synchronisation fails, the callback hears 10.
+// Options: NOT_SUPPORTED, before the handle.
+s32 sceNpTrophyNetworkSync(PPUContext& ctx, u32 handle, u32 callback, u32 arg, u64 options)
+{
+    if (options) return error(SCE_NP_TROPHY_ERROR_NOT_SUPPORTED);
+    {
+        TrophyState& s = trophy();
+        std::lock_guard lock(s.mutex);
+        if (!s.initialized) return error(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+        if (!in_range(handle)) return error(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+        const TrophyHandle* h = s.handles.find(handle);
+        if (!h) return error(SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE);
+        if (h->aborted) return error(SCE_NP_TROPHY_ERROR_ABORT);
+    }
+    PS_LOG_INFO(kChan, "sceNpTrophyNetworkSync(handle {}): offline, the synchronisation fails", handle);
+    if (callback && usable(ctx, callback, 8, "sceNpTrophyNetworkSync: callback")) call_guest(ctx, callback, {10, 0, 0, arg});
+    return lv2::CELL_OK;
+}
+
 // ------------------------------------------------------------------------------------- progress, flags and icons
 
 // sceNpTrophyGetGameProgress(context, handle, s32* percentage): the share of the set's trophies that are unlocked, in
@@ -1124,6 +1319,11 @@ void register_sceNpTrophy(Registry& r)
         PS_HLE_FUNC(0x1197B52C, sceNpTrophyRegisterContext),
         PS_HLE_FUNC(0x49D18217, sceNpTrophyGetGameInfo),
         PS_HLE_FUNC(0xFCE6D30A, sceNpTrophyGetTrophyInfo),
+        PS_HLE_UNVERIFIED(0x79770E3B, sceNpTrophyGetGameDetails),
+        PS_HLE_UNVERIFIED(0xF0F87A60, sceNpTrophyGetTrophyDetails),
+        PS_HLE_UNVERIFIED(0x9BD1F890, sceNpTrophyGetLatestTrophies),
+        PS_HLE_UNVERIFIED(0xB5573004, sceNpTrophyGetUserInfo),
+        PS_HLE_UNVERIFIED(0x014786F2, sceNpTrophyNetworkSync),
         PS_HLE_FUNC(0x8CEEDD21, sceNpTrophyUnlockTrophy),
         PS_HLE_FUNC(0x079F0E87, sceNpTrophyGetGameProgress),
         PS_HLE_FUNC(0xB3AC3478, sceNpTrophyGetTrophyUnlockState),

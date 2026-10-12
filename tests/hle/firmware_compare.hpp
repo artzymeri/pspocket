@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "guest.hpp" // runtime/hle/src: call_guest
 #include "hle_test_util.hpp"
@@ -28,17 +29,21 @@ inline std::optional<std::string> test_dev_flash()
 
 // The firmware module exporting `library`, loaded into `f` and started on `t`. Its functions are called by NID.
 // `start` false leaves module_start out: liblv2's is the process's own start-up (it loads the process's modules
-// through lv2), which a test's functions do not need.
+// through lv2), which a test's functions do not need. `also`: libraries the module imports whose firmware modules it is
+// given too, whatever the host has (Sony's libvdec with Sony's codec cores, once pspocket has cores of its own, D-920);
+// the module's other imports go to the host where it has them.
 struct FirmwareLibrary {
     std::string library;
     loader::LleModules lle;
     const loader::PrxModule* module = nullptr;
 
-    FirmwareLibrary(Fixture& f, GuestThread& t, const std::string& dev_flash, std::string lib, bool start = true)
+    FirmwareLibrary(Fixture& f, GuestThread& t, const std::string& dev_flash, std::string lib, bool start = true,
+        const std::vector<std::string>& also = {})
         : library(std::move(lib)), lle(dev_flash)
     {
         REQUIRE(lle.index());
         lle.force(library); // its module, whatever the host has
+        for (const std::string& other : also) lle.force(other);
         std::string why;
         module = lle.load(library, *f.hle, &why);
         INFO(why);

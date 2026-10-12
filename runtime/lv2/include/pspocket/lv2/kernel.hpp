@@ -320,6 +320,16 @@ public:
     std::shared_ptr<EventQueue> event_queue_by_key(u64 key) const;
     // An event flag by ID, or null (SPU code sets event flag bits through its interrupt mailbox).
     std::shared_ptr<EventFlag> event_flag(u32 id) const;
+    // A shared memory of the system software's under the IPC key `key` (RPCS3 init_system_shared_memory: an
+    // lv2_memory with a system handle), as the system software makes the ones a process opens by key: `size` bytes in
+    // the page size of `flags` (SYS_MEMORY_PAGE_SIZE_64K or 1M), charged to none of the process's containers, kept by
+    // the kernel. The process's sys_mmapper_allocate_shared_memory of the key, other than as newly created, then opens
+    // it, one handle at a time. For a system side a test plays (pspocket's console has no system software). False when
+    // the key is taken or the size does not suit the page size.
+    bool create_system_shared_memory(u64 key, u32 size, u64 flags);
+    // Whether lv2 has a shared memory under the IPC key `key` (HLE modules that would wait for one the system software
+    // makes).
+    bool shared_memory_key_exists(u64 key) const;
 
     // Gives the calling host thread an lv2 thread identity bound to `ctx` (ctx.runtime is set), so it can make
     // syscalls: tests, HLE helper threads. No guest stack is allocated. Undo with detach_thread().

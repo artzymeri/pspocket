@@ -62,6 +62,12 @@ struct Setup {
     Mode mode = Mode::Firmware;
     std::string flash; // the installed /dev_flash (Firmware)
     bool print = false;
+    // Libraries the Sony half gives Sony's module of the compared library their firmware modules too (Sony's codec cores
+    // under Sony's libvdec, once pspocket has its own, D-920): what that module imports goes to the host otherwise.
+    std::vector<std::string> forced;
+    // The pspocket half runs Sony's module of the compared library too, over pspocket's libraries (the Sony half over
+    // the firmware's `forced` ones): pspocket's codec cores driven by Sony's libvdec as a game's would be (D-920).
+    bool ours_on_firmware = false;
 };
 
 inline bool env_on(const char* name)
@@ -347,13 +353,19 @@ public:
     Side(Fixture& f, GuestThread& t, const Setup& s, bool sony_half, std::string library, bool start = true)
         : f_(f), t_(t), library_(std::move(library)), sony_half_(sony_half)
     {
-        if (sony_half_ && s.mode == Mode::Firmware)
-            firmware_ = std::make_unique<FirmwareLibrary>(f, t, s.flash, library_, start);
+        if (s.mode == Mode::Firmware && (sony_half_ || s.ours_on_firmware))
+            firmware_ = std::make_unique<FirmwareLibrary>(f, t, s.flash, library_, start,
+                sony_half_ ? s.forced : std::vector<std::string>{});
     }
 
+    // Whether the library's calls go to a firmware module (Sony's half; or both, Setup::ours_on_firmware).
     bool sony() const { return firmware_ != nullptr; }
     bool sony_half() const { return sony_half_; }
-    std::string who() const { return sony() ? "Sony" : sony_half_ ? "pspocket (again)" : "pspocket"; }
+    std::string who() const
+    {
+        if (firmware_ && !sony_half_) return "pspocket (under Sony's " + library_ + ")";
+        return sony() ? "Sony" : sony_half_ ? "pspocket (again)" : "pspocket";
+    }
     const std::string& library() const { return library_; }
     const FirmwareLibrary* firmware() const { return firmware_.get(); }
 

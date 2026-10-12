@@ -25,6 +25,7 @@
 #include <initializer_list>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -40,10 +41,12 @@
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/nid.hpp"
 #include "pspocket/recomp/npd.hpp"
 #include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "sysutil.hpp"
+#include "sysutil_cxml.hpp"
 
 namespace pspocket::hle {
 namespace {
@@ -99,10 +102,12 @@ enum : u32 {
     SCE_NP_MATCHING_ERROR_INVALID_ARG = 0x8002A703,
     SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND = 0x8002A709,
     SCE_NP_MATCHING_ERROR_ROOM_NOT_FOUND = 0x8002A70B,
+    SCE_NP_MATCHING_ERROR_TOO_BIG_VALUE = 0x8002A70D,
     SCE_NP_MATCHING_ERROR_INVALID_ATTR_ID = 0x8002A70F,
     SCE_NP_MATCHING_ERROR_CTX_STILL_RUNNING = 0x8002A713,
     SCE_NP_MATCHING_ERROR_CTX_MAX = 0x8002A716,
     SCE_NP_MATCHING_ERROR_INVALID_REQ_ID = 0x8002A717,
+    SCE_NP_MATCHING_ERROR_REQUEST_NOT_FOUND = 0x8002A727,
     SCE_NP_MATCHING_ERROR_RESULT_NOT_FOUND = 0x8002A718,
     SCE_NP_MATCHING_ERROR_BUSY = 0x8002A719,
     SCE_NP_MATCHING_ERROR_COND_MAX = 0x8002A71D,
@@ -127,11 +132,14 @@ enum : u32 {
     SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND = 0x80029426,
     SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND = 0x80029427,
     SCE_NP_COMMERCE_ERROR_INVALID_SKU_NUM = 0x80029429,
+    SCE_NP_COMMERCE_ERROR_INVALID_GPC_PROTOCOL_VERSION = 0x8002942A,
+    SCE_NP_COMMERCE_BROWSE_SERVER_ERROR_UNKNOWN = 0x80029600,
     SCE_NP_PROFILE_ERROR_NOT_INITIALIZED = 0x8002AB41,
     SCE_NP_PROFILE_ERROR_INVALID_ARGUMENT = 0x8002AB48,
     SCE_NP_DRM_ERROR_INVALID_PARAM = 0x80029502,
     SCE_NP_DRM_ERROR_NO_ENTITLEMENT = 0x80029513,
     SCE_NP_DRM_ERROR_BAD_FORMAT = 0x80029515,
+    SCE_NP_DRM_ERROR_INTERNAL = 0x80029517,
     SCE_NP_DRM_ERROR_TIME_LIMIT = 0x8002951B,
     SCE_NP_DRM_ERROR_SERVICE_NOT_STARTED = 0x8002951E,
     SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND = 0x80029521,
@@ -214,7 +222,7 @@ constexpr u64 kRoomInfoInterval = 30'000'000; // the limited room info calls: on
 // Commerce (version 1): SceNpCommerceProductCategory {be32 version; data; be32 dataSize; be32 dval; reserved[16]};
 // the category, SKU and currency infos {pc; data; reserved[8]}; SceNpCommercePrice {be32 integer, fractional}.
 constexpr u32 SCE_NP_COMMERCE_VERSION = 1;
-constexpr u32 kPcVersion = 0, kPcData = 4, kPcDataSize = 8, kPcDval = 12, kPcSize = 32;
+constexpr u32 kPcVersion = 0, kPcData = 4, kPcDataSize = 8, kPcDval = 12;
 constexpr u32 kPriceFractional = 4;
 constexpr u32 SCE_NP_SIGNALING_CTX_MAX = 8;
 constexpr u32 SCE_NP_SIGNALING_CONN_STATUS_INACTIVE = 0;
@@ -321,6 +329,9 @@ struct NpState {
     std::mutex mutex;                     // everything below but `initialized`, which changes only with it held
     std::atomic<bool> initialized{false}; // sceNpInit's state (RPCS3 is_NP_init); sceNp2Init's is in sceNp2.cpp
     u32 pool_size = 0;                     // the pool's size while NP is up (np_memory)
+    u32 pool_ptr = 0;                      // and its address
+    u32 client_heap = 0, client_buffer = 0; // libsysutil_np's client heap and receive buffer on it (np_client)
+    bool matching2_running = false;         // sce_np_matching_set_matching2_running's flag (kept over NP's term)
     u32 manager_cb = 0, manager_cb_arg = 0;
     bool basic_handler_registered = false;
     u32 basic_handler = 0, basic_handler_arg = 0;
@@ -2960,7 +2971,7 @@ s32 sceNpSignalingCancelPeerNetInfo(PPUContext&, u32 ctx_id, u32 req_id)
 // RPCS3's first checks of most matching calls: matching 2 not in use, then NP.
 s32 matching_check(bool need_np)
 {
-    if (np_match2_initialized()) return error(SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE);
+    if (np_match2_initialized() || np().matching2_running) return error(SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE);
     if (need_np && !np().initialized) return error(SCE_NP_MATCHING_ERROR_NOT_INITIALIZED);
     return lv2::CELL_OK;
 }
@@ -3433,6 +3444,60 @@ s32 sceNpMatchingSetRoomSearchFlag(PPUContext&, u32 ctx_id, u32 lobby_id, u32 ro
 }
 
 // RPCS3 sceNpMatchingLeaveRoom: the context, then (RPCS3 ensure()s it) a room.
+// sceNpMatchingCancelRequest(ctx_id, req_id), libsysutil_np's (D-923): matching 2 and NP first, then the context, then
+// the request ID's kind (bits 23..28: 6, 15 or 23 are request IDs, else INVALID_REQ_ID); then Sony's asks the system
+// to cancel it. pspocket never issues a request offline, so none is there: REQUEST_NOT_FOUND.
+s32 sceNpMatchingCancelRequest(PPUContext&, u32 ctx_id, u32 req_id)
+{
+    if (const s32 r = matching_check(true)) return r;
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    const u32 kind = (req_id >> 23) & 0x3F;
+    if (kind > 23 || !((0x808040u >> kind) & 1)) return error(SCE_NP_MATCHING_ERROR_INVALID_REQ_ID);
+    PS_LOG_DEBUG(kChan, "sceNpMatchingCancelRequest(context {:#x}, request {:#x}): no such request offline", ctx_id,
+        req_id);
+    return error(SCE_NP_MATCHING_ERROR_REQUEST_NOT_FOUND);
+}
+
+// sceNpMatchingCancelRequestGUI(ctx_id): matching 2 first (Sony's checks neither NP nor the context), then a request
+// to the system to close the GUI. pspocket's matching GUIs are answered at once, so none is open: CELL_OK.
+s32 sceNpMatchingCancelRequestGUI(PPUContext&, u32 ctx_id)
+{
+    if (const s32 r = matching_check(false)) return r;
+    PS_LOG_DEBUG(kChan, "sceNpMatchingCancelRequestGUI(context {:#x}): no GUI is open", ctx_id);
+    return lv2::CELL_OK;
+}
+
+// sceNpMatchingSendRoomMessage(ctx_id, msg, room, ...): matching 2 and NP, then Sony's checks of the message (its
+// words at +0 and +8 set, its size at +12 1 to 256: past it TOO_BIG_VALUE) and the room, then the context; offline no
+// room is ever joined: ROOM_NOT_FOUND.
+s32 sceNpMatchingSendRoomMessage(PPUContext& ctx, u32 ctx_id, u32 msg, u32 room)
+{
+    if (const s32 r = matching_check(true)) return r;
+    if (!msg || !room) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (!guest_readable(thread_of(ctx), msg, 16)) {
+        log_call_site(ctx, guest_base(ctx), "sceNpMatchingSendRoomMessage: the message is not guest memory");
+        return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    }
+    u8* base = guest_base(ctx);
+    const u32 size = ps_read32(base, msg + 12);
+    if (!ps_read32(base, msg) || !ps_read32(base, msg + 8) || !size) return error(SCE_NP_MATCHING_ERROR_INVALID_ARG);
+    if (size > 256) return error(SCE_NP_MATCHING_ERROR_TOO_BIG_VALUE);
+    NpState& s = np();
+    {
+        std::lock_guard lock(s.mutex);
+        if (!s.matching_ctxs.find(ctx_id)) return error(SCE_NP_MATCHING_ERROR_CTX_NOT_FOUND);
+    }
+    return matching_room_offline("sceNpMatchingSendRoomMessage", ctx_id);
+}
+
+// sceNpManagerIsSP(): whether the user subscribes to PlayStation Plus. Sony's asks the system (request 262) once NP is
+// up and answers 0 when it can't; pspocket's user is offline, never a subscriber: 0.
+s32 sceNpManagerIsSP(PPUContext&) { return 0; }
+
 s32 sceNpMatchingLeaveRoom(PPUContext& ctx, u32 ctx_id, u32 room_id, u32 req_id)
 {
     if (const s32 r = matching_check(true)) return r;
@@ -3615,122 +3680,232 @@ s32 sceNpCommerceGetProductCategoryResult(PPUContext& ctx, u32 req_id, u32 buf, 
     return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpCommerceInitProductCategory: records the data in the category (data, size), then its version (always
-// SCE_NP_COMMERCE_VERSION: a TODO reads it from the data) and its currency (at least 16 bytes); dval 0.
-s32 sceNpCommerceInitProductCategory(PPUContext& ctx, u32 pc, u32 data, u32 data_size)
+// The product category helpers, as Sony's libsysutil_np (4.92) parses the store's data: plain functions over the game's
+// memory, compared with Sony's (tests/hle/test_np_commerce_compare.cpp, D-921). The data (version 1): be32 version, be32
+// status (a browse server error, 0 for none), the currency (8 bytes from +8: its code's three letters, then be32
+// decimals), the category (760 bytes from +16), be32 child category count at +776, the child categories (760 bytes
+// each) from +780, then be32 SKU count and the SKUs (1004 bytes each) after them. An info is {pc, data}: the record's
+// address. Each info written NUL-terminates its record's strings in the data, as Sony's does. Sony's checks no pointer;
+// one that is not guest memory is refused here with a log (the call's "not found" error, or 0).
+constexpr u32 kCurrencyAt = 8, kCategoryAt = 16, kChildCountAt = 776, kChildrenAt = 780, kCategoryBytes = 760;
+constexpr u32 kSkuBytes = 1004;
+constexpr u32 kCategoryNuls[] = {759, 55, 247, 631};
+constexpr u32 kSkuNuls[] = {999, 55, 103, 295, 359, 743, 871};
+
+// The category's data and its size (pc->data, pc->dataSize), or nullopt when pc is not guest memory (logged).
+struct PcData {
+    u32 data, size;
+};
+std::optional<PcData> pc_data(PPUContext& ctx, std::string_view name, u32 pc)
 {
-    if (!pc) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
-    if (!commerce_usable(ctx, "sceNpCommerceInitProductCategory", pc, kPcSize)) {
-        return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
-    }
+    if (!commerce_usable(ctx, name, pc, 16)) return std::nullopt;
+    return PcData{ps_read32(guest_base(ctx), pc + kPcData), ps_read32(guest_base(ctx), pc + kPcDataSize)};
+}
+
+// A be32 of the data, or nullopt when it is not guest memory (logged).
+std::optional<u32> data32(PPUContext& ctx, std::string_view name, u32 addr)
+{
+    if (!commerce_usable(ctx, name, addr, 4)) return std::nullopt;
+    return ps_read32(guest_base(ctx), addr);
+}
+
+// Writes info {pc, record} and NUL-terminates the record's strings at `nuls`.
+bool write_info(PPUContext& ctx, std::string_view name, u32 info, u32 pc, u32 record, std::span<const u32> nuls)
+{
+    if (!commerce_usable(ctx, name, info, 8)) return false;
+    for (const u32 n : nuls)
+        if (!commerce_usable(ctx, name, record + n, 1)) return false;
     u8* base = guest_base(ctx);
-    ps_write32(base, pc + kPcData, data);
-    ps_write32(base, pc + kPcDataSize, data_size);
-    if (data_size < 4) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
-    ps_write32(base, pc + kPcVersion, SCE_NP_COMMERCE_VERSION);
-    if (data_size < 16) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY); // under 8, or no currency
-    ps_write32(base, pc + kPcDval, 0);
-    return lv2::CELL_OK;
-}
-
-// RPCS3 sceNpCommerceDestroyProductCategory: forgets the data.
-void sceNpCommerceDestroyProductCategory(PPUContext& ctx, u32 pc)
-{
-    if (!pc || !commerce_usable(ctx, "sceNpCommerceDestroyProductCategory", pc, kPcSize)) return;
-    ps_write32(guest_base(ctx), pc + kPcDataSize, 0);
-    ps_write32(guest_base(ctx), pc + kPcData, 0);
-}
-
-// The category's data size, or nullopt when there is no category (or it isn't guest memory: logged).
-std::optional<u32> category_size(PPUContext& ctx, std::string_view name, u32 pc)
-{
-    if (!pc || !commerce_usable(ctx, name, pc, kPcSize)) return std::nullopt;
-    return ps_read32(guest_base(ctx), pc + kPcDataSize);
-}
-
-// RPCS3 sceNpCommerceGetCurrencyInfo / GetCategoryInfo: the category must hold at least 16 (776) bytes; the info, when
-// given, points at it (the data pointer is a TODO).
-s32 commerce_info(PPUContext& ctx, std::string_view name, u32 pc, u32 info, u32 min_size, u32 not_found)
-{
-    const std::optional<u32> size = category_size(ctx, name, pc);
-    if (!size || *size < min_size) return error(not_found);
-    if (info) {
-        if (!commerce_usable(ctx, name, info, 4)) return error(not_found);
-        ps_write32(guest_base(ctx), info, pc);
-    }
-    return lv2::CELL_OK;
+    ps_write32(base, info, pc);
+    ps_write32(base, info + 4, record);
+    for (const u32 n : nuls) ps_write8(base, record + n, 0);
+    return true;
 }
 
 s32 sceNpCommerceGetCurrencyInfo(PPUContext& ctx, u32 pc, u32 info)
 {
-    return commerce_info(ctx, "sceNpCommerceGetCurrencyInfo", pc, info, 16, SCE_NP_COMMERCE_ERROR_CURRENCY_INFO_NOT_FOUND);
+    const auto d = pc_data(ctx, "sceNpCommerceGetCurrencyInfo", pc);
+    if (!d || d->size <= 15) return error(SCE_NP_COMMERCE_ERROR_CURRENCY_INFO_NOT_FOUND);
+    const u32 nul[] = {3};
+    if (!write_info(ctx, "sceNpCommerceGetCurrencyInfo", info, pc, d->data + kCurrencyAt, nul)) {
+        return error(SCE_NP_COMMERCE_ERROR_CURRENCY_INFO_NOT_FOUND);
+    }
+    return lv2::CELL_OK;
+}
+
+// sceNpCommerceInitProductCategory(pc, data, size): the data and size kept first; then the version (1), the status
+// (a browse server error 0x80029600 | status, 0x80029600 past 255), the currency, whose decimals make dval (10 to their
+// power in 32 bits, 0 for none: Sony multiplies that many times; done here by squaring).
+s32 sceNpCommerceInitProductCategory(PPUContext& ctx, u32 pc, u32 data, u32 data_size)
+{
+    constexpr std::string_view kName = "sceNpCommerceInitProductCategory";
+    if (!commerce_usable(ctx, kName, pc, 16)) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    u8* base = guest_base(ctx);
+    ps_write32(base, pc + kPcData, data);
+    ps_write32(base, pc + kPcDataSize, data_size);
+    if (data_size <= 3) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    const auto version = data32(ctx, kName, data);
+    if (!version) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    ps_write32(base, pc + kPcVersion, *version);
+    if (*version != SCE_NP_COMMERCE_VERSION) return error(SCE_NP_COMMERCE_ERROR_INVALID_GPC_PROTOCOL_VERSION);
+    if (data_size <= 7) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    const auto status = data32(ctx, kName, data + 4);
+    if (!status) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    if (*status) {
+        return error(*status > 255 ? SCE_NP_COMMERCE_BROWSE_SERVER_ERROR_UNKNOWN
+                                   : SCE_NP_COMMERCE_BROWSE_SERVER_ERROR_UNKNOWN | *status);
+    }
+    StackVar info(ctx, base, 16);
+    if (sceNpCommerceGetCurrencyInfo(ctx, pc, info.addr()) < 0) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    const auto decimals = data32(ctx, kName, ps_read32(base, info.addr() + 4) + 4);
+    if (!decimals) return error(SCE_NP_COMMERCE_ERROR_PARSE_PRODUCT_CATEGORY);
+    u32 dval = 0;
+    if (*decimals) {
+        dval = 1;
+        u32 b = 10;
+        for (u32 e = *decimals; e; e >>= 1, b *= b)
+            if (e & 1) dval *= b;
+    }
+    ps_write32(base, pc + kPcDval, dval);
+    return lv2::CELL_OK;
+}
+
+// sceNpCommerceDestroyProductCategory: forgets the data (its size, then its address).
+void sceNpCommerceDestroyProductCategory(PPUContext& ctx, u32 pc)
+{
+    if (!commerce_usable(ctx, "sceNpCommerceDestroyProductCategory", pc, 16)) return;
+    ps_write32(guest_base(ctx), pc + kPcDataSize, 0);
+    ps_write32(guest_base(ctx), pc + kPcData, 0);
 }
 
 s32 sceNpCommerceGetCategoryInfo(PPUContext& ctx, u32 pc, u32 info)
 {
-    return commerce_info(ctx, "sceNpCommerceGetCategoryInfo", pc, info, 776, SCE_NP_COMMERCE_ERROR_CATEGORY_INFO_NOT_FOUND);
+    const auto d = pc_data(ctx, "sceNpCommerceGetCategoryInfo", pc);
+    if (!d || d->size <= 775) return error(SCE_NP_COMMERCE_ERROR_CATEGORY_INFO_NOT_FOUND);
+    if (!write_info(ctx, "sceNpCommerceGetCategoryInfo", info, pc, d->data + kCategoryAt, kCategoryNuls)) {
+        return error(SCE_NP_COMMERCE_ERROR_CATEGORY_INFO_NOT_FOUND);
+    }
+    return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpCommerceGetCurrencyDecimals: a TODO that answers 0.
-u32 sceNpCommerceGetCurrencyDecimals(PPUContext&, u32 info)
+// The record an info points at (info->data), or nullopt when the info is not guest memory (logged).
+std::optional<u32> info_record(PPUContext& ctx, std::string_view name, u32 info)
 {
-    PS_LOG_DEBUG(kChan, "sceNpCommerceGetCurrencyDecimals({:#x}): 0 (RPCS3)", info);
-    return 0;
+    if (!commerce_usable(ctx, name, info, 8)) return std::nullopt;
+    return ps_read32(guest_base(ctx), info + 4);
 }
 
-// RPCS3 sceNpCommerceGetNumOfChildCategory / GetNumOfChildProductSku: at least 780 bytes; the count isn't written (a
-// TODO).
+// sceNpCommerceGetCurrencyDecimals(info): the currency's be32 decimals.
+u32 sceNpCommerceGetCurrencyDecimals(PPUContext& ctx, u32 info)
+{
+    const auto record = info_record(ctx, "sceNpCommerceGetCurrencyDecimals", info);
+    if (!record) return 0;
+    return data32(ctx, "sceNpCommerceGetCurrencyDecimals", *record + 4).value_or(0);
+}
+
 s32 sceNpCommerceGetNumOfChildCategory(PPUContext& ctx, u32 pc, u32 num)
 {
-    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetNumOfChildCategory", pc);
-    if (!size || *size < 780) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_COUNT_NOT_FOUND);
-    PS_LOG_DEBUG(kChan, "sceNpCommerceGetNumOfChildCategory: count {:#x} not written", num);
-    return commerce_todo("sceNpCommerceGetNumOfChildCategory");
+    constexpr std::string_view kName = "sceNpCommerceGetNumOfChildCategory";
+    const auto d = pc_data(ctx, kName, pc);
+    if (!d || d->size <= 779) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_COUNT_NOT_FOUND);
+    const auto count = data32(ctx, kName, d->data + kChildCountAt);
+    if (!count || !commerce_usable(ctx, kName, num, 4)) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_COUNT_NOT_FOUND);
+    ps_write32(guest_base(ctx), num, *count);
+    return lv2::CELL_OK;
 }
 
+// sceNpCommerceGetNumOfChildProductSku(pc, num): the SKU count after the child categories, once the data reaches it
+// (32-bit sizes, as Sony's compares them).
 s32 sceNpCommerceGetNumOfChildProductSku(PPUContext& ctx, u32 pc, u32 num)
 {
-    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetNumOfChildProductSku", pc);
-    if (!size || *size < 780) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
-    PS_LOG_DEBUG(kChan, "sceNpCommerceGetNumOfChildProductSku: count {:#x} not written", num);
-    return commerce_todo("sceNpCommerceGetNumOfChildProductSku");
+    constexpr std::string_view kName = "sceNpCommerceGetNumOfChildProductSku";
+    const auto d = pc_data(ctx, kName, pc);
+    if (!d || d->size <= 779) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
+    const auto children = data32(ctx, kName, d->data + kChildCountAt);
+    if (!children) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
+    const u32 skip = *children * kCategoryBytes;
+    if (d->size < skip + 784) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
+    const auto count = data32(ctx, kName, d->data + skip + kChildrenAt);
+    if (!count || !commerce_usable(ctx, kName, num, 4)) return error(SCE_NP_COMMERCE_ERROR_SKU_COUNT_NOT_FOUND);
+    ps_write32(guest_base(ctx), num, *count);
+    return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpCommerceGetChildCategoryInfo: child n's 760 bytes must lie within the data (n * 760 + 1540); nothing is
-// written (a TODO).
+// sceNpCommerceGetChildCategoryInfo(pc, child, info): child `child`'s whole record must lie in the data.
 s32 sceNpCommerceGetChildCategoryInfo(PPUContext& ctx, u32 pc, u32 child_index, u32 info)
 {
-    if (!info) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND);
-    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetChildCategoryInfo", pc);
-    if (!size || u64{child_index} * 760 + 1540 > *size) {
+    constexpr std::string_view kName = "sceNpCommerceGetChildCategoryInfo";
+    const auto d = pc_data(ctx, kName, pc);
+    const u32 at = child_index * kCategoryBytes;
+    if (!d || d->size < at + kChildrenAt + kCategoryBytes) return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND);
+    if (!write_info(ctx, kName, info, pc, d->data + at + kChildrenAt, kCategoryNuls)) {
         return error(SCE_NP_COMMERCE_ERROR_CHILD_CATEGORY_INFO_NOT_FOUND);
     }
-    return commerce_todo("sceNpCommerceGetChildCategoryInfo");
+    return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpCommerceGetChildProductSkuInfo: as RPCS3 writes it, a category of more than 780 bytes has no SKU info; a
-// smaller one answers CELL_OK with nothing written (a TODO).
+// sceNpCommerceGetChildProductSkuInfo(pc, sku, info): SKU `sku` after the child categories; Sony's checks only that its
+// first four bytes lie in the data.
 s32 sceNpCommerceGetChildProductSkuInfo(PPUContext& ctx, u32 pc, u32 child_index, u32 info)
 {
-    if (!info) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
-    const std::optional<u32> size = category_size(ctx, "sceNpCommerceGetChildProductSkuInfo", pc);
-    if (!size || *size > 780) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
-    PS_LOG_DEBUG(kChan, "sceNpCommerceGetChildProductSkuInfo: child {}", child_index);
-    return commerce_todo("sceNpCommerceGetChildProductSkuInfo");
+    constexpr std::string_view kName = "sceNpCommerceGetChildProductSkuInfo";
+    const auto d = pc_data(ctx, kName, pc);
+    if (!d || d->size <= 779) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    const auto children = data32(ctx, kName, d->data + kChildCountAt);
+    if (!children) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    const u32 at = *children * kCategoryBytes + child_index * kSkuBytes;
+    if (d->size < at + 788) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    if (!write_info(ctx, kName, info, pc, d->data + at + 784, kSkuNuls)) return error(SCE_NP_COMMERCE_ERROR_SKU_INFO_NOT_FOUND);
+    return lv2::CELL_OK;
 }
 
-// RPCS3 sceNpCommerceGetSkuPrice: with a category whose dval is set, nothing (a TODO); otherwise the fraction is 0
-// (the integer part is a TODO).
+// sceNpCommerceGetSkuPrice(info, price): the SKU's be32 price at +1000 split by the category's dval (whole and
+// fraction), or whole as it is when dval is 0.
 void sceNpCommerceGetSkuPrice(PPUContext& ctx, u32 info, u32 price)
 {
-    if (!price || !commerce_usable(ctx, "sceNpCommerceGetSkuPrice", price, 8)) return;
+    constexpr std::string_view kName = "sceNpCommerceGetSkuPrice";
+    if (!commerce_usable(ctx, kName, info, 8) || !commerce_usable(ctx, kName, price, 8)) return;
     u8* base = guest_base(ctx);
-    if (info && commerce_usable(ctx, "sceNpCommerceGetSkuPrice", info, 4)) {
-        const u32 pc = ps_read32(base, info);
-        if (pc && commerce_usable(ctx, "sceNpCommerceGetSkuPrice", pc, kPcSize) && ps_read32(base, pc + kPcDval)) return;
+    const auto value = data32(ctx, kName, ps_read32(base, info + 4) + 1000);
+    const auto dval = data32(ctx, kName, ps_read32(base, info) + kPcDval);
+    if (!value || !dval) return;
+    if (!*dval) {
+        ps_write32(base, price + kPriceFractional, 0);
+        ps_write32(base, price, *value);
+        return;
     }
-    ps_write32(base, price + kPriceFractional, 0);
+    ps_write32(base, price, *value / *dval);
+    ps_write32(base, price + kPriceFractional, *value % *dval);
 }
+
+// The getters: the address of a field of the record an info points at (Sony's adds the field's offset to info->data).
+u32 info_field(PPUContext& ctx, std::string_view name, u32 info, u32 offset)
+{
+    const auto record = info_record(ctx, name, info);
+    return record ? *record + offset : 0;
+}
+
+u32 sceNpCommerceGetCurrencyCode(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetCurrencyCode", info, 0); }
+u32 sceNpCommerceGetCategoryId(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetCategoryId", info, 0); }
+u32 sceNpCommerceGetCategoryName(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetCategoryName", info, 56); }
+u32 sceNpCommerceGetCategoryDescription(PPUContext& ctx, u32 info)
+{
+    return info_field(ctx, "sceNpCommerceGetCategoryDescription", info, 248);
+}
+u32 sceNpCommerceGetCategoryImageURL(PPUContext& ctx, u32 info)
+{
+    return info_field(ctx, "sceNpCommerceGetCategoryImageURL", info, 632);
+}
+u32 sceNpCommerceGetSkuId(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetSkuId", info, 0); }
+u32 sceNpCommerceGetProductId(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetProductId", info, 56); }
+u32 sceNpCommerceGetProductName(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetProductName", info, 104); }
+u32 sceNpCommerceGetSkuName(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetSkuName", info, 296); }
+u32 sceNpCommerceGetSkuDescription(PPUContext& ctx, u32 info)
+{
+    return info_field(ctx, "sceNpCommerceGetSkuDescription", info, 360);
+}
+u32 sceNpCommerceGetSkuImageURL(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetSkuImageURL", info, 744); }
+u32 sceNpCommerceGetSkuUserData(PPUContext& ctx, u32 info) { return info_field(ctx, "sceNpCommerceGetSkuUserData", info, 872); }
 
 // RPCS3 sceNpCommerceDoCheckoutStartAsync: 1 to 16 SKUs, then a TODO (no request ID written, nothing bought).
 s32 sceNpCommerceDoCheckoutStartAsync(PPUContext&, u32 ctx_id, u32 sku_ids, u32 sku_num, u32 container_id, u32 req_id)
@@ -3877,6 +4052,306 @@ s32 sceNpUtilSetPlatformType(PPUContext& ctx, u32 np_id, u32 platform_type)
     return lv2::CELL_OK;
 }
 
+
+// ------------------------------------------------------------------------------------------------- the system's NP service
+
+// libsysutil_np's helpers for requests to the system software's NP service (D-921): a cxml document written into one of
+// libsysutil's packet channels (D-534) under a request number, the reply read back into a document and its "result".
+// Sony's sibling modules (libsysutil_np2, _np_commerce2, _np_tus, _np_installer) build their requests with them;
+// pspocket serves those itself, so a game's process reaches these only by importing them. They do what Sony's
+// libsysutil_np 4.92 does, call for call, over pspocket's own cxml and packet functions (the exports, called as Sony's
+// module calls its imports). pspocket's console has no system software: its channels are closed, so a request ends
+// with the channel's error, as Sony's code ends on it. Unverified (D-594): Sony's need its sceNpInit's whole set-up
+// (heap, buffer, request threads) to be compared.
+
+// A host module's export, called as libsysutil_np calls its import; the caller's argument registers kept.
+u64 np_import(PPUContext& ctx, std::string_view module, std::string_view name, std::initializer_list<u64> args)
+{
+    const Function* f = registry().find(module, recomp::nid_of(name));
+    if (!f) PS_FATAL(kChan, "{}::{}, which libsysutil_np imports, is not pspocket's", module, name);
+    std::array<u64, 8> saved{};
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 0;
+    for (const u64 a : args) ctx.gpr[3 + i++] = a;
+    f->fn(ctx, guest_base(ctx));
+    const u64 r = ctx.gpr[3];
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
+    return r;
+}
+
+constexpr std::string_view kCxml = "cellSysutil";
+constexpr s32 kNpReplyTooLarge = static_cast<s32>(0x8002B006); // a reply larger than the buffer (read and dropped)
+constexpr u32 kNpReceiveBuffer = 0x18000;
+constexpr u32 kNpFixedBlock = 0x6000; // a FixedMemory instance: six 4 KB tables
+
+// The client heap and receive buffer Sony's sceNpInit makes over the game's NP pool: _sys_heap_create_heap(
+// "SceNpSysutilClientHeap", pool size, 0x80000000, {8, pool}) and 0x18000 bytes from it. Made here at first use while
+// NP is up; none otherwise (Sony's heap is 0 then). sceNpTerm deletes the heap, as Sony's does.
+struct NpClient {
+    u32 heap = 0, buffer = 0;
+};
+
+NpClient np_client(PPUContext& ctx)
+{
+    NpState& s = np();
+    std::lock_guard lock(s.mutex);
+    if (!s.initialized) return {};
+    if (!s.client_heap) {
+        u8* base = guest_base(ctx);
+        constexpr std::string_view kName = "SceNpSysutilClientHeap";
+        StackVar name(ctx, base, 32);
+        for (usize i = 0; i < kName.size(); i++) ps_write8(base, name.addr() + static_cast<u32>(i), static_cast<u8>(kName[i]));
+        StackVar attr(ctx, base, 8);
+        ps_write32(base, attr.addr(), 8);
+        ps_write32(base, attr.addr() + 4, s.pool_ptr);
+        s.client_heap = static_cast<u32>(np_import(ctx, "sysPrxForUser", "_sys_heap_create_heap",
+            {name.addr(), s.pool_size, 0x80000000u, attr.addr()}));
+        if (s.client_heap) {
+            s.client_buffer = static_cast<u32>(
+                np_import(ctx, "sysPrxForUser", "_sys_heap_malloc", {s.client_heap, kNpReceiveBuffer}));
+        }
+    }
+    return {s.client_heap, s.client_buffer};
+}
+
+// _sceNpSysutilClientMalloc(size) / _sceNpSysutilClientFree(p): the client heap's (its answers as they are).
+u32 _sceNpSysutilClientMalloc(PPUContext& ctx, u32 size)
+{
+    return static_cast<u32>(np_import(ctx, "sysPrxForUser", "_sys_heap_malloc", {np_client(ctx).heap, size}));
+}
+
+u64 _sceNpSysutilClientFree(PPUContext& ctx, u32 p)
+{
+    return np_import(ctx, "sysPrxForUser", "_sys_heap_free", {np_client(ctx).heap, p});
+}
+
+// sce_np_matching_set_matching2_running(bool): what matching 2 tells the older matching library while it runs (its
+// calls then refuse with SCE_NP_MATCHING_ERROR_UTILITY_UNAVAILABLE, matching_check); a byte, kept over NP's term.
+void np_set_matching2_running(PPUContext&, u32 running) { np().matching2_running = (running & 0xFF) != 0; }
+
+// Reads the reply to request `id` on `channel` into `buffer` (`size` bytes): 0, the read's error, or kNpReplyTooLarge
+// when the first read filled the buffer without finishing (the rest read and dropped first). Sony's answers 0 for a
+// reply read whole, whatever its size.
+s32 np_read_reply(PPUContext& ctx, s32 channel, s32 id, u32 buffer, u32 size)
+{
+    u8* base = guest_base(ctx);
+    StackVar done(ctx, base, 8);
+    const auto read = [&] {
+        return static_cast<s32>(np_import(ctx, kCxml, "cellSysutilPacketRead",
+            {static_cast<u64>(static_cast<s64>(channel)), static_cast<u64>(static_cast<s64>(id)), buffer, size, done.addr()}));
+    };
+    s32 r = read();
+    if (r < 0) return r;
+    if (ps_read8(base, done.addr()) || static_cast<u32>(r) != size) return 0;
+    for (;;) {
+        r = read();
+        if (r < 0 || ps_read8(base, done.addr())) return kNpReplyTooLarge;
+    }
+}
+
+// The reply in `buffer` made the document, its root element to `element` (a guest Element), and its "result": the
+// result when it is negative, else GetInt's answer.
+s32 np_parse_reply(PPUContext& ctx, u32 doc, u32 buffer, u32 size, u32 element)
+{
+    u8* base = guest_base(ctx);
+    np_import(ctx, kCxml, "_ZN4cxml8Document16CreateFromBufferEPKvjb", {doc, buffer, size, 0});
+    StackVar root(ctx, base, 8);
+    np_import(ctx, kCxml, "_ZN4cxml8Document18GetDocumentElementEv", {root.addr(), doc});
+    if (!guest_readable(thread_of(ctx), element, 8)) {
+        log_call_site(ctx, base, std::format("libsysutil_np: element {:#x} is not guest memory", element));
+        return static_cast<s32>(lv2::CELL_EFAULT);
+    }
+    ps_write32(base, element, ps_read32(base, root.addr()));
+    ps_write32(base, element + 4, ps_read32(base, root.addr() + 4));
+    StackVar result(ctx, base, 8);
+    StackVar key(ctx, base, 8);
+    std::memcpy(base + key.addr(), "result", 7);
+    const s32 r = static_cast<s32>(np_import(ctx, kCxml, "_ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi",
+        {element, key.addr(), result.addr()}));
+    if (r < 0) return r;
+    const s32 v = static_cast<s32>(ps_read32(base, result.addr()));
+    return v < 0 ? v : r;
+}
+
+// _sce_np_sysutil_recv_packet(id, doc, element): the reply to `id` on channel 0 into the receive buffer, then parsed.
+s32 np_recv_packet(PPUContext& ctx, s32 id, u32 doc, u32 element)
+{
+    const u32 buffer = np_client(ctx).buffer;
+    const s32 r = np_read_reply(ctx, 0, id, buffer, kNpReceiveBuffer);
+    if (r < 0) return r;
+    return np_parse_reply(ctx, doc, buffer, kNpReceiveBuffer, element);
+}
+
+// _sce_np_sysutil_recv_packet_fixedmem(id, mem, doc, element) and _sub: the reply into the FixedMemory instance itself
+// (0x6000 bytes), on channel 0 or 1.
+s32 np_recv_fixedmem(PPUContext& ctx, s32 channel, s32 id, u32 mem, u32 doc, u32 element)
+{
+    const s32 r = np_read_reply(ctx, channel, id, mem, kNpFixedBlock);
+    if (r < 0) return r;
+    return np_parse_reply(ctx, doc, mem, kNpFixedBlock, element);
+}
+
+s32 np_recv_packet_fixedmem(PPUContext& ctx, s32 id, u32 mem, u32 doc, u32 element)
+{
+    return np_recv_fixedmem(ctx, 0, id, mem, doc, element);
+}
+
+s32 np_recv_packet_fixedmem_sub(PPUContext& ctx, s32 id, u32 mem, u32 doc, u32 element)
+{
+    return np_recv_fixedmem(ctx, 1, id, mem, doc, element);
+}
+
+// _sce_np_sysutil_send_packet(id, doc) and _sub: Document::Write through a PacketWriter on channel 0 (1 for _sub).
+s32 np_send(PPUContext& ctx, s32 channel, s32 id, u32 doc)
+{
+    try {
+        sysutil::PacketWriter writer(ctx, channel, id, doc);
+        return sysutil::document_write(ctx, doc, writer);
+    } catch (const sysutil::Fault& f) {
+        log_call_site(ctx, guest_base(ctx),
+            std::format("libsysutil_np: guest memory at {:#010x} is not there (Sony's faults there)", f.addr));
+        return static_cast<s32>(lv2::CELL_EFAULT);
+    }
+}
+
+s32 np_send_packet(PPUContext& ctx, s32 id, u32 doc) { return np_send(ctx, 0, id, doc); }
+s32 np_send_packet_sub(PPUContext& ctx, s32 id, u32 doc) { return np_send(ctx, 1, id, doc); }
+
+// _sce_np_sysutil_cxml_prepare_doc(mem, doc, magic, element, name, attributes): the document's tables from the
+// FixedMemory instance, its header's magic, and its root element.
+s32 np_cxml_prepare_doc(PPUContext& ctx, u32 mem, u32 doc, u32 magic, u32 element, u32 name, s32 attributes)
+{
+    if (!guest_readable(thread_of(ctx), doc + 0x6C, 8)) {
+        log_call_site(ctx, guest_base(ctx), std::format("libsysutil_np: document {:#x} is not guest memory", doc));
+        return static_cast<s32>(lv2::CELL_EFAULT);
+    }
+    try {
+        sysutil::document_use_fixed_memory(ctx, doc, mem);
+    } catch (const sysutil::Fault& f) {
+        log_call_site(ctx, guest_base(ctx), std::format("libsysutil_np: guest memory at {:#010x} is not there", f.addr));
+        return static_cast<s32>(lv2::CELL_EFAULT);
+    }
+    np_import(ctx, kCxml, "_ZN4cxml8Document14SetHeaderMagicEPKc", {doc, magic});
+    return static_cast<s32>(np_import(ctx, kCxml, "_ZN4cxml8Document13CreateElementEPKciPNS_7ElementE",
+        {doc, name, static_cast<u64>(static_cast<s64>(attributes)), element}));
+}
+
+// _sce_np_sysutil_send_empty_packet(id, mem, magic, name): a request with only its root element.
+s32 np_send_empty_packet(PPUContext& ctx, s32 id, u32 mem, u32 magic, u32 name)
+{
+    u8* base = guest_base(ctx);
+    StackVar doc(ctx, base, 0x80);
+    StackVar element(ctx, base, 8);
+    np_import(ctx, kCxml, "_ZN4cxml8DocumentC1Ev", {doc.addr()});
+    ps_write32(base, element.addr(), 0);
+    ps_write32(base, element.addr() + 4, 0xFFFFFFFF);
+    s32 r = np_cxml_prepare_doc(ctx, mem, doc.addr(), magic, element.addr(), name, 0);
+    if (r >= 0) r = np_send_packet(ctx, id, doc.addr());
+    np_import(ctx, kCxml, "_ZN4cxml8DocumentD1Ev", {doc.addr()});
+    return r;
+}
+
+// Sony's helper: a file attribute `name` of `element` holding `size` bytes at `data` (registered in the document); no
+// data with a size is SCE_NP_ERROR_INVALID_ARGUMENT.
+s32 np_set_bytes(PPUContext& ctx, u32 doc, u32 element, u32 name, u32 data, u32 size)
+{
+    if (!data && size) return error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    u8* base = guest_base(ctx);
+    StackVar file(ctx, base, 16);
+    ps_write32(base, file.addr(), 0);
+    ps_write32(base, file.addr() + 4, 0xFFFFFFFF);
+    ps_write32(base, file.addr() + 8, 0);
+    const s32 r = static_cast<s32>(
+        np_import(ctx, kCxml, "_ZN4cxml8Document12RegisterFileEPKvjPNS_4FileE", {doc, data, size, file.addr()}));
+    if (r < 0) return r;
+    return static_cast<s32>(np_import(ctx, kCxml, "_ZN8cxmlutil7SetFileERKN4cxml7ElementEPKcRKNS0_4FileE",
+        {element, name, file.addr()}));
+}
+
+// A guest copy of a host string for an export to read (in a StackVar the caller keeps).
+u32 np_text(PPUContext& ctx, const StackVar& at, std::string_view text)
+{
+    std::memcpy(guest_base(ctx) + at.addr(), text.data(), text.size());
+    ps_write8(guest_base(ctx), at.addr() + static_cast<u32>(text.size()), 0);
+    return at.addr();
+}
+
+// _sce_np_sysutil_cxml_set_npid(doc, parent, name, npid): an element `name` under `parent` holding the NP ID: a child
+// "handle" whose "data" is the online ID, then the ID's "opt" and "reserved" bytes as files (8 each, at +20 and +28).
+s32 np_cxml_set_npid(PPUContext& ctx, u32 doc, u32 parent, u32 name, u32 npid)
+{
+    u8* base = guest_base(ctx);
+    StackVar element(ctx, base, 8);
+    StackVar child(ctx, base, 8);
+    StackVar s1(ctx, base, 16), s2(ctx, base, 16), s3(ctx, base, 16), s4(ctx, base, 16);
+    ps_write32(base, element.addr(), 0);
+    ps_write32(base, element.addr() + 4, 0xFFFFFFFF);
+    s32 r = static_cast<s32>(np_import(ctx, kCxml, "_ZN4cxml8Document13CreateElementEPKciPNS_7ElementE",
+        {doc, name, 2, element.addr()}));
+    if (r < 0) return r;
+    ps_write32(base, child.addr(), 0);
+    ps_write32(base, child.addr() + 4, 0xFFFFFFFF);
+    r = static_cast<s32>(np_import(ctx, kCxml, "_ZN4cxml8Document13CreateElementEPKciPNS_7ElementE",
+        {doc, np_text(ctx, s1, "handle"), 1, child.addr()}));
+    if (r < 0) return r;
+    r = static_cast<s32>(np_import(ctx, kCxml, "_ZN8cxmlutil9SetStringERKN4cxml7ElementEPKcS5_",
+        {child.addr(), np_text(ctx, s2, "data"), npid}));
+    if (r < 0) return r;
+    r = static_cast<s32>(np_import(ctx, kCxml, "_ZN4cxml7Element11AppendChildERS0_", {element.addr(), child.addr()}));
+    if (r < 0) return r;
+    r = np_set_bytes(ctx, doc, element.addr(), np_text(ctx, s3, "opt"), npid + 20, 8);
+    if (r < 0) return r;
+    r = np_set_bytes(ctx, doc, element.addr(), np_text(ctx, s4, "reserved"), npid + 28, 8);
+    if (r < 0) return r;
+    return static_cast<s32>(np_import(ctx, kCxml, "_ZN4cxml7Element11AppendChildERS0_", {parent, element.addr()}));
+}
+
+// sceNpDrmExecuteGamePurchase(): Sony's asks the system software to open the store at the game's full version: before
+// sceNpInit SCE_NP_DRM_ERROR_INTERNAL; then under its purchase mutex a "drmrequest" (magic "NPDR", reqtype 2, an
+// empty reqarg) sent as request 268 in a FixedMemory document between cellSysutilPacketBegin and End, and the reply's
+// result. pspocket's console has no system software: the request ends with the closed channel's error, as Sony's does
+// on it, and nothing opens.
+s32 sceNpDrmExecuteGamePurchase(PPUContext& ctx)
+{
+    if (!np().initialized) return error(SCE_NP_DRM_ERROR_INTERNAL);
+    constexpr s32 kRequest = 268;
+    u8* base = guest_base(ctx);
+    np_import(ctx, kCxml, "cellSysutilPacketBegin", {0, kRequest});
+    const u32 mem = static_cast<u32>(np_import(ctx, kCxml, "_ZN16sysutil_cxmlutil11FixedMemory5BeginEi", {0}));
+    StackVar doc(ctx, base, 0x80);
+    StackVar element(ctx, base, 8);
+    StackVar s1(ctx, base, 16), s2(ctx, base, 16), s3(ctx, base, 16), s4(ctx, base, 16);
+    np_import(ctx, kCxml, "_ZN4cxml8DocumentC1Ev", {doc.addr()});
+    ps_write32(base, element.addr(), 0);
+    ps_write32(base, element.addr() + 4, 0xFFFFFFFF);
+    s32 r = np_cxml_prepare_doc(ctx, mem, doc.addr(), np_text(ctx, s1, "NPDR"), element.addr(),
+        np_text(ctx, s2, "drmrequest"), 2);
+    if (r >= 0) {
+        r = static_cast<s32>(np_import(ctx, kCxml, "_ZN8cxmlutil6SetIntERKN4cxml7ElementEPKci",
+            {element.addr(), np_text(ctx, s3, "reqtype"), 2}));
+    }
+    if (r >= 0) r = np_set_bytes(ctx, doc.addr(), element.addr(), np_text(ctx, s4, "reqarg"), 0, 0);
+    if (r >= 0) r = np_send_packet(ctx, kRequest, doc.addr());
+    if (r >= 0) {
+        np_import(ctx, kCxml, "_ZN4cxml8DocumentD1Ev", {doc.addr()});
+        np_import(ctx, kCxml, "_ZN4cxml8DocumentC1Ev", {doc.addr()});
+        r = np_recv_packet(ctx, kRequest, doc.addr(), element.addr());
+        if (r >= 0) {
+            StackVar result(ctx, base, 8);
+            StackVar s5(ctx, base, 16);
+            r = static_cast<s32>(np_import(ctx, kCxml, "_ZN8cxmlutil6GetIntERKN4cxml7ElementEPKcPi",
+                {element.addr(), np_text(ctx, s5, "result"), result.addr()}));
+            if (r >= 0) r = static_cast<s32>(ps_read32(base, result.addr()));
+        }
+    }
+    np_import(ctx, kCxml, "_ZN4cxml8DocumentD1Ev", {doc.addr()});
+    np_import(ctx, kCxml, "_ZN16sysutil_cxmlutil11FixedMemory3EndEi", {0});
+    np_import(ctx, kCxml, "cellSysutilPacketEnd", {0, kRequest});
+    if (r < 0) PS_LOG_WARN(kChan, "sceNpDrmExecuteGamePurchase: the system software is not there ({:#x}); no store opens",
+        static_cast<u32>(r));
+    return r;
+}
+
 } // namespace
 
 // ------------------------------------------------------------------------------------------------- NP's state (np.hpp)
@@ -3892,6 +4367,7 @@ u32 np_init(u32 poolsize, u32 poolptr)
     if (poolsize < SCE_NP_MIN_POOL_SIZE) return SCE_NP_ERROR_INSUFFICIENT_BUFFER;
     s.initialized = true;
     s.pool_size = poolsize;
+    s.pool_ptr = poolptr;
     return lv2::CELL_OK;
 }
 
@@ -3920,6 +4396,8 @@ u32 np_term()
     if (!s.initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     s.initialized = false;
     s.pool_size = 0;
+    s.pool_ptr = 0;
+    s.client_heap = s.client_buffer = 0;
     s.basic_handler_registered = false;
     s.manager_cb = s.manager_cb_arg = 0;
     s.signaling_ctxs.clear();
@@ -3930,10 +4408,17 @@ namespace {
 
 // sceNpTerm: RPCS3's, through np_term, then the matching 2 room callbacks sceNp2.cpp keeps (terminate_NP drops them
 // too).
-s32 sceNpTerm(PPUContext&)
+s32 sceNpTerm(PPUContext& ctx)
 {
+    u32 heap = 0;
+    {
+        NpState& s = np();
+        std::lock_guard lock(s.mutex);
+        heap = s.client_heap;
+    }
     const u32 r = np_term();
     if (r == lv2::CELL_OK) np2_on_np_term();
+    if (r == lv2::CELL_OK && heap) np_import(ctx, "sysPrxForUser", "_sys_heap_delete_heap", {heap}); // as Sony's
     PS_LOG_INFO(kChan, "sceNpTerm() -> {:#x}", r);
     return static_cast<s32>(r);
 }
@@ -4144,6 +4629,30 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0x6CB81EB2, sceNpCommerceDestroyProductCategory),
         PS_HLE_FUNC(0xB1C02D66, sceNpCommerceGetCurrencyInfo),
         PS_HLE_FUNC(0xEB9DF054, sceNpCommerceGetCategoryInfo),
+        PS_HLE_FUNC(0x79225AA3, sceNpCommerceGetCurrencyCode),
+        PS_HLE_FUNC(0xAEE8CF71, sceNpCommerceGetCategoryId),
+        PS_HLE_FUNC(0x6E2AB18B, sceNpCommerceGetCategoryName),
+        PS_HLE_FUNC(0x359642A6, sceNpCommerceGetCategoryDescription),
+        PS_HLE_FUNC(0x9452F4F8, sceNpCommerceGetCategoryImageURL),
+        PS_HLE_FUNC(0x39A69619, sceNpCommerceGetSkuId),
+        PS_HLE_FUNC(0x936DF4AA, sceNpCommerceGetProductId),
+        PS_HLE_FUNC(0xEB5F2544, sceNpCommerceGetProductName),
+        PS_HLE_FUNC(0xEE530059, sceNpCommerceGetSkuName),
+        PS_HLE_FUNC(0xA85A4951, sceNpCommerceGetSkuDescription),
+        PS_HLE_FUNC(0xCCBE2E69, sceNpCommerceGetSkuImageURL),
+        PS_HLE_FUNC(0x1A3FCB69, sceNpCommerceGetSkuUserData),
+        Function{{}, "_sceNpSysutilClientMalloc", 0xEE0CC40C, &detail::thunk<&_sceNpSysutilClientMalloc>, false, true},
+        Function{{}, "_sceNpSysutilClientFree", 0x816C6A5F, &detail::thunk<&_sceNpSysutilClientFree>, false, true},
+        Function{{}, "_Z37sce_np_matching_set_matching2_runningb", 0xADCC5ADA, &detail::thunk<&np_set_matching2_running>, false, true},
+        Function{{}, "_Z27_sce_np_sysutil_recv_packetiRN4cxml8DocumentERNS_7ElementE", 0x48B3774F, &detail::thunk<&np_recv_packet>, false, true},
+        Function{{}, "_Z36_sce_np_sysutil_recv_packet_fixedmemiPN16sysutil_cxmlutil11FixedMemoryERN4cxml8DocumentERNS2_7ElementE", 0x2C5AD7B4, &detail::thunk<&np_recv_packet_fixedmem>, false, true},
+        Function{{}, "_Z40_sce_np_sysutil_recv_packet_fixedmem_subiPN16sysutil_cxmlutil11FixedMemoryERN4cxml8DocumentERNS2_7ElementE", 0x4299A92C, &detail::thunk<&np_recv_packet_fixedmem_sub>, false, true},
+        Function{{}, "_Z27_sce_np_sysutil_send_packetiRN4cxml8DocumentE", 0x25B8BD56, &detail::thunk<&np_send_packet>, false, true},
+        Function{{}, "_Z31_sce_np_sysutil_send_packet_subiRN4cxml8DocumentE", 0xAD12E5C9, &detail::thunk<&np_send_packet_sub>, false, true},
+        Function{{}, "_Z32_sce_np_sysutil_cxml_prepare_docPN16sysutil_cxmlutil11FixedMemoryERN4cxml8DocumentEPKcRNS2_7ElementES6_i", 0xFD61DFF5, &detail::thunk<&np_cxml_prepare_doc>, false, true},
+        Function{{}, "_Z33_sce_np_sysutil_send_empty_packetiPN16sysutil_cxmlutil11FixedMemoryEPKcS3_", 0x1FA740DB, &detail::thunk<&np_send_empty_packet>, false, true},
+        Function{{}, "_Z29_sce_np_sysutil_cxml_set_npidRN4cxml8DocumentERNS_7ElementEPKcPK7SceNpId", 0x9BA3E97F, &detail::thunk<&np_cxml_set_npid>, false, true},
+        Function{{}, "sceNpDrmExecuteGamePurchase", 0xF283C143, &detail::thunk<&sceNpDrmExecuteGamePurchase>, false, true},
         PS_HLE_FUNC(0xAF57D9C9, sceNpCommerceGetCurrencyDecimals),
         PS_HLE_FUNC(0x2BE41ECE, sceNpCommerceGetNumOfChildCategory),
         PS_HLE_FUNC(0x7208DC08, sceNpCommerceGetNumOfChildProductSku),
@@ -4161,8 +4670,11 @@ void register_sceNp(Registry& r)
     });
     // sceNpMatchingInt (RPCS3 sceNpMatchingInt.cpp): the matching library's internal entry points. Three share their
     // names, and so their NIDs, with sceNp's (RPCS3 registers its OLD_ functions under them); they do the same here.
-    // RPCS3's sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage are stubs (rpcs3_stubs.inc).
+    // sceNpMatchingCancelRequest(GUI) and sceNpMatchingSendRoomMessage, RPCS3's stubs, are libsysutil_np's (D-923).
     r.add("sceNpMatchingInt", {
+        PS_HLE_UNVERIFIED(0x033D5BA0, sceNpMatchingCancelRequest),
+        PS_HLE_UNVERIFIED(0xC4100412, sceNpMatchingCancelRequestGUI),
+        PS_HLE_UNVERIFIED(0xE61F7EE9, sceNpMatchingSendRoomMessage),
         PS_HLE_FUNC(0x170829D3, sceNpMatchingGetRoomMemberList),
         PS_HLE_FUNC(0x31B2B978, sceNpMatchingJoinRoomWithoutGUI),
         PS_HLE_FUNC(0x474B7B13, sceNpMatchingJoinRoomGUI),
@@ -4171,6 +4683,10 @@ void register_sceNp(Registry& r)
         PS_HLE_FUNC(0xB00F408A, sceNpMatchingGetRoomListGUI),
         PS_HLE_FUNC(0xB020684E, sceNpMatchingGetRoomInfoNoLimit),
         PS_HLE_FUNC(0xEADCB5CA, sceNpMatchingCreateRoomWithoutGUI),
+    });
+    // sceNpPlus: PlayStation Plus (D-923).
+    r.add("sceNpPlus", {
+        PS_HLE_UNVERIFIED(0x9CE5AC0B, sceNpManagerIsSP),
     });
 }
 
