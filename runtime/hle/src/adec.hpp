@@ -179,8 +179,10 @@ std::unique_ptr<AdecCore> make_lpcm_core();
 // pspocket's ATRAC3plus core on FFmpeg (adec_atracx.cpp), for up to `max_channels` channels (its memory size); none in a
 // build without FFmpeg.
 std::unique_ptr<AdecCore> make_atracx_core(u32 max_channels);
-// pspocket's own CELP core (adec_celp.cpp, D-932): libcelpdec's, for MPEG-4 CELP at 16 kHz.
+// pspocket's own CELP cores (adec_celp.cpp, D-932): libcelpdec's, for MPEG-4 CELP at 16 kHz, and libcelp8dec's, at
+// 8 kHz.
 std::unique_ptr<AdecCore> make_celp_core();
+std::unique_ptr<AdecCore> make_celp8_core();
 // pspocket's own core on FFmpeg for a codec whose firmware core serves first (adec_ffmpeg.cpp, D-577): MP3, MPEG audio
 // layers I and II, MPEG-4 AAC (the three types), AC-3 and ATRAC3; Dolby Digital Plus, MPEG-2 AAC, MP3 Surround and
 // ATRAC3 multichannel (D-621); TrueHD, the four DTS types and WMA, and the WMA Pro and WMA Lossless cores under the
@@ -220,5 +222,6 @@ void _pspocket_lpcm_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_atracx_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_adec_ffmpeg_dec_thread(PPUContext& ctx, u64 core_handle);
 void _pspocket_celp_dec_thread(PPUContext& ctx, u64 core_handle);
+void _pspocket_celp8_dec_thread(PPUContext& ctx, u64 core_handle);
 
 } // namespace pspocket::hle::adec
