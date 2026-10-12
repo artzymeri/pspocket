@@ -13705,3 +13705,20 @@ three words holding each half's function addresses masked), the slots and pipeli
 lv2 calls and the file libmp4 wrote byte for byte (the mvhd, tkhd and mdhd boxes' creation and modification times, the
 wall clock's, masked): 0 of 157, 113, 99 and 259 observations differ. With the MP4 composer every one of cellSailRec's
 58 functions and libsail_rec's internal paths are pspocket's own; nothing stops the process for a later part.
+
+### D-918, part 10: cellSailRec no longer firmware-first
+
+cellSailRec matches Sony's libsail_rec call for call (parts 3 to 9: 0 differences in every comparison of
+tests/hle/test_sail_rec_compare.cpp: the recorder before Boot, its parameters and API, feeders, the game's composer,
+profiles, video converters and their conversions, the booted recorder, streams through the game's composer, seven
+audio recordings, an audio stream's steps and refusals, 20 video recordings and the video refusals, four recordings
+through the MP4 composer: 12 test cases, 6077 assertions, 163 s on the Mac with the firmware), all 58 functions and
+libsail_rec's internal paths natively, nothing left stopping the process for a later part, so its firmware-first
+marker goes (D-563): where the system software is installed, a game importing cellSailRec now gets pspocket's, not
+libsail_rec.sprx, and the loader links its imports (the encoders, cellVpost2, cellApostSrcMini, cellAvchatJpgDec,
+cellMp4: link_host_imports) for it. What pspocket reads from libsail_rec.sprx at run time stays read from the installed
+module (its SPU programs, the conversions' coefficients, the option and channel tables: D-918 parts 5, 7, 8); without
+the system software those paths log and stop. Not reproduced, by nature, and bounded (parts 6 to 8): libsail_rec's
+faults (a composer table it reads at the session counter, a composer's list walked past its end), where pspocket stops
+with the call site; the stack bytes it copies or leaves unwritten (zeros here). The name check now asserts the library
+is pspocket's and unmarked. The whole of test_hle with the firmware: 902 test cases pass, 27 skip, in 546 s.

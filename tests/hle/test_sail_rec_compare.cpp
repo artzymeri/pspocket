@@ -312,8 +312,8 @@ struct H : Half<> {
         // libsail_rec's SPU programs and tables (pspocket's own reads them from the installed module).
         if (const auto flash = test_dev_flash()) REQUIRE(f.kernel->vfs_mount("/dev_flash", *flash, true));
         if (with_imports && !sony && s.mode == Mode::Firmware) {
-            // As the loader links a host module's imports (LleModules::link_host_imports, D-197), which passes over a
-            // firmware-first library's (its firmware module imports for itself): each module loaded, each export linked.
+            // As the loader links a host module's imports for a game (LleModules::link_host_imports, D-197): each
+            // module loaded, each export linked.
             imports = std::make_unique<loader::LleModules>(s.flash);
             REQUIRE(imports->index());
             for (const hle::HostImport& i : hle::registry().imports()) {
@@ -2910,6 +2910,7 @@ Observed half_recorder_api(const Setup& s, bool sony)
 TEST_CASE("cellSailRec's 58 functions are pspocket's own", "[hle][sailrec]")
 {
     const hle::Registry& r = hle::registry();
+    CHECK_FALSE(r.is_firmware_first("cellSailRec")); // pspocket's, Sony's module installed or not (D-918, part 10)
     usize n = 0;
     for (const hle::Function& f : r.functions())
         if (f.module == "cellSailRec" && !f.internal) n++;
@@ -2935,7 +2936,7 @@ TEST_CASE("cellSailRec's 58 functions are pspocket's own", "[hle][sailrec]")
         "cellSailProfileSetEsAudioParameter", "cellSailProfileSetEsVideoParameter",
         "cellSailVideoConverterCanGetResult", "cellSailVideoConverterCanProcess", "cellSailVideoConverterGetResult",
         "cellSailVideoConverterProcess"},
-        /*marked=*/true);
+        /*marked=*/false);
 }
 
 TEST_CASE("cellSailRec against Sony's libsail_rec: the recorder before Boot", "[hle][lle][compare][sailrec]")

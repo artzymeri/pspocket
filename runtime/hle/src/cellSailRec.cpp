@@ -811,9 +811,6 @@ void register_cellSailRec(Registry& r)
     register_feed(r);
     register_audio(r);
     register_video(r);
-    // Until the control thread and the recording are pspocket's too (later parts of D-918), a game gets Sony's
-    // libsail_rec where the system software is installed (D-563).
-    r.firmware_first(kChan);
 }
 
 } // namespace pspocket::hle
