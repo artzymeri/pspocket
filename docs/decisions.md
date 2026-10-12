@@ -12413,3 +12413,53 @@ the comparison's first run went from a spinning module to 5 of 649 observations 
 Test: test_lle.cpp "a firmware module with a module_prologue is started through it" (a synthetic PRX whose second
 management export is a prologue that records the descriptor it is given and calls it: started at boot and by
 sys_prx_start_module, module_start runs from the prologue, which was given module_start's descriptor).
+
+## D-916 · 2026-10-12 · cellRudp as Sony's librudp does it, call for call (part 2)
+
+D-630 to D-633 wrote cellRudp without Sony's module; its comparison (D-633) found 201 of 342 observations differing,
+and much of the design was wrong where it matters to a game or to a peer: the mux modes, the event handler's role, the
+signatures (Accept takes seven arguments), the IDs, the options and their checks, the structures, the wire format. The
+library is rewritten from librudp's behaviour, read from the module (firmware 4.92's librudp.sprx) in a scratch area
+outside the repository; nothing of the module is committed, the code is pspocket's own (cellRudp.cpp's header gives the
+architecture, rudp.hpp the wire format). What a game and a peer see, each matched against the module:
+- The answers and their order: every call's checks in librudp's order (Bind's mux mode 1 or 2 only, the socket not
+  looked at; Listen and Initiate refuse without the event handler; EnableInternalIOThread before any context, priority
+  below 0xC00; NetReceived and ProcessEvents THREAD_IN_USE with the thread; Terminate of a terminated context
+  INVALID_CONTEXT_ID); context and poll IDs from 0.
+- Options: 4-byte values only; the defaults (MAX_PAYLOAD 0x542 under a 0x582 segment, 64 KB buffers, delivery and
+  order critical, non-blocking, 60 s connection timeout, 30 ms aggregation, SACK on, 10 s cookies, 20 s keep-alive
+  timeout); a connection's parameters refused once it is not idle; LAST_ERROR cleared by its reading; booleans read
+  back as 0 or 1; librudp's hidden option 0xFF.
+- Structures: CellRudpContextStatus is 48 bytes (state, parent, children accepted, lost, sent and received packets and
+  bytes, retransmissions, the smoothed round trip in microseconds), CellRudpStatus 0x128 bytes of counters (per packet
+  type, per quality level, connections made and failed by reason), its context count and memory words written whatever
+  size is asked. The memory words count librudp's allocations as it sizes them (each with its 16-byte header), the
+  peak included.
+- The wire format: packets of a 2-byte prefix (vport code, length), their vports, an 8-bit type and flags, the window
+  in a byte, sequence and acknowledgement numbers, the acknowledgement delay, SYN parameters (stream, delivery, order,
+  level, versions 0x100, token, segment size), RST reasons, options (cookie, segment size, SACK blocks, retransmission
+  count and delay, time stamp, padding for the 32 and 64-byte alignment flags); a write larger than one payload in a
+  message context goes as several segments, all but the last flagged; aggregation per destination.
+- The handshake: a listener's cookie (a RST, reason 2, carrying 32 bytes: its time, a random word and a SHA-256 of
+  them with a secret), the SYN again with it, SYN-ACK, ACK; P2P contexts opening at once with Activate; Terminate's
+  RST and the peer's CLOSE_WAIT with CONN_RESET; a terminated context lingering, gone for the game, until its timer
+  lets it go (then SOCKET_RELEASED for its socket's last context).
+- Events: the context handler's (CLOSED with the reason's error, ESTABLISHED, WRITABLE, READABLE, FLUSHED, a child
+  ready) with the next round of events, blocking contexts woken instead; the event handler's SEND without the thread,
+  100 and 101 around the thread's sendings and receivings.
+- Timers and recovery: the context timer, round-trip estimation, retransmission timeouts from 1 to 16 s, delayed
+  acknowledgements, SACK, fast retransmission, window probes, keep-alive.
+- Reading: the read information's size byte stays the game's (librudp writes it back); a read that took a latency
+  critical message counts in the status (+0x40).
+- A packet for nobody (another vport, another mux mode) is passed over in silence; a datagram is malformed only where
+  a packet runs past its end.
+- Sockets go through libnet as librudp's imports do: without the game's sys_net_initialize_network_ex GetLocalInfo's
+  address stays zero and the internal I/O thread gets no wake-up socket, as on a console; its thread ends with
+  sys_net_free_thread_context. librudp's clock is sys_time_get_current_time.
+The comparison (test_rudp_compare.cpp) is rewritten for the real API: the game is the network (SEND's datagrams are
+described field by field, random values and times masked, and delivered with NetReceived, each direction compared in
+order), a listener with cookies, a stream connection without aggregation, P2P with a loss and its retransmission,
+malformed datagrams, the internal I/O thread over lv2's loopback with blocking contexts; each part waits for its
+contexts to go. Before: 201 of 342 observations differ; now 0 of 1,808, and the same twice running. Tests: test_rudp.cpp
+(the checks and defaults, the handshake with its cookie, data both ways with its read information, a loss, the reset
+and its end, packets for nobody, the I/O thread with blocking contexts and libnet).

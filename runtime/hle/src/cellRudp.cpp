@@ -1,47 +1,50 @@
-// cellRudp: Sony's reliable UDP for games' peer-to-peer play (librudp), pspocket's own (D-607, D-630 to D-633):
-// contexts that are connections over the game's UDP or UDP P2P sockets, with sequence numbers, acknowledgements,
-// retransmission after a timeout, flow control to the windows the options set, segments of the maximum segment size,
-// keep-alive, ordered or unordered and reliable or unreliable delivery as the options say, and the events the game's
-// handlers get; several contexts share a socket, told apart by virtual ports (vports).
+// cellRudp: Sony's reliable UDP for games' peer-to-peer play (librudp), pspocket's own (D-607, D-630 to D-633), made
+// to do what Sony's librudp does call for call (D-916): its answers and checks, its options, its structures, its
+// events and when they come, its wire format (rudp.hpp; a peer may be a real PS3), its timers, retransmissions,
+// congestion control and statistics. Read from Sony's module (firmware 4.92's librudp.sprx); nothing of it is copied
+// here: the code below is pspocket's own, written from what the module was understood to do.
 //
-// Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellRudp.cpp and cellRudp.h: the error codes, the option numbers, the poll
-// event flags, CellRudpAllocator, CellRudpEventHandler's arguments, Init, End and SetEventHandler. RPCS3 has stubs for
-// the rest and no signatures. What is not there was decided here (D-630) from the library's names, its error codes and
-// options, and the argument lists its successors (the PS Vita's and PS4's RUDP: the same functions) are recalled to
-// have, no document of them being at hand: unverified, each choice listed in D-630 with what to check against Sony's
-// librudp on the Mac (tests/hle/test_rudp_compare.cpp, D-633).
-// The wire format is pspocket's own (rudp.hpp, D-631): Sony's is not known, so this library talks only to pspocket's.
-// pspocket's network is a console without a link (D-523): datagrams go between the game's own sockets.
+// How librudp is built, and so this library:
+// - One lock (a recursive lightweight mutex) around everything: every call takes it, the internal I/O thread takes it
+//   to process what it received, and the game's handlers run with it held (they may call the library again).
+// - A scheduler: an event queue and timers. What a connection has to tell (established, readable, closed, a packet to
+//   send...) is queued as an event and handled later, when cellRudpProcessEvents runs the scheduler or the internal
+//   I/O thread does (about every 16.7 ms, and at once when it is woken). Each context has a timer (every 16 ms at
+//   first, then every half round trip, 125 ms before the first sample) that runs its retransmissions, delayed
+//   acknowledgements, window probes and keep-alive.
+// - The socket I/O: without the internal I/O thread the library never touches a socket: what it sends goes to the
+//   event handler (CELL_RUDP_EVENT_SEND), what the game receives it gives to cellRudpNetReceived. With the thread,
+//   the library sends with sendto (the handler first hears event 100, and may refuse) and the thread reads the
+//   sockets with socketselect and recvfrom (the handler first hears event 101). Those socket calls go through libnet
+//   (sys_net's exports, librudp's imports), so they fail as Sony's do until the game has brought the network up.
+//   Packets to one destination are aggregated into one datagram for up to the aggregation timeout.
+// - Its clock is the wall clock (sys_time_get_current_time): the timers and the time stamps a write may carry.
+// - Contexts: a connection each, over a socket bound in mux mode 1 (P2P: the peers share one vport) or 2 (each side
+//   its own vport; listeners). A listener answers a SYN with a cookie (a RST carrying 32 bytes) unless option 13 (the
+//   cookie's lifetime in seconds) is 0; a SYN echoing a valid cookie makes a child context that completes the
+//   handshake and waits to be accepted.
 //
-// The library stays firmware-first (D-563): where the system software is installed a game gets Sony's librudp.
-//
-// I/O (D-632). A context is bound to a socket the game made (cellRudpBind) in one of two modes:
-// - CELL_RUDP_MUXMODE_NORMAL: the library does the socket's I/O. It sends with sendto; it receives on the internal I/O
-//   thread (cellRudpEnableInternalIOThread: a PPU thread of the game's process) or, without one, in
-//   cellRudpProcessEvents, which also runs the timers (retransmission, keep-alive, connection and close timeouts).
-// - CELL_RUDP_MUXMODE_RAW: the game does it: the library hands each packet to the event handler (CELL_RUDP_EVENT_SEND)
-//   to send, and takes what the game received with cellRudpNetReceived (in either mode).
-// The context handler (CellRudpContextEventHandler: ctx_id, event_id, error_code, arg) and the event handler run on
-// the thread that processed what caused them: the I/O thread, or the game's in NetReceived or ProcessEvents. No lock of
-// the library is held while guest code runs, so a handler may call the library.
+// Reference for the names only: RPCS3 rpcs3/Emu/Cell/Modules/cellRudp.h (the error codes, the options, the poll
+// flags, CellRudpAllocator, the event handler's arguments). Everything else is librudp's behaviour.
 
 #include "rudp.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <format>
-#include <initializer_list>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
-#include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,15 +57,196 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/object.hpp"
 #include "pspocket/lv2/syscalls.hpp"
+#include "pspocket/recomp/hash.hpp"
 #include "pspocket/recomp/nid.hpp"
 
 namespace pspocket::hle {
+
+// ------------------------------------------------------------------------------------------------- the wire format
+
+namespace rudp {
+
+void encode(const Header& h, std::vector<u8>& out, u32 base_align)
+{
+    const usize start = out.size();
+    const auto w8 = [&](u32 v) { out.push_back(static_cast<u8>(v)); };
+    const auto w16 = [&](u32 v) {
+        w8(v >> 8);
+        w8(v);
+    };
+    const auto w32 = [&](u32 v) {
+        w16(v >> 16);
+        w16(v);
+    };
+    w8(static_cast<u32>(h.type << 6) | (h.flags & 0x3F));
+    w8(h.window);
+    w16(h.seq);
+    if (h.flags & kFlagAck) {
+        w16(h.ack);
+        if (h.flags & kFlagDelay) w16(h.delay);
+    }
+    if (h.type == kTypeSyn) {
+        w16((h.syn & kSynStream ? 0x800u : 0u) | (h.syn & kSynDelivery ? 0x200u : 0u) |
+            (h.syn & kSynOrder ? 0x100u : 0u) | (h.level & 0xFu));
+        w16(h.version);
+        w16(h.lowest);
+        w32(h.token);
+        w16(h.mss);
+    } else if (h.type == kTypeRst) {
+        w16(h.code);
+        w32(h.token);
+    }
+    std::optional<usize> last; // the last option's kind byte
+    if (h.opts & kOptCookie) {
+        last = out.size();
+        w8(1);
+        w8(h.cookie_len);
+        out.insert(out.end(), h.cookie.begin(), h.cookie.begin() + std::min<u32>(h.cookie_len, 32));
+    }
+    if (h.type != kTypeSyn && (h.opts & kOptMss)) {
+        last = out.size();
+        w8(2);
+        w8(2);
+        w16(h.mss);
+    }
+    if (h.nsack) {
+        last = out.size();
+        w8(5);
+        w8((h.nsack & 0x3F) << 2);
+        for (u32 i = 0; i < h.nsack && i < 8; i++) {
+            w16(h.sack[i][0]);
+            w16(h.sack[i][1]);
+        }
+    }
+    if (h.ext & kExtRetransmission) {
+        last = out.size();
+        w8(10);
+        w8(4);
+        w32(h.retransmission);
+    }
+    if (h.ext & kExtTimestamp) {
+        last = out.size();
+        w8(11);
+        w8(4);
+        w32(h.stamp);
+    }
+    if (h.align) {
+        const u32 a = h.align, at = (base_align + static_cast<u32>(out.size())) & (a - 1);
+        const u32 pad = (a - 1) & (a - at) & 0xFF;
+        for (u32 k = 0; k < pad; k++) {
+            last = out.size();
+            w8(0);
+        }
+    }
+    if (last) {
+        out[start] |= kFlagOptions;
+        out[*last] |= 0x80;
+    }
+}
+
+std::optional<u32> decode(const u8* p, u32 n, Header& h)
+{
+    h = Header{};
+    u32 at = 0;
+    const auto need = [&](u32 k) { return n - at >= k; };
+    const auto r8 = [&] { return p[at++]; };
+    const auto r16 = [&] {
+        const u16 v = static_cast<u16>(p[at] << 8 | p[at + 1]);
+        at += 2;
+        return v;
+    };
+    const auto r32 = [&] {
+        const u32 v = static_cast<u32>(p[at]) << 24 | static_cast<u32>(p[at + 1]) << 16 |
+                      static_cast<u32>(p[at + 2]) << 8 | p[at + 3];
+        at += 4;
+        return v;
+    };
+    if (!need(1)) return std::nullopt;
+    const u8 b0 = r8();
+    h.type = b0 >> 6;
+    h.flags = b0 & 0x3F;
+    if (!need(1)) return std::nullopt;
+    h.window = r8();
+    if (!need(2)) return std::nullopt;
+    h.seq = r16();
+    if (h.flags & kFlagAck) {
+        if (!need(2)) return std::nullopt;
+        h.ack = r16();
+    }
+    if (h.flags & kFlagDelay) {
+        if (!(h.flags & kFlagAck) || !need(2)) return std::nullopt;
+        h.delay = r16();
+    }
+    if (h.type == kTypeSyn) {
+        if (!need(12)) return std::nullopt;
+        const u16 params = r16();
+        h.syn = static_cast<u8>((params & 0x800 ? kSynStream : 0) | (params & 0x200 ? kSynDelivery : 0) |
+                                (params & 0x100 ? kSynOrder : 0));
+        h.level = params & 0xF;
+        h.version = r16();
+        h.lowest = r16();
+        h.token = r32();
+        h.mss = r16();
+        h.opts |= kOptMss;
+    } else if (h.type == kTypeRst) {
+        if (!need(6)) return std::nullopt;
+        h.code = static_cast<u8>(r16());
+        h.token = r32();
+    }
+    if (h.flags & kFlagOptions) {
+        while (n != at) {
+            u8 kind = r8();
+            const bool final = kind & 0x80;
+            kind &= 0x7F;
+            if (kind) {
+                if (!need(1)) return std::nullopt;
+                const u8 len = r8();
+                if (n - at < len) return std::nullopt;
+                switch (kind) {
+                case 1:
+                    if (static_cast<u8>(len - 1) > 31) return std::nullopt;
+                    h.cookie_len = len;
+                    std::memcpy(h.cookie.data(), p + at, len);
+                    at += len;
+                    h.opts |= kOptCookie;
+                    break;
+                case 2:
+                    if (len != 2) return std::nullopt;
+                    h.mss = r16();
+                    h.opts |= kOptMss;
+                    break;
+                case 5:
+                    if (len & 3) return std::nullopt;
+                    h.nsack = std::min<u32>(len >> 2, 8);
+                    for (u32 i = 0; i < len / 4u; i++) {
+                        const u16 a = r16(), b = r16();
+                        if (i < 8) h.sack[i] = {a, b};
+                    }
+                    break;
+                case 10:
+                    if (len != 4) return std::nullopt;
+                    h.retransmission = r32();
+                    h.ext |= kExtRetransmission;
+                    break;
+                case 11:
+                    if (len != 4) return std::nullopt;
+                    h.stamp = r32();
+                    h.ext |= kExtTimestamp;
+                    break;
+                default: at += len; break;
+                }
+            }
+            if (final) break;
+        }
+    }
+    return at;
+}
+
+} // namespace rudp
+
 namespace {
 
 using rudp::Header;
-using rudp::kHeaderSize;
-using rudp::kSynSize;
-using rudp::Type;
 
 constexpr std::string_view kModule = "cellRudp";
 constexpr const char* kChan = "cellRudp";
@@ -110,365 +294,2300 @@ enum : u32 {
     CELL_RUDP_ERROR_ALREADY_ESTABLISHED = 0x80770025,
     CELL_RUDP_ERROR_KEEP_ALIVE_FAILURE = 0x80770026,
 };
-constexpr s32 error(u32 code) { return static_cast<s32>(code); }
+constexpr s32 err(u32 code) { return static_cast<s32>(code); }
 
-// The context options (RPCS3 cellRudp.h CELL_RUDP_OPTION_*; 12 and 13 have no name there and are refused).
-enum : s32 {
-    kOptMaxPayload = 1,
-    kOptSndbuf = 2,
-    kOptRcvbuf = 3,
-    kOptNodelay = 4,
-    kOptDeliveryCritical = 5,
-    kOptOrderCritical = 6,
-    kOptNonblock = 7,
-    kOptStream = 8,
-    kOptConnectionTimeout = 9,
-    kOptCloseWaitTimeout = 10,
-    kOptAggregationTimeout = 11,
-    kOptLastError = 14,
-    kOptReadTimeout = 15,
-    kOptWriteTimeout = 16,
-    kOptFlushTimeout = 17,
-    kOptKeepAliveInterval = 18,
-    kOptKeepAliveTimeout = 19,
-};
-
-// A context's state (CellRudpContextStatus::state, D-630).
+// A context's state as CellRudpContextStatus and the connection have it.
 enum : u32 {
-    kStateIdle = 0,
-    kStateClosed = 1,
-    kStateSynSent = 2,
-    kStateSynRcvd = 3,
-    kStateEstablished = 4,
-    kStateCloseWait = 5,
+    kIdle = 0,
+    kClosed = 1, // also an Activate waiting for its peer's SYN
+    kSynSent = 2,
+    kSynRcvd = 3,
+    kEstablished = 4,
+    kCloseWait = 5,
+    kListening = 6, // the API's only
 };
 
-// The context handler's events and the event handler's (D-630).
-enum : s32 {
-    kEventClosed = 1,
-    kEventEstablished = 2,
-    kEventError = 3,
-    kEventWritable = 4,
-    kEventReadable = 5,
-    kEventFlushed = 6,
+// Why a connection ended (the RST's reason byte; the API's error codes in this order).
+enum : u8 {
+    kWhyNone = 0,
+    kWhyReset = 1,
+    kWhyRefused = 2,
+    kWhyTimeout = 3,
+    kWhyVersion = 4,
+    kWhyTransport = 5,
+    kWhyQuality = 6,
+    kWhyInternal = 7,
+    kWhyKeepAlive = 8,
 };
-enum : s32 { kEventSend = 1, kEventSocketReleased = 2 };
+u32 error_of(u8 why)
+{
+    switch (why) {
+    case kWhyNone: return 0;
+    case kWhyReset: return CELL_RUDP_ERROR_CONN_RESET;
+    case kWhyRefused: return CELL_RUDP_ERROR_CONN_REFUSED;
+    case kWhyTimeout: return CELL_RUDP_ERROR_CONN_TIMEOUT;
+    case kWhyVersion: return CELL_RUDP_ERROR_CONN_VERSION_MISMATCH;
+    case kWhyTransport: return CELL_RUDP_ERROR_CONN_TRANSPORT_TYPE_MISMATCH;
+    case kWhyQuality: return CELL_RUDP_ERROR_QUALITY_LEVEL_MISMATCH;
+    case kWhyKeepAlive: return CELL_RUDP_ERROR_KEEP_ALIVE_FAILURE;
+    default: return CELL_RUDP_ERROR_INTERNAL;
+    }
+}
 
-// Polling (RPCS3 cellRudp.h CELL_RUDP_POLL_EV_*; the operations D-630).
+// The context handler's events (CellRudpContextEventHandler) and the event handler's.
+enum : u32 {
+    kEvClosed = 1,
+    kEvEstablished = 2,
+    kEvError = 3,
+    kEvWritable = 4,
+    kEvReadable = 5,
+    kEvFlushed = 6,
+    kEvAcceptable = 7,
+};
+enum : u32 { kEvSend = 1, kEvSocketReleased = 2, kEvBeforeSend = 100, kEvBeforeReceive = 101 };
+
+// Polling (RPCS3 cellRudp.h).
 enum : u16 { kPollRead = 0x0001, kPollWrite = 0x0002, kPollFlush = 0x0004, kPollError = 0x0008 };
-constexpr u16 kPollEvents = kPollRead | kPollWrite | kPollFlush | kPollError;
-enum : s32 { kPollAdd = 1, kPollModify = 2, kPollRemove = 3 };
 
-// Read and Write flags (D-630): DONTWAIT, LATENCY_CRITICAL, ALIGN_32, ALIGN_64, WITH_TIMESTAMP.
-enum : u8 { kMsgDontwait = 0x01, kMsgLatencyCritical = 0x08 };
-
-enum : u8 { kMuxNormal = 0, kMuxRaw = 1 };
-
-// lv2's network calls (RPCS3 lv2/sys_net.h; the socket information as pspocket's lv2 gives it, D-523).
-constexpr u32 kSysGetsockname = 704, kSysRecvfrom = 707, kSysSendto = 710, kSysPoll = 715, kSysInfoctl = 722;
-constexpr u32 kInfoctlSockinfoEx = 11, kSockinfoBlock = 32, kSockinfoExSize = 80;
-constexpr s32 kSockDgram = 2, kSockDgramP2p = 6;
-constexpr s32 kMsgDontwaitNet = 0x80; // SYS_NET_MSG_DONTWAIT
-constexpr u16 kPollin = 0x0001, kPollnval = 0x0020; // SYS_NET_POLLIN, SYS_NET_POLLNVAL
-constexpr u32 kSockaddrSize = 16;
-constexpr u32 kLoopback = 0x7F000001;
-
-// Limits and defaults (D-630: Sony's are not known; to compare on the Mac).
-constexpr u16 kDefaultMss = 1400, kMinMss = 128; // a segment: header and payload, one UDP datagram
-constexpr u32 kMaxDatagram = 65507;             // what UDP carries
-constexpr u32 kDefaultBuffer = 65536, kMinBuffer = 256, kMaxBuffer = 16u << 20;
-constexpr u32 kMaxContexts = 256, kMaxPolls = 64, kMaxPollSize = 1024;
-constexpr u32 kDefaultBacklog = 8, kMaxBacklog = 64;
-constexpr u32 kRecordSize = 0x100; // each context's record from the allocator
-constexpr u64 kDefaultConnectionTimeout = 30'000'000, kDefaultCloseWaitTimeout = 1'000'000,
-              kDefaultAggregationTimeout = 10'000, kDefaultKeepAliveInterval = 1'000'000,
-              kDefaultKeepAliveTimeout = 10'000'000;
-constexpr u64 kInitialRto = 200'000, kMinRto = 20'000, kMaxRto = 1'000'000; // microseconds
-constexpr double kInitialCwnd = 4, kInitialSsthresh = 32, kMaxCwnd = 128; // segments in flight
-constexpr u64 kForever = 1ull << 40;   // a timeout this long or longer has no end
-constexpr u64 kIoTick = 10'000;        // the I/O thread looks at its sockets and timers at least this often
-constexpr u32 kRxSize = 65536;         // a datagram received
-constexpr u32 kPollSlots = 64;         // sockets the I/O thread waits on at once
-constexpr u32 kIoBlockSize = kRxSize + 32 + 8 * kPollSlots;
-constexpr u32 kStackScratch = 4096;    // packets up to this size are staged on the sending thread's stack
-constexpr u32 kDrainLimit = 512;       // datagrams taken from one socket in one go
-
-// CellRudpStatus (D-630): 50 counters of 8 bytes, in this order.
-enum Stat : u32 {
-    kSentUdpBytes, kRcvdUdpBytes, kSentUdpPackets, kRcvdUdpPackets, kSentUserBytes, kSentUserPackets,
-    kSentLatencyCriticalPackets, kRcvdUserBytes, kRcvdUserPackets, kRcvdLatencyCriticalPackets, kSentSynPackets,
-    kRcvdSynPackets, kSentUsrPackets, kRcvdUsrPackets, kSentPrbPackets, kRcvdPrbPackets, kSentRstPackets,
-    kRcvdRstPackets, kLostPackets, kRetransmittedPackets, kReorderedPackets, kCurrentContexts,
-    kQualityLevels, // per quality level 1 to 4: sent bytes, received bytes, sent packets, received packets
-    kAllocs = kQualityLevels + 16, kFrees, kMemCurrent, kMemPeak, kEstablishedConnections, kFailedConnections,
-    kFailedReset, kFailedRefused, kFailedTimeout, kFailedVersion, kFailedTransport, kFailedQuality, kStatCount
-};
-constexpr u32 kStatusSize = 8 * kStatCount;
-constexpr u32 kContextStatusSize = 48;
-constexpr u32 kReadInfoSize = 12, kPollEventSize = 8;
-
-u64 now_us() { return lv2::guest_system_time_us(); }
-bool seq_lt(u32 a, u32 b) { return static_cast<s32>(a - b) < 0; }
-bool seq_gt(u32 a, u32 b) { return static_cast<s32>(a - b) > 0; }
-
-// ------------------------------------------------------------------------------------------------- state
-
-// A peer's address as a game gives it (a sys_net_sockaddr_in, or _in_p2p with the P2P socket's virtual port).
-struct Endpoint {
-    std::array<u8, 16> raw{}; // sendto takes it as it is
-    u32 addr = 0;             // 0.0.0.0 as 127.0.0.1, where lv2 delivers it
-    u16 port = 0;
-    u16 p2p = 0; // sin_vport: P2P sockets only
+// Write flags.
+enum : u8 {
+    kMsgDontwait = 0x01,
+    kMsgLatencyCritical = 0x08,
+    kMsgAlign32 = 0x10,
+    kMsgAlign64 = 0x20,
+    kMsgWithTimestamp = 0x40,
 };
 
-Endpoint endpoint_of(const u8* sa)
+// The connection's flags.
+enum : u32 {
+    kCInitiated = 0x1,     // Initiate's handshake runs
+    kCWantWritable = 0x4,  // a write found no room: WRITABLE when there is
+    kCFlushing = 0x8,      // a Flush waits for its marked segment to be acknowledged
+    kCSendQueued = 0x10,   // an output event is queued
+    kCAckQueued = 0x20,    // an acknowledgement event is queued
+    kCActivated = 0x80,    // Activate waits for the peer's SYN
+    kCOrder = 0x10000,     // CELL_RUDP_OPTION_ORDER_CRITICAL
+    kCDelivery = 0x20000,  // CELL_RUDP_OPTION_DELIVERY_CRITICAL
+    kCStream = 0x40000,    // CELL_RUDP_OPTION_STREAM
+    kCNodelay = 0x80000,   // CELL_RUDP_OPTION_NODELAY
+    kCSack = 0x100000,     // option 12: selective acknowledgements
+    kCFreshIds = 0x400000, // the next handshake takes new token and sequence numbers
+    kCOpt255 = 0x80000000, // option 0xFF
+};
+constexpr u32 kCDefault = kCOrder | kCDelivery | kCSack | 0x200000 | kCFreshIds;
+
+// The context's flags.
+enum : u8 { kXListening = 0x1, kXPeer = 0x2, kXTerminated = 0x4 };
+// What a blocked call waits for (bits set by the events, cleared by the waiter; 0x80: the context goes).
+enum : u8 {
+    kWakeEstablished = 0x1,
+    kWakeClosed = 0x2,
+    kWakeWritable = 0x4,
+    kWakeReadable = 0x8,
+    kWakeFlushed = 0x10,
+    kWakeAcceptable = 0x20,
+    kWakeCancel = 0x80,
+};
+
+constexpr u16 kDefaultMss = 0x582; // 1410: header, payload and the datagram's prefix, one segment
+constexpr u32 kPayloadSlack = 0x40; // what a segment leaves for the header: MAX_PAYLOAD is the segment less this
+constexpr u64 kMinRto = 1'000'000, kMaxRto = 16'000'000, kInitialRto = 1'000'000; // microseconds
+constexpr u64 kMinVariance = 16'000;
+constexpr u32 kIoPollUs = 16'667;    // the internal I/O thread's socketselect timeout
+constexpr u32 kIoBufferDefault = 0x800;
+constexpr u32 kSysNetSoNbio = 0x1100, kSysNetSolSocket = 0xFFFF;
+
+// librudp's clock: sys_time_get_current_time in microseconds (the wall clock; its time stamps are its milliseconds).
+u64 now_us()
 {
-    Endpoint e;
-    std::memcpy(e.raw.data(), sa, kSockaddrSize);
-    e.port = ps_ld16(sa + 2);
-    e.addr = ps_ld32(sa + 4);
-    if (!e.addr) e.addr = kLoopback;
-    e.p2p = ps_ld16(sa + 8);
-    return e;
+    s64 sec = 0, nsec = 0;
+    lv2::host_current_time(sec, nsec);
+    return static_cast<u64>(sec) * 1000000 + static_cast<u64>(nsec) / 1000;
+}
+u32 now_ms32() { return static_cast<u32>(now_us() / 1000); }
+s16 sdiff(u16 a, u16 b) { return static_cast<s16>(static_cast<u16>(a - b)); }
+u64 sext(s32 v) { return static_cast<u64>(static_cast<s64>(v)); }
+
+// ------------------------------------------------------------------------------------------------- the lock
+
+// librudp's lock: a recursive lightweight mutex. A blocked call releases it entirely while it waits (as an lwcond
+// wait does) and takes it back as deep as it was.
+class LibLock {
+public:
+    void lock()
+    {
+        const std::thread::id me = std::this_thread::get_id();
+        std::unique_lock l(m_);
+        if (owner_ == me) {
+            depth_++;
+            return;
+        }
+        cv_.wait(l, [&] { return depth_ == 0; });
+        owner_ = me;
+        depth_ = 1;
+    }
+    void unlock()
+    {
+        std::unique_lock l(m_);
+        if (--depth_ == 0) {
+            owner_ = {};
+            cv_.notify_one();
+        }
+    }
+    u32 release_all()
+    {
+        std::unique_lock l(m_);
+        const u32 d = depth_;
+        depth_ = 0;
+        owner_ = {};
+        cv_.notify_one();
+        return d;
+    }
+    void reacquire(u32 d)
+    {
+        const std::thread::id me = std::this_thread::get_id();
+        std::unique_lock l(m_);
+        cv_.wait(l, [&] { return depth_ == 0; });
+        owner_ = me;
+        depth_ = d;
+    }
+    bool held() const
+    {
+        std::unique_lock l(m_);
+        return depth_ && owner_ == std::this_thread::get_id();
+    }
+
+private:
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    std::thread::id owner_{};
+    u32 depth_ = 0;
+};
+
+// A condition variable over the library's lock (librudp's lwconds: a context's, a poll set's, the scheduler's).
+// Blocked guest threads park on lv2 waiters, show as network waits, and the process's end unwinds them.
+class Cond {
+public:
+    // Waits for signal() or signal_all() or `timeout` microseconds (0: none). The lock is held on entry and on
+    // return. True when signalled.
+    bool wait(LibLock& lock, lv2::PpuThread& t, u64 timeout);
+    void signal_all();
+    void signal();
+
+private:
+    std::mutex m_;
+    lv2::WaitQueue q_;
+};
+
+bool Cond::wait(LibLock& lock, lv2::PpuThread& t, u64 timeout)
+{
+    std::unique_lock lk(m_);
+    lv2::Waiter& w = t.waiter;
+    lv2::prepare_wait(w);
+    q_.push(&w);
+    const u32 depth = lock.release_all();
+    const lv2::WaitStatus status = lv2::park(w, lk, timeout, {lv2::WaitKind::Net, 0}, [&](bool) {
+        return q_.remove(&w) ? lv2::CancelResult::Removed : lv2::CancelResult::Woken;
+    });
+    if (status == lv2::WaitStatus::Aborted) {
+        lock.reacquire(depth);
+        throw lv2::ThreadExit{};
+    }
+    lock.reacquire(depth);
+    return status == lv2::WaitStatus::Woken;
 }
 
-bool same_peer(const Endpoint& a, const Endpoint& b, bool p2p)
+void Cond::signal_all()
 {
-    return a.addr == b.addr && a.port == b.port && (!p2p || a.p2p == b.p2p);
+    std::lock_guard lk(m_);
+    for (lv2::Waiter* w : q_.take_all(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
 }
 
-struct Options {
-    u32 max_payload = 0; // set from the segment size when the context is made
-    u32 sndbuf = kDefaultBuffer, rcvbuf = kDefaultBuffer;
-    bool nodelay = false, delivery = true, order = true, nonblock = false, stream = false;
-    u64 connection_timeout = kDefaultConnectionTimeout, close_wait_timeout = kDefaultCloseWaitTimeout,
-        aggregation_timeout = kDefaultAggregationTimeout, read_timeout = 0, write_timeout = 0, flush_timeout = 0,
-        keep_alive_interval = kDefaultKeepAliveInterval, keep_alive_timeout = kDefaultKeepAliveTimeout;
+void Cond::signal()
+{
+    std::lock_guard lk(m_);
+    if (lv2::Waiter* w = q_.pop(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
+}
+
+// ------------------------------------------------------------------------------------------------- the state
+
+struct Lib;
+struct Ctx;
+struct Net;
+struct Seg;
+
+// The PPU thread calling into the library right now (an API call, the I/O thread): guest functions (the allocator,
+// the handlers) are called on it.
+thread_local PPUContext* t_ppu = nullptr;
+struct OnThread {
+    PPUContext* saved;
+    explicit OnThread(PPUContext& ctx) : saved(t_ppu) { t_ppu = &ctx; }
+    ~OnThread() { t_ppu = saved; }
+    OnThread(const OnThread&) = delete;
+    OnThread& operator=(const OnThread&) = delete;
 };
 
-// What a connection carries, fixed when it starts: a byte stream or messages; delivery and order guaranteed or not
-// (a stream always both).
-struct Params {
-    bool stream = false, reliable = true, ordered = true;
-};
-Params params_of(const Options& o) { return {o.stream, o.stream || o.delivery, o.stream || o.order}; }
-u32 quality_of(const Params& p) { return (p.reliable ? 0u : 2u) + (p.ordered ? 0u : 1u); } // level - 1
-
-// A segment sent or to send: DATA (a message, or a stream's bytes) or FIN.
-struct Segment {
-    u32 seq = 0;
-    Type type = Type::Data;
-    u8 flags = 0;
-    std::vector<u8> data;
-    u64 offset = 0; // the connection's payload bytes before it
-    u64 first_sent = 0, last_sent = 0;
-    u32 sends = 0, stamp = 0;
-    bool sacked = false;
+// One allocation the library made through its allocator (librudp's: 16 bytes of its own before each block, counted
+// in CellRudpStatus's allocs, frees, memCurrent and memPeak). `addr` is the game's block (with the library's own
+// allocator, nothing is taken from the game's heap: 1 marks the block as held).
+struct Block {
+    u32 addr = 0, size = 0;
+    explicit operator bool() const { return size != 0; }
 };
 
-// Data received, waiting for cellRudpRead.
-struct Chunk {
-    std::vector<u8> data;
-    usize read = 0; // a stream's bytes already read
-    u32 seq = 0, stamp = 0;
-    u8 flags = 0, retries = 0;
-    bool fin = false; // the peer's end (no data)
+// A segment: a packet's payload to send or one received, from the connection's pool (librudp keeps freed ones for
+// the next).
+struct Seg {
+    std::vector<u8> buf; // the payload's room (its size: the pool's when the segment was made)
+    u32 off = 0, len = 0; // what is in it: buf[off, off + len)
+    u32 stamp = 0;        // to send: the millisecond clock at its first sending; received: the sender's time stamp
+    u32 retrans = 0;      // to send: retransmissions (bits 31-24) and their delay in ms (23-0); received: as sent
+    u16 flags = 0;
+    u16 seq = 0;
+    Seg* next = nullptr;
+    Block mem_obj, mem_buf;
+    u32 room() const { return static_cast<u32>(buf.size()) - off - len; }
+};
+enum : u16 {
+    kSegSent = 0x1,     // to send: gone at least once
+    kSegLost = 0x2,     // to send: to send again; received: delivered in order (a stream's bytes)
+    kSegSacked = 0x4,   // to send: the peer has it (a selective acknowledgement); received: the oldest latency-critical
+    kSegFlush = 0x8,    // the last segment before a Flush
+    kSegAlign32 = 0x10,
+    kSegAlign64 = 0x20,
+    kSegLatency = 0x100, // latency critical
+    kSegMore = 0x200,    // a stream segment followed by more of the same write
+    kSegStamp = 0x800,   // carries a time stamp
+    kSegSend = 0x8000,   // a segment to send (a received one otherwise)
 };
 
-struct Context {
-    s32 id = 0; // 0: none (a listener's connection not accepted yet, or one the game terminated, lingering)
-    u32 handler = 0, arg = 0;
-    u32 record = 0, record_free = 0; // the context's record and the app_free it goes back to (0: the main area)
-    bool record_own = false;
-    u32 state = kStateIdle;
-    Options opt;
-    // The socket.
-    bool bound = false;
-    s32 soc = -1;
-    u16 vport = 0;
-    u8 mux = kMuxNormal;
-    // How it connects.
-    bool listening = false, activated = false, lingering = false;
-    u32 backlog = 0;
-    std::weak_ptr<Context> parent;
-    s32 parent_id = 0;
-    u32 children = 0;
-    std::vector<std::shared_ptr<Context>> pending; // a listener's connections not accepted yet
-    bool has_peer = false;
-    Endpoint peer;
-    u16 peer_vport = 0;
-    // The connection.
-    Params p;
-    u16 mss = 0;      // this side's segment size (header and payload); the peer's caps it
-    u32 payload = 0;  // a segment's payload
-    u32 iss = 0, irs = 0;
-    u32 snd_una = 0, snd_nxt = 0;
-    u64 snd_offset = 0; // payload bytes given sequence numbers so far
-    // The segments not acknowledged yet, in order: the first `sent` of them went out at least once (segments go out
-    // first in order), `flight` of those the peer has not acknowledged selectively; `queued_bytes` their payload and
-    // stream_out's.
-    std::deque<Segment> sndq;
-    usize sent = 0, queued_bytes = 0;
-    u32 flight = 0;
-    std::deque<u8> stream_out; // a stream's bytes not in a segment yet
-    bool fin_wanted = false, fin_queued = false, flush_now = false;
-    u64 nagle_since = 0;
-    u32 peer_window = 0;
-    double cwnd = kInitialCwnd, ssthresh = kInitialSsthresh;
-    u64 srtt = 0, rttvar = 0, rto = kInitialRto;
-    bool rtt_valid = false;
-    u64 rto_deadline = 0, persist_deadline = 0;
-    // Loss detection (RACK, RFC 8985, simplified): the latest sending of a segment the peer has; a recovery episode
-    // (the window shrinks once in one) until snd_una passes `recover`.
-    u64 rack_xmit = 0;
-    bool recovery = false;
-    u32 recover = 0;
-    u32 rcv_nxt = 0, highest = 0;
-    bool any_received = false;
-    std::map<u32, Chunk> ooo; // reliable and ordered: arrived ahead of rcv_nxt
-    usize ooo_bytes = 0;
-    std::set<u32> seen;       // unordered: arrived ahead of rcv_nxt (reliable), or lately (unreliable)
-    u32 delivered = 0;        // unreliable ordered: the last sequence number delivered
-    std::deque<Chunk> rcvq;
-    usize rcv_bytes = 0;
-    bool peer_fin = false;    // the peer's FIN taken in order: what is left in rcvq is the last
-    bool fin_seen = false;    // reliable unordered: the peer's FIN came, at fin_seq, maybe before what precedes it
-    u32 fin_seq = 0;
-    bool ack_now = false;
-    bool dropped = false; // gone from the library (a connection let go, or not accepted)
-    u32 last_window = 0;
-    s32 error = 0; // the last error (CELL_RUDP_OPTION_LAST_ERROR)
-    bool writable_wanted = false, flush_wanted = false;
-    u64 connect_deadline = 0, syn_next = 0, linger_deadline = 0, last_heard = 0, last_sent = 0;
-    u32 syn_sends = 0;
-    // Its statistics (CellRudpContextStatus).
-    u32 lost = 0, sent_packets = 0, rcvd_packets = 0, retransmissions = 0;
+struct Pool {
+    Seg* free = nullptr;
+    u16 nfree = 0, total = 0, nsend = 0, nrecv = 0, max_send = 0, max_recv = 0;
+    u16 bufsize = static_cast<u16>(kDefaultMss - kPayloadSlack); // MAX_PAYLOAD
+};
+
+// A connection (one per context): the protocol's state.
+struct Conn {
+    Ctx* owner = nullptr;
+    u32 token = 0, peer_token = 0;
+    u32 segsize = kDefaultMss;          // MAX_PAYLOAD + 64, the peer's segment size once connected
+    u32 sndbuf = 0x10000, rcvbuf = 0x10000;
+    Pool pool;
+    u16 snd_una = 0, snd_nxt = 0;       // the oldest unacknowledged sequence number, the next to give
+    u16 peer_window = 0;                // the peer's receive slots (its SYN)
+    u16 window = 0;                     // the peer's receive slots (its last packet)
+    u32 cwnd = kDefaultMss, ssthresh = 0x10000;
+    s32 recover = -1;                   // the sequence number fast recovery ends at
+    u16 recover_seq = 0;
+    u16 rcv_nxt = 0, rcv_high = 0, rcv_low = 0, rcv_last = 0;
+    Seg *sq_head = nullptr, *sq_tail = nullptr; // the segments to send and those in flight, in order
+    u32 sq_bytes = 0, sq_unsent = 0;    // their payload; what of it is still to send
+    Seg *rq_head = nullptr, *rq_tail = nullptr, *rq_ordered = nullptr; // received, waiting to be read
+    u32 rq_bytes = 0, rq_ordered_bytes = 0;
+    u16 rq_latency = 0;                 // latency-critical messages waiting (order not critical)
+    u32 readable = 0;                   // what the next Read gives (a message's size)
+    Seg* rq_next_latency = nullptr;
+    u16 dupacks = 0, backoff = 0, delayed_acks = 0;
+    u32 conn_timeout = 60000, close_wait_timeout = 0, aggregation = 30; // milliseconds
+    u64 rttvar = 0, srtt = 0, rto = kInitialRto, rexmit_at = 0, deadline = 0, min_var = kMinVariance;
+    u64 last_data = 0, delack_since = 0, persist_since = 0;
+    u32 persist_ms = 0;
+    u32 ka_interval = 0, ka_timeout = 20000; // milliseconds
+    u64 ka_first = 0, ka_last = 0, ka_heard = 0, ka_next = 0;
+    u32 ka_count = 0;
+    u64 last_rcvd = 0, last_sent = 0;
+    std::vector<u8> cookie; // a listener's cookie to echo in the SYN
+    Block cookie_mem;
+    u32 state = kIdle;
+    u32 flags = kCDefault;
+    // CellRudpContextStatus.
+    u32 lost = 0, recovered = 0, dups = 0, sent_packets = 0, rcvd_packets = 0, retransmissions = 0;
     u64 sent_bytes = 0, rcvd_bytes = 0;
 
-    usize queued() const { return queued_bytes; }
-    Segment* first_unsent() { return sent < sndq.size() ? &sndq[sent] : nullptr; }
-    // The oldest segment, off the queue (acknowledged, or lost without delivery guarantees).
-    void pop_front()
+    bool stream() const { return flags & kCStream; }
+    bool delivery() const { return flags & kCDelivery; }
+    bool order() const { return flags & kCOrder; }
+    bool reliable() const { return stream() || delivery(); }
+    u32 payload() const { return segsize - kPayloadSlack; }
+    u32 slots(u32 buffer) const { return segsize <= kPayloadSlack ? buffer : buffer / (segsize - kPayloadSlack); }
+    u16 free_rcv_slots() const
     {
-        const Segment& s = sndq.front();
-        if (s.sends) {
-            sent--;
-            if (!s.sacked) flight--;
-        }
-        queued_bytes -= s.data.size();
-        sndq.pop_front();
+        const u16 n = static_cast<u16>(segsize <= kPayloadSlack ? static_cast<u16>(rcvbuf) : rcvbuf / payload());
+        return n > pool.nrecv ? static_cast<u16>(n - pool.nrecv) : 0;
     }
-    void clear_send()
-    {
-        sndq.clear();
-        stream_out.clear();
-        sent = queued_bytes = 0;
-        flight = 0;
-    }
-    bool connected() const { return state == kStateEstablished || state == kStateCloseWait; }
-    bool connecting() const { return state == kStateSynSent || state == kStateSynRcvd; }
+    s32 writable() const;
+    s32 readable_size() const;
 };
 
-// What the library knows of one socket: the contexts bound at each vport, and the connections on it (the bound
-// contexts that have a peer, a listener's connections, those lingering after cellRudpTerminate).
-struct Binding {
-    u8 mux = kMuxNormal;
-    bool p2p = false;
-    bool closed = false; // the game closed the socket under its contexts: no longer read
-    std::map<u16, std::shared_ptr<Context>> ports;
-    std::vector<std::shared_ptr<Context>> conns;
+// The scheduler's event: for the object registered as `target`.
+struct Event {
+    u32 target = 0;
+    u8 type = 0, sub = 0;
+    u32 arg = 0;
+};
+// A context's events (librudp's types; what they do is Ctx::on_event).
+enum : u8 {
+    kQEstablished = 0,
+    kQClosed = 1,
+    kQError = 2,
+    kQReadable = 3,
+    kQWritable = 4,
+    kQFlushed = 5,
+    kQSendSyn = 6,
+    kQSendAck = 7,
+    kQSendRst = 8,
+    kQOutput = 9,
+    kQProbeReply = 10,
+    kQChildEstablished = 11,
+    kQChildClosed = 12,
+    kQCleanup = 13,
+    kQCookies = 14,
+    kQMemory = 15,
+    kQBadSocket = 16,
+    kQSocketReleased = 17, // the networker's
 };
 
-struct Poll {
-    u32 size = 0;
-    std::vector<std::pair<s32, u16>> entries; // context ID, events asked for
-    u64 cancels = 0;
+struct Target {
+    enum class Kind { Ctx, Net, Agg } kind = Kind::Net;
+    Ctx* ctx = nullptr;
+    u64 interval = 0; // a timer's period in microseconds (0: none)
+    Block mem;
+};
+
+struct Sched {
+    std::deque<Event> ring;
+    u32 cap = 0x100;
+    Block ring_mem, table_mem;
+    std::map<u32, Target> targets;
+    struct TimerNode {
+        u32 id;
+        Block mem;
+    };
+    std::multimap<u64, TimerNode> timers;
+    u32 last_id = 0xFFFFFFFF;
+    s32 busy = 0;
+    bool cancelled = false, kicked = false;
+    Cond cond;
+};
+
+// A peer's address as a context keeps it: a sys_net_sockaddr (16 bytes used of 34) and a vport.
+struct Addr {
+    std::array<u8, 0x22> raw{};
+    u16 vport = 0;
+};
+// librudp's order of addresses: by family, then (IPv4) port and address; else by length and bytes.
+bool addr_less(const std::array<u8, 0x22>& a, const std::array<u8, 0x22>& b)
+{
+    if (a[1] != b[1]) return a[1] < b[1];
+    if (a[1] == 2) {
+        if (const int c = std::memcmp(&a[2], &b[2], 2)) return c < 0;
+        return std::memcmp(&a[4], &b[4], 4) < 0;
+    }
+    if (!a[0] || a[0] != b[0]) return a[0] && a[0] < b[0];
+    return std::memcmp(&a[2], &b[2], static_cast<usize>(a[0] - 2) & 0x1F) < 0;
+}
+bool addr_equal(const std::array<u8, 0x22>& a, const std::array<u8, 0x22>& b)
+{
+    if (a[1] != b[1]) return false;
+    if (a[1] == 2) return !std::memcmp(&a[2], &b[2], 6);
+    if (!a[0]) return true;
+    return a[0] == b[0] && !std::memcmp(&a[2], &b[2], static_cast<usize>(b[0] - 2) & 0x1F);
+}
+struct AddrLess {
+    bool operator()(const Addr& a, const Addr& b) const
+    {
+        if (addr_less(a.raw, b.raw)) return true;
+        return addr_equal(a.raw, b.raw) && a.vport < b.vport;
+    }
+};
+
+// A context.
+struct Ctx {
+    Net* net = nullptr;
+    s32 id = -1;
+    u32 target = 0; // its scheduler registration (events and the timer)
+    u32 handler = 0, arg = 0;
+    Conn c;
+    Cond cond;
+    bool blocking = false; // CELL_RUDP_OPTION_NONBLOCK 0
+    s32 waiters = 0;
+    s32 soc = -1;
+    std::array<u8, 0x22> local{}; // never set (librudp hashes it into the token)
+    u16 vport = 0;
+    Addr peer;
+    Ctx* parent = nullptr;
+    bool child = false;
+    struct ChildNode {
+        Ctx* ctx;
+        Block mem;
+    };
+    std::multimap<Addr, ChildNode, AddrLess> accepted; // a listener's accepted children
+    struct Pending {
+        u64 since;
+        Ctx* ctx;
+        Block mem;
+    };
+    std::list<Pending> pending; // a listener's children not accepted yet
+    u16 backlog = 0;
+    u32 cookie_life = 10; // option 13, seconds (0: no cookies)
+    struct CookieRing {
+        std::array<Addr, 64> entries{};
+        u32 head = 0, tail = 0;
+        bool full = false;
+        Block mem_obj, mem_buf;
+    };
+    std::unique_ptr<CookieRing> cookies;
+    u32 secret = 0;
+    u8 mux = 0;
+    s32 poll = -1;
+    s32 error = 0;
+    u32 read_timeout = 0, write_timeout = 0, flush_timeout = 0; // milliseconds
+    u8 flags = 0;
+    u8 wake = 0;
+    bool valid = true;
+    Block mem;
+};
+
+// What the library keeps of one socket: its contexts, and how arriving packets find them.
+struct SockRec {
+    s32 soc = -1;
+    u16 next_vport = 10000;
+    struct CtxNode {
+        Ctx* ctx;
+        Block mem;
+    };
+    std::multimap<Ctx*, CtxNode> ctxs;
+    struct PeerNode {
+        Ctx* ctx;
+        Block mem;
+    };
+    std::multimap<Addr, PeerNode, AddrLess> peers; // mux 1: by the peer's address and the shared vport
+    struct VportNode {
+        Ctx* ctx;
+        Block mem;
+    };
+    std::multimap<u16, VportNode> vports; // mux 2: by vport
+    Block mem;
+};
+
+// The aggregator: one datagram per destination at a time, sent when it is full, when a packet that may not wait is
+// added, or when its oldest packet has waited its aggregation timeout.
+struct AggKey {
+    s32 soc = -1;
+    std::array<u8, 0x22> addr{};
+};
+struct AggKeyLess {
+    bool operator()(const AggKey& a, const AggKey& b) const
+    {
+        if (a.soc != b.soc) return a.soc < b.soc;
+        return addr_less(a.addr, b.addr);
+    }
+};
+struct AggUser {
+    s32 ctx = 0;
+    u32 aggregation = 0;
+    Block mem;
+};
+struct AggPacket {
+    u32 queued_ms = 0;
+    Seg* stamp = nullptr; // the segment whose first-sending time is the datagram's
+};
+struct AggDest {
+    std::vector<u8> bytes; // the datagram so far
+    u32 cap = 0;
+    u64 start = 0;
+    u32 max_wait = 0, wait = 0; // milliseconds
+    std::vector<AggPacket> packets;
+    std::list<AggUser> users;
+    Block mem_obj, mem_buf, mem_node;
+};
+struct Agg {
+    u16 mss = kDefaultMss;
+    u32 target = 0;
+    u32 interval_ms = 15;
+    bool armed = false;
+    std::multimap<AggKey, AggDest, AggKeyLess> dests;
+};
+
+// A poll set.
+struct PollSet {
+    s32 id = 0;
+    struct Entry {
+        u16 req = 0, ret = 0; // ret bit 15: queued in the ring
+        Block mem;
+    };
+    std::multimap<s32, Entry> entries;
+    std::vector<s32> ring;
+    u32 head = 0, tail = 0;
+    bool full = false;
+    u32 carried = 0; // entries the last wait handed out, looked at again by the next
+    Cond cond;
+    s32 waiters = 0, cancelling = 0;
+    bool cancel = false, dying = false;
+    Block mem_obj, mem_ring, mem_node;
+    u32 count() const
+    {
+        if (ring.empty()) return 0;
+        if (tail == head) return full ? static_cast<u32>(ring.size()) : 0;
+        return tail > head ? tail - head : static_cast<u32>(ring.size()) + tail - head;
+    }
+    bool push(s32 v)
+    {
+        if (ring.empty() || (tail == head && full)) return false;
+        full = true;
+        ring[tail] = v;
+        if (++tail == ring.size()) tail = 0;
+        return true;
+    }
+};
+
+// The internal I/O thread.
+struct IoThread {
+    bool running = false;   // librudp's thread object's "run" flag
+    bool started = false;
+    u32 stack = 0x1000, priority = 0x3E9;
+    u16 bufsize = kIoBufferDefault;
+    Block buf_mem;
+    u32 thread_id = 0;
+    s32 wake_soc = -1;
+    std::array<u8, 16> wake_addr{};
+    std::atomic<u32> woken{0};
+    std::vector<s32> sockets; // what it reads, the wake-up socket first
+    std::atomic<bool> stop{false};
+};
+
+struct Net {
+    Sched sched;
+    std::multimap<s32, std::pair<Ctx*, Block>> ctxs;
+    s32 next_ctx = 0;
+    u32 handler = 0, handler_arg = 0;
+    Agg agg;
+    IoThread io;
+    bool io_enabled = false;
+    std::multimap<s32, std::pair<std::unique_ptr<PollSet>, Block>> polls;
+    s32 next_poll = 0;
+    std::multimap<s32, std::unique_ptr<SockRec>> sockets;
+    u32 target = 0;
+    Block mem;
 };
 
 struct Lib {
-    std::mutex m; // everything below but the I/O buffers' users (rx_m) and the filter (filter_m)
-    bool initialized = false;
+    LibLock lock;
+    bool initialized = false, ending = false;
+    // Memory.
     u32 app_malloc = 0, app_free = 0;
-    u32 handler = 0, handler_arg = 0; // CellRudpEventHandler
-    u16 mss = kDefaultMss;
-    std::map<s32, std::shared_ptr<Context>> contexts;
-    std::map<s32, Binding> sockets;
-    std::map<s32, Poll> polls;
-    std::vector<std::shared_ptr<Context>> lingering;
-    s32 next_context = 1, next_poll = 1; // never reused within a process (a wait across End and Init sees that)
-    bool io = false;
-    std::atomic<bool> io_stop{false};
-    u32 io_thread = 0, io_block = 0;
-    std::mutex rx_m; // cellRudpProcessEvents' receive buffer, one caller at a time
-    u32 rx_block = 0;
-    lv2::WaitQueue waiters;
-    std::array<u64, kStatCount> stats{};
-    u64 records = 0; // bytes of context records held
+    u32 mem_current = 0, mem_peak = 0, mem_allocs = 0, mem_frees = 0;
+    std::array<u8, 0x128> status{};
+    Block status_mem;
+    std::unique_ptr<Net> net;
     std::mt19937 rng{std::random_device{}()};
     std::mutex filter_m;
     std::atomic<bool> has_filter{false};
     rudp::SendFilter filter;
-    bool raw_logged = false;
 };
 
 Lib& lib_of() { return HleProcess::current()->state<Lib>(); }
 
-// The contexts the library holds: the game's, the connections listeners have not had accepted, those lingering.
-u32 total_contexts(const Lib& lib)
+// ------------------------------------------------------------------------------------------------- memory, counters
+
+Block mem_alloc(Lib& lib, u32 size)
 {
-    usize n = lib.contexts.size() + lib.lingering.size();
-    for (const auto& [id, c] : lib.contexts) n += c->pending.size();
-    return static_cast<u32>(n);
+    const u32 total = size + 0x10;
+    Block b;
+    if (lib.app_malloc) {
+        if (!t_ppu) PS_FATAL(kChan, "an allocation with no PPU thread to call the game's allocator on");
+        const u64 p = call_guest(*t_ppu, lib.app_malloc, {total});
+        if (!static_cast<u32>(p)) return {};
+        b.addr = static_cast<u32>(p);
+    } else {
+        b.addr = 1;
+    }
+    b.size = total;
+    lib.mem_allocs++;
+    lib.mem_current += total;
+    lib.mem_peak = std::max(lib.mem_peak, lib.mem_current);
+    return b;
 }
 
-// What a call leaves to do once the library's lock is released: packets to send, records to give back, the handlers'
-// events, sockets released. The handlers and allocator are the library's as they were.
-struct Outgoing {
-    rudp::Packet packet;
-    bool raw = false;
-};
-struct Event {
-    u32 handler = 0, arg = 0;
-    s32 ctx = 0, event = 0, error = 0;
-};
-struct Record {
-    u32 addr = 0, app_free = 0;
-    bool own = false;
-};
-struct Work {
-    std::vector<Outgoing> out;
-    std::vector<Record> records;
-    std::vector<Event> events;
-    std::vector<s32> released;
-    u32 handler = 0, handler_arg = 0;
-};
-
-Work work_of(const Lib& lib)
+void mem_free(Lib& lib, Block& b)
 {
-    Work w;
-    w.handler = lib.handler;
-    w.handler_arg = lib.handler_arg;
-    return w;
+    if (!b) return;
+    lib.mem_frees++;
+    lib.mem_current -= b.size;
+    if (lib.app_free && b.addr) {
+        if (!t_ppu) PS_FATAL(kChan, "a free with no PPU thread to call the game's allocator on");
+        call_guest(*t_ppu, lib.app_free, {b.addr});
+    }
+    b = {};
 }
 
-// ------------------------------------------------------------------------------------------------- guest memory
+// CellRudpStatus's counters (librudp's layout).
+enum : u32 {
+    kStSentUdpPackets = 0x00,
+    kStSentUdpBytes = 0x08,
+    kStRcvdUdpPackets = 0x10,
+    kStRcvdUdpBytes = 0x18,
+    kStSentUserPackets = 0x20,
+    kStSentUserBytes = 0x28,
+    kStSentLatencyCritical = 0x30,
+    kStRcvdUserPackets = 0x34,
+    kStRcvdUserBytes = 0x38,
+    kStRcvdLatencyCritical = 0x40, // reads that took a latency critical message
+    kStSentSyn = 0x44,
+    kStRcvdSyn = 0x48,
+    kStSentUsr = 0x4C,
+    kStRcvdUsr = 0x50,
+    kStSentPrb = 0x54,
+    kStRcvdPrb = 0x58,
+    kStSentRst = 0x5C,
+    kStRcvdRst = 0x60,
+    kStLost = 0x64,
+    kStRetransmitted = 0x68,
+    kStReordered = 0x6C,
+    kStLevels = 0x70, // per quality level: u32 sent packets, u64 sent bytes, u32 received packets, u64 received bytes
+    kStContexts = 0xF0,
+    kStAllocs = 0xF4,
+    kStFrees = 0xF8,
+    kStMemCurrent = 0xFC,
+    kStMemPeak = 0x100,
+    kStEstablished = 0x104,
+    kStFailed = 0x108,
+    kStFailedReset = 0x10C,
+    kStFailedRefused = 0x110,
+    kStFailedTimeout = 0x114,
+    kStFailedVersion = 0x118,
+    kStFailedTransport = 0x11C,
+    kStFailedQuality = 0x120,
+};
 
-// Committed guest memory, page by page (guest_readable checks up to one host page).
-bool guest_range(lv2::PpuThread& t, u32 addr, u64 size)
+void st_add32(Lib& lib, u32 off, s32 v) { ps_st32(lib.status.data() + off, ps_ld32(lib.status.data() + off) + v); }
+void st_add64(Lib& lib, u32 off, u64 v) { ps_st64(lib.status.data() + off, ps_ld64(lib.status.data() + off) + v); }
+
+// A packet's type counted as sent (or received).
+void st_type(Lib& lib, u8 type, bool sent)
 {
-    if (!addr || u64{addr} + size > 0x100000000ull) return false;
-    for (u64 at = 0; at < size; at += 0x1000)
-        if (!guest_readable(t, static_cast<u32>(addr + at), static_cast<u32>(std::min<u64>(size - at, 0x1000))))
-            return false;
-    return true;
+    static constexpr u32 kSent[4] = {kStSentUsr, kStSentPrb, kStSentSyn, kStSentRst};
+    static constexpr u32 kRcvd[4] = {kStRcvdUsr, kStRcvdPrb, kStRcvdSyn, kStRcvdRst};
+    st_add32(lib, sent ? kSent[type & 3] : kRcvd[type & 3], 1);
 }
 
-// Guest memory for one packet on the calling thread: its stack for a small one, else a block of the main area.
+// A connection's quality level (0: delivery and order critical, 1: delivery, 2: order, 3: neither).
+u32 level_of(const Conn& c) { return (c.order() ? 0u : 1u) + (c.delivery() ? 0u : 2u); }
+
+// ------------------------------------------------------------------------------------------------- the scheduler
+
+// Registers an object for events and a timer: its ID (0 when there is no room or memory).
+s32 sched_register(Lib& lib, Sched& s, Target t, u32& id)
+{
+    id = 0;
+    if (!s.table_mem) return err(CELL_RUDP_ERROR_MEMORY);
+    u32 cand = s.last_id + 1;
+    if (!cand) cand = 1;
+    while (cand != s.last_id) {
+        if (!s.targets.count(cand)) {
+            t.mem = mem_alloc(lib, 0xC);
+            if (!t.mem) return err(CELL_RUDP_ERROR_MEMORY);
+            s.targets.emplace(cand, t);
+            s.last_id = cand;
+            id = cand;
+            return 0;
+        }
+        if (!++cand) cand = 1;
+    }
+    return err(CELL_RUDP_ERROR_INTERNAL);
+}
+
+void sched_unregister(Lib& lib, Sched& s, u32 id)
+{
+    const auto it = s.targets.find(id);
+    if (it == s.targets.end()) return;
+    mem_free(lib, it->second.mem);
+    s.targets.erase(it);
+}
+
+// Starts (or restarts) a target's timer: every `interval` microseconds from now. Each start adds a timer entry.
+s32 sched_arm(Lib& lib, Sched& s, u32 id, u64 interval)
+{
+    if (!s.table_mem) return err(CELL_RUDP_ERROR_MEMORY);
+    const auto it = s.targets.find(id);
+    if (it == s.targets.end()) return err(CELL_RUDP_ERROR_INTERNAL);
+    it->second.interval = interval;
+    Block node = mem_alloc(lib, 0x28);
+    if (!node) return err(CELL_RUDP_ERROR_MEMORY);
+    s.timers.emplace(now_us() + interval, Sched::TimerNode{id, node});
+    return 0;
+}
+
+// Stops a target's timer (its entries go when they come due).
+void sched_disarm(Sched& s, u32 id)
+{
+    const auto it = s.targets.find(id);
+    if (it != s.targets.end()) it->second.interval = 0;
+}
+
+void io_wake(Net& net);
+
+// Queues an event; the scheduler's waiter and the I/O thread wake.
+s32 sched_post(Lib& lib, Net& net, Event e)
+{
+    Sched& s = net.sched;
+    if (s.ring.size() == s.cap && s.cap) {
+        if (s.cap > 0xFFFF) return err(CELL_RUDP_ERROR_INTERNAL);
+        Block grown = mem_alloc(lib, s.cap * 2 * 12);
+        if (!grown) return err(CELL_RUDP_ERROR_MEMORY);
+        mem_free(lib, s.ring_mem);
+        s.ring_mem = grown;
+        s.cap *= 2;
+    }
+    if (!s.ring_mem || !s.cap || s.ring.size() >= s.cap) return err(CELL_RUDP_ERROR_INTERNAL);
+    s.ring.push_back(e);
+    s.kicked = true;
+    s.cond.signal();
+    io_wake(net);
+    return 0;
+}
+
+void ctx_on_event(Lib& lib, Ctx& x, const Event& e);
+void ctx_on_timer(Lib& lib, Ctx& x, u64& interval);
+void net_on_event(Lib& lib, Net& net, const Event& e);
+void agg_on_timer(Lib& lib, Net& net, u64& interval);
+
+// Runs what is due: the timers, then the events (those they add too); with a timeout (microseconds), then waits up to
+// that long for more, and runs it. CANCELLED when cellRudpEnd ends it.
+s32 sched_run(Lib& lib, Net& net, u64 timeout)
+{
+    Sched& s = net.sched;
+    lv2::PpuThread& t = thread_of(*t_ppu);
+    s.busy++;
+    s32 result = 0;
+    if (!s.cancelled) {
+        if (!s.table_mem) {
+            result = err(CELL_RUDP_ERROR_MEMORY);
+        } else {
+            const u64 start = now_us();
+            for (;;) {
+                const u64 now = now_us();
+                while (!s.timers.empty() && s.timers.begin()->first <= now) {
+                    Sched::TimerNode node = s.timers.begin()->second;
+                    s.timers.erase(s.timers.begin());
+                    const auto it = s.targets.find(node.id);
+                    if (it == s.targets.end() || !it->second.interval) {
+                        mem_free(lib, node.mem);
+                        continue;
+                    }
+                    Target& tg = it->second;
+                    u64 interval = tg.interval;
+                    if (tg.kind == Target::Kind::Ctx && tg.ctx) ctx_on_timer(lib, *tg.ctx, interval);
+                    else if (tg.kind == Target::Kind::Agg) agg_on_timer(lib, net, interval);
+                    const auto again = s.targets.find(node.id); // the callback may have let the target go
+                    if (again == s.targets.end()) {
+                        mem_free(lib, node.mem);
+                        continue;
+                    }
+                    again->second.interval = interval;
+                    s.timers.emplace(now + interval, node);
+                }
+                while (!s.ring.empty()) {
+                    const Event e = s.ring.front();
+                    s.ring.pop_front();
+                    const auto it = s.targets.find(e.target);
+                    if (it == s.targets.end()) continue;
+                    if (it->second.kind == Target::Kind::Ctx && it->second.ctx) ctx_on_event(lib, *it->second.ctx, e);
+                    else if (it->second.kind == Target::Kind::Net) net_on_event(lib, net, e);
+                }
+                if (!timeout) break;
+                s.kicked = false;
+                bool done = false, more = false;
+                while (!s.kicked) {
+                    const u64 tn = now_us();
+                    const u32 elapsed = static_cast<u32>(tn - start);
+                    if (timeout <= u64{elapsed} + 125) {
+                        done = true;
+                        break;
+                    }
+                    if (!s.ring.empty()) {
+                        more = true;
+                        break;
+                    }
+                    u64 wait = timeout - elapsed;
+                    bool overall = elapsed != 0;
+                    if (!s.timers.empty()) {
+                        const u64 due = s.timers.begin()->first;
+                        if (due <= tn) {
+                            more = true;
+                            break;
+                        }
+                        if (due - tn < wait) {
+                            overall = false;
+                            wait = due - tn;
+                        }
+                    }
+                    const bool woken = s.cond.wait(lib.lock, t, wait ? wait : 1);
+                    if (!woken && overall) {
+                        done = true;
+                        break;
+                    }
+                    if (s.cancelled) {
+                        done = true;
+                        break;
+                    }
+                }
+                if (done && !more) break;
+            }
+        }
+    }
+    s.busy--;
+    if (s.cancelled) {
+        result = err(CELL_RUDP_ERROR_CANCELLED);
+        if (!s.busy) {
+            s.cond.signal_all();
+            s.cancelled = false;
+        }
+    }
+    return result;
+}
+
+// ------------------------------------------------------------------------------------------------- segments
+
+Seg* pool_get(Lib& lib, Conn& c, bool send)
+{
+    Pool& p = c.pool;
+    Seg* s = p.free;
+    if (!s) {
+        Block obj = mem_alloc(lib, 0x28);
+        if (!obj) return nullptr;
+        Block buf = mem_alloc(lib, p.bufsize);
+        if (!buf) return nullptr; // librudp keeps the first block (lost)
+        s = new Seg;
+        s->mem_obj = obj;
+        s->mem_buf = buf;
+        s->buf.assign(p.bufsize, 0);
+        p.total++;
+    } else {
+        p.nfree--;
+        p.free = s->next;
+    }
+    s->seq = 0;
+    s->flags = 0;
+    s->stamp = 0;
+    s->retrans = 0;
+    s->next = nullptr;
+    s->off = s->len = 0;
+    if (send) {
+        s->flags = kSegSend;
+        if (++p.nsend > p.max_send) p.max_send = p.nsend;
+    } else {
+        if (++p.nrecv > p.max_recv) p.max_recv = p.nrecv;
+    }
+    return s;
+}
+
+void pool_put(Conn& c, Seg* s)
+{
+    Pool& p = c.pool;
+    s->next = p.free;
+    p.nfree++;
+    p.free = s;
+    if (s->flags & kSegSend) p.nsend--;
+    else p.nrecv--;
+}
+
+// Frees the segments kept for later (librudp's pool reset).
+void pool_clear(Lib& lib, Conn& c)
+{
+    Pool& p = c.pool;
+    while (Seg* s = p.free) {
+        p.free = s->next;
+        mem_free(lib, s->mem_buf);
+        mem_free(lib, s->mem_obj);
+        delete s;
+    }
+    p.nrecv = p.nfree = p.total = p.nsend = 0;
+}
+
+void seg_append(Seg& s, const u8* p, u32 n)
+{
+    if (n > s.room()) return; // librudp's buffer refuses a write that does not fit (and its callers go on)
+    std::memcpy(s.buf.data() + s.off + s.len, p, n);
+    s.len += n;
+}
+
+void seg_consume(Seg& s, u8* out, u32 n)
+{
+    if (n > s.len) n = s.len;
+    if (out) std::memcpy(out, s.buf.data() + s.off, n);
+    s.off += n;
+    s.len -= n;
+}
+
+// A byte buffer as librudp passes data around: room `cap`, `len` bytes from `off`.
+struct Bytes {
+    u8* p = nullptr;
+    u32 off = 0, len = 0, cap = 0;
+    u32 room() const { return cap - off - len; }
+};
+
+// ------------------------------------------------------------------------------------------------- the connection
+
+void ctx_post(Ctx& x, u8 type, u8 sub = 0, u32 arg = 0);
+void ctx_established(Ctx& x);
+void ctx_closed(Ctx& x, u8 why);
+void ctx_send(Ctx& x, const Header& h, const u8* payload, u32 len, u32 agg_ms, Seg* stamp);
+void ctx_drop_queue(Ctx& x);
+void ctx_init_params(Ctx& x, u16 (&p)[3]);
+
+void conn_queue_output(Conn& c)
+{
+    if (!(c.flags & kCSendQueued) && c.owner) {
+        c.flags |= kCSendQueued;
+        ctx_post(*c.owner, kQOutput);
+    }
+}
+
+void conn_queue_ack(Conn& c)
+{
+    if (!(c.flags & kCAckQueued) && c.owner) {
+        c.flags |= kCAckQueued;
+        ctx_post(*c.owner, kQSendAck);
+    }
+}
+
+u64 rto_capped(const Conn& c, u32 shift = 0)
+{
+    const u64 v = shift < 64 ? c.rto << shift : 0;
+    return (shift >= 64 || v >= kMaxRto || (shift && (v >> shift) != c.rto)) ? kMaxRto : v;
+}
+
+// The bytes a write may take now (CELL_RUDP_ERROR_NOT_ACCEPTABLE before a connection).
+s32 Conn::writable() const
+{
+    if (state != kEstablished && state != kCloseWait) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (state != kEstablished) return 0;
+    const u32 n = slots(sndbuf);
+    if (n <= pool.nsend || !(n - pool.nsend)) return 0;
+    if (!stream() && (!delivery() || !order())) return static_cast<s32>(payload());
+    return static_cast<s32>(payload() * (n - pool.nsend));
+}
+
+// What a read would give: a message's size, a stream's bytes; END_OF_DATA once the peer has ended and all is read.
+s32 Conn::readable_size() const
+{
+    if (state != kEstablished && state != kCloseWait) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    const s32 n = static_cast<s32>(stream() ? rq_ordered_bytes : readable);
+    if (!n && state != kEstablished) return err(CELL_RUDP_ERROR_END_OF_DATA);
+    return n;
+}
+
+// Everything queued goes; the congestion state starts again.
+void conn_drop_send(Conn& c)
+{
+    if (c.sq_head && c.owner) ctx_drop_queue(*c.owner);
+    while (Seg* s = c.sq_head) {
+        c.sq_head = s->next;
+        pool_put(c, s);
+    }
+    c.cwnd = kDefaultMss;
+    c.ssthresh = 0x10000;
+    c.recover = -1;
+    c.recover_seq = 0;
+    c.dupacks = 0;
+    c.snd_una = 0;
+    c.peer_window = 0;
+    c.window = 0;
+    c.sq_head = c.sq_tail = nullptr;
+    c.sq_bytes = c.sq_unsent = 0;
+}
+
+void conn_reset(Lib& lib, Conn& c)
+{
+    conn_drop_send(c);
+    while (Seg* s = c.rq_head) {
+        c.rq_head = s->next;
+        pool_put(c, s);
+    }
+    c.readable = 0;
+    c.rq_head = c.rq_tail = c.rq_ordered = nullptr;
+    c.rq_bytes = c.rq_ordered_bytes = 0;
+    c.rq_latency = 0;
+    c.rcv_last = c.rcv_nxt = c.rcv_high = 0;
+    pool_clear(lib, c);
+}
+
+void conn_free_cookie(Lib& lib, Conn& c)
+{
+    if (c.cookie_mem) mem_free(lib, c.cookie_mem);
+    c.cookie.clear();
+}
+
+// The state a new handshake (or a failed one) starts from.
+void conn_restart(Lib& lib, Conn& c, u32 keep_flags_mask)
+{
+    conn_reset(lib, c);
+    conn_free_cookie(lib, c);
+    c.backoff = 0;
+    c.rto = kInitialRto;
+    c.min_var = kMinVariance;
+    c.last_sent = 0;
+    c.flags &= keep_flags_mask;
+    c.peer_token = 0;
+    c.rttvar = c.srtt = c.rexmit_at = c.deadline = 0;
+    c.delack_since = c.persist_since = 0;
+    c.persist_ms = 0;
+    c.ka_first = c.ka_last = c.ka_heard = c.ka_next = 0;
+    c.ka_count = 0;
+    c.last_rcvd = 0;
+}
+
+// The token and first sequence number of a new handshake (fresh ones the first time, the token's count after).
+void conn_take_ids(Conn& c)
+{
+    u16 p[3] = {0, 0, 0};
+    if (c.owner) ctx_init_params(*c.owner, p);
+    if (c.flags & kCFreshIds) {
+        c.flags &= ~kCFreshIds;
+        c.token = static_cast<u32>(p[0]) << 16 | p[1];
+        c.snd_nxt = p[2];
+    } else {
+        c.token = static_cast<u32>((c.token >> 16) + 1) << 16 | p[1];
+    }
+    c.snd_una = c.snd_nxt;
+}
+
+void conn_arm_handshake(Conn& c)
+{
+    const u64 now = now_us();
+    c.backoff = 0;
+    c.deadline = now + u64{c.conn_timeout} * 1000;
+    c.rexmit_at = now_us() + rto_capped(c);
+}
+
+s32 conn_initiate(Lib& lib, Conn& c)
+{
+    if (!c.owner || c.state == kEstablished || c.state == kCloseWait) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.flags & kCActivated) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.flags & kCInitiated) return err(CELL_RUDP_ERROR_IN_PROGRESS);
+    conn_restart(lib, c, 0xFFFFFF00);
+    conn_take_ids(c);
+    c.state = kSynSent;
+    c.flags |= kCInitiated;
+    ctx_post(*c.owner, kQSendSyn);
+    conn_arm_handshake(c);
+    return 0;
+}
+
+s32 conn_activate(Lib& lib, Conn& c)
+{
+    if (!c.owner || c.state == kEstablished || c.state == kCloseWait) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.flags & kCInitiated) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.flags & kCActivated) return err(CELL_RUDP_ERROR_IN_PROGRESS);
+    conn_restart(lib, c, 0xFFFFFF00);
+    conn_take_ids(c);
+    c.state = kClosed;
+    c.flags |= kCActivated;
+    conn_arm_handshake(c);
+    return 0;
+}
+
+void conn_send_rst(Lib& lib, Conn& c, u32 token, u8 code);
+
+void conn_close_timers(Conn& c)
+{
+    const u64 now = now_us();
+    c.deadline = now + u64{c.close_wait_timeout} * 1000;
+    c.rexmit_at = now_us() + rto_capped(c);
+    c.flags &= ~(kCInitiated | kCActivated);
+}
+
+// The connection ends for `why`: told to the peer with a RST (mode 1: queued, 2: at once; 0: not told).
+void conn_abort(Lib& lib, Conn& c, u8 why, u32 mode)
+{
+    const u32 st = c.state;
+    if (st == kIdle || st == kCloseWait) return;
+    conn_drop_send(c);
+    if (mode) {
+        const u8 code = why > 8 ? 0xFF : why == kWhyKeepAlive ? kWhyReset : why;
+        if (mode == 1) {
+            if (c.owner) ctx_post(*c.owner, kQSendRst, code, c.token);
+        } else {
+            conn_send_rst(lib, c, c.token, code);
+        }
+    }
+    if (st == kEstablished) {
+        c.state = kCloseWait;
+        if (why && c.owner) ctx_post(*c.owner, kQError, why);
+        conn_close_timers(c);
+        return;
+    }
+    if (why != kWhyKeepAlive) {
+        st_add32(lib, kStFailed, 1);
+        static constexpr u32 kWhy[9] = {0, kStFailedReset, kStFailedRefused, kStFailedTimeout, kStFailedVersion,
+            kStFailedTransport, kStFailedQuality, 0, kStFailedQuality};
+        if (why <= 8 && kWhy[why]) st_add32(lib, kWhy[why], 1);
+    }
+    if (st == kSynSent || st == kSynRcvd) {
+        if (c.flags & kCInitiated) {
+            c.state = kCloseWait;
+            if (why && c.owner) ctx_closed(*c.owner, why);
+            conn_close_timers(c);
+            return;
+        }
+        c.state = kClosed;
+        conn_restart(lib, c, 0xFFFFFF00);
+        c.flags &= ~(kCInitiated | kCActivated);
+        return;
+    }
+    if (c.flags & kCActivated) {
+        if (c.owner) ctx_closed(*c.owner, why);
+    } else if (c.owner) {
+        ctx_post(*c.owner, kQCleanup);
+    }
+    conn_restart(lib, c, 0xFFFFFF00);
+    if (c.state == kCloseWait) conn_close_timers(c);
+    else c.flags &= ~(kCInitiated | kCActivated);
+}
+
+s32 conn_terminate(Lib& lib, Conn& c)
+{
+    if (c.state == kIdle || c.state == kClosed) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.state == kCloseWait) return 0;
+    conn_abort(lib, c, kWhyNone, 1);
+    return 0;
+}
+
+// The round trip measured as `ms` milliseconds (smoothed 88/12, its deviation 75/25; the timeout their sum with four
+// deviations, at least the timer's granularity, 1 to 16 s); a sample far off the mean shrinks the window by an eighth.
+void conn_rtt(Conn& c, u32 ms)
+{
+    const u64 sample = u64{ms} * 1000;
+    u64 dev = 0;
+    if (!c.srtt) {
+        c.srtt = sample;
+        c.rttvar = sample >> 1;
+    } else {
+        dev = sample - c.srtt;
+        c.srtt = c.srtt * 88 / 100 + u64{ms} * 12000 / 100;
+        const s64 d = static_cast<s64>(dev);
+        c.rttvar = c.rttvar * 75 / 100 + static_cast<u64>(d < 0 ? -d : d) * 25 / 100;
+    }
+    c.rto = c.srtt + std::max(c.min_var, c.rttvar * 4);
+    c.rto = std::clamp<u64>(c.rto, kMinRto, kMaxRto);
+    if (c.rttvar < 1001) return;
+    if (static_cast<s64>(dev) <= static_cast<s64>(c.rttvar * 4)) return;
+    c.cwnd -= c.cwnd >> 3;
+    if (c.cwnd < c.segsize) c.cwnd = c.segsize;
+    if (c.ssthresh > c.cwnd) c.ssthresh = c.cwnd;
+}
+
+// What can be read changed: the size of the next read, and READABLE when there is something.
+void conn_update_readable(Conn& c)
+{
+    if (c.state != kEstablished && c.state != kCloseWait) {
+        c.readable = 0;
+        c.flags &= ~0x2u;
+        return;
+    }
+    Seg* s = c.rq_head;
+    if (!s) {
+        c.readable = 0;
+        return;
+    }
+    if (c.readable) return;
+    const u32 f = c.flags;
+    const auto pick_latency = [&]() -> bool {
+        for (Seg* x = c.rq_head; x; x = x->next) {
+            if ((x->flags & kSegLatency) && !(x->flags & kSegSent)) {
+                c.rq_next_latency = x;
+                x->flags |= kSegSacked;
+                c.readable = x->len;
+                return true;
+            }
+        }
+        return false;
+    };
+    bool notify_check = true;
+    if (!(f & kCStream)) {
+        if (f & kCDelivery) {
+            if (!(f & kCOrder)) {
+                if (!c.rq_latency) {
+                    if (c.rq_ordered_bytes) {
+                        for (Seg* x = s; x; x = x->next) {
+                            if (!(x->flags & kSegSent)) {
+                                c.readable = x->len;
+                                break;
+                            }
+                            if (c.rq_ordered == x) break;
+                        }
+                    }
+                } else {
+                    pick_latency();
+                }
+            } else if (c.rq_ordered_bytes) {
+                u32 n = 0;
+                for (Seg* x = s; x; x = x->next) {
+                    n += x->len;
+                    if (!(x->flags & kSegMore)) {
+                        c.readable = n;
+                        break;
+                    }
+                    if (c.rq_ordered == x) break;
+                }
+            }
+        } else if (f & kCOrder) {
+            c.readable = s->len;
+        } else if (c.rq_latency) {
+            pick_latency();
+        } else {
+            c.readable = s->len;
+        }
+    } else if (c.rq_ordered_bytes) {
+        c.readable = c.rq_ordered_bytes;
+    }
+    if (!notify_check) return;
+    const s32 n = static_cast<s32>(f & kCStream ? c.rq_ordered_bytes : c.readable);
+    if (n > 0 && !(f & 0x2u) && c.owner) ctx_post(*c.owner, kQReadable);
+}
+
+// A received segment into the receive queue.
+void conn_receive_segment(Lib& lib, Conn& c, Bytes& payload, const Header& h)
+{
+    const u32 len = payload.len;
+    c.last_data = now_us();
+    c.rcv_last = h.seq;
+    const u16 gap = static_cast<u16>(h.seq - c.rcv_high);
+    if (static_cast<s16>(gap) > 0) {
+        if (gap > 1) {
+            c.lost += gap - 1u;
+            st_add32(lib, kStLost, gap - 1);
+        }
+        c.rcv_high = h.seq;
+    }
+    const auto fill = [&](Seg* s) {
+        seg_append(*s, payload.p + payload.off, len);
+        payload.off += len;
+        payload.len = 0;
+        s->seq = h.seq;
+    };
+    const auto marks = [&](Seg* s, bool count_latency) {
+        if (h.flags & rudp::kFlagLatency) {
+            s->flags |= kSegLatency;
+            if (count_latency && !c.order()) c.rq_latency++;
+        }
+        if (h.flags & rudp::kFlagMore) s->flags |= kSegMore;
+        if (h.ext & rudp::kExtRetransmission) s->retrans = h.retransmission;
+        if (h.ext & rudp::kExtTimestamp) {
+            s->stamp = h.stamp;
+            s->flags |= kSegStamp;
+        }
+    };
+    const auto extend = [&](bool account) {
+        bool moved = false;
+        Seg* o = c.rq_ordered;
+        while (o->next && static_cast<s16>(static_cast<u16>(o->seq - o->next->seq + 1)) >= 0) {
+            o = o->next;
+            c.rq_ordered = o;
+            c.rq_ordered_bytes += o->len;
+            o->flags |= kSegLost;
+            moved = true;
+        }
+        if (moved && account && c.lost && !(h.ext & rudp::kExtRetransmission)) {
+            c.lost--;
+            c.recovered++;
+            st_add32(lib, kStLost, -1);
+            st_add32(lib, kStReordered, 1);
+        }
+    };
+    if (!c.stream() && !c.delivery()) {
+        c.rcv_nxt = static_cast<u16>(c.rcv_high + 1);
+        if (!c.order()) {
+            Seg* s = pool_get(lib, c, false);
+            if (!s) return conn_abort(lib, c, 9, 1);
+            fill(s);
+            if (c.rq_tail) c.rq_tail->next = s;
+            else c.rq_head = s;
+            c.rq_tail = s;
+            marks(s, true);
+            c.rq_bytes += len;
+            return;
+        }
+        if (sdiff(h.seq, c.rcv_low) < 0) return;
+        Seg *prev = nullptr, *at = c.rq_head;
+        while (at) {
+            if (at->seq == h.seq) {
+                c.dups++;
+                return;
+            }
+            if (sdiff(h.seq, at->seq) < 0) break;
+            prev = at;
+            at = at->next;
+        }
+        Seg* s = pool_get(lib, c, false);
+        if (!s) return conn_abort(lib, c, 9, 1);
+        fill(s);
+        marks(s, false);
+        c.rq_bytes += len;
+        if (at) {
+            s->next = at;
+            if (c.rq_head == at) c.rq_head = s;
+            else prev->next = s;
+        } else {
+            s->next = nullptr;
+            if (prev) c.rq_tail->next = s;
+            else c.rq_head = s;
+            c.rq_tail = s;
+        }
+        return;
+    }
+    if (sdiff(h.seq, c.rcv_nxt) < 0) {
+        c.dups++;
+        return;
+    }
+    if (h.seq == c.rcv_nxt) {
+        Seg* s = pool_get(lib, c, false);
+        if (!s) return conn_abort(lib, c, 9, 1);
+        fill(s);
+        s->flags |= kSegLost;
+        marks(s, true);
+        c.rq_ordered_bytes += len;
+        c.rcv_nxt++;
+        c.rq_bytes += len;
+        if (!c.rq_head) {
+            s->next = nullptr;
+            c.rq_ordered = c.rq_head = c.rq_tail = s;
+        } else if (!c.rq_ordered) {
+            s->next = c.rq_head;
+            c.rq_ordered = c.rq_head = s;
+        } else {
+            s->next = c.rq_ordered->next;
+            c.rq_ordered->next = s;
+            if (c.rq_ordered == c.rq_tail) c.rq_tail = s;
+            c.rq_ordered = s;
+        }
+        extend(true);
+        c.rcv_nxt = static_cast<u16>(c.rq_ordered->seq + 1);
+        return;
+    }
+    Seg* prev = c.rq_ordered;
+    Seg* at = c.rq_ordered ? c.rq_ordered->next : c.rq_head;
+    while (at) {
+        if (at->seq == h.seq) {
+            c.dups++;
+            return;
+        }
+        if (sdiff(h.seq, at->seq) < 0) break;
+        prev = at;
+        at = at->next;
+    }
+    Seg* s = pool_get(lib, c, false);
+    if (!s) return conn_abort(lib, c, 9, 1);
+    fill(s);
+    marks(s, true);
+    c.rq_bytes += len;
+    if (!at) {
+        s->next = nullptr;
+        if (prev) c.rq_tail->next = s;
+        else c.rq_head = s;
+        c.rq_tail = s;
+        return;
+    }
+    if (c.rq_head != at) {
+        s->next = at;
+        if (prev) prev->next = s;
+        return;
+    }
+    s->next = at;
+    c.rq_head = s;
+    if (sdiff(c.rcv_nxt, s->seq) < 0) {
+        c.rq_ordered = nullptr;
+        c.rq_ordered_bytes = 0;
+        return;
+    }
+    c.rq_ordered = s;
+    c.rq_ordered_bytes = s->len;
+    extend(false);
+}
+
+void conn_data(Lib& lib, Conn& c, const Header& h, Bytes& payload)
+{
+    const u16 slots = static_cast<u16>(c.slots(c.rcvbuf));
+    if (slots <= c.pool.nrecv && sdiff(h.seq, c.rcv_high) > 0) return;
+    conn_receive_segment(lib, c, payload, h);
+    if (!c.stream() && !c.delivery()) return conn_update_readable(c);
+    if (c.delayed_acks) {
+        conn_queue_ack(c);
+        return conn_update_readable(c);
+    }
+    c.delack_since = now_us();
+    c.delayed_acks++;
+    conn_update_readable(c);
+}
+
+void conn_usr(Lib& lib, Conn& c, const Header& h, Bytes& payload)
+{
+    if (c.state != kEstablished) {
+        if (c.state == kCloseWait) {
+            if (c.owner) ctx_post(*c.owner, kQSendRst, 1, c.token);
+            return;
+        }
+        if (c.state != kSynRcvd) return;
+        if (!(h.flags & rudp::kFlagAck)) {
+            conn_queue_ack(c);
+        } else {
+            c.backoff = 0;
+            c.state = kEstablished;
+            c.snd_una = c.snd_nxt;
+            c.rexmit_at = 0;
+            st_add32(lib, kStEstablished, 1);
+            if (c.owner) ctx_established(*c.owner);
+            if (c.rq_bytes) conn_update_readable(c);
+        }
+    }
+    if (!payload.len) return;
+    conn_data(lib, c, h, payload);
+}
+
+void conn_mark_lost(Lib& lib, Conn& c, Seg* s)
+{
+    c.sq_unsent += s->len;
+    c.retransmissions++;
+    s->flags |= kSegLost;
+    st_add32(lib, kStRetransmitted, 1);
+    conn_queue_output(c);
+}
+
+// An acknowledgement: what it covers leaves the queue (a round trip measured on the way), the window grows or a
+// loss is recovered from, WRITABLE when a write found no room before.
+s32 conn_ack(Lib& lib, Conn& c, const Header& h)
+{
+    if (c.state == kSynSent || c.state == kSynRcvd) {
+        const u16 expect = static_cast<u16>(c.snd_nxt + 1);
+        if (expect != h.ack) {
+            conn_abort(lib, c, kWhyRefused, 1);
+            return -1;
+        }
+        c.snd_nxt = expect;
+        return 0;
+    }
+    if (h.type == rudp::kTypeSyn) return 0;
+    if (h.type == rudp::kTypePrb) {
+        c.ka_heard = now_us();
+        return 0;
+    }
+    if (c.state == kCloseWait || !c.reliable()) return 0;
+    const u64 now = now_us();
+    Seg* s = c.sq_head;
+    if (s && (s->flags & kSegSent)) {
+        bool delay = h.flags & rudp::kFlagDelay;
+        while (sdiff(s->seq, h.ack) < 0) {
+            if (delay && static_cast<u16>(s->seq + 1) == h.ack) {
+                const u32 elapsed = static_cast<u32>(now / 1000) - s->stamp;
+                if (static_cast<s32>(elapsed) >= 0) conn_rtt(c, elapsed > h.delay ? elapsed - h.delay : 0);
+                delay = false;
+            }
+            if ((c.flags & kCFlushing) && (s->flags & kSegFlush)) {
+                c.flags &= ~kCFlushing;
+                if (c.owner) ctx_post(*c.owner, kQFlushed);
+            }
+            c.sq_bytes -= s->len;
+            if (s->flags & kSegLost) c.sq_unsent -= s->len;
+            c.sq_head = s->next;
+            if (!c.sq_head) c.sq_tail = nullptr;
+            pool_put(c, s);
+            s = c.sq_head;
+            if (!s || !(s->flags & kSegSent)) break;
+        }
+    }
+    const u16 prev = c.snd_una;
+    c.snd_una = h.ack;
+    if (s && sdiff(h.ack, prev) < 1) c.dupacks++;
+    bool sacked = false;
+    if ((c.flags & kCSack) && h.nsack) {
+        const u16 last = h.sack[h.nsack - 1][1];
+        Seg* x = c.sq_head;
+        while (x && (x->flags & kSegSent) && sdiff(x->seq, last) < 0) {
+            for (u32 i = 0; i < h.nsack; i++) {
+                if (sdiff(x->seq, h.sack[i][0]) < 0 || sdiff(x->seq, h.sack[i][1]) >= 0) continue;
+                sacked = true;
+                x->flags |= kSegSacked;
+            }
+            x = x->next;
+        }
+    }
+    if (c.dupacks < 3) {
+        if (sdiff(h.ack, prev) > 0) {
+            if (c.cwnd < c.ssthresh) {
+                c.cwnd += c.segsize;
+            } else {
+                const u32 inc = static_cast<u32>((u64{c.segsize} * c.segsize & 0xFFFFFFFFu) / c.cwnd);
+                c.cwnd += inc ? inc : 1;
+            }
+            if (c.cwnd > c.sndbuf) c.cwnd = c.sndbuf;
+            if (!c.sq_bytes) {
+                if (c.ssthresh < c.cwnd) c.ssthresh = c.cwnd;
+                c.cwnd = c.segsize;
+            }
+        }
+    } else {
+        Seg* x = nullptr;
+        bool walk = true;
+        if (c.recover < 0) {
+            const u32 half = (c.sq_bytes - c.sq_unsent) >> 1, two = (c.segsize & 0x7FFFFFFF) << 1;
+            const u32 v = std::max(half, two);
+            c.cwnd = c.ssthresh = v;
+            c.recover = c.snd_nxt;
+            c.recover_seq = h.ack;
+            x = c.sq_head;
+            if (!x) walk = false;
+            else {
+                if (c.reliable() && (x->flags & kSegSent) && !(x->flags & (kSegSacked | kSegLost)))
+                    conn_mark_lost(lib, c, x);
+                c.recover_seq++;
+            }
+        } else if (sdiff(h.ack, static_cast<u16>(c.recover)) < 0) {
+            x = c.sq_head;
+        } else {
+            x = c.sq_head;
+            c.cwnd = c.ssthresh;
+            c.dupacks = 0;
+            c.recover = -1;
+        }
+        if (walk && x && (x->flags & kSegSent)) {
+            s32 third = -1, second = -1, newest = -1;
+            for (Seg* y = x; y && (y->flags & kSegSent); y = y->next) {
+                if (y->flags & kSegSacked) {
+                    third = second;
+                    second = newest;
+                    newest = y->seq;
+                }
+            }
+            if (third >= 0) {
+                const u16 lim = static_cast<u16>(third);
+                for (Seg* y = c.sq_head; y && (y->flags & kSegSent) && sdiff(y->seq, lim) < 0; y = y->next) {
+                    if (!(y->flags & kSegSacked) && sdiff(y->seq, c.recover_seq) >= 0 && c.reliable() &&
+                        !(y->flags & kSegLost))
+                        conn_mark_lost(lib, c, y);
+                }
+                c.recover_seq = lim;
+            }
+        }
+    }
+    if (sacked || sdiff(h.ack, prev) > 0) {
+        c.backoff = 0;
+        c.rexmit_at = c.sq_bytes ? now_us() + rto_capped(c) : 0;
+    }
+    if ((c.flags & kCWantWritable) && c.state == kEstablished && c.writable() > 0) {
+        c.flags &= ~kCWantWritable;
+        if (c.owner) ctx_post(*c.owner, kQWritable);
+    }
+    conn_queue_output(c);
+    return 0;
+}
+
+// The peer's SYN parameters: they must agree with ours (else a RST with the reason, and the error here too).
+void conn_syn(Lib& lib, Conn& c, const Header& h)
+{
+    if (h.lowest > rudp::kVersion || h.version < rudp::kVersion) return conn_abort(lib, c, kWhyVersion, 1);
+    if (c.stream()) {
+        if (!(h.syn & rudp::kSynStream)) return conn_abort(lib, c, kWhyTransport, 1);
+    } else {
+        if (h.syn & rudp::kSynStream) return conn_abort(lib, c, kWhyTransport, 1);
+        if (c.delivery() != static_cast<bool>(h.syn & rudp::kSynDelivery)) return conn_abort(lib, c, kWhyQuality, 1);
+        if (c.order() != static_cast<bool>(h.syn & rudp::kSynOrder)) return conn_abort(lib, c, kWhyQuality, 1);
+    }
+    const auto take_seq = [&] {
+        const u16 seq = static_cast<u16>(h.seq + 1);
+        c.rcv_low = c.rcv_nxt = c.rcv_high = c.rcv_last = seq;
+        c.peer_window = rudp::decode_window(h.window);
+    };
+    switch (c.state) {
+    case kIdle: return;
+    case kClosed: {
+        if (h.flags & rudp::kFlagAck) {
+            if (c.owner) ctx_post(*c.owner, kQSendRst, 1, c.token);
+            return;
+        }
+        conn_restart(lib, c, ~0x7Fu);
+        conn_take_ids(c);
+        c.peer_token = h.token;
+        c.snd_una = c.snd_nxt;
+        c.state = kSynRcvd;
+        take_seq();
+        const u32 mss = std::max<u32>(h.mss, kPayloadSlack);
+        c.segsize = std::min<u32>(mss, (c.pool.bufsize + kPayloadSlack) & 0xFFFF);
+        conn_queue_ack(c);
+        c.backoff = 0;
+        c.deadline = now_us() + u64{c.conn_timeout} * 1000;
+        c.rexmit_at = now_us() + rto_capped(c);
+        return;
+    }
+    case kSynSent:
+        c.peer_token = h.token;
+        take_seq();
+        c.segsize = std::min<u32>(std::max<u32>(h.mss, kPayloadSlack), c.segsize);
+        conn_queue_ack(c);
+        c.backoff = 0;
+        if (h.flags & rudp::kFlagAck) {
+            c.state = kEstablished;
+            c.rexmit_at = 0;
+            c.snd_una = c.snd_nxt;
+            st_add32(lib, kStEstablished, 1);
+            if (c.owner) ctx_established(*c.owner);
+        } else {
+            c.state = kSynRcvd;
+            c.rexmit_at = now_us() + rto_capped(c);
+        }
+        return;
+    case kSynRcvd:
+        if (h.token != c.peer_token) return conn_abort(lib, c, kWhyReset, 0);
+        if (!(h.flags & rudp::kFlagAck)) {
+            conn_queue_ack(c);
+            c.rexmit_at = now_us() + rto_capped(c);
+            return;
+        }
+        c.peer_token = h.token;
+        c.state = kEstablished;
+        take_seq();
+        c.segsize = std::clamp<u32>(h.mss, kPayloadSlack, kDefaultMss);
+        st_add32(lib, kStEstablished, 1);
+        c.backoff = 0;
+        c.snd_una = c.snd_nxt;
+        c.rexmit_at = 0;
+        if (c.owner) ctx_established(*c.owner);
+        return;
+    case kEstablished:
+        if (h.token != c.peer_token) return conn_abort(lib, c, kWhyReset, 0);
+        if (h.flags & rudp::kFlagAck) conn_queue_ack(c);
+        return;
+    case kCloseWait:
+        if (c.owner) ctx_post(*c.owner, kQSendRst, 1, c.token);
+        return;
+    default: return;
+    }
+}
+
+void conn_rst(Lib& lib, Conn& c, const Header& h)
+{
+    switch (c.state) {
+    case kSynRcvd:
+        if (h.token != c.peer_token) return;
+        c.state = kClosed;
+        st_add32(lib, kStFailed, 1);
+        st_add32(lib, kStFailedReset, 1);
+        if (c.owner) ctx_closed(*c.owner, kWhyReset);
+        return;
+    case kSynSent:
+        if ((h.opts & rudp::kOptCookie) && h.cookie_len && h.cookie_len <= 32) {
+            if (!c.cookie_mem) {
+                c.cookie_mem = mem_alloc(lib, h.cookie_len);
+                if (!c.cookie_mem) return conn_abort(lib, c, kWhyReset, 0);
+            }
+            c.cookie.assign(h.cookie.begin(), h.cookie.begin() + h.cookie_len);
+            if (c.owner) ctx_post(*c.owner, kQSendSyn);
+            return;
+        }
+        return conn_abort(lib, c, kWhyReset, 0);
+    case kEstablished:
+    case kCloseWait:
+        if (h.token == c.peer_token) conn_abort(lib, c, kWhyReset, 0);
+        return;
+    default: return;
+    }
+}
+
+// A packet for this connection (its header first): MSG_MALFORMED for a header that does not parse.
+s32 conn_input(Lib& lib, Conn& c, Bytes& pkt)
+{
+    if (c.state == kIdle) return 0;
+    c.rcvd_packets++;
+    c.rcvd_bytes += pkt.len;
+    Header h;
+    const std::optional<u32> used = rudp::decode(pkt.p + pkt.off, pkt.len, h);
+    if (!used) return err(CELL_RUDP_ERROR_MSG_MALFORMED);
+    pkt.off += *used;
+    pkt.len -= *used;
+    c.last_rcvd = now_us();
+    st_type(lib, h.type, false);
+    if (h.flags & rudp::kFlagAck) {
+        if (h.type == rudp::kTypeRst) return err(CELL_RUDP_ERROR_MSG_MALFORMED);
+        if (conn_ack(lib, c, h) < 0) return 0;
+    }
+    if (h.type == rudp::kTypeRst) {
+        conn_rst(lib, c, h);
+        return 0;
+    }
+    c.window = rudp::decode_window(h.window);
+    if (!c.window && c.sq_bytes) {
+        if (!c.persist_ms) {
+            c.persist_since = now_us();
+            c.persist_ms = 3000;
+        }
+    } else if (c.persist_ms) {
+        if (c.sq_bytes) conn_queue_output(c);
+        c.persist_ms = 0;
+    }
+    switch (h.type) {
+    case rudp::kTypePrb:
+        if (c.state == kEstablished) {
+            if (!(h.flags & rudp::kFlagAck) && c.owner) ctx_post(*c.owner, kQProbeReply);
+        } else if (c.state == kCloseWait && c.owner) {
+            ctx_post(*c.owner, kQSendRst, 1, c.token);
+        }
+        break;
+    case rudp::kTypeUsr: conn_usr(lib, c, h, pkt); break;
+    case rudp::kTypeSyn: conn_syn(lib, c, h); break;
+    default: break;
+    }
+    return 0;
+}
+
+// The acknowledgement a packet carries: the next expected, the blocks held past a hole, and how long since the data
+// it acknowledges came (when it was the newest).
+void conn_ack_info(Conn& c, Header& h)
+{
+    h.ack = c.rcv_nxt;
+    h.flags |= rudp::kFlagAck;
+    if ((c.flags & kCSack) && c.rq_head && (!c.rq_ordered || c.rq_tail != c.rq_ordered)) {
+        Seg* cur = c.rq_ordered ? c.rq_ordered->next : c.rq_head;
+        u16 start = cur->seq;
+        while (cur && h.nsack <= 7) {
+            Seg* nx = cur->next;
+            if (!nx) {
+                h.sack[h.nsack++] = {start, static_cast<u16>(cur->seq + 1)};
+                break;
+            }
+            if (nx->seq != static_cast<u16>(cur->seq + 1)) {
+                h.sack[h.nsack++] = {start, static_cast<u16>(cur->seq + 1)};
+                start = nx->seq;
+            }
+            cur = nx;
+        }
+    }
+    if (h.type == rudp::kTypeUsr && c.rcv_high == c.rcv_last && c.rcv_nxt == static_cast<u16>(c.rcv_last + 1)) {
+        h.flags |= rudp::kFlagDelay;
+        h.delay = static_cast<u16>((now_us() - c.last_data) / 1000);
+    }
+}
+
+u32 conn_agg(const Conn& c, const Header& h) { return (h.flags & rudp::kFlagLatency) || (c.flags & kCNodelay) ? 0 : c.aggregation; }
+
+void conn_count_sent(Lib& lib, Conn& c, u8 type, u32 payload)
+{
+    c.last_sent = now_us();
+    c.sent_packets++;
+    c.sent_bytes += payload;
+    st_type(lib, type, true);
+}
+
+void conn_syn_fields(Conn& c, Header& h)
+{
+    h.type = rudp::kTypeSyn;
+    if (c.stream()) {
+        h.syn |= rudp::kSynStream | rudp::kSynDelivery | rudp::kSynOrder;
+        h.level = 1;
+    } else {
+        if (c.delivery()) {
+            h.syn |= rudp::kSynDelivery;
+            h.level = 1;
+        } else {
+            h.level = 0;
+        }
+        if (c.order()) h.syn |= rudp::kSynOrder;
+    }
+    h.mss = static_cast<u16>(c.pool.bufsize + kPayloadSlack);
+    h.token = c.token;
+    h.opts |= rudp::kOptMss;
+}
+
+void conn_send_syn(Lib& lib, Conn& c)
+{
+    Header h;
+    h.seq = c.snd_nxt;
+    h.window = rudp::encode_window(c.free_rcv_slots());
+    conn_syn_fields(c, h);
+    if (!c.cookie.empty()) {
+        h.opts |= rudp::kOptCookie;
+        h.cookie_len = static_cast<u32>(c.cookie.size());
+        std::copy(c.cookie.begin(), c.cookie.end(), h.cookie.begin());
+    }
+    conn_count_sent(lib, c, h.type, 0);
+    if (c.owner) ctx_send(*c.owner, h, nullptr, 0, conn_agg(c, h), nullptr);
+}
+
+void conn_send_ack(Lib& lib, Conn& c)
+{
+    c.delack_since = 0;
+    c.flags &= ~kCAckQueued;
+    c.delayed_acks = 0;
+    Header h;
+    if (c.state == kSynSent || c.state == kSynRcvd) conn_syn_fields(c, h);
+    h.window = rudp::encode_window(c.free_rcv_slots());
+    h.seq = c.snd_nxt;
+    conn_ack_info(c, h);
+    conn_count_sent(lib, c, h.type, 0);
+    if (c.owner) ctx_send(*c.owner, h, nullptr, 0, conn_agg(c, h), nullptr);
+}
+
+// A probe (PRB): the window shut, keep-alive; `reply` (an answer to the peer's) carries the acknowledgement.
+void conn_send_probe(Lib& lib, Conn& c, bool reply)
+{
+    Header h;
+    h.type = rudp::kTypePrb;
+    h.seq = c.snd_nxt;
+    h.window = rudp::encode_window(c.free_rcv_slots());
+    if (reply) conn_ack_info(c, h);
+    conn_count_sent(lib, c, h.type, 0);
+    if (c.owner) ctx_send(*c.owner, h, nullptr, 0, conn_agg(c, h), nullptr);
+}
+
+void conn_send_rst(Lib& lib, Conn& c, u32 token, u8 code)
+{
+    c.snd_nxt++;
+    Header h;
+    h.type = rudp::kTypeRst;
+    h.seq = 0;
+    h.window = rudp::encode_window(0);
+    h.token = token;
+    h.code = code;
+    conn_count_sent(lib, c, h.type, 0);
+    if (c.owner) ctx_send(*c.owner, h, nullptr, 0, 0, nullptr);
+}
+
+// What may go now goes: new segments within the peer's window and the congestion window, those to send again.
+void conn_output(Lib& lib, Conn& c)
+{
+    c.flags &= ~kCSendQueued;
+    if (!c.sq_bytes) return;
+    const u16 base = (c.sq_head->flags & kSegSent) ? c.snd_una : c.snd_nxt;
+    const u16 wnd_end = static_cast<u16>(base + c.window);
+    const u64 now = now_us();
+    const u32 now_ms = static_cast<u32>(now / 1000);
+    Seg* s = c.sq_head;
+    if (s && c.sq_unsent) {
+        u32 bytes = 0;
+        for (;;) {
+            const u16 f = s->flags;
+            const bool sent = f & kSegSent;
+            if (sent && !(f & kSegLost)) {
+                if (!(f & kSegSacked)) bytes += s->len;
+                s = s->next;
+                if (!s) break;
+                continue;
+            }
+            u16 seq_for_window = 0;
+            if (c.recover < 0) {
+                if (!sent) seq_for_window = c.snd_nxt;
+                else if ((f & kSegLost) && (f & kSegSacked)) {
+                    s->flags &= ~kSegLost;
+                    s = s->next;
+                    if (!s || !c.sq_unsent) break;
+                    continue;
+                } else seq_for_window = s->seq;
+            } else {
+                if (!sent) break;
+                if ((f & kSegLost) && (f & kSegSacked)) {
+                    s->flags &= ~kSegLost;
+                    s = s->next;
+                    if (!s || !c.sq_unsent) break;
+                    continue;
+                }
+                seq_for_window = s->seq;
+            }
+            if (sdiff(seq_for_window, wnd_end) >= 0) break;
+            bytes += s->len;
+            if (c.reliable() && c.cwnd <= bytes) break;
+            Header h;
+            h.type = rudp::kTypeUsr;
+            Seg* stamp = nullptr;
+            if (!(s->flags & kSegSent)) {
+                s->seq = c.snd_nxt++;
+                if (c.reliable()) {
+                    stamp = s;
+                    s->stamp = now_ms;
+                }
+                h.seq = s->seq;
+            } else {
+                const u8 count = static_cast<u8>(s->retrans >> 24);
+                const u32 hi = count == 0xFF ? 0xFF000000u : static_cast<u32>(count + 1) << 24;
+                h.seq = s->seq;
+                s->retrans = ((now_ms - s->stamp) & 0xFFFFFF) | hi;
+                h.retransmission = s->retrans;
+                h.ext |= rudp::kExtRetransmission;
+            }
+            if (s->flags & kSegStamp) {
+                h.stamp = now_ms;
+                h.ext |= rudp::kExtTimestamp;
+            }
+            h.window = rudp::encode_window(c.free_rcv_slots());
+            if (c.delayed_acks && !(c.flags & kCAckQueued)) {
+                conn_ack_info(c, h);
+                c.delayed_acks = 0;
+                c.delack_since = 0;
+            }
+            if (s->flags & kSegLatency) h.flags |= rudp::kFlagLatency;
+            if (s->flags & kSegMore) h.flags |= rudp::kFlagMore;
+            const u32 u = (s->flags & kSegAlign32 ? 1u : 0u) + (s->flags & kSegAlign64 ? 2u : 0u);
+            if (u) h.align = static_cast<u8>(1u << (u + 1));
+            if (c.persist_ms) {
+                c.persist_since = now;
+                c.persist_ms = 3000;
+            }
+            conn_count_sent(lib, c, h.type, s->len);
+            if (c.owner) ctx_send(*c.owner, h, s->buf.data() + s->off, s->len, conn_agg(c, h), stamp);
+            s->flags = static_cast<u16>((s->flags | kSegSent) & ~kSegLost);
+            if (!c.reliable()) {
+                Seg* next = s->next;
+                c.sq_bytes -= s->len;
+                c.snd_una = s->seq;
+                c.sq_unsent -= s->len;
+                if (c.sq_head == s) {
+                    c.sq_head = next;
+                    if (!next) {
+                        c.sq_tail = nullptr;
+                        c.sq_unsent = 0;
+                    }
+                }
+                if ((c.flags & kCFlushing) && (s->flags & kSegFlush)) {
+                    c.flags &= ~kCFlushing;
+                    if (c.owner) ctx_post(*c.owner, kQFlushed);
+                }
+                pool_put(c, s);
+                if ((c.flags & kCWantWritable) && c.state == kEstablished && c.writable() > 0) {
+                    c.flags &= ~kCWantWritable;
+                    if (c.owner) ctx_post(*c.owner, kQWritable);
+                }
+                s = next;
+            } else {
+                c.sq_unsent -= s->len;
+                s = s->next;
+            }
+            if (!s || !c.sq_unsent) break;
+        }
+    }
+    if (!c.rexmit_at) {
+        c.backoff = 0;
+        c.rexmit_at = c.sq_bytes ? now_us() + rto_capped(c) : 0;
+    }
+}
+
+// A write into the send queue: a stream's bytes fill the last unsent segment first; each segment a payload.
+s32 conn_enqueue(Lib& lib, Conn& c, Bytes& in, u8 wflags)
+{
+    u32 free = 0;
+    if (c.state == kEstablished) {
+        const u32 n = c.slots(c.sndbuf);
+        free = n > c.pool.nsend ? n - c.pool.nsend : 0;
+    }
+    if (c.stream() && c.sq_tail && !(c.sq_tail->flags & kSegSent) && c.sq_tail->len + kPayloadSlack < c.segsize) {
+        const u32 take = std::min(in.len, c.segsize - c.sq_tail->len - kPayloadSlack);
+        seg_append(*c.sq_tail, in.p + in.off, take);
+        in.off += take;
+        in.len -= take;
+        c.sq_bytes += take;
+        c.sq_unsent += take;
+        if (wflags & kMsgWithTimestamp) c.sq_tail->flags |= kSegStamp;
+    }
+    if (!in.len || !free) return 0;
+    for (;;) {
+        Seg* s = pool_get(lib, c, true);
+        if (!s) return err(CELL_RUDP_ERROR_MEMORY);
+        if (c.stream()) s->flags |= kSegMore;
+        const u32 take = std::min(in.len, c.segsize - kPayloadSlack);
+        s->next = nullptr;
+        seg_append(*s, in.p + in.off, take);
+        in.off += take;
+        in.len -= take;
+        if (wflags & kMsgLatencyCritical) s->flags |= kSegLatency;
+        if (wflags & kMsgAlign32) s->flags |= kSegAlign32;
+        if (wflags & kMsgAlign64) s->flags |= kSegAlign64;
+        if (wflags & kMsgWithTimestamp) s->flags |= kSegStamp;
+        if (!(s->flags & kSegLatency) || c.stream() || c.order()) {
+            if (c.sq_tail) c.sq_tail->next = s;
+            else c.sq_head = s;
+            c.sq_tail = s;
+        } else {
+            Seg *prev = nullptr, *cur = c.sq_head;
+            bool placed = false;
+            while (cur) {
+                if (!(cur->flags & kSegSent) && !(cur->flags & kSegLatency)) {
+                    if (!prev) {
+                        s->next = c.sq_head;
+                        c.sq_head = s;
+                    } else {
+                        prev->next = s;
+                        s->next = cur;
+                    }
+                    placed = true;
+                    break;
+                }
+                prev = cur;
+                cur = cur->next;
+            }
+            if (!placed) {
+                if (prev) prev->next = s;
+                else c.sq_head = s;
+                c.sq_tail = s;
+            }
+        }
+        c.sq_bytes += take;
+        c.sq_unsent += take;
+        if (!in.len || !--free) break;
+        if (!c.stream()) s->flags |= kSegMore;
+    }
+    return 0;
+}
+
+s32 conn_write(Lib& lib, Conn& c, Bytes& in, u8 wflags)
+{
+    if (c.state != kEstablished) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    const u32 len = in.len;
+    if (!len) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    const u32 n = c.slots(c.sndbuf);
+    if (n <= c.pool.nsend || !(n - c.pool.nsend)) return err(CELL_RUDP_ERROR_WOULDBLOCK);
+    const bool whole = c.stream() || (c.delivery() && c.order());
+    const u32 room = whole ? c.payload() * (n - c.pool.nsend) : c.payload();
+    if (!room) return err(CELL_RUDP_ERROR_WOULDBLOCK);
+    if (!c.stream()) {
+        const u32 most = c.delivery() && c.order() ? c.payload() * c.peer_window : c.payload();
+        if (most < len) return err(CELL_RUDP_ERROR_MSG_TOO_LARGE);
+        if (room < len) {
+            c.flags |= kCWantWritable;
+            return err(CELL_RUDP_ERROR_WOULDBLOCK);
+        }
+    }
+    if (const s32 r = conn_enqueue(lib, c, in, wflags); r < 0) return r;
+    if (!c.window && c.sq_unsent && !c.persist_ms) {
+        c.persist_since = now_us();
+        c.persist_ms = 3000;
+    }
+    conn_queue_output(c);
+    if (c.state == kEstablished || c.state == kCloseWait) {
+        if (c.state != kEstablished || c.writable() <= 0) c.flags |= kCWantWritable;
+    }
+    const u32 written = len - in.len;
+    st_add32(lib, kStSentUserPackets, 1);
+    st_add64(lib, kStSentUserBytes, written);
+    if ((wflags & kMsgLatencyCritical) || (c.flags & kCNodelay)) st_add32(lib, kStSentLatencyCritical, 1);
+    const u32 lv = kStLevels + 0x20 * level_of(c);
+    st_add32(lib, lv, 1);
+    st_add64(lib, lv + 8, written);
+    return static_cast<s32>(written);
+}
+
+// Reads the next message (or a stream's bytes) into `out`; `info` gets the read information.
+s32 conn_read(Lib& lib, Conn& c, Bytes& out, u8* info)
+{
+    if (info) std::memset(info, 0, 12);
+    if (c.state != kEstablished && c.state != kCloseWait) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    const s32 avail = static_cast<s32>(c.stream() ? c.rq_ordered_bytes : c.readable);
+    if (!avail) return c.state == kEstablished ? err(CELL_RUDP_ERROR_WOULDBLOCK) : err(CELL_RUDP_ERROR_END_OF_DATA);
+    if (out.cap - out.off == out.len) return err(CELL_RUDP_ERROR_BUFFER_TOO_SMALL);
+    out.off = out.len = 0;
+    bool latency = false;
+    u32 n;
+    if (!c.stream()) {
+        n = c.readable;
+        if (out.room() < n) return err(CELL_RUDP_ERROR_BUFFER_TOO_SMALL);
+    } else {
+        n = std::min(out.room(), c.rq_ordered_bytes);
+    }
+    while (n) {
+        Seg* s = c.rq_head;
+        if (!s) break;
+        if (c.rq_next_latency) {
+            if (c.stream() || c.order()) {
+                c.rq_next_latency = nullptr;
+                break;
+            }
+            s = c.rq_next_latency;
+        }
+        const u32 take = std::min(n, s->len);
+        if (sdiff(c.rcv_low, s->seq) < 1) c.rcv_low = static_cast<u16>(s->seq + 1);
+        n -= take;
+        seg_consume(*s, out.p + out.off + out.len, take);
+        out.len += take;
+        c.rq_bytes -= take;
+        if (c.stream() || c.delivery()) c.rq_ordered_bytes -= take;
+        if (c.rq_next_latency) {
+            s->flags = static_cast<u16>((s->flags & ~kSegSacked) | kSegSent);
+            c.rq_next_latency = nullptr;
+            if (c.rq_latency) c.rq_latency--;
+        }
+        if (s->flags & kSegLatency) latency = true;
+        if (info) {
+            info[1] = static_cast<u8>(s->retrans >> 24);
+            ps_st16(info + 2, static_cast<u16>(s->retrans));
+            info[4] = static_cast<u8>(s->retrans >> 16);
+            if (s->flags & kSegLatency) info[5] |= 0x08;
+            ps_st16(info + 6, s->seq);
+            if (s->flags & kSegStamp) {
+                info[5] |= 0x40;
+                ps_st32(info + 8, s->stamp);
+            }
+        }
+        Seg* head = c.rq_head;
+        if (head->len) continue;
+        c.rq_head = head->next;
+        if (!c.rq_head) {
+            c.rq_bytes = 0;
+            c.rq_tail = nullptr;
+            if (c.stream() || c.delivery()) {
+                c.rq_ordered = nullptr;
+                c.rq_ordered_bytes = 0;
+            }
+        } else if ((c.stream() || c.delivery()) && c.rq_ordered == head) {
+            c.rq_ordered = nullptr;
+            c.rq_ordered_bytes = 0;
+        }
+        pool_put(c, head);
+    }
+    st_add32(lib, kStRcvdUserPackets, 1);
+    st_add64(lib, kStRcvdUserBytes, out.len);
+    if (latency) st_add32(lib, kStRcvdLatencyCritical, 1);
+    const u32 lv = kStLevels + 0x20 * level_of(c) + 0x10;
+    st_add32(lib, lv, 1);
+    st_add64(lib, lv + 8, out.len);
+    c.readable = 0;
+    c.flags &= ~0x2u;
+    conn_update_readable(c);
+    return static_cast<s32>(out.len);
+}
+
+s32 conn_flush(Conn& c)
+{
+    if (c.state != kEstablished) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (c.flags & kCFlushing) return err(CELL_RUDP_ERROR_IN_PROGRESS);
+    if (!c.sq_tail) {
+        if (c.owner) ctx_post(*c.owner, kQFlushed);
+    } else {
+        c.flags |= kCFlushing;
+        c.sq_tail->flags |= kSegFlush;
+    }
+    return 0;
+}
+
+void conn_keepalive(Lib& lib, Conn& c)
+{
+    const u64 now = now_us();
+    if (!c.ka_interval) return;
+    u64 next;
+    if (!c.ka_first) {
+        const u64 iv = u64{c.ka_interval} * 1000;
+        if (iv + c.last_rcvd < now) goto probe;
+        next = iv + c.last_sent;
+    } else {
+        if (c.ka_first < c.ka_heard) {
+            c.ka_next = c.ka_first = c.ka_last = c.ka_heard = 0;
+            c.ka_count = 0;
+            return;
+        }
+        if (c.ka_first + u64{c.ka_timeout} * 1000 < now) return conn_abort(lib, c, kWhyKeepAlive, 1);
+        next = c.ka_last + c.ka_next;
+    }
+    if (now <= next) return;
+probe:
+    const u64 t = now_us();
+    conn_send_probe(lib, c, false);
+    if (!c.ka_first) c.ka_first = t;
+    c.ka_last = t;
+    c.ka_next = rto_capped(c, c.ka_count);
+    c.ka_count++;
+}
+
+// The retransmission timer came due.
+void conn_timeout(Lib& lib, Conn& c)
+{
+    const auto rearm = [&](u32 shift) { c.rexmit_at = now_us() + rto_capped(c, shift); };
+    switch (c.state) {
+    case kClosed:
+        if (!(c.flags & kCActivated)) return;
+        if (c.deadline && c.deadline <= now_us()) return conn_abort(lib, c, kWhyTimeout, 0);
+        c.backoff++;
+        return rearm(c.backoff);
+    case kSynSent:
+        if (c.deadline && c.deadline <= now_us()) return conn_abort(lib, c, kWhyTimeout, 2);
+        c.backoff++;
+        conn_send_syn(lib, c);
+        return rearm(c.backoff);
+    case kSynRcvd:
+        if (c.deadline && c.deadline <= now_us()) return conn_abort(lib, c, kWhyTimeout, 2);
+        c.backoff++;
+        conn_send_ack(lib, c);
+        return rearm(c.backoff);
+    case kEstablished: {
+        const u32 half = (c.sq_bytes - c.sq_unsent) >> 1, two = c.segsize << 1;
+        c.ssthresh = std::max(half, two);
+        c.cwnd = c.segsize;
+        if (c.reliable()) {
+            for (Seg* s = c.sq_head; s && (s->flags & kSegSent); s = s->next) {
+                if (s->flags & (kSegSacked | kSegLost)) continue;
+                c.retransmissions++;
+                s->flags |= kSegLost;
+                st_add32(lib, kStRetransmitted, 1);
+                c.sq_unsent += s->len;
+            }
+        }
+        c.backoff++;
+        c.dupacks = 0;
+        c.recover = -1;
+        rearm(c.backoff);
+        if (c.reliable() && !(c.flags & kCSendQueued)) conn_output(lib, c);
+        return;
+    }
+    case kCloseWait:
+        if (c.deadline >= now_us()) return rearm(0);
+        c.backoff = 0;
+        c.state = kClosed;
+        c.rexmit_at = 0;
+        if (c.owner) ctx_post(*c.owner, kQCleanup);
+        return;
+    default: return;
+    }
+}
+
+// The context's timer: every half round trip (16 ms at least; 125 ms before the first sample).
+void conn_tick(Lib& lib, Conn& c, u64& interval)
+{
+    const u64 now = now_us();
+    if (c.rexmit_at && c.rexmit_at < now) {
+        c.rexmit_at = 0;
+        conn_timeout(lib, c);
+    }
+    u64 iv = 125000;
+    if (c.srtt) iv = std::max<u64>(c.srtt >> 1, 16000);
+    c.min_var = iv;
+    interval = iv;
+    if (c.state != kEstablished) return;
+    if (!(c.flags & kCSendQueued)) conn_output(lib, c);
+    if (c.delayed_acks && !(c.flags & kCAckQueued) && c.delack_since + 100000 < now) conn_send_ack(lib, c);
+    if (c.persist_ms && u64{c.persist_ms} * 1000 + c.persist_since < now) {
+        conn_send_probe(lib, c, false);
+        c.persist_since = now;
+        c.persist_ms = std::min<u32>(c.persist_ms << 1, 16000);
+    }
+    conn_keepalive(lib, c);
+}
+
+// ------------------------------------------------------------------------------------------------- guest calls
+
+// A guest function the game gave (a handler, its allocator): called when its descriptor and entry are guest memory,
+// else logged and skipped (D-042): nullopt.
+std::optional<u64> call_game(u32 opd, std::initializer_list<u64> args, std::string_view what)
+{
+    if (!t_ppu) PS_FATAL(kChan, "{}: no PPU thread to call it on", what);
+    lv2::PpuThread& t = thread_of(*t_ppu);
+    if (!opd || !guest_readable(t, opd, 8) || !guest_readable(t, ps_read32(t.kernel.base(), opd), 4)) {
+        PS_LOG_ERROR(kChan, "{} {:#x} is not a function in guest memory: not called", what, opd);
+        return std::nullopt;
+    }
+    return call_guest(*t_ppu, opd, args);
+}
+
+// Guest memory for a datagram on the calling thread: its stack for a small one, else a block of the main area.
 class Scratch {
 public:
     Scratch(PPUContext& ctx, u32 size)
     {
-        if (size <= kStackScratch) {
+        if (size <= 4096) {
             var_.emplace(ctx, guest_base(ctx), size);
             addr = var_->addr();
         } else {
@@ -489,2236 +2608,2591 @@ private:
     bool heap_ = false;
 };
 
-// A guest function the game gave (a handler, its allocator), called when its descriptor and entry are guest memory;
-// else logged and skipped (D-042): nullopt.
-std::optional<u64> call_game(PPUContext& ctx, u32 opd, std::initializer_list<u64> args, std::string_view what)
+// librudp's sockets go through libnet, as its imports do (sys_net's exports: socket, bind, getsockname, setsockopt,
+// getsockopt, socketselect, recvfrom, sendto, socketclose): without the game's sys_net_initialize_network_ex they fail
+// as Sony's do (GetLocalInfo's address stays zero, the internal I/O thread gets no wake-up socket). The answer: >= 0,
+// or negative with libnet's errno set (net_errno).
+s32 libnet(std::string_view name, std::initializer_list<u64> args)
 {
-    lv2::PpuThread& t = thread_of(ctx);
-    if (!opd || !guest_range(t, opd, 8) || !guest_range(t, ps_read32(t.kernel.base(), opd), 4)) {
-        PS_LOG_ERROR(kChan, "{} {:#x} is not a function in guest memory: not called", what, opd);
-        return std::nullopt;
-    }
-    return call_guest(ctx, opd, args);
-}
-
-u64 sext(s32 v) { return static_cast<u64>(static_cast<s64>(v)); }
-
-// A context's record: from the game's app_malloc, or the main area for the library's own allocator. 0 when none came.
-Record alloc_record(PPUContext& ctx, u32 app_malloc, u32 app_free)
-{
-    lv2::PpuThread& t = thread_of(ctx);
-    Record r;
-    if (app_malloc) {
-        const std::optional<u64> v = call_game(ctx, app_malloc, {kRecordSize}, "app_malloc");
-        r.addr = v ? static_cast<u32>(*v) : 0;
-        if (r.addr && !guest_range(t, r.addr, kRecordSize)) {
-            PS_LOG_ERROR(kChan, "app_malloc({}) gave {:#x}, not guest memory", kRecordSize, r.addr);
-            r.addr = 0;
-        }
-        r.app_free = app_free;
-    } else {
-        r.addr = HleProcess::current()->main_memory().alloc(kRecordSize, 16);
-        r.own = true;
-    }
-    if (r.addr) std::memset(t.kernel.base() + r.addr, 0, kRecordSize);
+    PPUContext& ctx = *t_ppu;
+    const Function* fn = registry().find("sys_net", recomp::nid_of(name));
+    if (!fn) PS_FATAL(kChan, "sys_net::{}, which librudp imports, is not pspocket's", name);
+    u64 saved[8];
+    for (u32 k = 0; k < 8; k++) saved[k] = ctx.gpr[3 + k];
+    u32 i = 3;
+    for (const u64 a : args) ctx.gpr[i++] = a;
+    fn->fn(ctx, guest_base(ctx));
+    const s32 r = static_cast<s32>(ctx.gpr[3]);
+    for (u32 k = 0; k < 8; k++) ctx.gpr[3 + k] = saved[k];
     return r;
 }
-
-void free_record(PPUContext& ctx, const Record& r)
+s32 net_errno()
 {
-    if (!r.addr) return;
-    if (r.own) HleProcess::current()->main_memory().free(r.addr);
-    else if (r.app_free) call_game(ctx, r.app_free, {r.addr}, "app_free");
+    const u32 loc = static_cast<u32>(libnet("_sys_net_errno_loc", {}));
+    return loc ? static_cast<s32>(ps_read32(guest_base(*t_ppu), loc)) : 0;
+}
+constexpr s32 kNetEbadf = 9, kNetEwouldblock = 35;
+
+// ------------------------------------------------------------------------------------------------- contexts
+
+void ctx_post(Ctx& x, u8 type, u8 sub, u32 arg)
+{
+    if (!x.net) return;
+    sched_post(lib_of(), *x.net, {x.target, type, sub, arg});
 }
 
-// ------------------------------------------------------------------------------------------------- waiting
-
-// Wakes every thread waiting in the library: a context's state, data or a poll set changed.
-void notify(Lib& lib)
+void ctx_established(Ctx& x)
 {
-    for (lv2::Waiter* w : lib.waiters.take_all(lv2::SYS_SYNC_FIFO)) lv2::wake(*w, lv2::CELL_OK);
+    if (x.parent) sched_post(lib_of(), *x.net, {x.parent->target, kQChildEstablished, 0, static_cast<u32>(x.parent->id)});
+    else ctx_post(x, kQEstablished);
 }
 
-// Parks the calling thread until notify or `deadline` (guest microseconds; 0: none). `lk` holds lib.m on entry and on
-// return. False when the deadline passed. The process ending unwinds the thread (ThreadExit), as it does a blocked
-// lv2 call; the wait shows in the thread report as a network one.
-bool wait_change(Lib& lib, lv2::PpuThread& t, std::unique_lock<std::mutex>& lk, u64 deadline)
+void ctx_closed(Ctx& x, u8 why)
 {
-    u64 timeout = 0;
-    if (deadline) {
-        const u64 now = now_us();
-        if (now >= deadline) return false;
-        timeout = deadline - now;
+    if (x.parent) sched_post(lib_of(), *x.net, {x.parent->target, kQChildClosed, 0, static_cast<u32>(x.id)});
+    else ctx_post(x, kQClosed, why);
+}
+
+void agg_send(Lib& lib, Net& net, const AggKey& key, s32 ctx_id, u8 mux, u16 src, u16 dst, const Header& h,
+    const u8* payload, u32 len, u32 agg_ms, Seg* stamp);
+void agg_forget_stamps(Net& net, const AggKey& key, u16 vport);
+
+void ctx_send(Ctx& x, const Header& h, const u8* payload, u32 len, u32 agg_ms, Seg* stamp)
+{
+    if (!x.net) return;
+    AggKey key;
+    key.soc = x.soc;
+    key.addr = x.peer.raw;
+    agg_send(lib_of(), *x.net, key, x.id, x.mux, x.vport, x.peer.vport, h, payload, len, agg_ms, stamp);
+}
+
+void ctx_drop_queue(Ctx& x)
+{
+    if (!x.net) return;
+    AggKey key;
+    key.soc = x.soc;
+    key.addr = x.peer.raw;
+    agg_forget_stamps(*x.net, key, x.vport);
+}
+
+// The token and first sequence number of a handshake: from SHA-256 over the socket, the local address, the vport,
+// the time and a random number (librudp's way; the values only need to be hard to guess).
+void ctx_init_params(Ctx& x, u16 (&p)[3])
+{
+    Lib& lib = lib_of();
+    std::array<u8, 4 + 0x22 + 2 + 8 + 4> in{};
+    ps_st32(in.data(), static_cast<u32>(x.soc));
+    std::memcpy(in.data() + 4, x.local.data(), 0x22);
+    ps_st16(in.data() + 0x26, x.vport);
+    ps_st64(in.data() + 0x28, now_us());
+    ps_st32(in.data() + 0x30, static_cast<u32>(lib.rng()));
+    const recomp::Sha256Digest d = recomp::Sha256::hash(std::span<const u8>(in.data(), in.size()));
+    p[0] = ps_ld16(d.data());
+    p[1] = ps_ld16(d.data() + 2);
+    p[2] = ps_ld16(d.data() + 4);
+}
+
+// A listener's cookie: the millisecond clock, a random word and 24 bytes of SHA-256 over them and its secret.
+std::array<u8, 32> make_cookie(Ctx& x)
+{
+    Lib& lib = lib_of();
+    std::array<u8, 12> in{};
+    ps_st32(in.data(), now_ms32());
+    ps_st32(in.data() + 4, static_cast<u32>(lib.rng()));
+    ps_st32(in.data() + 8, x.secret);
+    const recomp::Sha256Digest d = recomp::Sha256::hash(std::span<const u8>(in.data(), in.size()));
+    std::array<u8, 32> out{};
+    std::memcpy(out.data(), d.data(), 32);
+    std::memcpy(out.data(), in.data(), 8);
+    return out;
+}
+
+// 0: valid, 1: forged, 2: expired (older than the cookie's lifetime, option 13).
+u32 check_cookie(Ctx& x, const u8* cookie)
+{
+    const u32 stamp = ps_ld32(cookie);
+    if (static_cast<s32>(now_ms32() - (x.cookie_life * 1000 + stamp)) >= 0) return 2;
+    std::array<u8, 12> in{};
+    std::memcpy(in.data(), cookie, 8);
+    ps_st32(in.data() + 8, x.secret);
+    const recomp::Sha256Digest d = recomp::Sha256::hash(std::span<const u8>(in.data(), in.size()));
+    return std::memcmp(cookie + 8, d.data() + 8, 24) ? 1 : 0;
+}
+
+// The events a context's poll set would report now.
+u16 ctx_ready(const Ctx& x)
+{
+    if (x.flags & kXListening) {
+        for (const Ctx::Pending& p : x.pending)
+            if (p.ctx->c.state == kEstablished) return kPollRead;
+        return 0;
     }
-    lv2::Waiter& w = t.waiter;
-    lv2::prepare_wait(w);
-    lib.waiters.push(&w);
-    const lv2::WaitStatus status = lv2::park(w, lk, timeout, {lv2::WaitKind::Net, 0}, [&](bool) {
-        return lib.waiters.remove(&w) ? lv2::CancelResult::Removed : lv2::CancelResult::Woken;
-    });
-    if (status == lv2::WaitStatus::Aborted) throw lv2::ThreadExit{};
-    lk.lock();
-    return status == lv2::WaitStatus::Woken;
-}
-
-// The deadline of a wait of `timeout` microseconds from now (0, or kForever and more: none).
-u64 deadline_after(u64 timeout) { return timeout && timeout < kForever ? now_us() + timeout : 0; }
-
-// ------------------------------------------------------------------------------------------------- statistics
-
-void count_sent(Lib& lib, Type type, usize bytes)
-{
-    lib.stats[kSentUdpPackets]++;
-    lib.stats[kSentUdpBytes] += bytes;
-    switch (type) {
-    case Type::Syn:
-    case Type::SynAck: lib.stats[kSentSynPackets]++; break;
-    case Type::Data: lib.stats[kSentUsrPackets]++; break;
-    case Type::Probe: lib.stats[kSentPrbPackets]++; break;
-    case Type::Rst: lib.stats[kSentRstPackets]++; break;
-    default: break;
+    if (x.c.state == kEstablished) {
+        u16 r = x.c.readable_size() > 0 ? kPollRead : 0;
+        if (x.c.writable() >= 1) r |= kPollWrite;
+        return r;
     }
-}
-
-void count_received(Lib& lib, Type type)
-{
-    switch (type) {
-    case Type::Syn:
-    case Type::SynAck: lib.stats[kRcvdSynPackets]++; break;
-    case Type::Data: lib.stats[kRcvdUsrPackets]++; break;
-    case Type::Probe: lib.stats[kRcvdPrbPackets]++; break;
-    case Type::Rst: lib.stats[kRcvdRstPackets]++; break;
-    default: break;
+    if (x.c.state == kCloseWait) {
+        const s32 n = x.c.readable_size();
+        return n > 0 || n == err(CELL_RUDP_ERROR_END_OF_DATA) ? kPollRead : 0;
     }
-}
-
-// The memory the library holds: the contexts' records and what they buffer.
-void note_memory(Lib& lib)
-{
-    u64 bytes = lib.records;
-    const auto add = [&](const Context& c) { bytes += c.queued() + c.rcv_bytes + c.ooo_bytes; };
-    for (const auto& [id, c] : lib.contexts) {
-        add(*c);
-        for (const auto& k : c->pending) add(*k);
-    }
-    for (const auto& c : lib.lingering) add(*c);
-    lib.stats[kMemCurrent] = bytes;
-    lib.stats[kMemPeak] = std::max(lib.stats[kMemPeak], bytes);
-}
-
-void count_failure(Lib& lib, s32 err)
-{
-    lib.stats[kFailedConnections]++;
-    switch (static_cast<u32>(err)) {
-    case CELL_RUDP_ERROR_CONN_RESET: lib.stats[kFailedReset]++; break;
-    case CELL_RUDP_ERROR_CONN_REFUSED: lib.stats[kFailedRefused]++; break;
-    case CELL_RUDP_ERROR_CONN_TIMEOUT: lib.stats[kFailedTimeout]++; break;
-    case CELL_RUDP_ERROR_CONN_VERSION_MISMATCH: lib.stats[kFailedVersion]++; break;
-    case CELL_RUDP_ERROR_CONN_TRANSPORT_TYPE_MISMATCH: lib.stats[kFailedTransport]++; break;
-    case CELL_RUDP_ERROR_QUALITY_LEVEL_MISMATCH: lib.stats[kFailedQuality]++; break;
-    default: break;
-    }
-}
-
-// ------------------------------------------------------------------------------------------------- packets out
-
-u32 window_of(const Context& c)
-{
-    return c.opt.rcvbuf > c.rcv_bytes ? c.opt.rcvbuf - static_cast<u32>(c.rcv_bytes) : 0;
-}
-
-u32 ack_of(const Context& c) { return c.p.reliable || !c.any_received ? c.rcv_nxt : c.highest + 1; }
-
-u32 sack_of(const Context& c)
-{
-    if (!c.p.reliable) return 0;
-    u32 bits = 0;
-    for (u32 i = 0; i < 32; i++) {
-        const u32 seq = c.rcv_nxt + 1 + i;
-        if (c.ooo.contains(seq) || c.seen.contains(seq)) bits |= 1u << i;
-    }
-    return bits;
-}
-
-void event(Work& w, const Context& c, s32 ev, s32 err = 0)
-{
-    if (c.id && c.handler) w.events.push_back({c.handler, c.arg, c.id, ev, err});
-}
-
-// A packet of connection `c`: its vports, its acknowledgement state and window, `payload` after the header. An
-// activated context that has not heard its peer yet sends to its own vport (D-630).
-void queue(Lib& lib, Context& c, Header h, const u8* payload, usize n, u64 now, Work& w)
-{
-    h.src = c.vport;
-    h.dst = c.peer_vport ? c.peer_vport : c.vport;
-    if (h.type != Type::Syn && h.type != Type::Rst) {
-        h.ack = ack_of(c);
-        h.sack = sack_of(c);
-    }
-    h.window = window_of(c);
-    if (!h.stamp) h.stamp = static_cast<u32>(now);
-    Outgoing o;
-    o.packet.soc = c.soc;
-    o.packet.to = c.peer.raw;
-    o.packet.bytes.resize(kHeaderSize + n);
-    rudp::encode(h, o.packet.bytes.data());
-    if (n) std::memcpy(o.packet.bytes.data() + kHeaderSize, payload, n);
-    o.raw = c.mux == kMuxRaw;
-    count_sent(lib, h.type, o.packet.bytes.size());
-    c.sent_packets++;
-    c.sent_bytes += o.packet.bytes.size();
-    c.last_sent = now;
-    c.ack_now = false;
-    c.last_window = h.window;
-    w.out.push_back(std::move(o));
-}
-
-void send_control(Lib& lib, Context& c, Type type, u64 now, Work& w, u8 reason = 0)
-{
-    Header h;
-    h.type = type;
-    h.reason = reason;
-    queue(lib, c, h, nullptr, 0, now, w);
-}
-
-// A SYN or SYN-ACK: this side's sequence number and its connection's parameters.
-void send_syn(Lib& lib, Context& c, u64 now, Work& w)
-{
-    Header h;
-    h.type = c.state == kStateSynRcvd ? Type::SynAck : Type::Syn;
-    h.seq = c.iss;
-    if (c.activated && h.type == Type::Syn) h.flags |= rudp::kFlagSoft;
-    std::array<u8, kSynSize> p{};
-    p[0] = c.p.stream;
-    p[1] = c.p.reliable;
-    p[2] = c.p.ordered;
-    ps_st16(p.data() + 4, c.mss);
-    ps_st32(p.data() + 8, c.opt.rcvbuf);
-    queue(lib, c, h, p.data(), p.size(), now, w);
-    c.syn_sends++;
-    c.syn_next = now + std::min(kInitialRto << std::min<u32>(c.syn_sends - 1, 3), kMaxRto);
-}
-
-// A RST to whoever sent `h` from `from` on socket `soc`, for which no connection here was found.
-void reply_rst(Lib& lib, const Binding& b, s32 soc, const Endpoint& from, const Header& h, u8 reason, Work& w)
-{
-    Header r;
-    r.type = Type::Rst;
-    r.reason = reason;
-    r.src = h.dst;
-    r.dst = h.src;
-    r.stamp = static_cast<u32>(now_us());
-    Outgoing o;
-    o.packet.soc = soc;
-    o.packet.to = from.raw;
-    o.packet.bytes.resize(kHeaderSize);
-    rudp::encode(r, o.packet.bytes.data());
-    o.raw = b.mux == kMuxRaw;
-    count_sent(lib, Type::Rst, kHeaderSize);
-    w.out.push_back(std::move(o));
-}
-
-u32 in_flight(const Context& c) { return c.flight; }
-
-u64 acked_offset(const Context& c) { return c.sndq.empty() ? c.snd_offset : c.sndq.front().offset; }
-
-// Whether the peer's window takes `size` more bytes at `offset`; one segment past it when nothing is in flight, so a
-// window smaller than a segment never stalls the connection.
-bool window_allows(const Context& c, u64 offset, usize size)
-{
-    if (offset + size <= acked_offset(c) + c.peer_window) return true;
-    return c.peer_window > 0 && in_flight(c) == 0;
-}
-
-void send_segment(Lib& lib, Context& c, Segment& s, u64 now, Work& w)
-{
-    Header h;
-    h.type = s.type;
-    h.seq = s.seq;
-    h.flags = s.flags;
-    h.retries = static_cast<u8>(std::min<u32>(s.sends, 255));
-    if (!s.sends) { // the first unsent one (Context::first_unsent)
-        s.first_sent = now;
-        s.stamp = static_cast<u32>(now);
-        c.sent++;
-        c.flight++;
-    } else {
-        lib.stats[kRetransmittedPackets]++;
-        c.retransmissions++;
-    }
-    h.stamp = s.stamp ? s.stamp : 1;
-    s.sends++;
-    s.last_sent = now;
-    queue(lib, c, h, s.data.data(), s.data.size(), now, w);
-}
-
-// Sends what the windows let go: the next unsent segments in order, a stream's bytes cut into segments of the payload
-// (a part segment held back while others are in flight, up to the aggregation timeout, unless NODELAY), the FIN after
-// them.
-void push(Lib& lib, Context& c, u64 now, Work& w)
-{
-    if (!c.connected()) return;
-    for (;;) {
-        Segment* next = c.first_unsent();
-        if (!next && c.p.stream && !c.stream_out.empty()) {
-            const usize n = std::min<usize>(c.payload, c.stream_out.size());
-            const bool part = n < c.payload;
-            if (part && !c.opt.nodelay && !c.flush_now && in_flight(c) && c.opt.aggregation_timeout) {
-                if (!c.nagle_since) c.nagle_since = now;
-                if (now < c.nagle_since + c.opt.aggregation_timeout) break;
-            }
-            if (in_flight(c) >= static_cast<u32>(c.cwnd) || !window_allows(c, c.snd_offset, n)) break;
-            Segment s;
-            s.seq = c.snd_nxt++;
-            s.offset = c.snd_offset;
-            s.data.assign(c.stream_out.begin(), c.stream_out.begin() + static_cast<std::ptrdiff_t>(n));
-            c.stream_out.erase(c.stream_out.begin(), c.stream_out.begin() + static_cast<std::ptrdiff_t>(n));
-            c.snd_offset += n;
-            c.nagle_since = 0;
-            c.sndq.push_back(std::move(s));
-            next = &c.sndq.back();
-        }
-        if (!next && c.fin_wanted && !c.fin_queued && c.stream_out.empty()) {
-            Segment s;
-            s.type = Type::Fin;
-            s.seq = c.snd_nxt++;
-            s.offset = c.snd_offset;
-            c.sndq.push_back(std::move(s));
-            c.fin_queued = true;
-            next = &c.sndq.back();
-        }
-        if (!next) break;
-        if (in_flight(c) >= static_cast<u32>(c.cwnd) || !window_allows(c, next->offset, next->data.size())) break;
-        send_segment(lib, c, *next, now, w);
-    }
-    c.flush_now = false;
-    if (in_flight(c) && !c.rto_deadline) c.rto_deadline = now + c.rto;
-}
-
-// ------------------------------------------------------------------------------------------------- connections
-
-void link(Lib& lib, const std::shared_ptr<Context>& c) { lib.sockets[c->soc].conns.push_back(c); }
-
-void unlink(Lib& lib, const Context& c)
-{
-    const auto it = lib.sockets.find(c.soc);
-    if (it == lib.sockets.end()) return;
-    std::erase_if(it->second.conns, [&](const std::shared_ptr<Context>& x) { return x.get() == &c; });
-}
-
-// A socket nothing uses any more is the game's again (CELL_RUDP_EVENT_SOCKET_RELEASED).
-void release_if_unused(Lib& lib, s32 soc, Work& w)
-{
-    const auto it = lib.sockets.find(soc);
-    if (it == lib.sockets.end() || !it->second.ports.empty() || !it->second.conns.empty()) return;
-    lib.sockets.erase(it);
-    w.released.push_back(soc);
-}
-
-void drop_lingering(Lib& lib, Context& c, Work& w)
-{
-    c.dropped = true;
-    unlink(lib, c);
-    std::erase_if(lib.lingering, [&](const std::shared_ptr<Context>& x) { return x.get() == &c; });
-    release_if_unused(lib, c.soc, w);
-}
-
-// A listener's connection gone before it was accepted.
-void drop_pending(Lib& lib, Context& c, Work& w)
-{
-    c.dropped = true;
-    unlink(lib, c);
-    if (const auto parent = c.parent.lock()) {
-        std::erase_if(parent->pending, [&](const std::shared_ptr<Context>& x) { return x.get() == &c; });
-    }
-    release_if_unused(lib, c.soc, w);
-}
-
-// The connection ends with `err`: the context is CLOSED, what it buffered is dropped, its handler hears ERROR and
-// CLOSED. The game still terminates it.
-void fail(Lib& lib, Context& c, s32 err, Work& w)
-{
-    if (c.lingering) {
-        drop_lingering(lib, c, w);
-        return;
-    }
-    if (c.connecting()) count_failure(lib, err);
-    PS_LOG_INFO(kChan, "context {} (vport {}): the connection ends with {:#x}", c.id, c.vport, static_cast<u32>(err));
-    c.state = kStateClosed;
-    c.error = err;
-    c.clear_send();
-    c.ooo.clear();
-    c.ooo_bytes = 0;
-    c.seen.clear();
-    c.rcvq.clear();
-    c.rcv_bytes = 0;
-    c.rto_deadline = c.persist_deadline = 0;
-    if (!c.id && c.parent.lock()) {
-        drop_pending(lib, c, w);
-        return;
-    }
-    unlink(lib, c);
-    event(w, c, kEventError, err);
-    event(w, c, kEventClosed, err);
-    notify(lib);
-}
-
-u8 reason_of(s32 err)
-{
-    switch (static_cast<u32>(err)) {
-    case CELL_RUDP_ERROR_CONN_TRANSPORT_TYPE_MISMATCH: return rudp::kRstTransport;
-    case CELL_RUDP_ERROR_QUALITY_LEVEL_MISMATCH: return rudp::kRstQuality;
-    case CELL_RUDP_ERROR_CONN_VERSION_MISMATCH: return rudp::kRstVersion;
-    default: return rudp::kRstReset;
-    }
-}
-
-s32 error_of_reset(u8 reason, bool connecting)
-{
-    switch (reason) {
-    case rudp::kRstRefused: return error(connecting ? CELL_RUDP_ERROR_CONN_REFUSED : CELL_RUDP_ERROR_CONN_RESET);
-    case rudp::kRstVersion: return error(CELL_RUDP_ERROR_CONN_VERSION_MISMATCH);
-    case rudp::kRstTransport: return error(CELL_RUDP_ERROR_CONN_TRANSPORT_TYPE_MISMATCH);
-    case rudp::kRstQuality: return error(CELL_RUDP_ERROR_QUALITY_LEVEL_MISMATCH);
-    default: return error(CELL_RUDP_ERROR_CONN_RESET);
-    }
-}
-
-// Why a SYN's parameters do not fit what `p` carries (0 when they do); nullopt for a SYN too short to have them.
-std::optional<s32> mismatch(const Params& p, const u8* payload, usize n)
-{
-    if (n < kSynSize) return std::nullopt;
-    const bool stream = payload[0] != 0;
-    if (stream != p.stream) return error(CELL_RUDP_ERROR_CONN_TRANSPORT_TYPE_MISMATCH);
-    if (!stream && ((payload[1] != 0) != p.reliable || (payload[2] != 0) != p.ordered))
-        return error(CELL_RUDP_ERROR_QUALITY_LEVEL_MISMATCH);
     return 0;
 }
 
-// The peer's parameters from its SYN or SYN-ACK: the smaller segment, its window.
-void take_peer(Context& c, const u8* payload)
+u32 api_state(const Ctx& x) { return (x.flags & kXListening) ? kListening : x.c.state <= 5 ? x.c.state : 0; }
+
+PollSet* poll_find(Net& net, s32 id)
 {
-    const u16 peer_mss = ps_ld16(payload + 4);
-    if (peer_mss >= kMinMss && peer_mss < c.mss) c.mss = peer_mss;
-    c.payload = c.mss - kHeaderSize;
-    c.peer_window = ps_ld32(payload + 8);
+    const auto it = net.polls.find(id);
+    return it == net.polls.end() ? nullptr : it->second.first.get();
 }
 
-// The handshake's end: the connection carries data both ways.
-void establish(Lib& lib, Context& c, u64 now, Work& w)
+void poll_signal(PollSet& p, s32 ctx, u16 events);
+
+void ctx_poll_notify(Ctx& x, u16 events)
 {
-    c.state = kStateEstablished;
-    c.snd_una = c.iss + 1;
-    c.rto = kInitialRto;
-    c.rto_deadline = 0;
-    c.last_heard = now;
-    lib.stats[kEstablishedConnections]++;
-    const std::shared_ptr<Context> listener = c.id ? nullptr : c.parent.lock(); // not accepted yet
-    const std::string who = c.id ? std::format("context {}", c.id)
-                                 : std::format("a connection for listener {}", listener ? listener->id : 0);
-    PS_LOG_INFO(kChan, "{} (vport {}): established with vport {}{}", who, c.vport, c.peer_vport,
-        c.p.stream ? ", a stream" : "");
-    event(w, c, kEventEstablished);
-    if (listener) event(w, *listener, kEventReadable); // one to accept
-    push(lib, c, now, w);
-    notify(lib);
+    if (!x.net) return;
+    if (PollSet* p = poll_find(*x.net, x.poll)) poll_signal(*p, x.id, events);
+    else x.poll = -1;
 }
 
-// A connection starting from this side (Initiate, Activate) or from a SYN a listener took: its sequence numbers and
-// segment size; the SYN or SYN-ACK goes out at once.
-void start(Lib& lib, Context& c, u64 now)
+void ctx_call_handler(Ctx& x, u32 event, u32 code)
 {
-    c.p = params_of(c.opt);
-    c.mss = lib.mss;
-    c.payload = c.mss - kHeaderSize;
-    c.iss = static_cast<u32>(lib.rng());
-    c.snd_una = c.iss;
-    c.snd_nxt = c.iss + 1;
-    c.connect_deadline = c.opt.connection_timeout ? now + c.opt.connection_timeout : 0;
-    c.syn_sends = 0;
-    c.cwnd = kInitialCwnd;
-    c.ssthresh = kInitialSsthresh;
-    c.rto = kInitialRto;
-    c.rack_xmit = 0;
-    c.recovery = false;
-    c.has_peer = true;
+    if (!x.handler || (x.flags & kXTerminated)) return;
+    call_game(x.handler, {sext(x.id), event, sext(static_cast<s32>(code)), x.arg}, "the context handler");
 }
 
-// A loss found (RACK or a retransmission timeout): the window shrinks once in a recovery episode.
-void enter_recovery(Context& c, bool timeout)
+void ctx_wake(Ctx& x, u8 bits)
 {
-    if (c.recovery && !timeout) return;
-    c.ssthresh = std::max(2.0, std::min(c.cwnd, static_cast<double>(in_flight(c))) / 2);
-    c.cwnd = timeout ? 2.0 : c.ssthresh;
-    c.recovery = true;
-    c.recover = c.snd_nxt;
+    x.wake |= bits;
+    x.cond.signal_all();
 }
 
-// How long after its sending a segment the peer still lacks is lost once one sent after it has arrived: an RTT and a
-// reordering window (a quarter of it, at least a millisecond).
-u64 rack_wait(const Context& c) { return c.srtt + std::max<u64>(c.srtt / 4, 1000); }
+s32 ctx_delete(Lib& lib, Net& net, s32 id);
+void ctx_detach_child(Lib& lib, Ctx& parent, const Addr& peer);
+void net_unregister_peer(Lib& lib, Net& net, Ctx& x);
+void conn_cookies(Lib& lib, Ctx& x);
 
-// The segments the peer lacks that were sent before one it has, and long enough ago: sent again.
-void detect_losses(Lib& lib, Context& c, u64 now, Work& w)
+// A context's queued event (librudp's: what a blocked call, a poll set or the handler hears, and the work the
+// connection queued).
+void ctx_on_event(Lib& lib, Ctx& x, const Event& e)
 {
-    if (!c.p.reliable || !c.rack_xmit) return;
-    const u64 wait = rack_wait(c);
-    for (usize i = 0; i < c.sent; i++) {
-        Segment& s = c.sndq[i];
-        if (s.sacked || s.last_sent >= c.rack_xmit || now < s.last_sent + wait) continue;
-        enter_recovery(c, false);
-        c.lost++;
-        lib.stats[kLostPackets]++;
-        send_segment(lib, c, s, now, w);
-    }
-}
-
-// An RTT sample (Jacobson and Karels, as TCP's), from a segment acknowledged after one sending (Karn).
-void sample_rtt(Context& c, u64 rtt)
-{
-    if (!c.rtt_valid) {
-        c.srtt = rtt;
-        c.rttvar = rtt / 2;
-        c.rtt_valid = true;
-    } else {
-        const u64 d = c.srtt > rtt ? c.srtt - rtt : rtt - c.srtt;
-        c.rttvar = (3 * c.rttvar + d) / 4;
-        c.srtt = (7 * c.srtt + rtt) / 8;
-    }
-    c.rto = std::clamp(c.srtt + std::max<u64>(4 * c.rttvar, 1000), kMinRto, kMaxRto);
-}
-
-// What the peer acknowledged: segments off the queue, the RTT, the congestion window, the selective
-// acknowledgements, the losses they show (detect_losses); the peer's window.
-void on_ack(Lib& lib, Context& c, const Header& h, u64 now, Work& w)
-{
-    const usize before = c.queued();
-    u32 newly = 0;
-    if (seq_gt(h.ack, c.snd_una) && !seq_gt(h.ack, c.snd_nxt)) {
-        while (!c.sndq.empty() && seq_lt(c.sndq.front().seq, h.ack) && c.sndq.front().sends) {
-            const Segment& s = c.sndq.front();
-            if (s.sends == 1 && s.type == Type::Data && c.p.reliable) sample_rtt(c, now - s.first_sent);
-            c.rack_xmit = std::max(c.rack_xmit, s.last_sent);
-            c.pop_front();
-            newly++;
-        }
-        c.snd_una = h.ack;
-        if (c.recovery && !seq_lt(c.snd_una, c.recover)) c.recovery = false;
-        if (c.p.reliable) {
-            if (!c.rtt_valid) c.rto = kInitialRto;
-            else c.rto = std::clamp(c.srtt + std::max<u64>(4 * c.rttvar, 1000), kMinRto, kMaxRto);
-        }
-        c.rto_deadline = in_flight(c) ? now + c.rto : 0;
-        if (!c.recovery)
-            for (u32 i = 0; i < newly; i++) c.cwnd += c.cwnd < c.ssthresh ? 1.0 : 1.0 / c.cwnd;
-        c.cwnd = std::min(c.cwnd, kMaxCwnd);
-    }
-    if (c.p.reliable && h.sack) {
-        for (usize i = 0; i < c.sent; i++) {
-            Segment& s = c.sndq[i];
-            const u32 d = s.seq - h.ack - 1;
-            if (d < 32 && (h.sack >> d) & 1 && !s.sacked) {
-                s.sacked = true;
-                c.flight--;
-                c.rack_xmit = std::max(c.rack_xmit, s.last_sent);
-            }
-        }
-    }
-    detect_losses(lib, c, now, w);
-    c.peer_window = h.window;
-    if (c.peer_window) c.persist_deadline = 0;
-    const usize after = c.queued();
-    if (after < before) {
-        if (c.writable_wanted && after < c.opt.sndbuf) {
-            c.writable_wanted = false;
-            event(w, c, kEventWritable);
-        }
-        if (!after && c.flush_wanted) {
-            c.flush_wanted = false;
-            event(w, c, kEventFlushed);
-        }
-        notify(lib);
-    }
-}
-
-void deliver(Lib& lib, Context& c, Chunk&& chunk, Work& w)
-{
-    if (chunk.fin) c.peer_fin = true;
-    if (c.lingering) return; // nobody reads a terminated context: its data acknowledged and dropped
-    if (chunk.fin) {
-        if (c.state == kStateEstablished) c.state = kStateCloseWait;
-        PS_LOG_INFO(kChan, "context {} (vport {}): the peer ended the connection", c.id, c.vport);
-        event(w, c, kEventClosed, 0);
-        notify(lib);
-        return;
-    }
-    const bool was_empty = c.rcvq.empty();
-    const u32 level = quality_of(c.p);
-    lib.stats[kRcvdUserBytes] += chunk.data.size();
-    lib.stats[kRcvdUserPackets]++;
-    lib.stats[kQualityLevels + 4 * level + 1] += chunk.data.size();
-    lib.stats[kQualityLevels + 4 * level + 3]++;
-    if (chunk.flags & rudp::kFlagLatency) lib.stats[kRcvdLatencyCriticalPackets]++;
-    c.rcv_bytes += chunk.data.size();
-    c.rcvq.push_back(std::move(chunk));
-    if (was_empty) event(w, c, kEventReadable);
-    notify(lib);
-}
-
-// A DATA or FIN segment into the receive side, by the connection's delivery and order guarantees.
-void on_segment(Lib& lib, Context& c, const Header& h, const u8* payload, usize n, Work& w)
-{
-    Chunk chunk;
-    chunk.data.assign(payload, payload + n);
-    chunk.seq = h.seq;
-    chunk.stamp = h.stamp;
-    chunk.flags = h.flags;
-    chunk.retries = h.retries;
-    chunk.fin = h.type == Type::Fin;
-    c.ack_now = true;
-    if (c.peer_fin) return; // past the peer's end
-    const usize slack = 2 * std::max<usize>(c.payload, 1);
-    if (c.p.reliable) {
-        if (seq_lt(h.seq, c.rcv_nxt) || c.ooo.contains(h.seq) || c.seen.contains(h.seq)) return; // a duplicate
-        if (c.p.ordered) {
-            if (h.seq != c.rcv_nxt) {
-                if (c.rcv_bytes + c.ooo_bytes + n > c.opt.rcvbuf + slack || h.seq - c.rcv_nxt > 4096) return;
-                lib.stats[kReorderedPackets]++;
-                c.ooo_bytes += n;
-                c.ooo.emplace(h.seq, std::move(chunk));
-                return;
-            }
-            if (c.rcv_bytes + n > c.opt.rcvbuf + slack) return; // past the window: the peer sends it again
-            c.rcv_nxt++;
-            deliver(lib, c, std::move(chunk), w);
-            for (auto it = c.ooo.find(c.rcv_nxt); it != c.ooo.end(); it = c.ooo.find(c.rcv_nxt)) {
-                c.ooo_bytes -= it->second.data.size();
-                Chunk next = std::move(it->second);
-                c.ooo.erase(it);
-                c.rcv_nxt++;
-                deliver(lib, c, std::move(next), w);
-            }
+    // An event the game hears: a blocked call wakes (and the poll set hears it), else the poll set or the handler.
+    const auto tell = [&](u8 wake, u16 poll_extra, u32 event, u32 code, bool check_terminated_for_poll) {
+        if (x.blocking) {
+            ctx_wake(x, wake);
+            if (x.poll >= 0 && !(check_terminated_for_poll && (x.flags & kXTerminated)))
+                ctx_poll_notify(x, ctx_ready(x) | poll_extra);
             return;
         }
-        // Reliable, unordered: each message as it comes, its sequence number kept until the ones before it came; the
-        // peer's end once everything before it came.
-        if (c.rcv_bytes + n > c.opt.rcvbuf + slack || h.seq - c.rcv_nxt > 4096) return;
-        if (h.seq != c.rcv_nxt) {
-            lib.stats[kReorderedPackets]++;
-            c.seen.insert(h.seq);
-        } else {
-            c.rcv_nxt++;
-            while (c.seen.erase(c.rcv_nxt)) c.rcv_nxt++;
-        }
-        if (chunk.fin) {
-            c.fin_seen = true;
-            c.fin_seq = h.seq;
-        } else {
-            deliver(lib, c, std::move(chunk), w);
-        }
-        if (c.fin_seen && c.rcv_nxt == c.fin_seq + 1) {
-            Chunk end;
-            end.fin = true;
-            deliver(lib, c, std::move(end), w);
-        }
-        return;
-    }
-    // Unreliable: no retransmission; the highest sequence number seen is acknowledged.
-    if (!c.any_received || seq_gt(h.seq, c.highest)) c.highest = h.seq;
-    const bool first = !c.any_received;
-    c.any_received = true;
-    if (chunk.fin) {
-        deliver(lib, c, std::move(chunk), w);
-        return;
-    }
-    if (c.rcv_bytes + n > c.opt.rcvbuf + slack) return; // no room: lost
-    if (c.p.ordered) {
-        if (!first && !seq_gt(h.seq, c.delivered)) return; // late: an older message than one delivered
-        c.delivered = h.seq;
-    } else {
-        if (c.seen.contains(h.seq)) return;
-        c.seen.insert(h.seq);
-        while (c.seen.size() > 1024) c.seen.erase(c.seen.begin());
-        if (!first && seq_lt(h.seq, c.highest)) lib.stats[kReorderedPackets]++;
-    }
-    deliver(lib, c, std::move(chunk), w);
-}
-
-// A SYN for a listener's vport from a peer it has no connection with: a connection of its own, SYN-ACK sent, which the
-// game takes with cellRudpAccept once the handshake ends.
-void on_listen_syn(Lib& lib, Binding& b, const std::shared_ptr<Context>& l, const Endpoint& from, const Header& h,
-    const u8* payload, usize n, u64 now, Work& w)
-{
-    const std::optional<s32> bad = mismatch(params_of(l->opt), payload, n);
-    if (!bad) return;
-    if (*bad) {
-        reply_rst(lib, b, l->soc, from, h, reason_of(*bad), w);
-        count_failure(lib, *bad);
-        return;
-    }
-    // Full (the backlog, the library's contexts): the peer sends its SYN again.
-    if (l->pending.size() >= l->backlog || total_contexts(lib) >= kMaxContexts) return;
-    auto c = std::make_shared<Context>();
-    c->handler = l->handler;
-    c->arg = l->arg;
-    c->opt = l->opt;
-    c->bound = true;
-    c->soc = l->soc;
-    c->vport = l->vport;
-    c->mux = l->mux;
-    c->parent = l;
-    c->peer = from;
-    c->peer_vport = h.src;
-    start(lib, *c, now);
-    c->irs = h.seq;
-    c->rcv_nxt = h.seq + 1;
-    take_peer(*c, payload);
-    c->state = kStateSynRcvd;
-    c->last_heard = now;
-    b.conns.push_back(c);
-    l->pending.push_back(c);
-    send_syn(lib, *c, now, w);
-}
-
-// A SYN on a connection: a simultaneous open (Initiate or Activate meeting the peer's SYN), or a SYN again.
-void on_syn(Lib& lib, Binding& b, Context& c, const Endpoint& from, const Header& h, const u8* payload, usize n,
-    u64 now, Work& w)
-{
-    if (c.state == kStateSynSent) {
-        const std::optional<s32> bad = mismatch(c.p, payload, n);
-        if (!bad) return;
-        if (*bad) {
-            reply_rst(lib, b, c.soc, from, h, reason_of(*bad), w);
-            fail(lib, c, *bad, w);
+        if (x.poll >= 0) {
+            if (!(check_terminated_for_poll && (x.flags & kXTerminated))) ctx_poll_notify(x, ctx_ready(x) | poll_extra);
             return;
         }
-        if (!c.peer_vport) c.peer_vport = h.src;
-        c.irs = h.seq;
-        c.rcv_nxt = h.seq + 1;
-        take_peer(c, payload);
-        c.state = kStateSynRcvd;
-        c.syn_sends = 0;
-        send_syn(lib, c, now, w);
-        return;
-    }
-    if (h.seq != c.irs) { // the peer started again
-        reply_rst(lib, b, c.soc, from, h, rudp::kRstReset, w);
-        fail(lib, c, error(CELL_RUDP_ERROR_CONN_RESET), w);
-        return;
-    }
-    if (c.state == kStateSynRcvd) send_syn(lib, c, now, w);
-    else c.ack_now = true; // our SYN-ACK or ACK was lost
-}
-
-void on_synack(Lib& lib, Binding& b, Context& c, const Endpoint& from, const Header& h, const u8* payload, usize n,
-    u64 now, Work& w)
-{
-    if (c.state == kStateSynSent) {
-        if (h.ack != c.iss + 1) return;
-        const std::optional<s32> bad = mismatch(c.p, payload, n);
-        if (!bad) return;
-        if (*bad) {
-            reply_rst(lib, b, c.soc, from, h, reason_of(*bad), w);
-            fail(lib, c, *bad, w);
-            return;
+        ctx_call_handler(x, event, code);
+    };
+    switch (e.type) {
+    case kQEstablished: return tell(kWakeEstablished, kPollWrite, kEvEstablished, 0, false);
+    case kQClosed:
+        if (x.flags & kXPeer) {
+            x.flags &= ~kXPeer;
+            net_unregister_peer(lib, *x.net, x);
         }
-        if (!c.peer_vport) c.peer_vport = h.src;
-        c.irs = h.seq;
-        c.rcv_nxt = h.seq + 1;
-        take_peer(c, payload);
-        establish(lib, c, now, w);
-        c.ack_now = true;
-        return;
-    }
-    if (c.state == kStateSynRcvd) {
-        if (h.ack != c.iss + 1 || h.seq != c.irs) return;
-        if (n >= kSynSize) take_peer(c, payload);
-        establish(lib, c, now, w);
-        c.ack_now = true;
-        return;
-    }
-    if (h.seq == c.irs) c.ack_now = true; // our ACK was lost
-}
-
-// The connection on `b` a packet from `from` with header `h` belongs to.
-std::shared_ptr<Context> find_conn(const Binding& b, const Endpoint& from, const Header& h)
-{
-    for (const auto& c : b.conns) {
-        if (c->vport != h.dst || !same_peer(c->peer, from, b.p2p)) continue;
-        if (c->peer_vport == h.src) return c;
-        if (!c->peer_vport && c->activated && c->state == kStateSynSent) return c;
-    }
-    return nullptr;
-}
-
-// One packet that came on socket `soc` from `from`. False when it is not an RUDP packet (the magic, the size, the
-// type).
-bool receive(Lib& lib, s32 soc, const Endpoint& from, const u8* bytes, usize size, u64 now, Work& w)
-{
-    const auto bit = lib.sockets.find(soc);
-    if (bit == lib.sockets.end()) return true; // no context uses it any more
-    Binding& b = bit->second;
-    const std::optional<Header> hh = rudp::decode(bytes, size);
-    if (!hh) return false;
-    const Header& h = *hh;
-    if (h.version == rudp::kVersion && (h.type < Type::Syn || h.type > Type::Rst)) return false;
-    lib.stats[kRcvdUdpPackets]++;
-    lib.stats[kRcvdUdpBytes] += size;
-    if (h.version != rudp::kVersion) {
-        if (h.type != Type::Rst) reply_rst(lib, b, soc, from, h, rudp::kRstVersion, w);
-        return true;
-    }
-    count_received(lib, h.type);
-    const u8* payload = bytes + kHeaderSize;
-    const usize n = size - kHeaderSize;
-    std::shared_ptr<Context> c = find_conn(b, from, h);
-    if (c && c->lingering && h.type == Type::Syn && h.seq != c->irs) { // a new connection over one let go
-        drop_lingering(lib, *c, w);
-        if (!lib.sockets.contains(soc)) return true;
-        c = find_conn(b, from, h);
-    }
-    if (!c) {
-        if (h.type == Type::Syn) {
-            const auto port = b.ports.find(h.dst);
-            if (port != b.ports.end() && port->second->listening) {
-                on_listen_syn(lib, b, port->second, from, h, payload, n, now, w);
-                return true;
+        x.error = static_cast<s32>(error_of(e.sub > 8 ? kWhyInternal : e.sub));
+        return tell(kWakeClosed, kPollWrite, kEvClosed, static_cast<u32>(x.error), true);
+    case kQError:
+        x.error = static_cast<s32>(error_of(e.sub > 8 ? kWhyInternal : e.sub));
+        return tell(kWakeClosed, kPollRead, kEvClosed, static_cast<u32>(x.error), true);
+    case kQReadable:
+        if (!x.c.readable_size()) return;
+        return tell(kWakeReadable, kPollRead, kEvReadable, 0, false);
+    case kQWritable:
+        if (!x.c.writable()) return;
+        return tell(kWakeWritable, kPollWrite, kEvWritable, 0, false);
+    case kQFlushed: return tell(kWakeFlushed, kPollFlush, kEvFlushed, 0, false);
+    case kQSendSyn: return conn_send_syn(lib, x.c);
+    case kQSendAck: return conn_send_ack(lib, x.c);
+    case kQSendRst: return conn_send_rst(lib, x.c, e.arg, e.sub);
+    case kQOutput: return conn_output(lib, x.c);
+    case kQProbeReply: return conn_send_probe(lib, x.c, true);
+    case kQChildEstablished: return tell(kWakeAcceptable, 0, kEvAcceptable, 0, false);
+    case kQChildClosed: {
+        const s32 child = static_cast<s32>(e.arg);
+        const auto it = x.net->ctxs.find(child);
+        if (it != x.net->ctxs.end()) {
+            Ctx* c = it->second.first;
+            for (auto p = x.pending.begin(); p != x.pending.end(); ++p) {
+                if (addr_equal(p->ctx->peer.raw, c->peer.raw) && p->ctx->peer.vport == c->peer.vport &&
+                    p->ctx->id == child) {
+                    mem_free(lib, p->mem);
+                    x.pending.erase(p);
+                    break;
+                }
             }
-            // A context bound there that has not started yet (two Initiates, or an Activate, one a little later than
-            // the other) or one with another peer: dropped, the SYN comes again. An Activate's SYN where nothing waits.
-            if (port != b.ports.end() || (h.flags & rudp::kFlagSoft)) return true;
         }
-        if (h.type != Type::Rst)
-            reply_rst(lib, b, soc, from, h, h.type == Type::Syn ? rudp::kRstRefused : rudp::kRstReset, w);
-        return true;
+        if (child != -1) ctx_delete(lib, *x.net, child);
+        return;
     }
-    Context& x = *c;
-    x.rcvd_packets++;
-    x.rcvd_bytes += size;
-    x.last_heard = now;
-    switch (h.type) {
-    case Type::Rst: fail(lib, x, error_of_reset(h.reason, x.connecting()), w); return true;
-    case Type::Syn: on_syn(lib, b, x, from, h, payload, n, now, w); break;
-    case Type::SynAck: on_synack(lib, b, x, from, h, payload, n, now, w); break;
-    case Type::Ack:
-    case Type::Probe:
-    case Type::Data:
-    case Type::Fin:
-        if (x.state == kStateSynRcvd && h.ack == x.iss + 1) establish(lib, x, now, w);
-        if (!x.connected()) break;
-        on_ack(lib, x, h, now, w);
-        if (h.type == Type::Probe) x.ack_now = true;
-        if (h.type == Type::Data || h.type == Type::Fin) on_segment(lib, x, h, payload, n, w);
-        break;
+    case kQCleanup:
+        if (x.flags & kXPeer) {
+            x.flags &= ~kXPeer;
+            net_unregister_peer(lib, *x.net, x);
+        }
+        if (x.flags & kXTerminated) {
+            if (x.id != -1) ctx_delete(lib, *x.net, x.id);
+            return;
+        }
+        if (x.parent) ctx_detach_child(lib, *x.parent, x.peer);
+        x.parent = nullptr;
+        return;
+    case kQCookies: return conn_cookies(lib, x);
+    case kQMemory:
+    case kQBadSocket: {
+        x.error = static_cast<s32>(e.type == kQMemory ? CELL_RUDP_ERROR_MEMORY : CELL_RUDP_ERROR_INVALID_SOCKET);
+        if (x.blocking) {
+            ctx_wake(x, kWakeCancel);
+            if (x.poll >= 0) ctx_poll_notify(x, ctx_ready(x) | kPollError);
+            return;
+        }
+        if (x.poll >= 0) return ctx_poll_notify(x, ctx_ready(x) | kPollError);
+        return ctx_call_handler(x, kEvError, static_cast<u32>(x.error));
     }
-    if (x.dropped || x.state == kStateClosed) return true;
-    push(lib, x, now, w);
-    if (x.ack_now && x.has_peer) send_control(lib, x, Type::Ack, now, w);
-    if (x.lingering && x.sndq.empty() && x.fin_queued && x.peer_fin) drop_lingering(lib, x, w); // both ends done
-    note_memory(lib);
+    default: return;
+    }
+}
+
+void ctx_on_timer(Lib& lib, Ctx& x, u64& interval)
+{
+    if (x.valid) conn_tick(lib, x.c, interval);
+}
+
+// A listener lets a child go (it ended, or went away): from those waiting and those accepted. A terminated listener
+// with none left goes too.
+void ctx_detach_child(Lib& lib, Ctx& parent, const Addr& peer)
+{
+    if (!parent.valid) return;
+    for (auto p = parent.pending.begin(); p != parent.pending.end(); ++p) {
+        if (addr_equal(p->ctx->peer.raw, peer.raw) && p->ctx->peer.vport == peer.vport) {
+            mem_free(lib, p->mem);
+            parent.pending.erase(p);
+            break;
+        }
+    }
+    const auto it = parent.accepted.find(peer);
+    if (it != parent.accepted.end()) {
+        mem_free(lib, it->second.mem);
+        parent.accepted.erase(it);
+    }
+    if ((parent.flags & kXTerminated) && parent.pending.empty() && parent.accepted.empty())
+        ctx_post(parent, kQCleanup);
+}
+
+// A listener's cookies go out: a RST (reason 2) with 32 bytes, one per SYN that came without a valid one.
+void net_send_control(Lib& lib, Net& net, u8 mux, const Header& h, s32 soc, u16 src, const Addr& to);
+void conn_cookies(Lib& lib, Ctx& x)
+{
+    if (!x.cookies) return;
+    Ctx::CookieRing& r = *x.cookies;
+    while (r.head != r.tail || r.full) {
+        r.full = false;
+        const Addr to = r.entries[r.head];
+        if (++r.head == r.entries.size()) r.head = 0;
+        const std::array<u8, 32> cookie = make_cookie(x);
+        Header h;
+        h.type = rudp::kTypeRst;
+        h.seq = 0;
+        h.window = rudp::encode_window(0);
+        h.opts |= rudp::kOptCookie;
+        h.cookie_len = 32;
+        h.cookie = cookie;
+        h.token = 0;
+        h.code = kWhyRefused;
+        if (x.net) net_send_control(lib, *x.net, x.mux, h, x.soc, x.vport, to);
+        if (!x.cookies) return;
+    }
+    if (!x.cookie_life) {
+        mem_free(lib, r.mem_buf);
+        mem_free(lib, r.mem_obj);
+        x.cookies.reset();
+    }
+}
+
+bool ctx_cookie_ring(Lib& lib, Ctx& x)
+{
+    if (x.cookies) return true;
+    Block obj = mem_alloc(lib, 0x14);
+    if (!obj) return false;
+    Block buf = mem_alloc(lib, 0x900);
+    if (!buf) {
+        mem_free(lib, obj);
+        return false;
+    }
+    x.cookies = std::make_unique<Ctx::CookieRing>();
+    x.cookies->mem_obj = obj;
+    x.cookies->mem_buf = buf;
     return true;
 }
 
-// ------------------------------------------------------------------------------------------------- timers
-
-// What is due on connection `c` at `now`: the handshake's next SYN or its timeout, a retransmission, a held segment,
-// a window probe, keep-alive, the end of a terminated connection's time to close.
-void on_timers(Lib& lib, Context& c, u64 now, Work& w)
+// The context's peer (Initiate's, Activate's, a child's): a P2P context's peer shares its vport. The aggregator
+// learns the destination.
+s32 net_register_peer(Lib& lib, Net& net, Ctx& x);
+s32 ctx_set_peer(Lib& lib, Ctx& x, const std::array<u8, 0x22>& addr, u16 vport)
 {
-    if (c.connecting()) {
-        if (c.connect_deadline && now >= c.connect_deadline) {
-            fail(lib, c, error(CELL_RUDP_ERROR_CONN_TIMEOUT), w);
-            return;
-        }
-        if (now >= c.syn_next) send_syn(lib, c, now, w);
-        return;
+    if (x.mux == 2) {
+        if (x.flags & kXListening) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    } else {
+        vport = x.vport;
     }
-    if (!c.connected()) return;
-    if (c.lingering && now >= c.linger_deadline) {
-        send_control(lib, c, Type::Rst, now, w, rudp::kRstReset);
-        drop_lingering(lib, c, w);
-        return;
+    if (x.flags & kXPeer) {
+        return addr_equal(addr, x.peer.raw) && x.peer.vport == vport ? 0 : err(CELL_RUDP_ERROR_IN_PROGRESS);
     }
-    if (c.opt.keep_alive_timeout && now >= c.last_heard + c.opt.keep_alive_timeout) {
-        fail(lib, c, error(CELL_RUDP_ERROR_KEEP_ALIVE_FAILURE), w);
-        return;
-    }
-    if (!c.p.reliable) { // what was sent and is not acknowledged within the timeout is lost; a FIN is sent again
-        while (!c.sndq.empty() && c.sndq.front().sends && c.sndq.front().type == Type::Data &&
-               now >= c.sndq.front().last_sent + c.rto) {
-            c.lost++;
-            lib.stats[kLostPackets]++;
-            c.pop_front();
-            notify(lib);
-        }
-    }
-    detect_losses(lib, c, now, w);
-    if (c.rto_deadline && now >= c.rto_deadline) {
-        Segment* oldest = nullptr;
-        for (usize i = 0; i < c.sent && !oldest; i++)
-            if (!c.sndq[i].sacked && (c.p.reliable || c.sndq[i].type == Type::Fin)) oldest = &c.sndq[i];
-        if (oldest) {
-            c.lost++;
-            lib.stats[kLostPackets]++;
-            enter_recovery(c, true);
-            send_segment(lib, c, *oldest, now, w);
-            c.rto = std::min(c.rto * 2, kMaxRto);
-            c.rto_deadline = now + c.rto;
+    x.flags |= kXPeer;
+    x.peer.raw = {};
+    std::memcpy(x.peer.raw.data(), addr.data(), std::min<usize>(addr[0], 0x22));
+    x.peer.vport = vport;
+    if (!x.net) return 0;
+    return net_register_peer(lib, *x.net, x);
+}
+
+// Makes a context (its ID the next of a count that never goes back, from 0): MEMORY when the allocator gives none.
+s32 ctx_create(Lib& lib, Net& net, Ctx*& out)
+{
+    out = nullptr;
+    const s32 id = net.next_ctx;
+    net.next_ctx = (net.next_ctx + 1) & 0x7FFFFFFF;
+    Block mem = mem_alloc(lib, 0x280);
+    if (!mem) return err(CELL_RUDP_ERROR_MEMORY);
+    auto* x = new Ctx;
+    x->mem = mem;
+    x->net = &net;
+    x->id = id;
+    x->c.owner = x;
+    s32 r = 0;
+    Target t;
+    t.kind = Target::Kind::Ctx;
+    t.ctx = x;
+    if (sched_register(lib, net.sched, t, x->target) < 0) {
+        x->target = 0;
+        r = err(CELL_RUDP_ERROR_INTERNAL);
+    } else if (const s32 a = sched_arm(lib, net.sched, x->target, 16000); a < 0) {
+        if (a == err(CELL_RUDP_ERROR_MEMORY)) {
+            ctx_post(*x, kQMemory);
+            x->error = err(CELL_RUDP_ERROR_MEMORY);
         } else {
-            c.rto_deadline = in_flight(c) ? now + c.rto : 0;
+            x->error = err(CELL_RUDP_ERROR_INTERNAL);
         }
     }
-    push(lib, c, now, w); // a held part segment, a window that opened
-    const bool waiting = !c.stream_out.empty() || c.sent < c.sndq.size();
-    if (waiting && !in_flight(c) && !c.peer_window) { // the peer's window is shut: ask it now and then
-        if (!c.persist_deadline) c.persist_deadline = now + c.rto;
-        else if (now >= c.persist_deadline) {
-            send_control(lib, c, Type::Probe, now, w);
-            c.persist_deadline = now + std::min(c.rto * 2, kMaxRto);
+    if (!r) r = x->error;
+    if (!r) {
+        Block node = mem_alloc(lib, 0x20);
+        if (!node) r = err(CELL_RUDP_ERROR_MEMORY);
+        else net.ctxs.emplace(id, std::make_pair(x, node));
+    }
+    if (r) {
+        // librudp deletes the context it could not finish
+        x->c.owner = nullptr;
+        if (x->target) {
+            sched_disarm(net.sched, x->target);
+            sched_unregister(lib, net.sched, x->target);
+        }
+        mem_free(lib, x->mem);
+        delete x;
+        return r;
+    }
+    out = x;
+    return 0;
+}
+
+// A context goes: its waiters return, it leaves its listener, the scheduler, the aggregator; its queues and records go.
+void ctx_destroy(Lib& lib, Ctx* x)
+{
+    lv2::PpuThread& t = thread_of(*t_ppu);
+    while (x->waiters > 0) {
+        x->wake |= kWakeCancel;
+        x->cond.signal_all();
+        x->cond.wait(lib.lock, t, 0);
+    }
+    x->wake &= ~kWakeCancel;
+    if (x->valid && x->parent) {
+        ctx_detach_child(lib, *x->parent, x->peer);
+        x->parent = nullptr;
+    }
+    Net* net = x->net;
+    if (x->target && net) {
+        sched_disarm(net->sched, x->target);
+        sched_unregister(lib, net->sched, x->target);
+    }
+    x->c.owner = nullptr;
+    if (x->flags & kXPeer) {
+        x->flags &= ~kXPeer;
+        if (net) net_unregister_peer(lib, *net, *x);
+    }
+    if (x->cookies) {
+        mem_free(lib, x->cookies->mem_buf);
+        mem_free(lib, x->cookies->mem_obj);
+        x->cookies.reset();
+    }
+    x->valid = false;
+    for (auto& [k, n] : x->accepted) {
+        if (n.ctx->parent == x) n.ctx->parent = nullptr;
+        mem_free(lib, n.mem);
+    }
+    x->accepted.clear();
+    for (Ctx::Pending& p : x->pending) {
+        if (p.ctx->parent == x) p.ctx->parent = nullptr;
+        mem_free(lib, p.mem);
+    }
+    x->pending.clear();
+    if (net)
+        for (auto& [id, e] : net->ctxs)
+            if (e.first->parent == x) e.first->parent = nullptr;
+    conn_reset(lib, x->c);
+    conn_free_cookie(lib, x->c);
+    pool_clear(lib, x->c);
+    mem_free(lib, x->mem);
+    delete x;
+}
+
+void net_ctx_removed(Lib& lib, Net& net, Ctx& x);
+
+s32 ctx_delete(Lib& lib, Net& net, s32 id)
+{
+    const auto it = net.ctxs.find(id);
+    if (it == net.ctxs.end()) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    Ctx* x = it->second.first;
+    net_ctx_removed(lib, net, *x);
+    ctx_destroy(lib, x);
+    const auto again = net.ctxs.find(id);
+    if (again != net.ctxs.end()) {
+        mem_free(lib, again->second.second);
+        net.ctxs.erase(again);
+    }
+    return 0;
+}
+
+// The context with this ID (one terminated and lingering only when `any`): INVALID_CONTEXT_ID otherwise.
+Ctx* ctx_find(Net& net, s32 id, bool any, s32* error)
+{
+    const auto it = net.ctxs.find(id);
+    Ctx* x = it == net.ctxs.end() ? nullptr : it->second.first;
+    if (x && !any && x->valid && (x->flags & kXTerminated)) x = nullptr;
+    if (error) *error = x ? 0 : err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    return x;
+}
+
+// Terminate: a connection resets its peer and lingers until its close-wait time is over; a listener ends its children.
+s32 ctx_terminate(Lib& lib, Ctx& x)
+{
+    if (x.flags & kXTerminated) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    x.flags |= kXTerminated;
+    s32 r = 0;
+    if (!(x.flags & kXListening)) {
+        r = conn_terminate(lib, x.c);
+    } else {
+        std::vector<Ctx*> accepted;
+        for (auto& [k, n] : x.accepted) accepted.push_back(n.ctx);
+        for (Ctx* c : accepted) ctx_terminate(lib, *c);
+        std::vector<Ctx*> pending;
+        for (Ctx::Pending& p : x.pending) pending.push_back(p.ctx);
+        for (Ctx* c : pending) {
+            ctx_terminate(lib, *c);
+            ctx_post(*c, kQCleanup);
+        }
+        if (x.accepted.empty() && x.pending.empty()) ctx_post(x, kQCleanup);
+    }
+    if (x.blocking) ctx_wake(x, kWakeCancel);
+    return r;
+}
+
+// ------------------------------------------------------------------------------------------------- polls
+
+void poll_signal(PollSet& p, s32 ctx, u16 events)
+{
+    const auto it = p.entries.find(ctx);
+    if (it == p.entries.end()) return;
+    PollSet::Entry& e = it->second;
+    const u16 v = static_cast<u16>((events & e.req) | e.ret);
+    e.ret = v;
+    if (!(v & 0x8000) && (v & 0x7FFF) && p.push(ctx)) {
+        e.ret = static_cast<u16>(v | 0x8000);
+        p.cond.signal();
+    }
+}
+
+// Ends the waits in a poll set: PollCancel's (a cancel the next wait sees when nobody waits), or the set going.
+void poll_cancel(Lib& lib, PollSet& p, bool cancel, bool dying)
+{
+    lv2::PpuThread& t = thread_of(*t_ppu);
+    if (!p.waiters) {
+        if (cancel) p.cancel = true;
+    } else if (p.waiters > 0) {
+        if (!dying) {
+            do {
+                if (p.dying) {
+                    p.cond.signal_all();
+                    return;
+                }
+                p.cancelling++;
+                p.cond.signal_all();
+                p.cond.wait(lib.lock, t, 0);
+                p.cancelling--;
+            } while (p.waiters > 0);
+        } else {
+            do {
+                p.cancelling++;
+                p.cond.signal_all();
+                p.cond.wait(lib.lock, t, 0);
+                p.cancelling--;
+            } while (p.waiters > 0);
         }
     }
-    if (c.opt.keep_alive_interval && now >= c.last_sent + c.opt.keep_alive_interval)
-        send_control(lib, c, Type::Probe, now, w);
-}
-
-// The earliest time something is due on `c` (0: nothing).
-u64 next_due(const Context& c)
-{
-    u64 due = 0;
-    const auto at = [&](u64 t) {
-        if (t && (!due || t < due)) due = t;
-    };
-    if (c.connecting()) {
-        at(c.connect_deadline);
-        at(c.syn_next);
-        return due;
+    if (p.dying) {
+        if (!dying) {
+            p.cond.signal_all();
+        } else {
+            while (p.cancelling > 0) {
+                p.cond.signal_all();
+                p.cond.wait(lib.lock, t, 0);
+            }
+        }
     }
-    if (!c.connected()) return 0;
-    if (c.lingering) at(c.linger_deadline);
-    if (c.opt.keep_alive_timeout) at(c.last_heard + c.opt.keep_alive_timeout);
-    if (c.opt.keep_alive_interval) at(c.last_sent + c.opt.keep_alive_interval);
-    at(c.rto_deadline);
-    at(c.persist_deadline);
-    if (c.p.reliable && c.rack_xmit)
-        for (usize i = 0; i < c.sent; i++)
-            if (!c.sndq[i].sacked && c.sndq[i].last_sent < c.rack_xmit) at(c.sndq[i].last_sent + rack_wait(c));
-    if (c.nagle_since) at(c.nagle_since + c.opt.aggregation_timeout);
-    if (!c.p.reliable && !c.sndq.empty() && c.sndq.front().sends) at(c.sndq.front().last_sent + c.rto);
-    return due;
 }
 
-template <class F>
-void each_connection(Lib& lib, F&& f)
+void poll_destroy(Lib& lib, Net& net, PollSet& p)
 {
-    std::vector<std::shared_ptr<Context>> all;
-    for (const auto& [id, c] : lib.contexts) {
-        all.push_back(c);
-        for (const auto& k : c->pending) all.push_back(k);
+    p.dying = true;
+    poll_cancel(lib, p, false, true);
+    for (auto& [ctx, e] : p.entries) {
+        if (Ctx* x = ctx_find(net, ctx, true, nullptr)) x->poll = -1;
     }
-    for (const auto& c : lib.lingering) all.push_back(c);
-    for (const auto& c : all) f(*c);
+    mem_free(lib, p.mem_ring);
+    p.ring.clear();
+    for (auto& [ctx, e] : p.entries) mem_free(lib, e.mem);
+    p.entries.clear();
 }
 
-void run_timers(Lib& lib, u64 now, Work& w)
-{
-    each_connection(lib, [&](Context& c) { on_timers(lib, c, now, w); });
-    note_memory(lib);
-}
+// ------------------------------------------------------------------------------------------------- datagrams out
 
-u64 next_deadline(Lib& lib)
-{
-    u64 due = 0;
-    each_connection(lib, [&](Context& c) {
-        const u64 t = next_due(c);
-        if (t && (!due || t < due)) due = t;
-    });
-    return due;
-}
+void net_socket_error(Lib& lib, Net& net, s32 soc);
 
-// ------------------------------------------------------------------------------------------------- doing the work
-
-void send_packet(PPUContext& ctx, Lib& lib, const Work& w, const rudp::Packet& p, bool raw)
+// One datagram to lv2 or to the game: without the internal I/O thread the event handler sends it
+// (CELL_RUDP_EVENT_SEND); with it, sendto (the handler first hears event 100 and may refuse).
+s32 net_send_one(Lib& lib, Net& net, const rudp::Packet& p)
 {
-    u8* base = guest_base(ctx);
     const u32 len = static_cast<u32>(p.bytes.size());
-    Scratch s(ctx, kSockaddrSize + len);
+    Scratch s(*t_ppu, 16 + len);
     if (!s.addr) {
-        PS_LOG_ERROR(kChan, "no guest memory to send a packet of {} bytes from", len);
-        return;
+        PS_LOG_ERROR(kChan, "no guest memory to send a datagram of {} bytes from", len);
+        return 0;
     }
-    std::memcpy(base + s.addr, p.to.data(), kSockaddrSize);
-    std::memcpy(base + s.addr + kSockaddrSize, p.bytes.data(), len);
-    if (raw) {
-        if (!w.handler) {
-            std::lock_guard lock(lib.m);
-            if (!lib.raw_logged) PS_LOG_WARN(kChan, "a RAW socket's packet with no event handler to send it: lost");
-            lib.raw_logged = true;
-            return;
+    u8* base = guest_base(*t_ppu);
+    std::memcpy(base + s.addr, p.to.data(), 16);
+    std::memcpy(base + s.addr + 16, p.bytes.data(), len);
+    const u32 addrlen = p.to[0];
+    s32 result = 0;
+    if (!net.io_enabled) {
+        if (net.handler) {
+            const std::optional<u64> r = call_game(net.handler,
+                {kEvSend, sext(p.soc), s.addr + 16u, len, s.addr, addrlen, net.handler_arg}, "the event handler");
+            const s32 v = r ? static_cast<s32>(*r) : 0;
+            if (v >= 0) result = v;
+            else if (v == err(CELL_RUDP_ERROR_INVALID_SOCKET)) {
+                net_socket_error(lib, net, p.soc);
+                result = v;
+            }
         }
-        call_game(ctx, w.handler,
-            {static_cast<u64>(kEventSend), sext(p.soc), s.addr + kSockaddrSize, len, s.addr, kSockaddrSize,
-                w.handler_arg},
-            "the event handler");
-        return;
+    } else {
+        if (net.handler) {
+            const std::optional<u64> r = call_game(net.handler,
+                {kEvBeforeSend, sext(p.soc), s.addr + 16u, len, s.addr, addrlen, net.handler_arg},
+                "the event handler");
+            if (r && static_cast<s32>(*r) < 0) return static_cast<s32>(len);
+        }
+        const s32 r = libnet("sendto", {sext(p.soc), s.addr + 16u, len, 0, s.addr, 16});
+        if (r < 0 && net_errno() != kNetEwouldblock) {
+            net_socket_error(lib, net, p.soc);
+            result = -1;
+        }
     }
-    const s32 r = static_cast<s32>(
-        lv2_syscall(ctx, kSysSendto, {sext(p.soc), s.addr + kSockaddrSize, len, 0, s.addr, kSockaddrSize}));
-    if (r < 0) PS_LOG_DEBUG(kChan, "sendto(s {}, {} bytes): errno {}", p.soc, len, -r);
+    st_add32(lib, kStSentUdpPackets, 1);
+    st_add64(lib, kStSentUdpBytes, len);
+    return result;
 }
 
-// Sends the packets, gives the records back, calls the handlers: with no lock of the library held.
-void finish(PPUContext& ctx, Lib& lib, Work& w)
+s32 net_send_datagram(Lib& lib, Net& net, s32 soc, const std::array<u8, 0x22>& to, std::vector<u8> bytes)
 {
-    for (Outgoing& o : w.out) {
-        if (!lib.has_filter.load(std::memory_order_acquire)) {
-            send_packet(ctx, lib, w, o.packet, o.raw);
+    rudp::Packet p;
+    p.soc = soc;
+    std::memcpy(p.to.data(), to.data(), 16);
+    p.bytes = std::move(bytes);
+    if (!lib.has_filter.load(std::memory_order_acquire)) return net_send_one(lib, net, p);
+    rudp::SendFilter filter;
+    {
+        std::lock_guard lock(lib.filter_m);
+        filter = lib.filter;
+    }
+    std::vector<rudp::Packet> now;
+    if (filter) filter(std::move(p), now);
+    else now.push_back(std::move(p));
+    s32 r = 0;
+    for (const rudp::Packet& q : now) r = net_send_one(lib, net, q);
+    return r;
+}
+
+void put16(std::vector<u8>& v, usize at, u16 x)
+{
+    v[at] = static_cast<u8>(x >> 8);
+    v[at + 1] = static_cast<u8>(x);
+}
+
+// A packet sent at once, not aggregated (a listener's cookie).
+void net_send_control(Lib& lib, Net& net, u8 mux, const Header& h, s32 soc, u16 src, const Addr& to)
+{
+    std::vector<u8> d = {0, 0};
+    u16 prefix = 0x4000;
+    if (mux == 1) {
+        prefix = 0x8000;
+        d.push_back(static_cast<u8>(src >> 8));
+        d.push_back(static_cast<u8>(src));
+    } else if (mux == 2) {
+        prefix = 0xC000;
+        d.push_back(static_cast<u8>(src >> 8));
+        d.push_back(static_cast<u8>(src));
+        d.push_back(static_cast<u8>(to.vport >> 8));
+        d.push_back(static_cast<u8>(to.vport));
+    } else if (mux) {
+        return;
+    }
+    rudp::encode(h, d);
+    if (d.size() > 70) return; // librudp builds these in 70 bytes
+    put16(d, 0, static_cast<u16>(prefix | d.size()));
+    net_send_datagram(lib, net, soc, to.raw, std::move(d));
+}
+
+// ------------------------------------------------------------------------------------------------- the aggregator
+
+void agg_recompute(Agg& a, AggDest& d)
+{
+    u32 mx = 30, mn = 500;
+    if (!d.users.empty()) {
+        mn = 1000;
+        for (const AggUser& u : d.users) {
+            if (u.aggregation < mn) {
+                mn = u.aggregation;
+                if (u.aggregation < 30) mn = 30;
+            }
+            if (mx < u.aggregation) {
+                mx = u.aggregation;
+                if (u.aggregation > 999) mx = 1000;
+            }
+        }
+        mn >>= 1;
+    }
+    d.max_wait = mx;
+    a.interval_ms = mn;
+}
+
+s32 net_register_peer(Lib& lib, Net& net, Ctx& x)
+{
+    AggKey key;
+    key.soc = x.soc;
+    key.addr = x.peer.raw;
+    if (key.soc < 0) return err(CELL_RUDP_ERROR_INVALID_SOCKET);
+    Agg& a = net.agg;
+    auto it = a.dests.find(key);
+    if (it == a.dests.end()) {
+        AggDest d;
+        d.mem_obj = mem_alloc(lib, 0x238);
+        if (!d.mem_obj) return err(CELL_RUDP_ERROR_MEMORY);
+        d.mem_buf = mem_alloc(lib, a.mss);
+        if (!d.mem_buf) {
+            mem_free(lib, d.mem_obj);
+            return err(CELL_RUDP_ERROR_MEMORY);
+        }
+        d.mem_node = mem_alloc(lib, 0x44);
+        if (!d.mem_node) {
+            mem_free(lib, d.mem_buf);
+            mem_free(lib, d.mem_obj);
+            return err(CELL_RUDP_ERROR_MEMORY);
+        }
+        d.cap = a.mss;
+        it = a.dests.emplace(key, std::move(d));
+    }
+    AggDest& d = it->second;
+    AggUser u;
+    u.ctx = x.id;
+    u.aggregation = x.c.aggregation;
+    u.mem = mem_alloc(lib, 0xC);
+    s32 r = 0;
+    if (!u.mem) {
+        r = err(CELL_RUDP_ERROR_MEMORY);
+    } else {
+        d.users.push_front(u);
+        agg_recompute(a, d);
+        if (!a.armed) {
+            a.armed = true;
+            d.wait = d.max_wait;
+            r = sched_arm(lib, net.sched, a.target, u64{a.interval_ms} * 1000);
+        }
+    }
+    if (r == err(CELL_RUDP_ERROR_MEMORY) && d.users.empty()) {
+        mem_free(lib, d.mem_buf);
+        mem_free(lib, d.mem_obj);
+        mem_free(lib, d.mem_node);
+        a.dests.erase(it);
+    }
+    return r;
+}
+
+void net_unregister_peer(Lib& lib, Net& net, Ctx& x)
+{
+    AggKey key;
+    key.soc = x.soc;
+    key.addr = x.peer.raw;
+    if (key.soc < 0) return;
+    Agg& a = net.agg;
+    const auto it = a.dests.find(key);
+    if (it == a.dests.end()) return;
+    AggDest& d = it->second;
+    if (!d.users.empty()) {
+        for (auto u = d.users.begin(); u != d.users.end(); ++u) {
+            if (u->ctx == x.id) {
+                mem_free(lib, u->mem);
+                d.users.erase(u);
+                break;
+            }
+        }
+        if (!d.users.empty()) return agg_recompute(a, d);
+    }
+    mem_free(lib, d.mem_buf);
+    mem_free(lib, d.mem_obj);
+    mem_free(lib, d.mem_node);
+    a.dests.erase(it);
+    if (a.dests.empty() && a.armed) {
+        a.armed = false;
+        sched_disarm(net.sched, a.target);
+    }
+}
+
+// The datagram goes: each acknowledgement's delay grows by the time it waited, each segment's first-sending time
+// becomes now.
+s32 agg_flush(Lib& lib, Net& net, const AggKey& key, AggDest& d, u64 now)
+{
+    const u32 now_ms = static_cast<u32>(now / 1000);
+    usize at = 0;
+    for (const AggPacket& p : d.packets) {
+        if (at + 2 > d.bytes.size()) break;
+        const u16 prefix = static_cast<u16>(d.bytes[at] << 8 | d.bytes[at + 1]);
+        const usize hdr = at + 2u * (prefix >> 14);
+        if (hdr + 8 <= d.bytes.size() && (d.bytes[hdr] & 0x24) == 0x24) {
+            const u16 delay = static_cast<u16>(d.bytes[hdr + 6] << 8 | d.bytes[hdr + 7]);
+            put16(d.bytes, hdr + 6, static_cast<u16>(delay + (now_ms - p.queued_ms)));
+        }
+        if (p.stamp) p.stamp->stamp = now_ms;
+        at += prefix & 0x7FF;
+    }
+    const s32 r = net_send_datagram(lib, net, key.soc, key.addr, d.bytes);
+    d.bytes.clear();
+    d.packets.clear();
+    d.wait = d.max_wait;
+    d.start = now;
+    return r;
+}
+
+bool agg_append(AggDest& d, u8 mux, u16 src, u16 dst, const Header& h, const u8* payload, u32 len, u32 now_ms,
+    Seg* stamp)
+{
+    const usize start = d.bytes.size();
+    std::vector<u8>& v = d.bytes;
+    v.push_back(0);
+    v.push_back(0);
+    u16 prefix = 0x4000;
+    if (mux == 1) {
+        prefix = 0x8000;
+        v.push_back(static_cast<u8>(src >> 8));
+        v.push_back(static_cast<u8>(src));
+    } else if (mux == 2) {
+        prefix = 0xC000;
+        v.push_back(static_cast<u8>(src >> 8));
+        v.push_back(static_cast<u8>(src));
+        v.push_back(static_cast<u8>(dst >> 8));
+        v.push_back(static_cast<u8>(dst));
+    } else if (mux) {
+        v.resize(start);
+        return false;
+    }
+    rudp::encode(h, v);
+    v.insert(v.end(), payload, payload + len);
+    if (v.size() > d.cap) {
+        v.resize(start);
+        return false;
+    }
+    put16(v, start, static_cast<u16>(prefix | (v.size() - start)));
+    d.packets.push_back({now_ms, stamp});
+    return true;
+}
+
+// A context's packet to its peer: into the destination's datagram, sent at once when it may not wait.
+void agg_send(Lib& lib, Net& net, const AggKey& key, s32, u8 mux, u16 src, u16 dst, const Header& h,
+    const u8* payload, u32 len, u32 agg_ms, Seg* stamp)
+{
+    if (key.soc < 0) return;
+    const auto it = net.agg.dests.find(key);
+    if (it == net.agg.dests.end()) return;
+    AggDest& d = it->second;
+    const u64 now = now_us();
+    bool flush_now = false;
+    if (d.bytes.empty()) {
+        d.start = now;
+        d.wait = d.max_wait;
+    } else if (d.cap - d.bytes.size() < 2u * mux + len + 0x42) {
+        if (agg_flush(lib, net, key, d, now) < 0) return;
+    }
+    const u32 elapsed = static_cast<u32>((now - d.start) / 1000);
+    if (elapsed < d.wait) {
+        if (elapsed + agg_ms < d.wait) d.wait = elapsed + agg_ms;
+        flush_now = agg_ms == 0;
+    } else {
+        flush_now = true;
+    }
+    if (agg_append(d, mux, src, dst, h, payload, len, static_cast<u32>(now / 1000), stamp) &&
+        (d.packets.size() > 63 || flush_now))
+        agg_flush(lib, net, key, d, now);
+}
+
+// The segments a context lets go are no longer the datagram's to stamp.
+void agg_forget_stamps(Net& net, const AggKey& key, u16 vport)
+{
+    if (key.soc < 0) return;
+    const auto it = net.agg.dests.find(key);
+    if (it == net.agg.dests.end() || it->second.packets.empty()) return;
+    AggDest& d = it->second;
+    usize at = 0;
+    for (AggPacket& p : d.packets) {
+        if (at + 2 > d.bytes.size()) break;
+        const u16 prefix = static_cast<u16>(d.bytes[at] << 8 | d.bytes[at + 1]);
+        const u32 code = prefix >> 14;
+        if (code == 1) p.stamp = nullptr;
+        else if (code && at + 4 <= d.bytes.size() && vport == static_cast<u16>(d.bytes[at + 2] << 8 | d.bytes[at + 3]))
+            p.stamp = nullptr;
+        at += prefix & 0x7FF;
+    }
+}
+
+void agg_on_timer(Lib& lib, Net& net, u64& interval)
+{
+    const u64 now = now_us();
+    for (auto& [key, d] : net.agg.dests) {
+        if (d.bytes.empty()) {
+            d.packets.clear();
             continue;
         }
-        rudp::SendFilter filter;
-        {
-            std::lock_guard lock(lib.filter_m);
-            filter = lib.filter;
-        }
-        std::vector<rudp::Packet> now;
-        if (filter) filter(std::move(o.packet), now);
-        else now.push_back(std::move(o.packet));
-        for (const rudp::Packet& p : now) send_packet(ctx, lib, w, p, o.raw);
+        if (now <= u64{d.wait} * 1000 + d.start) continue;
+        agg_flush(lib, net, key, d, now);
     }
-    for (const Record& r : w.records) free_record(ctx, r);
-    for (const Event& e : w.events)
-        call_game(ctx, e.handler, {sext(e.ctx), sext(e.event), sext(e.error), e.arg}, "the context handler");
-    if (w.handler)
-        for (const s32 soc : w.released)
-            call_game(ctx, w.handler, {static_cast<u64>(kEventSocketReleased), sext(soc), 0, 0, 0, 0, w.handler_arg},
-                "the event handler");
-    w = Work{};
+    interval = u64{net.agg.interval_ms} * 1000;
 }
 
-// ------------------------------------------------------------------------------------------------- the library's I/O
+// ------------------------------------------------------------------------------------------------- datagrams in
 
-// The NORMAL-mode sockets the library reads.
-std::vector<s32> normal_sockets(Lib& lib)
+void net_on_event(Lib&, Net& net, const Event& e)
 {
-    std::vector<s32> s;
-    for (const auto& [soc, b] : lib.sockets)
-        if (b.mux == kMuxNormal && !b.closed) s.push_back(soc);
-    return s;
+    if (e.type != kQSocketReleased) return;
+    const s32 soc = static_cast<s32>(e.arg);
+    if (net.sockets.count(soc) || !net.handler) return;
+    call_game(net.handler, {kEvSocketReleased, sext(soc), 0, 0, 0, 0, net.handler_arg}, "the event handler");
 }
 
-// Every datagram waiting on `sockets`, received into `buf` (kRxSize bytes, then the source address and its length)
-// and processed. The number taken.
-u32 drain(PPUContext& ctx, Lib& lib, u32 buf, const std::vector<s32>& sockets)
+void net_socket_error(Lib& lib, Net& net, s32 soc)
 {
-    u8* base = guest_base(ctx);
-    const u32 from = buf + kRxSize, fromlen = from + kSockaddrSize;
-    u32 taken = 0;
-    for (const s32 soc : sockets) {
-        for (u32 k = 0; k < kDrainLimit; k++) {
-            ps_write32(base, fromlen, kSockaddrSize);
-            const s32 n = static_cast<s32>(
-                lv2_syscall(ctx, kSysRecvfrom, {sext(soc), buf, kRxSize, kMsgDontwaitNet, from, fromlen}));
-            if (n <= 0) break;
-            taken++;
-            const Endpoint e = endpoint_of(base + from);
-            std::vector<u8> bytes(base + buf, base + buf + n);
-            Work w;
-            {
-                std::lock_guard lock(lib.m);
-                if (!lib.initialized) return taken;
-                w = work_of(lib);
-                if (!receive(lib, soc, e, bytes.data(), bytes.size(), now_us(), w))
-                    PS_LOG_DEBUG(kChan, "socket {}: a datagram of {} bytes that is not RUDP, dropped", soc, n);
+    const auto it = net.sockets.find(soc);
+    if (it == net.sockets.end()) return;
+    for (auto& [p, n] : it->second->ctxs) ctx_post(*n.ctx, kQBadSocket);
+    (void)lib;
+}
+
+// A packet for a context (`kind`: the mux mode it came in; 2 knows the sender's address and vports).
+s32 ctx_receive(Lib& lib, Ctx& x, Bytes pkt, u8 kind, u16 dst, u16 src, const std::array<u8, 0x22>* from)
+{
+    if (x.flags & kXListening) {
+        if (x.flags & kXTerminated) return 0;
+    } else if (x.c.state == kIdle) {
+        return 0;
+    }
+    if (kind < 2) return conn_input(lib, x.c, pkt);
+    if (kind != 2 || !src || !from || !(*from)[0]) return 0;
+    if (!(x.flags & kXListening)) {
+        if (!(x.flags & kXPeer) || (x.c.state != kClosed && !addr_equal(x.peer.raw, *from))) return 0;
+        const s32 r = conn_input(lib, x.c, pkt);
+        if (!r && !(x.flags & kXPeer)) ctx_set_peer(lib, x, *from, src);
+        return r;
+    }
+    Addr key;
+    key.raw = *from;
+    key.vport = src;
+    if (const auto it = x.accepted.find(key); it != x.accepted.end())
+        return ctx_receive(lib, *it->second.ctx, pkt, 2, dst, src, from);
+    for (Ctx::Pending& p : x.pending)
+        if (addr_equal(p.ctx->peer.raw, key.raw) && p.ctx->peer.vport == src)
+            return ctx_receive(lib, *p.ctx, pkt, 2, dst, src, from);
+    Header h;
+    const std::optional<u32> used = rudp::decode(pkt.p + pkt.off, pkt.len, h);
+    if (!used || h.type != rudp::kTypeSyn) return 0;
+    if (x.pending.size() >= x.backlog) return 0;
+    const auto queue_cookie = [&] {
+        if (!x.cookies) return;
+        Ctx::CookieRing& r = *x.cookies;
+        if (r.tail == r.head && r.full) return;
+        r.full = true;
+        r.entries[r.tail] = key;
+        if (++r.tail == r.entries.size()) r.tail = 0;
+        ctx_post(x, kQCookies);
+    };
+    if (x.cookie_life) {
+        if (!ctx_cookie_ring(lib, x)) return err(CELL_RUDP_ERROR_MEMORY);
+        if (!(h.opts & rudp::kOptCookie)) {
+            queue_cookie();
+            return 0;
+        }
+        if (h.cookie_len != 32) return 0;
+        const u32 v = check_cookie(x, h.cookie.data());
+        if (v == 2) {
+            if (x.pending.size() < x.backlog) queue_cookie();
+            return 0;
+        }
+        if (v) return 0;
+    }
+    // A child completes the handshake (an Activate with the listener's options) and waits to be accepted.
+    Ctx* child = nullptr;
+    if (const s32 r = ctx_create(lib, *x.net, child); r < 0) return r;
+    child->child = true;
+    child->parent = &x;
+    Conn& cc = child->c;
+    const Conn& lc = x.c;
+    const auto set_payload = [&](u32 v) {
+        if (cc.state == kIdle && v >= kPayloadSlack && v <= std::min(cc.sndbuf, cc.rcvbuf)) {
+            cc.segsize = v;
+            cc.pool.bufsize = static_cast<u16>(v - kPayloadSlack);
+        }
+    };
+    set_payload(lc.pool.bufsize + kPayloadSlack);
+    if (cc.state == kIdle && lc.sndbuf >= cc.pool.bufsize + kPayloadSlack) cc.sndbuf = lc.sndbuf;
+    if (cc.state == kIdle && lc.rcvbuf >= cc.pool.bufsize + kPayloadSlack) cc.rcvbuf = lc.rcvbuf;
+    cc.conn_timeout = lc.conn_timeout;
+    cc.close_wait_timeout = lc.close_wait_timeout;
+    cc.aggregation = lc.aggregation;
+    if (child->blocking) {
+        child->wake |= kWakeCancel;
+        child->blocking = false;
+        child->cond.signal_all();
+    }
+    const u32 keep = kCStream | kCDelivery | kCOrder | kCNodelay | kCSack | kCOpt255;
+    cc.flags = (cc.flags & ~keep) | (lc.flags & keep);
+    if (lc.ka_interval != cc.ka_interval) {
+        cc.ka_next = cc.ka_first = cc.ka_last = cc.ka_heard = 0;
+        cc.ka_count = 0;
+        cc.ka_interval = lc.ka_interval;
+    }
+    cc.ka_timeout = lc.ka_timeout;
+    child->soc = x.soc;
+    child->vport = x.vport;
+    child->mux = x.mux;
+    ctx_set_peer(lib, *child, *from, src);
+    child->c.owner = child;
+    conn_activate(lib, child->c);
+    child->error = 0;
+    if (x.blocking && !child->blocking) child->blocking = true;
+    if (!ctx_receive(lib, *child, pkt, 2, dst, src, from)) {
+        Ctx::Pending p;
+        p.since = now_us();
+        p.ctx = child;
+        p.mem = mem_alloc(lib, 0x28);
+        if (p.mem) x.pending.push_back(p);
+    } else {
+        ctx_delete(lib, *x.net, child->id);
+    }
+    return 0;
+}
+
+// A datagram from a socket (the I/O thread's, or the game's through cellRudpNetReceived): its packets to their
+// contexts. MSG_MALFORMED when a packet does not parse or finds no context.
+s32 net_receive(Lib& lib, Net& net, s32 soc, const u8* data, u32 len, const std::array<u8, 0x22>& from, bool api)
+{
+    s32 result = 0;
+    if (api && net.io_enabled) {
+        result = err(CELL_RUDP_ERROR_THREAD_IN_USE);
+    } else {
+        const auto rit = net.sockets.find(soc);
+        if (rit == net.sockets.end()) {
+            result = err(CELL_RUDP_ERROR_INVALID_SOCKET);
+        } else if (!rit->second->ctxs.empty()) {
+            SockRec& rec = *rit->second;
+            u32 at = 0;
+            while (len - at > 1) {
+                const u16 prefix = static_cast<u16>(data[at] << 8 | data[at + 1]);
+                at += 2;
+                const u32 code = prefix >> 14, plen = prefix & 0x7FF;
+                if (!code || plen < 2 * code || plen - 2 > len - at) {
+                    result = err(CELL_RUDP_ERROR_MSG_MALFORMED);
+                    break;
+                }
+                Addr key;
+                std::memcpy(key.raw.data(), from.data(), 0x22);
+                key.vport = 0;
+                u16 dst = 0;
+                const u32 pkt_len = plen - 2 * code;
+                const u8 mux = static_cast<u8>(code - 1);
+                bool skip = false;
+                if (mux == 1) {
+                    if (len - at <= 1) {
+                        result = err(CELL_RUDP_ERROR_MSG_MALFORMED);
+                        break;
+                    }
+                    key.vport = static_cast<u16>(data[at] << 8 | data[at + 1]);
+                    at += 2;
+                } else if (mux == 2) {
+                    if (len - at <= 3) {
+                        result = err(CELL_RUDP_ERROR_MSG_MALFORMED);
+                        break;
+                    }
+                    key.vport = static_cast<u16>(data[at] << 8 | data[at + 1]);
+                    dst = static_cast<u16>(data[at + 2] << 8 | data[at + 3]);
+                    at += 4;
+                }
+                Ctx* x = nullptr;
+                if (mux > 2) skip = true;
+                if (!skip) {
+                    const u8 m = rec.ctxs.begin()->first->mux;
+                    if (m != 0xFF && m != mux) skip = true;
+                }
+                if (!skip && mux == 2) {
+                    const auto v = rec.vports.find(dst);
+                    if (v == rec.vports.end()) skip = true;
+                    else x = v->second.ctx;
+                } else if (!skip) {
+                    const auto p = rec.peers.find(key);
+                    if (p == rec.peers.end()) skip = true;
+                    else {
+                        x = p->second.ctx;
+                        if (mux == 1 && (key.vport != x->vport || x->peer.vport != key.vport)) skip = true;
+                    }
+                }
+                if (!skip && len - at < pkt_len) {
+                    result = err(CELL_RUDP_ERROR_MSG_MALFORMED);
+                    break;
+                }
+                if (skip) { // nobody's packet: passed over (malformed only when it runs past the datagram)
+                    if (len - at < pkt_len) {
+                        result = err(CELL_RUDP_ERROR_MSG_MALFORMED);
+                        break;
+                    }
+                    at += pkt_len;
+                    continue;
+                }
+                Bytes pkt;
+                pkt.p = const_cast<u8*>(data);
+                pkt.off = at;
+                pkt.len = pkt_len;
+                pkt.cap = at + pkt_len;
+                result = ctx_receive(lib, *x, pkt, mux, dst, key.vport, &from);
+                if (result < 0) break;
+                at += pkt_len;
             }
-            finish(ctx, lib, w);
         }
     }
-    return taken;
+    st_add32(lib, kStRcvdUdpPackets, 1);
+    st_add64(lib, kStRcvdUdpBytes, len);
+    return result;
 }
 
-void timers(PPUContext& ctx, Lib& lib)
-{
-    Work w;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return;
-        w = work_of(lib);
-        run_timers(lib, now_us(), w);
-    }
-    finish(ctx, lib, w);
-}
+// ------------------------------------------------------------------------------------------------- sockets
 
-// Whether the calling thread is in the library's I/O (a handler it called calling cellRudpProcessEvents).
-thread_local bool t_pumping = false;
+void io_add_socket(Net& net, s32 soc);
+void io_remove_socket(Net& net, s32 soc);
 
-// The library's own I/O (the internal thread's, cellRudpProcessEvents'): its NORMAL-mode sockets read, the timers that
-// are due run; with `wait`, then up to that long (microseconds) for a datagram or the next timer, and once more.
-// `buf`: kIoBlockSize bytes of guest memory.
-void pump(PPUContext& ctx, Lib& lib, u32 buf, u64 wait)
+// A context bound to a socket: mux mode 1 (P2P: the peers share the vport, it is never 0) or 2 (the vport its own, 0
+// the next free one from 10001). A new socket record when the socket has none; INVALID_MUXMODE when its contexts use
+// the other mode.
+s32 net_bind(Lib& lib, Net& net, s32 id, s32 soc, u16 vport, u8 mux)
 {
-    lv2::PpuThread& t = thread_of(ctx);
-    t_pumping = true;
-    const struct Done {
-        ~Done() { t_pumping = false; }
-    } done;
-    std::vector<s32> sockets;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return;
-        sockets = normal_sockets(lib);
+    Ctx* x = ctx_find(net, id, false, nullptr);
+    if (!x) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    if (api_state(*x)) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (x->soc != -1) return err(CELL_RUDP_ERROR_ALREADY_BOUND);
+    bool fresh = false;
+    auto rit = net.sockets.find(soc);
+    if (rit == net.sockets.end()) {
+        auto rec = std::make_unique<SockRec>();
+        rec->mem = mem_alloc(lib, 0x84);
+        if (!rec->mem) return err(CELL_RUDP_ERROR_MEMORY);
+        rec->soc = soc;
+        rit = net.sockets.emplace(soc, std::move(rec));
+        fresh = true;
+    } else if (!rit->second->ctxs.empty()) {
+        const u8 m = rit->second->ctxs.begin()->first->mux;
+        if (m != 0xFF && m != mux) return err(CELL_RUDP_ERROR_INVALID_MUXMODE);
     }
-    const u32 got = drain(ctx, lib, buf, sockets);
-    timers(ctx, lib);
-    if (got || !wait) return;
-    u64 deadline = 0;
-    {
-        std::unique_lock lk(lib.m);
-        if (!lib.initialized) return;
-        const u64 now = now_us();
-        deadline = wait < kForever ? now + wait : 0;
-        const u64 due = next_deadline(lib);
-        if (due && (!deadline || due < deadline)) deadline = std::max(due, now);
-        sockets = normal_sockets(lib);
-        if (sockets.empty()) {
-            wait_change(lib, t, lk, deadline ? deadline : now + kIoTick);
-            sockets = normal_sockets(lib);
-        }
-    }
-    if (!sockets.empty()) {
-        u8* base = t.kernel.base();
-        const u32 fds = buf + kRxSize + 32, n = std::min<u32>(static_cast<u32>(sockets.size()), kPollSlots);
-        for (u32 i = 0; i < n; i++) {
-            ps_write32(base, fds + 8 * i, static_cast<u32>(sockets[i]));
-            ps_write16(base, fds + 8 * i + 4, kPollin);
-            ps_write16(base, fds + 8 * i + 6, 0);
-        }
-        const u64 now = now_us();
-        const u64 left = deadline > now ? deadline - now : 0;
-        const s32 ms = deadline ? static_cast<s32>(std::clamp<u64>((left + 999) / 1000, 1, 1'000'000)) : -1;
-        lv2_syscall(ctx, kSysPoll, {fds, n, sext(ms)});
-        {
-            // A socket the game closed answers POLLNVAL at once: it is not read again (else this loop would spin).
-            std::lock_guard lock(lib.m);
-            for (u32 i = 0; i < n; i++) {
-                if (!(ps_read16(base, fds + 8 * i + 6) & kPollnval)) continue;
-                const auto it = lib.sockets.find(sockets[i]);
-                if (it == lib.sockets.end() || it->second.closed) continue;
-                it->second.closed = true;
-                PS_LOG_WARN(kChan, "socket {} was closed while contexts use it: no longer read", sockets[i]);
+    SockRec& rec = *rit->second;
+    s32 r = 0;
+    bool link = false;
+    if (mux == 1) {
+        if (!vport) r = err(CELL_RUDP_ERROR_INVALID_VPORT);
+        else link = true;
+    } else if (mux == 0) {
+        link = true;
+    } else if (mux == 2) {
+        if (!vport) {
+            u16 v = rec.next_vport;
+            for (;;) {
+                if (!++v) v = 10000;
+                if (rec.next_vport == v) {
+                    r = err(CELL_RUDP_ERROR_VPORT_EXHAUSTED);
+                    break;
+                }
+                if (!rec.vports.count(v)) break;
+            }
+            if (!r) {
+                rec.next_vport = v;
+                vport = v;
             }
         }
-        drain(ctx, lib, buf, sockets);
+        if (!r) {
+            if (rec.vports.count(vport)) {
+                r = err(CELL_RUDP_ERROR_VPORT_IN_USE);
+            } else {
+                SockRec::VportNode n;
+                n.ctx = x;
+                n.mem = mem_alloc(lib, 0x1C);
+                if (!n.mem) r = err(CELL_RUDP_ERROR_MEMORY);
+                else {
+                    rec.vports.emplace(vport, n);
+                    link = true;
+                }
+            }
+        }
+    } else {
+        r = err(CELL_RUDP_ERROR_INVALID_MUXMODE);
     }
-    timers(ctx, lib);
+    if (link) {
+        if (api_state(*x) || x->c.state) r = err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        else if (x->soc != -1) r = err(CELL_RUDP_ERROR_ALREADY_BOUND);
+        else {
+            x->mux = mux;
+            x->soc = soc;
+            x->vport = vport;
+            SockRec::CtxNode n;
+            n.ctx = x;
+            n.mem = mem_alloc(lib, 0x20);
+            if (!n.mem) {
+                r = err(CELL_RUDP_ERROR_MEMORY);
+            } else {
+                rec.ctxs.emplace(x, n);
+                if (net.io_enabled && fresh) io_add_socket(net, soc);
+            }
+        }
+    }
+    if (r < 0 && fresh) {
+        auto again = net.sockets.find(soc);
+        if (again != net.sockets.end()) {
+            mem_free(lib, again->second->mem);
+            net.sockets.erase(again);
+        }
+    }
+    return r;
 }
 
-// The internal I/O thread (cellRudpEnableInternalIOThread): the library's I/O until cellRudpEnd. Its argument is its
-// guest memory block.
-void _pspocket_rudp_io_thread(PPUContext& ctx, u64 arg)
+// Connect's preparation (Initiate, Activate, Listen): the socket bound, the peer known, the context findable by the
+// packets that will come.
+s32 net_prepare(Lib& lib, Net& net, Ctx& x, const std::array<u8, 0x22>* addr, u16 vport)
 {
+    const u32 st = api_state(x);
+    if (st > 1 && st != kListening) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    const auto rit = x.soc == -1 ? net.sockets.end() : net.sockets.find(x.soc);
+    if (rit == net.sockets.end()) return err(CELL_RUDP_ERROR_NOT_BOUND);
+    SockRec& rec = *rit->second;
+    if (addr) {
+        if (const s32 r = ctx_set_peer(lib, x, *addr, vport); r < 0) return r;
+    }
+    if (x.mux < 2) {
+        if (x.mux == 1 && !x.vport) return err(CELL_RUDP_ERROR_INVALID_VPORT);
+        Addr key;
+        key.raw = x.peer.raw;
+        key.vport = x.vport;
+        const auto p = rec.peers.find(key);
+        if (p == rec.peers.end()) {
+            SockRec::PeerNode n;
+            n.ctx = &x;
+            n.mem = mem_alloc(lib, 0x40);
+            if (n.mem) rec.peers.emplace(key, n);
+        } else if (p->second.ctx != &x) {
+            p->second.ctx = &x;
+        }
+    } else if (x.mux == 2) {
+        if (!x.vport) return err(CELL_RUDP_ERROR_INVALID_VPORT);
+        if (!rec.vports.count(x.vport)) return err(CELL_RUDP_ERROR_NOT_BOUND);
+    } else {
+        return err(CELL_RUDP_ERROR_INVALID_MUXMODE);
+    }
+    return 0;
+}
+
+// A context leaves its poll set and its socket; the socket's last context releases it (SOCKET_RELEASED, queued).
+void net_ctx_removed(Lib& lib, Net& net, Ctx& x)
+{
+    if (x.poll >= 0) {
+        if (PollSet* p = poll_find(net, x.poll)) {
+            const auto it = p->entries.find(x.id);
+            if (it != p->entries.end()) {
+                if (!(it->second.ret & 0x8000) && p->push(x.id)) p->cond.signal_all();
+                mem_free(lib, it->second.mem);
+                p->entries.erase(it);
+            }
+        }
+        x.poll = -1;
+    }
+    const auto rit = x.soc < 0 ? net.sockets.end() : net.sockets.find(x.soc);
+    if (rit != net.sockets.end()) {
+        SockRec& rec = *rit->second;
+        if (x.mux == 2) {
+            const auto v = rec.vports.find(x.vport);
+            if (v != rec.vports.end() && v->second.ctx == &x) {
+                mem_free(lib, v->second.mem);
+                rec.vports.erase(v);
+            }
+        } else {
+            Addr key;
+            key.raw = x.peer.raw;
+            key.vport = x.peer.vport;
+            const auto p = rec.peers.find(key);
+            if (p != rec.peers.end() && p->second.ctx == &x) {
+                mem_free(lib, p->second.mem);
+                rec.peers.erase(p);
+            }
+        }
+        const auto n = rec.ctxs.find(&x);
+        if (n != rec.ctxs.end()) {
+            mem_free(lib, n->second.mem);
+            rec.ctxs.erase(n);
+        }
+        if (rec.ctxs.empty()) {
+            const s32 soc = x.soc;
+            sched_post(lib, net, {net.target, kQSocketReleased, 0, static_cast<u32>(soc)});
+            mem_free(lib, rec.mem);
+            net.sockets.erase(rit);
+            if (net.io_enabled) io_remove_socket(net, soc);
+        }
+    }
+    x.handler = 0;
+    x.arg = 0;
+}
+
+// ------------------------------------------------------------------------------------------------- the I/O thread
+
+void io_wake(Net& net)
+{
+    IoThread& io = net.io;
+    if (!io.running || !t_ppu) return;
+    if (io.woken.exchange(1)) return;
+    u8* base = guest_base(*t_ppu);
+    Scratch s(*t_ppu, 32);
+    std::memcpy(base + s.addr, io.wake_addr.data(), 16);
+    libnet("sendto", {sext(io.wake_soc), s.addr + 16u, 4, 0, s.addr, 16});
+}
+
+void io_add_socket(Net& net, s32 soc)
+{
+    IoThread& io = net.io;
+    if (!io.running) return;
+    if (std::find(io.sockets.begin(), io.sockets.end(), soc) == io.sockets.end()) io.sockets.push_back(soc);
+    io_wake(net);
+}
+
+void io_remove_socket(Net& net, s32 soc)
+{
+    IoThread& io = net.io;
+    if (!io.running) return;
+    io.sockets.erase(std::remove(io.sockets.begin(), io.sockets.end(), soc), io.sockets.end());
+    io_wake(net);
+}
+
+// The internal I/O thread: socketselect over its sockets (16.7 ms at most), each datagram to the library (the event
+// handler hears event 101 first), then the scheduler. A socket whose datagram the library refuses, or whose recvfrom
+// fails, is no longer read (librudp's).
+void _pspocket_rudp_io_thread(PPUContext& ctx, u64)
+{
+    OnThread on(ctx);
     Lib& lib = lib_of();
-    const u32 block = static_cast<u32>(arg);
-    PS_LOG_INFO(kChan, "the internal I/O thread runs");
-    while (!lib.io_stop.load(std::memory_order_acquire)) pump(ctx, lib, block, kIoTick);
+    u8* base = guest_base(ctx);
+    u32 bufsize = kIoBufferDefault;
+    {
+        std::lock_guard lock(lib.lock);
+        if (lib.net) bufsize = lib.net->io.bufsize;
+    }
+    const u32 block = HleProcess::current()->main_memory().alloc(bufsize + 512, 16);
+    if (!block) PS_FATAL(kChan, "no guest memory for the internal I/O thread's buffers");
+    const u32 rset = block, tv = block + 128, from = block + 160, fromlen = block + 176, buf = block + 512;
+    for (;;) {
+        std::vector<s32> sockets;
+        s32 wake = -1;
+        {
+            std::lock_guard lock(lib.lock);
+            if (!lib.net || !lib.net->io.running || lib.net->io.stop.load()) break;
+            lib.net->io.woken.store(0);
+            sockets = lib.net->io.sockets;
+            wake = lib.net->io.wake_soc;
+        }
+        std::vector<s32> all = {wake};
+        all.insert(all.end(), sockets.begin(), sockets.end());
+        std::memset(base + rset, 0, 128);
+        s32 nfds = 0;
+        for (const s32 s : all) {
+            if (s < 0 || s >= 1024) continue;
+            ps_write32(base, rset + 4 * (s >> 5), ps_read32(base, rset + 4 * (s >> 5)) | 1u << (s & 31));
+            nfds = std::max(nfds, s + 1);
+        }
+        ps_write64(base, tv, kIoPollUs / 1000000);
+        ps_write64(base, tv + 8, kIoPollUs % 1000000);
+        const s32 n = libnet("socketselect", {sext(nfds), rset, 0, 0, tv});
+        std::vector<s32> ready, bad;
+        if (n > 0) {
+            for (const s32 s : all) {
+                if (s >= 0 && s < 1024 && (ps_read32(base, rset + 4 * (s >> 5)) & 1u << (s & 31))) ready.push_back(s);
+                if (ready.size() >= 8) break;
+            }
+        } else if (n < 0 && net_errno() == kNetEbadf) { // a socket was closed under its contexts
+            for (const s32 s : sockets) {
+                StackVar opt(ctx, base, 8);
+                ps_write32(base, opt.addr() + 4, 4);
+                if (libnet("getsockopt", {sext(s), kSysNetSolSocket, 0x1007, opt.addr(), opt.addr() + 4}) < 0 &&
+                    net_errno() == kNetEbadf) {
+                    bad.push_back(s);
+                    break;
+                }
+            }
+        }
+        for (const s32 s : bad) {
+            std::lock_guard lock(lib.lock);
+            if (lib.net) lib.net->io.sockets.erase(std::remove(lib.net->io.sockets.begin(),
+                                                       lib.net->io.sockets.end(), s),
+                lib.net->io.sockets.end());
+        }
+        for (const s32 s : ready) {
+            ps_write32(base, fromlen, 16);
+            std::memset(base + from, 0, 16);
+            const s32 r = libnet("recvfrom", {sext(s), buf, bufsize, 0, from, fromlen});
+            const s32 e = r < 0 ? net_errno() : 0;
+            if (s == wake) continue;
+            std::lock_guard lock(lib.lock);
+            if (!lib.net || !lib.net->io.running) break;
+            Net& net = *lib.net;
+            if (r >= 0) {
+                if (net.handler) {
+                    const std::optional<u64> h = call_game(net.handler,
+                        {kEvBeforeReceive, sext(s), buf, static_cast<u32>(r), from, ps_read32(base, fromlen),
+                            net.handler_arg},
+                        "the event handler");
+                    if (h && static_cast<s32>(*h) < 0) continue;
+                }
+                std::array<u8, 0x22> key{};
+                std::memcpy(key.data(), base + from, 16);
+                std::vector<u8> bytes(base + buf, base + buf + r);
+                if (net_receive(lib, net, s, bytes.data(), static_cast<u32>(r), key, false) < 0)
+                    net.io.sockets.erase(std::remove(net.io.sockets.begin(), net.io.sockets.end(), s),
+                        net.io.sockets.end());
+            } else if (e != kNetEwouldblock && e != 54) { // ECONNRESET
+                net.io.sockets.erase(std::remove(net.io.sockets.begin(), net.io.sockets.end(), s), net.io.sockets.end());
+            }
+        }
+        std::lock_guard lock(lib.lock);
+        if (!lib.net || !lib.net->io.running || lib.net->io.stop.load()) break;
+        lib.net->io.woken.store(0);
+        sched_run(lib, *lib.net, 0);
+    }
+    HleProcess::current()->main_memory().free(block);
+    libnet("sys_net_free_thread_context", {0, 1}); // the thread's libnet context, as librudp's threads end
     const Function* exit = registry().find("sysPrxForUser", recomp::nid_of("sys_ppu_thread_exit"));
     if (!exit) PS_FATAL(kChan, "sysPrxForUser::sys_ppu_thread_exit, which the I/O thread ends with, is not pspocket's");
     ctx.gpr[3] = 0;
     exit->fn(ctx, guest_base(ctx));
 }
 
-// ------------------------------------------------------------------------------------------------- contexts
-
-std::shared_ptr<Context> find(Lib& lib, s32 id)
+// Starts the internal I/O thread: its buffer, a wake-up socket (UDP at 127.0.0.1, non-blocking), the PPU thread
+// ("librudp", joinable).
+s32 io_start(Lib& lib, Net& net)
 {
-    const auto it = lib.contexts.find(id);
-    return it == lib.contexts.end() ? nullptr : it->second;
-}
-
-s32 new_context_id(Lib& lib)
-{
-    for (;;) {
-        const s32 id = lib.next_context;
-        lib.next_context = lib.next_context == 0x7FFFFFFF ? 1 : lib.next_context + 1;
-        if (!lib.contexts.contains(id)) return id;
-    }
-}
-
-// The largest message a datagram context takes: its MAX_PAYLOAD, within a segment.
-u32 max_message(const Lib& lib, const Context& c)
-{
-    const u32 seg = c.payload ? c.payload : lib.mss - kHeaderSize;
-    return std::min(c.opt.max_payload, seg);
-}
-
-u16 ready_events(const Lib& lib, const Context& c)
-{
-    u16 r = 0;
-    bool acceptable = false;
-    for (const auto& k : c.pending) acceptable = acceptable || k->connected();
-    if (!c.rcvq.empty() || c.state == kStateCloseWait || c.state == kStateClosed || acceptable) r |= kPollRead;
-    const usize unit = c.p.stream ? 1 : max_message(lib, c);
-    if ((c.state == kStateEstablished && c.queued() + unit <= c.opt.sndbuf) || c.state == kStateCloseWait ||
-        c.state == kStateClosed)
-        r |= kPollWrite;
-    if (c.connected() && !c.queued()) r |= kPollFlush;
-    if (c.state == kStateClosed && c.error) r |= kPollError;
-    return r;
-}
-
-// The answer of a call that needs a connection, for a context that has none (0 when it has one, or is making one).
-s32 not_connected(const Context& c)
-{
-    switch (c.state) {
-    case kStateIdle: return error(CELL_RUDP_ERROR_NOT_BOUND);
-    case kStateCloseWait: return error(CELL_RUDP_ERROR_END_OF_DATA);
-    case kStateClosed: return c.error ? c.error : error(CELL_RUDP_ERROR_END_OF_DATA);
-    default: return 0;
-    }
-}
-
-// ------------------------------------------------------------------------------------------------- the API: life
-
-// int cellRudpInit(CellRudpAllocator *allocator): NULL for the library's own (D-607).
-s32 cellRudpInit(PPUContext& ctx, u32 allocator)
-{
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (lib.initialized) return error(CELL_RUDP_ERROR_ALREADY_INITIALIZED);
-    if (allocator && !guest_readable(thread_of(ctx), allocator, 8)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    lib.initialized = true;
-    lib.app_malloc = allocator ? ps_read32(guest_base(ctx), allocator) : 0;
-    lib.app_free = allocator ? ps_read32(guest_base(ctx), allocator + 4) : 0;
-    lib.handler = lib.handler_arg = 0;
-    lib.mss = kDefaultMss;
-    lib.stats = {};
-    lib.records = 0;
-    lib.io = false;
-    PS_LOG_INFO(kChan, "cellRudpInit: {}", allocator ? "the game's allocator" : "the library's own allocator");
-    return lv2::CELL_OK;
-}
-
-// int cellRudpEnd(void): every connection reset (its peer told), the I/O thread stopped, the contexts, polls and
-// records gone, the allocator and handler forgotten. Threads waiting in the library return.
-s32 cellRudpEnd(PPUContext& ctx)
-{
-    Lib& lib = lib_of();
-    Work w;
-    bool io = false;
-    u32 io_thread = 0, io_block = 0;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        w = work_of(lib);
-        const u64 now = now_us();
-        each_connection(lib, [&](Context& c) {
-            if (c.has_peer && (c.connected() || c.connecting()))
-                send_control(lib, c, Type::Rst, now, w, rudp::kRstReset);
-            if (c.record) w.records.push_back({c.record, c.record_free, c.record_own});
-        });
-        lib.contexts.clear();
-        lib.lingering.clear();
-        lib.sockets.clear();
-        lib.polls.clear();
-        lib.initialized = false;
-        lib.app_malloc = lib.app_free = 0;
-        lib.handler = lib.handler_arg = 0;
-        io = lib.io;
-        io_thread = lib.io_thread;
-        io_block = lib.io_block;
-        lib.io = false;
-        lib.io_thread = lib.io_block = 0;
-        lib.io_stop.store(true, std::memory_order_release);
-        notify(lib);
-    }
-    // A handler the I/O called may end the library: the I/O thread then ends by itself, and the buffers it or
-    // ProcessEvents still holds stay where they are.
-    const bool from_io = io && lv2::sys_ppu_thread_get_id(thread_of(ctx)) == io_thread;
-    if (io && !from_io) {
-        StackVar status(ctx, guest_base(ctx), 16);
-        lv2::sys_ppu_thread_join(thread_of(ctx), io_thread, status.addr());
-        HleProcess::current()->main_memory().free(io_block);
-    }
-    finish(ctx, lib, w); // the resets (a RAW socket's through the handler as it was), the records; no other event
-    if (!t_pumping) {
-        std::lock_guard rx(lib.rx_m);
-        if (lib.rx_block) HleProcess::current()->main_memory().free(lib.rx_block);
-        lib.rx_block = 0;
-    }
-    PS_LOG_INFO(kChan, "cellRudpEnd");
-    return lv2::CELL_OK;
-}
-
-// int cellRudpEnableInternalIOThread(uint32_t stack_size, uint32_t priority): the library's I/O on a PPU thread of its
-// own (D-632). A second one THREAD_IN_USE; one that lv2 does not make THREAD.
-s32 cellRudpEnableInternalIOThread(PPUContext& ctx, u32 stack_size, u32 priority)
-{
-    Lib& lib = lib_of();
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        if (lib.io) return error(CELL_RUDP_ERROR_THREAD_IN_USE);
-        lib.io = true;
-    }
-    const u32 stack = std::clamp<u32>(stack_size, 0x4000, 0x100000);
-    const u32 prio = std::min<u32>(priority, 3071);
-    if (stack != stack_size || prio != priority)
-        PS_LOG_WARN(kChan, "cellRudpEnableInternalIOThread(stack {:#x}, priority {}): stack {:#x}, priority {}",
-            stack_size, priority, stack, prio);
-    const auto undo = [&](u32 code) {
-        std::lock_guard lock(lib.m);
-        lib.io = false;
-        return error(code);
+    IoThread& io = net.io;
+    io.buf_mem = mem_alloc(lib, io.bufsize);
+    if (!io.buf_mem) return err(CELL_RUDP_ERROR_MEMORY);
+    PPUContext& ctx = *t_ppu;
+    u8* base = guest_base(ctx);
+    StackVar v(ctx, base, 0x40);
+    const s32 soc = libnet("socket", {2, 2, 0});
+    if (soc < 0) return err(CELL_RUDP_ERROR_INVALID_SOCKET);
+    std::memset(base + v.addr(), 0, 16);
+    ps_write8(base, v.addr() + 1, 2);
+    ps_write32(base, v.addr() + 4, 0x7F000001);
+    libnet("bind", {sext(soc), v.addr(), 16});
+    ps_write32(base, v.addr() + 0x20, 16);
+    const auto fail = [&](u32 code) {
+        libnet("socketclose", {sext(soc)});
+        return err(code);
     };
-    const u32 block = HleProcess::current()->main_memory().alloc(kIoBlockSize, 16);
-    if (!block) return undo(CELL_RUDP_ERROR_MEMORY);
+    if (libnet("getsockname", {sext(soc), v.addr(), v.addr() + 0x20}) < 0) return fail(CELL_RUDP_ERROR_INVALID_SOCKET);
+    std::memcpy(io.wake_addr.data(), base + v.addr(), 16);
+    ps_write32(base, v.addr() + 0x24, 1);
+    if (libnet("setsockopt", {sext(soc), kSysNetSolSocket, kSysNetSoNbio, v.addr() + 0x24, 4}) < 0)
+        return fail(CELL_RUDP_ERROR_INVALID_SOCKET);
+    io.wake_soc = soc;
+    io.sockets.clear();
+    io.stop.store(false);
+    io.running = true;
     const u32 entry = HleProcess::current()->link_function(kModule, recomp::nid_of("_pspocket_rudp_io_thread"),
         "_pspocket_rudp_io_thread");
     const Function* create = registry().find("sysPrxForUser", recomp::nid_of("sys_ppu_thread_create"));
     if (!entry || !create) {
-        HleProcess::current()->main_memory().free(block);
-        return undo(CELL_RUDP_ERROR_THREAD);
+        io.running = false;
+        io.wake_soc = -1;
+        return fail(CELL_RUDP_ERROR_THREAD);
     }
-    u8* base = guest_base(ctx);
-    StackVar v(ctx, base, 0x20); // the thread ID, then its name
-    std::memcpy(base + v.addr() + 8, "_cellRudpIOThread", 18);
-    lib.io_stop.store(false, std::memory_order_release);
+    std::memcpy(base + v.addr() + 0x28, "librudp", 8);
     u64 saved[7];
     for (u32 k = 0; k < 7; k++) saved[k] = ctx.gpr[3 + k];
-    const u64 args[7] = {v.addr(), entry, block, prio, stack, 1, v.addr() + 8u};
+    const u64 args[7] = {v.addr() + 0x30u, entry, 0, io.priority, io.stack, 1, v.addr() + 0x28u};
     for (u32 k = 0; k < 7; k++) ctx.gpr[3 + k] = args[k];
     create->fn(ctx, base);
     const s32 r = static_cast<s32>(ctx.gpr[3]);
     for (u32 k = 0; k < 7; k++) ctx.gpr[3 + k] = saved[k];
     if (r != lv2::CELL_OK) {
+        io.running = false;
+        io.wake_soc = -1;
         PS_LOG_WARN(kChan, "cellRudpEnableInternalIOThread: sys_ppu_thread_create gives {:#x}", static_cast<u32>(r));
-        HleProcess::current()->main_memory().free(block);
-        return undo(CELL_RUDP_ERROR_THREAD);
+        return fail(CELL_RUDP_ERROR_THREAD);
     }
-    std::lock_guard lock(lib.m);
-    lib.io_thread = static_cast<u32>(ps_read64(base, v.addr()));
-    lib.io_block = block;
-    return lv2::CELL_OK;
+    io.thread_id = static_cast<u32>(ps_read64(base, v.addr() + 0x30));
+    io.started = true;
+    return 0;
 }
 
-// int cellRudpSetEventHandler(CellRudpEventHandler handler, void *arg): NULL takes the handler away.
-s32 cellRudpSetEventHandler(PPUContext&, u32 handler, u32 arg)
+// Stops the internal I/O thread (the library's lock released while it is joined).
+void io_stop(Lib& lib, Net& net)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    lib.handler = handler;
-    lib.handler_arg = arg;
-    return lv2::CELL_OK;
+    IoThread& io = net.io;
+    if (!io.running) return;
+    io.running = false;
+    io.stop.store(true);
+    io.woken.store(0);
+    {
+        u8* base = guest_base(*t_ppu);
+        Scratch s(*t_ppu, 32);
+        std::memcpy(base + s.addr, io.wake_addr.data(), 16);
+        libnet("sendto", {sext(io.wake_soc), s.addr + 16u, 4, 0, s.addr, 16});
+    }
+    const u32 tid = io.thread_id;
+    const bool self = lv2::sys_ppu_thread_get_id(thread_of(*t_ppu)) == tid;
+    if (!self && tid) {
+        const u32 depth = lib.lock.release_all();
+        StackVar status(*t_ppu, guest_base(*t_ppu), 16);
+        lv2::sys_ppu_thread_join(thread_of(*t_ppu), tid, status.addr());
+        lib.lock.reacquire(depth);
+    }
+    if (io.wake_soc >= 0) libnet("socketclose", {sext(io.wake_soc)});
+    io.wake_soc = -1;
+    io.sockets.clear();
+    mem_free(lib, io.buf_mem);
+    io.started = false;
 }
 
-// int cellRudpSetMaxSegmentSize(uint16_t mss): the segment (header and payload in one datagram) of the connections
-// started from now on.
-s32 cellRudpSetMaxSegmentSize(PPUContext&, u16 mss)
+// ------------------------------------------------------------------------------------------------- life
+
+std::unique_ptr<Net> net_create(Lib& lib, Block mem)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    if (mss < kMinMss || mss > kMaxDatagram) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    lib.mss = mss;
-    return lv2::CELL_OK;
+    auto net = std::make_unique<Net>();
+    net->mem = mem;
+    Sched& s = net->sched;
+    s.ring_mem = mem_alloc(lib, 0xC00);
+    s.table_mem = mem_alloc(lib, 0x100);
+    Target agg;
+    agg.kind = Target::Kind::Agg;
+    if (sched_register(lib, s, agg, net->agg.target) < 0) net->agg.target = 0;
+    if (s.table_mem) {
+        Target t;
+        t.kind = Target::Kind::Net;
+        if (sched_register(lib, s, t, net->target) < 0) net->target = 0;
+    }
+    return net;
+}
+
+// Everything goes: the polls, the aggregator's datagrams (not sent), the sockets, the scheduler.
+void net_destroy(Lib& lib, std::unique_ptr<Net> net)
+{
+    for (auto& [id, e] : net->polls) {
+        poll_destroy(lib, *net, *e.first);
+        mem_free(lib, e.first->mem_obj);
+        mem_free(lib, e.second);
+    }
+    net->polls.clear();
+    if (net->agg.target) sched_unregister(lib, net->sched, net->agg.target);
+    for (auto& [k, d] : net->agg.dests) {
+        for (AggUser& u : d.users) mem_free(lib, u.mem);
+        mem_free(lib, d.mem_buf);
+        mem_free(lib, d.mem_obj);
+        mem_free(lib, d.mem_node);
+    }
+    net->agg.dests.clear();
+    for (auto& [soc, rec] : net->sockets) {
+        for (auto& [p, n] : rec->ctxs) mem_free(lib, n.mem);
+        for (auto& [k, n] : rec->peers) mem_free(lib, n.mem);
+        for (auto& [k, n] : rec->vports) mem_free(lib, n.mem);
+        mem_free(lib, rec->mem);
+    }
+    net->sockets.clear();
+    Sched& s = net->sched;
+    for (auto& [due, node] : s.timers) mem_free(lib, node.mem);
+    s.timers.clear();
+    for (auto& [id, t] : s.targets) mem_free(lib, t.mem);
+    s.targets.clear();
+    mem_free(lib, s.table_mem);
+    mem_free(lib, s.ring_mem);
+    Block mem = net->mem;
+    net.reset();
+    mem_free(lib, mem);
+}
+
+// The library's lock and initialisation check around each call.
+struct Locked {
+    Lib& lib;
+    OnThread on;
+    explicit Locked(PPUContext& ctx) : lib(lib_of()), on(ctx) { lib.lock.lock(); }
+    ~Locked() { lib.lock.unlock(); }
+    Locked(const Locked&) = delete;
+    Locked& operator=(const Locked&) = delete;
+    bool ready() const { return lib.initialized && lib.net; }
+};
+
+bool writable_guest(PPUContext& ctx, u32 addr, u32 size)
+{
+    if (!addr) return false;
+    lv2::PpuThread& t = thread_of(ctx);
+    for (u32 at = 0; at < size; at += 0x1000)
+        if (!guest_readable(t, addr + at, std::min<u32>(size - at, 0x1000))) return false;
+    return true;
+}
+
+// A pointer the module would follow: one that is not guest memory is refused (librudp would fault).
+bool usable(PPUContext& ctx, u32 addr, u32 size, std::string_view what)
+{
+    if (writable_guest(ctx, addr, size)) return true;
+    PS_LOG_ERROR(kChan, "{}: {:#x} ({} bytes) is not guest memory", what, addr, size);
+    return false;
+}
+
+// ------------------------------------------------------------------------------------------------- the API: life
+
+// int cellRudpInit(CellRudpAllocator *allocator): NULL for the library's own (the system's malloc).
+s32 cellRudpInit(PPUContext& ctx, u32 allocator)
+{
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    while (lib.ending) {
+        lib.lock.unlock();
+        std::this_thread::yield();
+        lib.lock.lock();
+    }
+    if (lib.initialized) return err(CELL_RUDP_ERROR_ALREADY_INITIALIZED);
+    if (allocator && !usable(ctx, allocator, 8, "cellRudpInit: allocator")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    lib.app_malloc = allocator ? ps_read32(guest_base(ctx), allocator) : 0;
+    lib.app_free = allocator ? ps_read32(guest_base(ctx), allocator + 4) : 0;
+    lib.mem_current = lib.mem_peak = lib.mem_allocs = lib.mem_frees = 0;
+    lib.status_mem = mem_alloc(lib, 0x128);
+    if (lib.status_mem) {
+        lib.status = {};
+        Block nm = mem_alloc(lib, 0x200);
+        if (nm) {
+            lib.net = net_create(lib, nm);
+            Net& net = *lib.net;
+            if (net.sched.table_mem && net.agg.target > 0 && net.target > 0) {
+                lib.initialized = true;
+                return 0;
+            }
+            net_destroy(lib, std::move(lib.net));
+        }
+        mem_free(lib, lib.status_mem);
+    }
+    lib.net.reset();
+    return err(CELL_RUDP_ERROR_MEMORY);
+}
+
+// int cellRudpEnd(void): every waiter returns, the contexts go (nothing is told to the peers), the I/O thread stops.
+s32 cellRudpEnd(PPUContext& ctx)
+{
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    lib.initialized = false;
+    lib.ending = true;
+    Net& net = *lib.net;
+    lv2::PpuThread& t = thread_of(ctx);
+    while (net.sched.busy > 0) {
+        net.sched.cancelled = true;
+        net.sched.cond.signal_all();
+        net.sched.cond.wait(lib.lock, t, 0);
+    }
+    for (auto& [id, e] : net.polls) poll_cancel(lib, *e.first, false, false);
+    for (auto& [id, e] : net.ctxs) {
+        Ctx* x = e.first;
+        while (x->waiters > 0) {
+            x->wake |= kWakeCancel;
+            x->cond.signal_all();
+            x->cond.wait(lib.lock, t, 0);
+        }
+        x->wake &= ~kWakeCancel;
+    }
+    for (auto& [id, e] : net.ctxs) {
+        Ctx* x = e.first;
+        if (x->valid && x->parent) {
+            ctx_detach_child(lib, *x->parent, x->peer);
+            x->parent = nullptr;
+        }
+    }
+    while (!net.ctxs.empty()) ctx_delete(lib, net, net.ctxs.begin()->first);
+    io_stop(lib, net);
+    net_destroy(lib, std::move(lib.net));
+    mem_free(lib, lib.status_mem);
+    lib.ending = false;
+    return 0;
+}
+
+// int cellRudpEnableInternalIOThread(uint32_t stack_size, uint32_t priority): before any context (NOT_ACCEPTABLE
+// after), once (THREAD_IN_USE).
+s32 cellRudpEnableInternalIOThread(PPUContext& ctx, u32 stack_size, u32 priority)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (priority >= 0xC00) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *l.lib.net;
+    if (!net.ctxs.empty()) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (net.io_enabled) return err(CELL_RUDP_ERROR_THREAD_IN_USE);
+    net.io.stack = std::max<u32>(stack_size, 0x1000);
+    net.io.priority = priority;
+    if (const s32 r = io_start(l.lib, net); r < 0) return r;
+    net.io_enabled = true;
+    return 0;
+}
+
+// int cellRudpSetEventHandler(CellRudpEventHandler handler, void *arg)
+s32 cellRudpSetEventHandler(PPUContext& ctx, u32 handler, u32 arg)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    l.lib.net->handler = handler;
+    l.lib.net->handler_arg = arg;
+    return 0;
+}
+
+// int cellRudpSetMaxSegmentSize(uint16_t mss): any value, only while there is no context (NOT_ACCEPTABLE).
+s32 cellRudpSetMaxSegmentSize(PPUContext& ctx, u16 mss)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    Net& net = *l.lib.net;
+    if (!net.ctxs.empty()) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    net.agg.mss = mss;
+    net.io.bufsize = mss;
+    return 0;
 }
 
 // int cellRudpGetMaxSegmentSize(uint16_t *mss)
 s32 cellRudpGetMaxSegmentSize(PPUContext& ctx, u32 mss)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    if (!guest_range(thread_of(ctx), mss, 2)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    ps_write16(guest_base(ctx), mss, lib.mss);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (!mss) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, mss, 2, "cellRudpGetMaxSegmentSize")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    ps_write16(guest_base(ctx), mss, l.lib.net->agg.mss);
+    return 0;
 }
 
-// int cellRudpGetStatus(CellRudpStatus *status, size_t size): the library's counters (D-630's layout), as many bytes
-// as `size` asks for, zeros past them.
+// int cellRudpGetStatus(CellRudpStatus *status, size_t size): `size` bytes (1 to 296) of the counters, then the
+// contexts and the memory words written whatever the size (librudp's).
 s32 cellRudpGetStatus(PPUContext& ctx, u32 status, u32 size)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const u32 n = std::min(size, kStatusSize), all = std::min(size, 1024u);
-    if (!size || !guest_range(thread_of(ctx), status, all)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    note_memory(lib);
-    lib.stats[kCurrentContexts] = total_contexts(lib);
-    std::array<u8, kStatusSize> out{};
-    for (u32 i = 0; i < kStatCount; i++) ps_st64(out.data() + 8 * i, lib.stats[i]);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (!status || size - 1 >= 0x128) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, status, std::max<u32>(size, 0x104), "cellRudpGetStatus")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
     u8* base = guest_base(ctx);
-    std::memcpy(base + status, out.data(), n);
-    if (all > n) std::memset(base + status + n, 0, all - n);
-    return lv2::CELL_OK;
+    std::memcpy(base + status, lib.status.data(), size);
+    ps_write32(base, status + kStContexts, static_cast<u32>(lib.net->ctxs.size()));
+    ps_write32(base, status + kStAllocs, lib.mem_allocs);
+    ps_write32(base, status + kStFrees, lib.mem_frees);
+    ps_write32(base, status + kStMemCurrent, lib.mem_current);
+    ps_write32(base, status + kStMemPeak, lib.mem_peak);
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------------- the API: contexts
 
-// int cellRudpCreateContext(CellRudpContextEventHandler handler, void *arg, int *ctx_id): a context and its record
-// from the allocator (MEMORY when it gives none). A NULL handler: no events.
+// int cellRudpCreateContext(CellRudpContextEventHandler handler, void *arg, int *ctx_id)
 s32 cellRudpCreateContext(PPUContext& ctx, u32 handler, u32 arg, u32 ctx_id)
 {
-    Lib& lib = lib_of();
-    u32 app_malloc = 0, app_free = 0;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        if (!guest_range(thread_of(ctx), ctx_id, 4)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        if (total_contexts(lib) >= kMaxContexts) return error(CELL_RUDP_ERROR_TOO_MANY_CONTEXTS);
-        app_malloc = lib.app_malloc;
-        app_free = lib.app_free;
-    }
-    const Record r = alloc_record(ctx, app_malloc, app_free);
-    if (!r.addr) return error(CELL_RUDP_ERROR_MEMORY);
-    std::unique_lock lock(lib.m);
-    if (!lib.initialized || total_contexts(lib) >= kMaxContexts) {
-        const s32 e = error(lib.initialized ? CELL_RUDP_ERROR_TOO_MANY_CONTEXTS : CELL_RUDP_ERROR_NOT_INITIALIZED);
-        lock.unlock();
-        free_record(ctx, r);
-        return e;
-    }
-    auto c = std::make_shared<Context>();
-    c->id = new_context_id(lib);
-    c->handler = handler;
-    c->arg = arg;
-    c->record = r.addr;
-    c->record_free = r.app_free;
-    c->record_own = r.own;
-    c->opt.max_payload = lib.mss - kHeaderSize;
-    lib.contexts.emplace(c->id, c);
-    lib.stats[kAllocs]++;
-    lib.records += kRecordSize;
-    note_memory(lib);
-    ps_write32(guest_base(ctx), ctx_id, static_cast<u32>(c->id));
-    PS_LOG_INFO(kChan, "cellRudpCreateContext: context {}", c->id);
-    return lv2::CELL_OK;
-}
-
-// An option's value as a game gives it: 1, 2, 4 or 8 big-endian bytes.
-std::optional<u64> option_value(lv2::PpuThread& t, u32 optval, u32 optlen)
-{
-    if ((optlen != 1 && optlen != 2 && optlen != 4 && optlen != 8) || !guest_range(t, optval, optlen))
-        return std::nullopt;
-    u8* base = t.kernel.base();
-    switch (optlen) {
-    case 1: return ps_read8(base, optval);
-    case 2: return ps_read16(base, optval);
-    case 4: return ps_read32(base, optval);
-    default: return ps_read64(base, optval);
-    }
-}
-
-// int cellRudpSetOption(int ctx_id, int option, const void *optval, size_t optlen): the value in 1, 2, 4 or 8 bytes
-// (D-630). What a connection agrees on (STREAM, DELIVERY_CRITICAL, ORDER_CRITICAL) only before it starts.
-s32 cellRudpSetOption(PPUContext& ctx, s32 ctx_id, s32 option, u32 optval, u32 optlen)
-{
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    Work w;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        const auto c = find(lib, ctx_id);
-        if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        const std::optional<u64> v = option_value(t, optval, optlen);
-        if (!v) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        Options& o = c->opt;
-        const bool on = *v != 0;
-        const auto fixed = [&]() -> s32 {
-            if (c->state == kStateIdle) return 0;
-            return error(c->connecting() ? CELL_RUDP_ERROR_IN_PROGRESS : CELL_RUDP_ERROR_ALREADY_ESTABLISHED);
-        };
-        switch (option) {
-        case kOptMaxPayload:
-            if (!*v) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-            if (*v > static_cast<u64>(lib.mss - kHeaderSize)) return error(CELL_RUDP_ERROR_PAYLOAD_TOO_LARGE);
-            o.max_payload = static_cast<u32>(*v);
-            break;
-        case kOptSndbuf:
-        case kOptRcvbuf:
-            if (*v < kMinBuffer || *v > kMaxBuffer) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-            (option == kOptSndbuf ? o.sndbuf : o.rcvbuf) = static_cast<u32>(*v);
-            break;
-        case kOptNodelay: o.nodelay = on; break;
-        case kOptNonblock: o.nonblock = on; break;
-        case kOptDeliveryCritical:
-        case kOptOrderCritical:
-        case kOptStream:
-            if (const s32 e = fixed()) return e;
-            (option == kOptStream ? o.stream : option == kOptDeliveryCritical ? o.delivery : o.order) = on;
-            break;
-        case kOptConnectionTimeout: o.connection_timeout = *v; break;
-        case kOptCloseWaitTimeout: o.close_wait_timeout = *v; break;
-        case kOptAggregationTimeout: o.aggregation_timeout = *v; break;
-        case kOptReadTimeout: o.read_timeout = *v; break;
-        case kOptWriteTimeout: o.write_timeout = *v; break;
-        case kOptFlushTimeout: o.flush_timeout = *v; break;
-        case kOptKeepAliveInterval: o.keep_alive_interval = *v; break;
-        case kOptKeepAliveTimeout: o.keep_alive_timeout = *v; break;
-        default: return error(CELL_RUDP_ERROR_INVALID_OPTION); // LAST_ERROR is read-only
-        }
-        if (option == kOptNodelay || option == kOptRcvbuf || option == kOptAggregationTimeout) {
-            w = work_of(lib);
-            if (option == kOptRcvbuf && c->connected()) c->ack_now = true; // the window it has now
-            push(lib, *c, now_us(), w);
-            if (c->ack_now && c->connected()) send_control(lib, *c, Type::Ack, now_us(), w);
-        }
-    }
-    finish(ctx, lib, w);
-    return lv2::CELL_OK;
-}
-
-// int cellRudpGetOption(int ctx_id, int option, void *optval, size_t optlen): written in the width asked for (1, 2, 4
-// or 8 bytes); BUFFER_TOO_SMALL when the value does not fit it.
-s32 cellRudpGetOption(PPUContext& ctx, s32 ctx_id, s32 option, u32 optval, u32 optlen)
-{
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if ((optlen != 1 && optlen != 2 && optlen != 4 && optlen != 8) || !guest_range(t, optval, optlen))
-        return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    const Options& o = c->opt;
-    s64 v = 0;
-    switch (option) {
-    case kOptMaxPayload: v = o.max_payload; break;
-    case kOptSndbuf: v = o.sndbuf; break;
-    case kOptRcvbuf: v = o.rcvbuf; break;
-    case kOptNodelay: v = o.nodelay; break;
-    case kOptDeliveryCritical: v = o.delivery; break;
-    case kOptOrderCritical: v = o.order; break;
-    case kOptNonblock: v = o.nonblock; break;
-    case kOptStream: v = o.stream; break;
-    case kOptConnectionTimeout: v = static_cast<s64>(o.connection_timeout); break;
-    case kOptCloseWaitTimeout: v = static_cast<s64>(o.close_wait_timeout); break;
-    case kOptAggregationTimeout: v = static_cast<s64>(o.aggregation_timeout); break;
-    case kOptLastError: v = c->error; break;
-    case kOptReadTimeout: v = static_cast<s64>(o.read_timeout); break;
-    case kOptWriteTimeout: v = static_cast<s64>(o.write_timeout); break;
-    case kOptFlushTimeout: v = static_cast<s64>(o.flush_timeout); break;
-    case kOptKeepAliveInterval: v = static_cast<s64>(o.keep_alive_interval); break;
-    case kOptKeepAliveTimeout: v = static_cast<s64>(o.keep_alive_timeout); break;
-    default: return error(CELL_RUDP_ERROR_INVALID_OPTION);
-    }
-    u8* base = t.kernel.base();
-    const bool fits = optlen == 8 || (v >= 0 ? static_cast<u64>(v) >> (8 * optlen) == 0
-                                             : optlen == 4 && v >= -0x80000000LL);
-    if (!fits) return error(CELL_RUDP_ERROR_BUFFER_TOO_SMALL);
-    switch (optlen) {
-    case 1: ps_write8(base, optval, static_cast<u8>(v)); break;
-    case 2: ps_write16(base, optval, static_cast<u16>(v)); break;
-    case 4: ps_write32(base, optval, static_cast<u32>(v)); break;
-    default: ps_write64(base, optval, static_cast<u64>(v)); break;
-    }
-    return lv2::CELL_OK;
-}
-
-// int cellRudpGetContextStatus(int ctx_id, CellRudpContextStatus *status, size_t size): D-630's 48 bytes (state,
-// parentId, children, lostPackets, sentPackets, rcvdPackets, then u64 sentBytes and rcvdBytes, retransmissions, rtt in
-// microseconds), as many as `size` asks for, zeros past them.
-s32 cellRudpGetContextStatus(PPUContext& ctx, s32 ctx_id, u32 status, u32 size)
-{
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    const u32 n = std::min(size, kContextStatusSize), all = std::min(size, 256u);
-    if (!size || !guest_range(thread_of(ctx), status, all)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    std::array<u8, kContextStatusSize> out{};
-    ps_st32(out.data(), c->state);
-    ps_st32(out.data() + 4, static_cast<u32>(c->parent_id));
-    ps_st32(out.data() + 8, c->listening ? static_cast<u32>(c->pending.size()) + c->children : 0);
-    ps_st32(out.data() + 12, c->lost);
-    ps_st32(out.data() + 16, c->sent_packets);
-    ps_st32(out.data() + 20, c->rcvd_packets);
-    ps_st64(out.data() + 24, c->sent_bytes);
-    ps_st64(out.data() + 32, c->rcvd_bytes);
-    ps_st32(out.data() + 40, c->retransmissions);
-    ps_st32(out.data() + 44, static_cast<u32>(std::min<u64>(c->srtt, 0xFFFFFFFF)));
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (!ctx_id) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, ctx_id, 4, "cellRudpCreateContext")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
     u8* base = guest_base(ctx);
-    std::memcpy(base + status, out.data(), n);
-    if (all > n) std::memset(base + status + n, 0, all - n);
-    return lv2::CELL_OK;
-}
-
-// int cellRudpGetLocalInfo(int ctx_id, int *soc, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport,
-// uint8_t *muxmode): each output that is given; the address is the socket's (getsockname), *addrlen its length in
-// (the room) and out (16). NOT_BOUND before cellRudpBind.
-s32 cellRudpGetLocalInfo(PPUContext& ctx, s32 ctx_id, u32 soc, u32 addr, u32 addrlen, u32 vport, u32 muxmode)
-{
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if ((soc && !guest_range(t, soc, 4)) || (addr && (!addrlen || !guest_range(t, addrlen, 4))) ||
-        (addrlen && !guest_range(t, addrlen, 4)) || (vport && !guest_range(t, vport, 2)) ||
-        (muxmode && !guest_range(t, muxmode, 1)))
-        return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    if (!c->bound) return error(CELL_RUDP_ERROR_NOT_BOUND);
-    if (addr) {
-        const u32 room = std::min(ps_read32(base, addrlen), kSockaddrSize);
-        if (!guest_range(t, addr, room)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        StackVar name(ctx, base, 32);
-        ps_write32(base, name.addr() + 16, kSockaddrSize);
-        lv2_syscall(ctx, kSysGetsockname, {sext(c->soc), name.addr(), name.addr() + 16});
-        std::memcpy(base + addr, base + name.addr(), room);
-    }
-    if (addrlen) ps_write32(base, addrlen, kSockaddrSize);
-    if (soc) ps_write32(base, soc, static_cast<u32>(c->soc));
-    if (vport) ps_write16(base, vport, c->vport);
-    if (muxmode) ps_write8(base, muxmode, c->mux);
-    return lv2::CELL_OK;
-}
-
-// int cellRudpGetRemoteInfo(int ctx_id, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport): the peer's
-// address as the game gave it (or as its packets came) and vport; zeros before there is one.
-s32 cellRudpGetRemoteInfo(PPUContext& ctx, s32 ctx_id, u32 addr, u32 addrlen, u32 vport)
-{
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if ((addr && (!addrlen || !guest_range(t, addrlen, 4))) || (addrlen && !guest_range(t, addrlen, 4)) ||
-        (vport && !guest_range(t, vport, 2)))
-        return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    if (addr) {
-        const u32 room = std::min(ps_read32(base, addrlen), kSockaddrSize);
-        if (!guest_range(t, addr, room)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        const std::array<u8, 16> zero{};
-        std::memcpy(base + addr, c->has_peer ? c->peer.raw.data() : zero.data(), room);
-    }
-    if (addrlen) ps_write32(base, addrlen, kSockaddrSize);
-    if (vport) ps_write16(base, vport, c->peer_vport);
-    return lv2::CELL_OK;
-}
-
-// int cellRudpBind(int ctx_id, int soc, uint16_t vport, uint8_t muxmode): the context on the game's UDP or UDP P2P
-// socket at a virtual port (0: the lowest free one). A socket's contexts share its mux mode; RAW needs the event
-// handler.
-s32 cellRudpBind(PPUContext& ctx, s32 ctx_id, s32 soc, u16 vport, u8 muxmode)
-{
-    Lib& lib = lib_of();
-    u8* base = guest_base(ctx);
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (muxmode > kMuxRaw) return error(CELL_RUDP_ERROR_INVALID_MUXMODE);
-    if (c->bound) return error(CELL_RUDP_ERROR_ALREADY_BOUND);
-    // The socket's type, from lv2's socket information (sys_net_get_sockinfo_ex: lv2 keeps no SO_TYPE for a P2P
-    // socket, as RPCS3's keeps none): the request block {s, 0, 0, the information, 1}, then the 80 bytes.
-    StackVar info(ctx, base, kSockinfoBlock + kSockinfoExSize);
-    ps_write32(base, info.addr(), static_cast<u32>(soc));
-    ps_write32(base, info.addr() + 12, info.addr() + kSockinfoBlock);
-    ps_write32(base, info.addr() + 16, 1);
-    const s32 r = static_cast<s32>(lv2_syscall(ctx, kSysInfoctl, {kInfoctlSockinfoEx, info.addr()}));
-    const s32 type = static_cast<s32>(ps_read32(base, info.addr() + kSockinfoBlock + 36));
-    if (r < 0 || (type != kSockDgram && type != kSockDgramP2p)) return error(CELL_RUDP_ERROR_INVALID_SOCKET);
-    if (muxmode == kMuxRaw && !lib.handler) return error(CELL_RUDP_ERROR_NO_EVENT_HANDLER);
-    const auto existing = lib.sockets.find(soc);
-    if (existing != lib.sockets.end() && existing->second.mux != muxmode) return error(CELL_RUDP_ERROR_INVALID_MUXMODE);
-    Binding& b = lib.sockets[soc];
-    b.mux = muxmode;
-    b.p2p = type == kSockDgramP2p;
-    b.closed = false; // open: lv2 may hand a closed socket's number out again
-    if (!vport) {
-        for (u32 v = 1; v <= 0xFFFF && !vport; v++)
-            if (!b.ports.contains(static_cast<u16>(v))) vport = static_cast<u16>(v);
-        if (!vport) {
-            if (b.ports.empty() && b.conns.empty()) lib.sockets.erase(soc);
-            return error(CELL_RUDP_ERROR_VPORT_EXHAUSTED);
-        }
-    } else if (b.ports.contains(vport)) {
-        return error(CELL_RUDP_ERROR_VPORT_IN_USE);
-    }
-    c->bound = true;
-    c->soc = soc;
-    c->vport = vport;
-    c->mux = muxmode;
-    b.ports[vport] = c;
-    PS_LOG_INFO(kChan, "cellRudpBind: context {} on socket {} vport {}{}", ctx_id, soc, vport,
-        muxmode == kMuxRaw ? " (RAW)" : "");
-    notify(lib); // the I/O thread reads a new socket
-    return lv2::CELL_OK;
-}
-
-// int cellRudpListen(int ctx_id, int backlog): the bound context takes SYNs from any peer at its vport, each a
-// connection of its own for cellRudpAccept, up to `backlog` waiting (8 for 0 or less, at most 64).
-s32 cellRudpListen(PPUContext&, s32 ctx_id, s32 backlog)
-{
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (!c->bound) return error(CELL_RUDP_ERROR_NOT_BOUND);
-    if (c->state != kStateIdle || c->has_peer)
-        return error(c->connecting() ? CELL_RUDP_ERROR_IN_PROGRESS : CELL_RUDP_ERROR_ALREADY_ESTABLISHED);
-    c->listening = true;
-    c->backlog = backlog <= 0 ? kDefaultBacklog : std::min<u32>(static_cast<u32>(backlog), kMaxBacklog);
-    return lv2::CELL_OK;
-}
-
-// int cellRudpAccept(int ctx_id): the listener's oldest connection that finished its handshake, as a context of its
-// own (its ID the answer; the listener's handler, argument and options). Without one: WOULDBLOCK when non-blocking,
-// else a wait (READ_TIMEOUT).
-s32 cellRudpAccept(PPUContext& ctx, s32 ctx_id)
-{
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    std::unique_lock lk(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    auto l = find(lib, ctx_id);
-    if (!l) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (!l->listening) return error(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
-    const u64 deadline = deadline_after(l->opt.read_timeout);
-    for (;;) {
-        const auto it = std::find_if(l->pending.begin(), l->pending.end(),
-            [](const std::shared_ptr<Context>& k) { return k->connected(); });
-        if (it != l->pending.end()) {
-            if (total_contexts(lib) > kMaxContexts) return error(CELL_RUDP_ERROR_TOO_MANY_CONTEXTS);
-            std::shared_ptr<Context> k = *it;
-            l->pending.erase(it);
-            const u32 app_malloc = lib.app_malloc, app_free = lib.app_free;
-            lk.unlock();
-            const Record r = alloc_record(ctx, app_malloc, app_free);
-            lk.lock();
-            Work w = work_of(lib);
-            if (!r.addr || !lib.initialized) {
-                if (lib.initialized) {
-                    send_control(lib, *k, Type::Rst, now_us(), w, rudp::kRstReset);
-                    unlink(lib, *k);
-                }
-                lk.unlock();
-                finish(ctx, lib, w);
-                free_record(ctx, r);
-                return error(r.addr ? CELL_RUDP_ERROR_NOT_INITIALIZED : CELL_RUDP_ERROR_MEMORY);
-            }
-            k->id = new_context_id(lib);
-            k->record = r.addr;
-            k->record_free = r.app_free;
-            k->record_own = r.own;
-            k->parent_id = l->id;
-            k->parent.reset();
-            l->children++;
-            lib.contexts.emplace(k->id, k);
-            lib.stats[kAllocs]++;
-            lib.records += kRecordSize;
-            PS_LOG_INFO(kChan, "cellRudpAccept: context {} from listener {}", k->id, ctx_id);
-            return k->id;
-        }
-        if (l->opt.nonblock) return error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!wait_change(lib, t, lk, deadline)) return error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        l = find(lib, ctx_id);
-        if (!l || !l->listening) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    }
-}
-
-// The peer's address of Initiate and Activate: a sys_net_sockaddr of at least 16 bytes.
-std::optional<Endpoint> peer_arg(lv2::PpuThread& t, u32 to, u32 tolen)
-{
-    if (!to || tolen < kSockaddrSize || !guest_range(t, to, kSockaddrSize)) return std::nullopt;
-    return endpoint_of(t.kernel.base() + to);
-}
-
-// What stops a context from starting a connection (0: nothing).
-s32 cannot_start(const Context& c)
-{
-    if (!c.bound) return error(CELL_RUDP_ERROR_NOT_BOUND);
-    if (c.listening) return error(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
-    if (c.connecting()) return error(CELL_RUDP_ERROR_IN_PROGRESS);
-    if (c.state != kStateIdle || c.has_peer) return error(CELL_RUDP_ERROR_ALREADY_ESTABLISHED);
+    ps_write32(base, ctx_id, 0xFFFFFFFF);
+    Ctx* x = nullptr;
+    if (const s32 r = ctx_create(l.lib, *l.lib.net, x); r < 0) return r;
+    x->handler = handler;
+    x->arg = arg;
+    ps_write32(base, ctx_id, static_cast<u32>(x->id));
     return 0;
 }
 
-// Initiate's and Activate's connection: its peer, the SYN.
-s32 open(PPUContext& ctx, s32 ctx_id, u32 to, u32 tolen, u16 vport, bool active)
+// The context of an API call (terminated ones are gone for it).
+Ctx* api_ctx(Locked& l, s32 id, s32& r) { return ctx_find(*l.lib.net, id, false, &r); }
+
+// int cellRudpSetOption(int ctx_id, int option, const void *optval, size_t optlen): 4 bytes; the connection's
+// parameters only before a connection (NOT_ACCEPTABLE).
+s32 cellRudpSetOption(PPUContext& ctx, s32 ctx_id, s32 option, u32 optval, u32 optlen)
 {
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    Work w;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        const auto c = find(lib, ctx_id);
-        if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        if (const s32 e = cannot_start(*c)) return e;
-        const std::optional<Endpoint> peer = peer_arg(t, to, tolen);
-        if (!peer) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        if (active && !vport) return error(CELL_RUDP_ERROR_INVALID_VPORT);
-        w = work_of(lib);
-        Binding& b = lib.sockets[c->soc];
-        for (const auto& old : std::vector(lib.lingering)) // a connection this side let go to the same place
-            if (old->soc == c->soc && old->vport == c->vport && same_peer(old->peer, *peer, b.p2p) &&
-                (!active || old->peer_vport == vport))
-                drop_lingering(lib, *old, w);
-        const u64 now = now_us();
-        c->peer = *peer;
-        c->peer_vport = active ? vport : 0;
-        c->activated = !active;
-        start(lib, *c, now);
-        c->state = kStateSynSent;
-        link(lib, c);
-        send_syn(lib, *c, now, w);
-        PS_LOG_INFO(kChan, "{}: context {} vport {} to {}.{}.{}.{}:{} vport {}",
-            active ? "cellRudpInitiate" : "cellRudpActivate", ctx_id, c->vport, peer->addr >> 24,
-            (peer->addr >> 16) & 0xFF, (peer->addr >> 8) & 0xFF, peer->addr & 0xFF, peer->port,
-            active ? vport : c->vport);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !optval) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    Conn& c = x->c;
+    const auto value = [&]() -> std::optional<u32> {
+        if (optlen != 4) return std::nullopt;
+        if (!usable(ctx, optval, 4, "cellRudpSetOption")) return std::nullopt;
+        return ps_read32(guest_base(ctx), optval);
+    };
+    const bool idle = !api_state(*x);
+    const auto bit = [&](u32 b, u32 v) {
+        if (v) c.flags |= b;
+        else c.flags &= ~b;
+    };
+    switch (option) {
+    case 1: {
+        if (!idle) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        const u32 seg = *v + kPayloadSlack;
+        if (seg > lib.net->agg.mss) return err(CELL_RUDP_ERROR_PAYLOAD_TOO_LARGE);
+        if (c.state) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        if (seg < kPayloadSlack || seg > std::min(c.sndbuf, c.rcvbuf)) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        c.segsize = seg;
+        c.pool.bufsize = static_cast<u16>(seg - kPayloadSlack);
+        return 0;
     }
-    finish(ctx, lib, w);
-    return lv2::CELL_OK;
+    case 2:
+    case 3: {
+        if (!idle) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        if (c.state) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        if (*v < c.pool.bufsize + kPayloadSlack) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        (option == 2 ? c.sndbuf : c.rcvbuf) = *v;
+        return 0;
+    }
+    case 4: {
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        bit(kCNodelay, *v);
+        return 0;
+    }
+    case 5:
+    case 6:
+    case 8:
+    case 12: {
+        if (!idle) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        bit(option == 5 ? kCDelivery : option == 6 ? kCOrder : option == 8 ? kCStream : kCSack, *v);
+        return 0;
+    }
+    case 7: {
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        if (!x->blocking) {
+            if (!*v) x->blocking = true;
+        } else if (*v) {
+            x->blocking = false;
+            ctx_wake(*x, kWakeCancel);
+        }
+        return 0;
+    }
+    case 9:
+    case 10:
+    case 11:
+    case 13: {
+        if (!idle) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        if (option == 9) c.conn_timeout = *v;
+        else if (option == 10) c.close_wait_timeout = *v;
+        else if (option == 11) c.aggregation = *v;
+        else x->cookie_life = *v;
+        return 0;
+    }
+    case 15:
+    case 16:
+    case 17:
+    case 18:
+    case 19: {
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        if (option == 15) x->read_timeout = *v;
+        else if (option == 16) x->write_timeout = *v;
+        else if (option == 17) x->flush_timeout = *v;
+        else if (option == 19) c.ka_timeout = *v;
+        else if (c.ka_interval != *v) {
+            c.ka_next = c.ka_first = c.ka_last = c.ka_heard = 0;
+            c.ka_count = 0;
+            c.ka_interval = *v;
+        }
+        return 0;
+    }
+    case 0xFF: {
+        const auto v = value();
+        if (!v) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        bit(kCOpt255, *v);
+        return 0;
+    }
+    default: return err(CELL_RUDP_ERROR_INVALID_OPTION);
+    }
 }
 
-// int cellRudpInitiate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen, uint16_t vport): a connection to the
-// peer's vport (D-630), which it takes with Listen, Activate or an Initiate of its own (the two SYNs meet).
+// int cellRudpGetOption(int ctx_id, int option, void *optval, size_t optlen): 4 bytes; LAST_ERROR is cleared by its
+// reading.
+s32 cellRudpGetOption(PPUContext& ctx, s32 ctx_id, s32 option, u32 optval, u32 optlen)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !optval) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (static_cast<u32>(option) >= 20 || !option) return err(CELL_RUDP_ERROR_INVALID_OPTION);
+    if (optlen != 4) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, optval, 4, "cellRudpGetOption")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    const Conn& c = x->c;
+    u32 v = 0;
+    switch (option) {
+    case 1: v = c.pool.bufsize; break;
+    case 2: v = c.sndbuf; break;
+    case 3: v = c.rcvbuf; break;
+    case 4: v = (c.flags & kCNodelay) ? 1 : 0; break;
+    case 5: v = c.delivery() ? 1 : 0; break;
+    case 6: v = c.order() ? 1 : 0; break;
+    case 7: v = x->blocking ? 0 : 1; break;
+    case 8: v = c.stream() ? 1 : 0; break;
+    case 9: v = c.conn_timeout; break;
+    case 10: v = c.close_wait_timeout; break;
+    case 11: v = c.aggregation; break;
+    case 12: v = (c.flags & kCSack) ? 1 : 0; break;
+    case 13: v = x->cookie_life; break;
+    case 14:
+        v = static_cast<u32>(x->error);
+        x->error = 0;
+        break;
+    case 15: v = x->read_timeout; break;
+    case 16: v = x->write_timeout; break;
+    case 17: v = x->flush_timeout; break;
+    case 18: v = c.ka_interval; break;
+    case 19: v = c.ka_timeout; break;
+    default: break;
+    }
+    ps_write32(guest_base(ctx), optval, v);
+    return 0;
+}
+
+// int cellRudpGetContextStatus(int ctx_id, CellRudpContextStatus *status, size_t size): 1 to 48 bytes of: state,
+// parentId, children (accepted ones), lostPackets, sentPackets, rcvdPackets, sentBytes, rcvdBytes,
+// retransmissions, rtt (the smoothed round trip in microseconds).
+s32 cellRudpGetContextStatus(PPUContext& ctx, s32 ctx_id, u32 status, u32 size)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !status || size - 1 >= 0x30) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (!usable(ctx, status, size, "cellRudpGetContextStatus")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    const Conn& c = x->c;
+    std::array<u8, 0x30> s{};
+    ps_st32(s.data(), api_state(*x));
+    ps_st32(s.data() + 4, x->valid && x->parent ? static_cast<u32>(x->parent->id) : 0xFFFFFFFF);
+    ps_st32(s.data() + 8, static_cast<u32>(x->accepted.size()));
+    ps_st32(s.data() + 0xC, c.lost);
+    ps_st32(s.data() + 0x10, c.sent_packets);
+    ps_st32(s.data() + 0x14, c.rcvd_packets);
+    ps_st64(s.data() + 0x18, c.sent_bytes);
+    ps_st64(s.data() + 0x20, c.rcvd_bytes);
+    ps_st32(s.data() + 0x28, c.retransmissions);
+    ps_st32(s.data() + 0x2C, static_cast<u32>(c.srtt));
+    std::memcpy(guest_base(ctx) + status, s.data(), size);
+    return 0;
+}
+
+// int cellRudpGetLocalInfo(int ctx_id, int *soc, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport,
+// uint8_t *muxmode): NOT_BOUND before Bind; the address is the socket's (getsockname), at most 16 bytes.
+s32 cellRudpGetLocalInfo(PPUContext& ctx, s32 ctx_id, u32 soc, u32 addr, u32 addrlen, u32 vport, u32 muxmode)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (x->soc == -1) return err(CELL_RUDP_ERROR_NOT_BOUND);
+    u8* base = guest_base(ctx);
+    if (soc && usable(ctx, soc, 4, "cellRudpGetLocalInfo: soc")) ps_write32(base, soc, static_cast<u32>(x->soc));
+    if (addr && addrlen && usable(ctx, addrlen, 4, "cellRudpGetLocalInfo: addrlen")) {
+        u32 n = ps_read32(base, addrlen);
+        if (n > 16) {
+            n = 16;
+            ps_write32(base, addrlen, 16);
+        }
+        StackVar v(ctx, base, 0x30);
+        ps_write32(base, v.addr() + 0x20, 16);
+        libnet("getsockname", {sext(x->soc), v.addr(), v.addr() + 0x20});
+        if (n && usable(ctx, addr, n, "cellRudpGetLocalInfo: addr")) std::memcpy(base + addr, base + v.addr(), n);
+    }
+    if (vport && usable(ctx, vport, 2, "cellRudpGetLocalInfo: vport")) ps_write16(base, vport, x->vport);
+    if (muxmode && usable(ctx, muxmode, 1, "cellRudpGetLocalInfo: muxmode")) ps_write8(base, muxmode, x->mux);
+    return 0;
+}
+
+// int cellRudpGetRemoteInfo(int ctx_id, sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport): connected
+// contexts only (NOT_ACCEPTABLE); the peer's address, at most 34 bytes.
+s32 cellRudpGetRemoteInfo(PPUContext& ctx, s32 ctx_id, u32 addr, u32 addrlen, u32 vport)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if ((x->c.state != kEstablished && x->c.state != kCloseWait) || (x->flags & kXListening))
+        return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    u8* base = guest_base(ctx);
+    if (vport && usable(ctx, vport, 2, "cellRudpGetRemoteInfo: vport"))
+        ps_write16(base, vport, x->mux == 1 ? x->vport : x->peer.vport);
+    if (addr && addrlen && usable(ctx, addrlen, 4, "cellRudpGetRemoteInfo: addrlen")) {
+        const u32 n = std::min<u32>(ps_read32(base, addrlen), 0x22);
+        ps_write32(base, addrlen, n);
+        if (usable(ctx, addr, std::max<u32>(n, 2), "cellRudpGetRemoteInfo: addr")) {
+            std::memcpy(base + addr, x->peer.raw.data(), n);
+            ps_write8(base, addr + 1, x->peer.raw[1]);
+        }
+    }
+    return 0;
+}
+
+// int cellRudpBind(int ctx_id, int soc, uint16_t vport, uint8_t muxmode): mux mode 1 or 2. librudp does not look at
+// the socket (a socket that is not one only shows when sending fails).
+s32 cellRudpBind(PPUContext& ctx, s32 ctx_id, s32 soc, u16 vport, u8 muxmode)
+{
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || soc < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (static_cast<u8>(muxmode - 1) >= 2) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    return net_bind(l.lib, *l.lib.net, ctx_id, soc, vport, muxmode);
+}
+
+// int cellRudpListen(int ctx_id, int backlog): a context bound in mux mode 2; the event handler must be set.
+s32 cellRudpListen(PPUContext& ctx, s32 ctx_id, s32 backlog)
+{
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || backlog < 1) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    if (!net.handler) return err(CELL_RUDP_ERROR_NO_EVENT_HANDLER);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (x->mux != 2 || x->c.state) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (x->flags & kXListening) return err(CELL_RUDP_ERROR_IN_PROGRESS);
+    x->flags |= kXListening;
+    for (Ctx::Pending& p : x->pending) mem_free(lib, p.mem);
+    x->pending.clear();
+    x->backlog = static_cast<u16>(std::min(backlog, 0x80));
+    if (x->cookie_life) {
+        u16 p[3];
+        ctx_init_params(*x, p);
+        x->secret = static_cast<u32>(p[0]) << 16 | p[1];
+        if (!ctx_cookie_ring(lib, *x)) return err(CELL_RUDP_ERROR_MEMORY);
+    }
+    return net_prepare(lib, net, *x, nullptr, 0);
+}
+
+// Waits for a blocking context's connection (Initiate's, Activate's): its error when it failed, CANCELLED when it went.
+s32 wait_connected(Lib& lib, PPUContext& ctx, Ctx& x, s32 r, bool activate)
+{
+    if (!(r == 0 || r == err(CELL_RUDP_ERROR_IN_PROGRESS)) || !x.blocking) return r;
+    lv2::PpuThread& t = thread_of(ctx);
+    x.waiters++;
+    while (!(x.wake & kWakeCancel) && !(x.wake & (kWakeEstablished | kWakeClosed))) x.cond.wait(lib.lock, t, 0);
+    const u8 w = x.wake;
+    x.wake &= ~(kWakeEstablished | kWakeClosed);
+    if (!--x.waiters && (x.wake & kWakeCancel)) x.cond.signal_all();
+    if (activate) r = 0;
+    if (w & kWakeClosed) {
+        r = x.error;
+        x.error = 0;
+    } else if (w & kWakeCancel) {
+        r = err(CELL_RUDP_ERROR_CANCELLED);
+    }
+    return r;
+}
+
+std::optional<std::array<u8, 0x22>> peer_arg(PPUContext& ctx, u32 to, u32 tolen)
+{
+    std::array<u8, 0x24> a{};
+    if (tolen && !usable(ctx, to, tolen, "a peer's address")) return std::nullopt;
+    if (tolen) std::memcpy(a.data(), guest_base(ctx) + to, tolen);
+    std::array<u8, 0x22> out{};
+    std::memcpy(out.data(), a.data(), 0x22);
+    return out;
+}
+
+// int cellRudpInitiate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen, uint16_t vport)
 s32 cellRudpInitiate(PPUContext& ctx, s32 ctx_id, u32 to, u32 tolen, u16 vport)
 {
-    return open(ctx, ctx_id, to, tolen, vport, true);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !to || tolen > 0x22) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    if (!net.handler) return err(CELL_RUDP_ERROR_NO_EVENT_HANDLER);
+    const auto peer = peer_arg(ctx, to, tolen);
+    if (!peer) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    const u32 st = api_state(*x);
+    if (st > 4) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (st == kEstablished) return err(CELL_RUDP_ERROR_ALREADY_ESTABLISHED);
+    if (st <= 1) {
+        if (const s32 p = net_prepare(lib, net, *x, &*peer, vport); p < 0) return p;
+    }
+    x->error = 0;
+    return wait_connected(lib, ctx, *x, conn_initiate(lib, x->c), false);
 }
 
-// int cellRudpActivate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen): a connection with this peer only,
-// from whichever vport its SYN comes; this side's SYNs go to its own vport and are dropped, not refused, where nothing
-// there waits for them (two peers activating each other at the same vport meet) (D-630).
-s32 cellRudpActivate(PPUContext& ctx, s32 ctx_id, u32 to, u32 tolen) { return open(ctx, ctx_id, to, tolen, 0, false); }
+// int cellRudpActivate(int ctx_id, const sys_net_sockaddr *to, socklen_t tolen): waits for that peer's SYN.
+s32 cellRudpActivate(PPUContext& ctx, s32 ctx_id, u32 to, u32 tolen)
+{
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !to || tolen > 0x22) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    if (!net.handler) return err(CELL_RUDP_ERROR_NO_EVENT_HANDLER);
+    const auto peer = peer_arg(ctx, to, tolen);
+    if (!peer) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    const u32 st = api_state(*x);
+    if (st > 4) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    if (st == kEstablished) return err(CELL_RUDP_ERROR_ALREADY_ESTABLISHED);
+    if (st <= 1) {
+        if (const s32 p = net_prepare(lib, net, *x, &*peer, x->vport); p < 0) return p;
+    }
+    x->error = 0;
+    return wait_connected(lib, ctx, *x, conn_activate(lib, x->c), true);
+}
 
-// int cellRudpTerminate(int ctx_id): the context goes. A connection sends what was written, then its end (FIN), and
-// lingers until its FIN and the peer's are acknowledged, at most CLOSE_WAIT_TIMEOUT (then a RST); one still being made
-// is reset, and so are a listener's connections not accepted.
+// int cellRudpAccept(int ctx_id, CellRudpContextEventHandler handler, void *arg, int *ctx_id_out,
+// sys_net_sockaddr *addr, socklen_t *addrlen, uint16_t *vport): the oldest established child, which gets the
+// handler; WOULDBLOCK when there is none and the listener does not block.
+s32 cellRudpAccept(PPUContext& ctx, s32 ctx_id, u32 handler, u32 arg, u32 out_id, u32 addr, u32 addrlen, u32 vport)
+{
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !out_id) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, out_id, 4, "cellRudpAccept")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (!(x->flags & kXListening)) return err(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
+    u8* base = guest_base(ctx);
+    lv2::PpuThread& t = thread_of(ctx);
+    for (;;) {
+        for (auto it = x->pending.begin(); it != x->pending.end(); ++it) {
+            Ctx* child = it->ctx;
+            if (child->c.state != kEstablished) continue;
+            ps_write32(base, out_id, static_cast<u32>(child->id));
+            mem_free(lib, it->mem);
+            x->pending.erase(it);
+            Ctx::ChildNode n;
+            n.ctx = child;
+            n.mem = mem_alloc(lib, 0x40);
+            if (n.mem) x->accepted.emplace(child->peer, n);
+            if (addr && addrlen && usable(ctx, addrlen, 4, "cellRudpAccept: addrlen")) {
+                const u32 len = ps_read32(base, addrlen);
+                std::array<u8, 0x24> raw{};
+                std::memcpy(raw.data(), child->peer.raw.data(), 0x22);
+                ps_st16(raw.data() + 0x22, child->peer.vport);
+                if (usable(ctx, addr, std::max<u32>(len, 2), "cellRudpAccept: addr")) {
+                    std::memcpy(base + addr, raw.data(), std::min<u32>(len, 0x24));
+                    ps_write8(base, addr + 1, child->peer.raw[1]);
+                }
+                ps_write32(base, addrlen, child->peer.raw[0]);
+            }
+            if (vport && usable(ctx, vport, 2, "cellRudpAccept: vport")) ps_write16(base, vport, x->peer.vport);
+            if (x->c.readable_size() > 0) ctx_post(*x, kQReadable);
+            s32 e = 0;
+            Ctx* got = ctx_find(*lib.net, static_cast<s32>(ps_read32(base, out_id)), false, &e);
+            if (!got) return e;
+            if (got->valid) {
+                got->handler = handler;
+                got->arg = arg;
+            }
+            return 0;
+        }
+        if (!x->blocking) return err(CELL_RUDP_ERROR_WOULDBLOCK);
+        x->waiters++;
+        while (!(x->wake & kWakeCancel) && !(x->wake & kWakeAcceptable)) x->cond.wait(lib.lock, t, 0);
+        const u8 w = x->wake;
+        x->waiters--;
+        x->wake &= ~kWakeAcceptable;
+        if (!x->waiters && (x->wake & kWakeCancel)) x->cond.signal_all();
+        if (w & kWakeCancel) return err(CELL_RUDP_ERROR_CANCELLED);
+    }
+}
+
+// int cellRudpTerminate(int ctx_id): a connection or a listener ends (and lingers until it is told it may go); an idle
+// one goes at once.
 s32 cellRudpTerminate(PPUContext& ctx, s32 ctx_id)
 {
-    Lib& lib = lib_of();
-    Work w;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        const auto c = find(lib, ctx_id);
-        if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        w = work_of(lib);
-        const u64 now = now_us();
-        lib.contexts.erase(ctx_id);
-        for (auto& [id, poll] : lib.polls)
-            std::erase_if(poll.entries, [&](const std::pair<s32, u16>& e) { return e.first == ctx_id; });
-        for (const auto& k : std::vector(c->pending)) {
-            send_control(lib, *k, Type::Rst, now, w, rudp::kRstReset);
-            unlink(lib, *k);
-        }
-        c->pending.clear();
-        if (c->record) {
-            w.records.push_back({c->record, c->record_free, c->record_own});
-            lib.stats[kFrees]++;
-            lib.records -= kRecordSize;
-            c->record = 0;
-        }
-        if (c->bound) {
-            Binding& b = lib.sockets[c->soc];
-            const auto port = b.ports.find(c->vport);
-            if (port != b.ports.end() && port->second == c) b.ports.erase(port);
-        }
-        if (c->parent_id)
-            if (const auto l = find(lib, c->parent_id); l && l->children) l->children--;
-        if (c->connected()) { // its end after what it wrote; lingering until both ends' FINs are acknowledged
-            c->id = 0;
-            c->lingering = true;
-            c->linger_deadline = now + c->opt.close_wait_timeout;
-            c->fin_wanted = true;
-            if (!c->p.stream) {
-                Segment s;
-                s.type = Type::Fin;
-                s.seq = c->snd_nxt++;
-                s.offset = c->snd_offset;
-                c->sndq.push_back(std::move(s));
-                c->fin_queued = true;
-            }
-            lib.lingering.push_back(c);
-            push(lib, *c, now, w);
-        } else {
-            if (c->connecting()) send_control(lib, *c, Type::Rst, now, w, rudp::kRstReset);
-            if (c->has_peer) unlink(lib, *c);
-        }
-        if (c->bound) release_if_unused(lib, c->soc, w);
-        note_memory(lib);
-        notify(lib);
-        PS_LOG_INFO(kChan, "cellRudpTerminate: context {}", ctx_id);
-    }
-    finish(ctx, lib, w);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    Ctx* x = ctx_find(net, ctx_id, true, nullptr);
+    if (!x) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    if (x->valid && ((x->flags & kXListening) || (x->c.state >= kSynSent && x->c.state <= kCloseWait)))
+        return ctx_terminate(lib, *x);
+    ctx_delete(lib, net, ctx_id);
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------------- the API: data
 
-void write_read_info(u8* base, u32 info, const Chunk& c)
+// Waits for a blocking call's event (`bits`) up to `timeout_ms` (0: none): 0, WOULDBLOCK when it ran out,
+// CANCELLED when the context went.
+s32 wait_event(Lib& lib, PPUContext& ctx, Ctx& x, u8 bits, u32 timeout_ms)
 {
-    // CellRudpReadInfo (D-630, 12 bytes): size, retransmissionCount, retransmissionDelay, retransmissionDelay2,
-    // flags, sequenceNumber, timestamp.
-    ps_write8(base, info, kReadInfoSize);
-    ps_write8(base, info + 1, c.retries);
-    ps_write16(base, info + 2, 0);
-    ps_write8(base, info + 4, 0);
-    ps_write8(base, info + 5, c.flags & rudp::kFlagLatency ? kMsgLatencyCritical : 0);
-    ps_write16(base, info + 6, static_cast<u16>(c.seq));
-    ps_write32(base, info + 8, c.stamp);
+    lv2::PpuThread& t = thread_of(ctx);
+    x.waiters++;
+    s32 r = 0;
+    if (!timeout_ms) {
+        while (!(x.wake & kWakeCancel) && !(x.wake & bits)) x.cond.wait(lib.lock, t, 0);
+    } else {
+        while (!(x.wake & kWakeCancel) && !(x.wake & bits)) {
+            if (!x.cond.wait(lib.lock, t, u64{timeout_ms} * 1000)) {
+                if (!(x.wake & kWakeCancel) && !(x.wake & bits)) r = err(CELL_RUDP_ERROR_WOULDBLOCK);
+                break;
+            }
+        }
+    }
+    const u8 w = x.wake;
+    x.wake &= ~bits;
+    if (!--x.waiters && (x.wake & kWakeCancel)) x.cond.signal_all();
+    if (r < 0) return r;
+    if (w & kWakeCancel) return err(CELL_RUDP_ERROR_CANCELLED);
+    return 0;
 }
 
-// int cellRudpRead(int ctx_id, void *data, size_t len, uint8_t flags, CellRudpReadInfo *info): a message (datagram
-// contexts; BUFFER_TOO_SMALL, the message kept, when it does not fit) or the bytes there are, up to len (a stream).
-// With nothing to read: WOULDBLOCK when non-blocking (NONBLOCK, CELL_RUDP_MSG_DONTWAIT), else a wait (READ_TIMEOUT);
-// END_OF_DATA once the peer's end is read; the error that closed the connection.
+// int cellRudpRead(int ctx_id, void *data, size_t len, uint8_t flags, CellRudpReadInfo *info): info->size (its first
+// byte) at most 12; that many bytes of the information come back (its own first byte then 0).
 s32 cellRudpRead(PPUContext& ctx, s32 ctx_id, u32 data, u32 len, u8 flags, u32 info)
 {
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    std::unique_lock lk(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (!len || !guest_range(t, data, len) || (info && !guest_range(t, info, kReadInfoSize)))
-        return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    if (c->listening) return error(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
-    const bool nonblock = c->opt.nonblock || (flags & kMsgDontwait);
-    const u64 deadline = deadline_after(c->opt.read_timeout);
-    for (;;) {
-        if (!c->rcvq.empty()) {
-            u32 n = 0;
-            if (!c->p.stream) {
-                const Chunk& m = c->rcvq.front();
-                if (m.data.size() > len) return error(CELL_RUDP_ERROR_BUFFER_TOO_SMALL);
-                n = static_cast<u32>(m.data.size());
-                std::memcpy(base + data, m.data.data(), n);
-                if (info) write_read_info(base, info, m);
-                c->rcv_bytes -= n;
-                c->rcvq.pop_front();
-            } else {
-                if (info) write_read_info(base, info, c->rcvq.front());
-                while (n < len && !c->rcvq.empty()) {
-                    Chunk& m = c->rcvq.front();
-                    const u32 k = static_cast<u32>(std::min<usize>(len - n, m.data.size() - m.read));
-                    std::memcpy(base + data + n, m.data.data() + m.read, k);
-                    m.read += k;
-                    n += k;
-                    c->rcv_bytes -= k;
-                    if (m.read == m.data.size()) c->rcvq.pop_front();
-                }
-            }
-            // A window that opened by a segment (or half the buffer, when that is less) is told at once (RFC 1122's
-            // rule against silly windows).
-            Work w = work_of(lib);
-            const u32 step = std::min(std::max(c->payload, 1u), std::max(c->opt.rcvbuf / 2, 1u));
-            if (c->connected() && window_of(*c) >= c->last_window + step) send_control(lib, *c, Type::Ack, now_us(), w);
-            note_memory(lib);
-            lk.unlock();
-            finish(ctx, lib, w);
-            return static_cast<s32>(n);
-        }
-        if (const s32 e = not_connected(*c)) return e;
-        if (nonblock) return error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!wait_change(lib, t, lk, deadline)) return error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        c = find(lib, ctx_id);
-        if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !data) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    u8* base = guest_base(ctx);
+    u32 info_size = 0;
+    if (info) {
+        if (!usable(ctx, info, 1, "cellRudpRead: info")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+        info_size = ps_read8(base, info);
+        if (info_size >= 13) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
     }
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (len && !usable(ctx, data, len, "cellRudpRead: data")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    std::vector<u8> buf(len);
+    std::array<u8, 12> ri{};
+    Bytes out;
+    out.p = buf.data();
+    out.cap = len;
+    r = conn_read(lib, x->c, out, info ? ri.data() : nullptr);
+    if (r == err(CELL_RUDP_ERROR_WOULDBLOCK) && x->blocking && !(flags & kMsgDontwait)) {
+        for (;;) {
+            if (x->c.state != kEstablished && x->c.state != kCloseWait) break;
+            const s32 w = wait_event(lib, ctx, *x, kWakeClosed | kWakeReadable, x->read_timeout);
+            if (w < 0) {
+                r = w == err(CELL_RUDP_ERROR_WOULDBLOCK) ? w : err(CELL_RUDP_ERROR_CANCELLED);
+                break;
+            }
+            out = Bytes{buf.data(), 0, 0, len};
+            r = conn_read(lib, x->c, out, info ? ri.data() : nullptr);
+            if (r >= 0 || r != err(CELL_RUDP_ERROR_WOULDBLOCK)) break;
+        }
+    }
+    if (r > 0) std::memcpy(base + data, buf.data(), static_cast<u32>(r));
+    ri[0] = static_cast<u8>(info_size); // the size the game gave stays (librudp's)
+    if (info && info_size && usable(ctx, info, info_size, "cellRudpRead: info")) std::memcpy(base + info, ri.data(), info_size);
+    return r;
 }
 
-// int cellRudpWrite(int ctx_id, const void *data, size_t len, uint8_t flags): a message (datagram contexts: at most
-// MAX_PAYLOAD, else MSG_TOO_LARGE; taken whole) or bytes (a stream: as many as the send buffer takes, all of them when
-// blocking). Without room: WOULDBLOCK when non-blocking, else a wait (WRITE_TIMEOUT). Written before the handshake
-// ends, it goes out once it does. LATENCY_CRITICAL sends at once.
+// int cellRudpWrite(int ctx_id, const void *data, size_t len, uint8_t flags): the bytes taken.
 s32 cellRudpWrite(PPUContext& ctx, s32 ctx_id, u32 data, u32 len, u8 flags)
 {
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    std::unique_lock lk(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (!len || !guest_range(t, data, len)) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    if (c->listening) return error(CELL_RUDP_ERROR_NOT_ACCEPTABLE);
-    if (const s32 e = not_connected(*c)) return e;
-    if (!c->p.stream && (len > max_message(lib, *c) || len > c->opt.sndbuf))
-        return error(CELL_RUDP_ERROR_MSG_TOO_LARGE);
-    const bool nonblock = c->opt.nonblock || (flags & kMsgDontwait);
-    const bool latency = flags & kMsgLatencyCritical;
-    const u64 deadline = deadline_after(c->opt.write_timeout);
-    u32 written = 0;
-    for (;;) {
-        const usize queued = c->queued();
-        const usize room = c->opt.sndbuf > queued ? c->opt.sndbuf - queued : 0;
-        u32 n = 0;
-        if (!c->p.stream) {
-            if (len <= room) {
-                Segment s;
-                s.seq = c->snd_nxt++;
-                s.flags = latency ? rudp::kFlagLatency : 0;
-                s.data.assign(base + data, base + data + len);
-                s.offset = c->snd_offset;
-                c->snd_offset += len;
-                c->sndq.push_back(std::move(s));
-                n = len;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0 || !data || !len) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    if (!usable(ctx, data, len, "cellRudpWrite: data")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    std::vector<u8> buf(guest_base(ctx) + data, guest_base(ctx) + data + len);
+    Bytes in{buf.data(), 0, len, len};
+    r = conn_write(lib, x->c, in, flags);
+    if (r == err(CELL_RUDP_ERROR_WOULDBLOCK) && x->blocking && !(flags & kMsgDontwait)) {
+        while (x->c.state == kEstablished) {
+            const s32 w = wait_event(lib, ctx, *x, kWakeClosed | kWakeWritable, x->write_timeout);
+            if (w < 0) {
+                r = w;
+                break;
             }
-        } else {
-            n = static_cast<u32>(std::min<usize>(len - written, room));
-            c->stream_out.insert(c->stream_out.end(), base + data + written, base + data + written + n);
+            in = Bytes{buf.data(), 0, len, len};
+            r = conn_write(lib, x->c, in, flags);
+            if (r >= 0 || r != err(CELL_RUDP_ERROR_WOULDBLOCK)) break;
         }
-        if (n) {
-            written += n;
-            c->queued_bytes += n;
-            const u32 level = quality_of(c->p);
-            lib.stats[kSentUserBytes] += n;
-            lib.stats[kQualityLevels + 4 * level] += n;
-            if (!c->p.stream || written == len) {
-                lib.stats[kSentUserPackets]++;
-                lib.stats[kQualityLevels + 4 * level + 2]++;
-                if (latency) lib.stats[kSentLatencyCriticalPackets]++;
-            }
-            Work w = work_of(lib);
-            c->flush_now = c->flush_now || latency;
-            push(lib, *c, now_us(), w);
-            note_memory(lib);
-            lk.unlock();
-            finish(ctx, lib, w);
-            if (written == len) return static_cast<s32>(written);
-            lk.lock(); // a stream's bytes that did not fit yet
-            if (!lib.initialized) return static_cast<s32>(written);
-            c = find(lib, ctx_id);
-            if (!c || not_connected(*c)) return static_cast<s32>(written);
-            continue;
-        }
-        c->writable_wanted = true;
-        if (nonblock) return written ? static_cast<s32>(written) : error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!wait_change(lib, t, lk, deadline))
-            return written ? static_cast<s32>(written) : error(CELL_RUDP_ERROR_WOULDBLOCK);
-        if (!lib.initialized) return written ? static_cast<s32>(written) : error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        c = find(lib, ctx_id);
-        if (!c) return written ? static_cast<s32>(written) : error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        if (const s32 e = not_connected(*c)) return written ? static_cast<s32>(written) : e;
     }
+    return r;
 }
 
-// int cellRudpGetSizeReadable(int ctx_id): the bytes waiting to be read (every message's).
-s32 cellRudpGetSizeReadable(PPUContext&, s32 ctx_id)
+// int cellRudpGetSizeReadable(int ctx_id)
+s32 cellRudpGetSizeReadable(PPUContext& ctx, s32 ctx_id)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    return static_cast<s32>(std::min<usize>(c->rcv_bytes, 0x7FFFFFFF));
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    return x->c.readable_size();
 }
 
-// int cellRudpGetSizeWritable(int ctx_id): the room left in the send buffer.
-s32 cellRudpGetSizeWritable(PPUContext&, s32 ctx_id)
+// int cellRudpGetSizeWritable(int ctx_id)
+s32 cellRudpGetSizeWritable(PPUContext& ctx, s32 ctx_id)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    const usize q = c->queued();
-    return static_cast<s32>(c->opt.sndbuf > q ? c->opt.sndbuf - q : 0);
+    Locked l(ctx);
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    return x->c.writable();
 }
 
-// int cellRudpFlush(int ctx_id): what was written goes out now (no aggregation), and the call waits until the peer
-// has it all (FLUSH_TIMEOUT); non-blocking, WOULDBLOCK until then, and a FLUSHED event when it has.
+// int cellRudpFlush(int ctx_id): what was written is marked; FLUSHED when the peer has all of it. A blocking context
+// waits for it (up to FLUSH_TIMEOUT).
 s32 cellRudpFlush(PPUContext& ctx, s32 ctx_id)
 {
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    std::unique_lock lk(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    auto c = find(lib, ctx_id);
-    if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    if (const s32 e = not_connected(*c); e && c->state != kStateCloseWait) return e;
-    Work w = work_of(lib);
-    c->flush_now = true;
-    push(lib, *c, now_us(), w);
-    lk.unlock();
-    finish(ctx, lib, w);
-    lk.lock();
-    const u64 deadline = deadline_after(c->opt.flush_timeout);
-    for (;;) {
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        c = find(lib, ctx_id);
-        if (!c) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        if (!c->queued()) return lv2::CELL_OK;
-        if (c->state == kStateClosed) return not_connected(*c);
-        if (c->opt.nonblock) {
-            c->flush_wanted = true;
-            return error(CELL_RUDP_ERROR_WOULDBLOCK);
-        }
-        if (!wait_change(lib, t, lk, deadline)) return error(CELL_RUDP_ERROR_WOULDBLOCK);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    s32 r = 0;
+    Ctx* x = api_ctx(l, ctx_id, r);
+    if (!x) return r;
+    r = conn_flush(x->c);
+    if ((r == 0 || r == err(CELL_RUDP_ERROR_IN_PROGRESS)) && x->blocking) {
+        const s32 w = wait_event(lib, ctx, *x, kWakeFlushed, x->flush_timeout);
+        if (w < 0) r = w;
     }
+    return r;
 }
 
 // ------------------------------------------------------------------------------------------------- the API: polling
 
-// int cellRudpPollCreate(size_t size): a poll set for up to `size` contexts; its ID the answer.
-s32 cellRudpPollCreate(PPUContext&, u32 size)
+// int cellRudpPollCreate(size_t size): the set's ID (from 0).
+s32 cellRudpPollCreate(PPUContext& ctx, u32 size)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    if (!size || size > kMaxPollSize) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    if (lib.polls.size() >= kMaxPolls) return error(CELL_RUDP_ERROR_MEMORY);
-    s32 id = 0;
-    while (!id || lib.polls.contains(id)) {
-        id = lib.next_poll;
-        lib.next_poll = lib.next_poll == 0x7FFFFFFF ? 1 : lib.next_poll + 1;
-    }
-    lib.polls[id].size = size;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (!size) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    Block obj = mem_alloc(lib, 0x60);
+    if (!obj) return err(CELL_RUDP_ERROR_MEMORY);
+    auto p = std::make_unique<PollSet>();
+    p->mem_obj = obj;
+    p->id = net.next_poll;
+    net.next_poll = (net.next_poll + 1) & 0x7FFFFFFF;
+    p->mem_ring = mem_alloc(lib, size * 4);
+    if (p->mem_ring) p->ring.assign(size, 0);
+    const s32 id = p->id;
+    Block node = mem_alloc(lib, 0x20);
+    if (node) net.polls.emplace(id, std::make_pair(std::move(p), node));
     return id;
 }
 
-// int cellRudpPollDestroy(int poll_id): a wait on it ends with CANCELLED.
-s32 cellRudpPollDestroy(PPUContext&, s32 poll_id)
+// int cellRudpPollDestroy(int poll_id): its waits end (CANCELLED), its contexts leave it.
+s32 cellRudpPollDestroy(PPUContext& ctx, s32 poll_id)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    if (!lib.polls.erase(poll_id)) return error(CELL_RUDP_ERROR_INVALID_POLL_ID);
-    notify(lib);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (poll_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    const auto it = net.polls.find(poll_id);
+    if (it == net.polls.end()) return err(CELL_RUDP_ERROR_INVALID_POLL_ID);
+    std::unique_ptr<PollSet> p = std::move(it->second.first);
+    Block node = it->second.second;
+    net.polls.erase(it);
+    mem_free(lib, node);
+    poll_destroy(lib, net, *p);
+    mem_free(lib, p->mem_obj);
+    return 0;
 }
 
-// int cellRudpPollControl(int poll_id, int op, int ctx_id, uint16_t events): ADD (ALREADY_EXISTS twice; MEMORY past
-// the set's size), MODIFY, REMOVE (INVALID_CONTEXT_ID for one not in the set).
-s32 cellRudpPollControl(PPUContext&, s32 poll_id, s32 op, s32 ctx_id, u16 events)
+// int cellRudpPollControl(int poll_id, int op, int ctx_id, uint16_t events): 1 ADD, 2 MODIFY, 3 REMOVE.
+s32 cellRudpPollControl(PPUContext& ctx, s32 poll_id, s32 op, s32 ctx_id, u16 events)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto p = lib.polls.find(poll_id);
-    if (p == lib.polls.end()) return error(CELL_RUDP_ERROR_INVALID_POLL_ID);
-    if (!find(lib, ctx_id)) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-    auto& entries = p->second.entries;
-    const auto it = std::find_if(entries.begin(), entries.end(),
-        [&](const std::pair<s32, u16>& e) { return e.first == ctx_id; });
-    switch (op) {
-    case kPollAdd:
-        if (events & ~kPollEvents) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        if (it != entries.end()) return error(CELL_RUDP_ERROR_ALREADY_EXISTS);
-        if (entries.size() >= p->second.size) return error(CELL_RUDP_ERROR_MEMORY);
-        entries.emplace_back(ctx_id, events);
-        break;
-    case kPollModify:
-        if (events & ~kPollEvents) return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        if (it == entries.end()) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        it->second = events;
-        break;
-    case kPollRemove:
-        if (it == entries.end()) return error(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
-        entries.erase(it);
-        break;
-    default: return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (poll_id < 0 || ctx_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    PollSet* p = poll_find(net, poll_id);
+    if (!p) return err(CELL_RUDP_ERROR_INVALID_POLL_ID);
+    if (op == 1) {
+        s32 r = 0;
+        Ctx* x = ctx_find(net, ctx_id, false, &r);
+        if (!x) return r;
+        if (x->poll > 0) return err(CELL_RUDP_ERROR_ALREADY_EXISTS);
+        x->poll = p->id;
+        const u16 ready = ctx_ready(*x);
+        if (p->entries.count(ctx_id)) return err(CELL_RUDP_ERROR_ALREADY_EXISTS);
+        const u32 n = static_cast<u32>(p->entries.size());
+        if (p->ring.size() == n) {
+            bool grown = false;
+            if (n < 0x10000) {
+                const u32 cap = n * 2;
+                const u32 count = p->count();
+                if (cap >= count) {
+                    Block mem = mem_alloc(lib, cap * 4);
+                    if (mem) {
+                        std::vector<s32> ring(cap, 0);
+                        for (u32 i = 0; i < count; i++) ring[i] = p->ring[(p->head + i) % p->ring.size()];
+                        mem_free(lib, p->mem_ring);
+                        p->mem_ring = mem;
+                        p->ring = std::move(ring);
+                        p->head = 0;
+                        p->tail = count % std::max<u32>(cap, 1);
+                        p->full = count == cap && cap;
+                        grown = true;
+                    }
+                }
+            }
+            if (!grown) {
+                x->poll = -1;
+                return err(CELL_RUDP_ERROR_TOO_MANY_CONTEXTS);
+            }
+        }
+        PollSet::Entry e;
+        e.req = events;
+        e.ret = static_cast<u16>(events & ready);
+        e.mem = mem_alloc(lib, 0x20);
+        if (e.mem) p->entries.emplace(ctx_id, e);
+        if ((events & ready) && p->push(ctx_id)) {
+            auto it = p->entries.find(ctx_id);
+            if (it == p->entries.end()) {
+                PollSet::Entry z;
+                z.mem = mem_alloc(lib, 0x20);
+                if (z.mem) it = p->entries.emplace(ctx_id, z);
+            }
+            if (it != p->entries.end()) it->second.ret |= 0x8000;
+            p->cond.signal();
+        }
+        return 0;
     }
-    notify(lib);
-    return lv2::CELL_OK;
+    if (op == 2) {
+        Ctx* x = ctx_find(net, ctx_id, true, nullptr);
+        const u16 ready = x ? ctx_ready(*x) : kPollError;
+        const auto it = p->entries.find(ctx_id);
+        if (it == p->entries.end()) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+        PollSet::Entry& e = it->second;
+        e.req = events;
+        const u16 v = static_cast<u16>(((events | 0x8000) & e.ret) | (ready & events));
+        e.ret = v;
+        if (!(v & 0x8000) && (v & 0x7FFF) && p->push(ctx_id)) {
+            e.ret = static_cast<u16>(v | 0x8000);
+            p->cond.signal();
+        }
+        return 0;
+    }
+    if (op == 3) {
+        if (Ctx* x = ctx_find(net, ctx_id, true, nullptr)) x->poll = -1;
+        const auto it = p->entries.find(ctx_id);
+        if (it == p->entries.end()) return err(CELL_RUDP_ERROR_INVALID_CONTEXT_ID);
+        if (!(it->second.ret & 0x8000) && p->push(ctx_id)) p->cond.signal_all();
+        mem_free(lib, it->second.mem);
+        p->entries.erase(it);
+        return 0;
+    }
+    return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
 }
 
-// int cellRudpPollWait(int poll_id, CellRudpPollEvent *events, size_t event_len, uint64_t timeout): the set's
-// contexts with an event asked for (ERROR always), up to event_len of {ctx_id, reqEvents, rtnEvents} (8 bytes each);
-// their number the answer. Timeout in microseconds: 0 answers at once, a wait that ends without one 0 (D-630).
-// PollCancel or PollDestroy end a wait with CANCELLED.
+// int cellRudpPollWait(int poll_id, CellRudpPollEvent *events, size_t event_len, uint64_t timeout): microseconds,
+// all ones for none; the number of events written.
 s32 cellRudpPollWait(PPUContext& ctx, s32 poll_id, u32 events, u32 event_len, u64 timeout)
 {
-    Lib& lib = lib_of();
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (poll_id < 0 || !events || !event_len) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    Net& net = *lib.net;
+    PollSet* p = poll_find(net, poll_id);
+    if (!p) return err(CELL_RUDP_ERROR_INVALID_POLL_ID);
+    if (!usable(ctx, events, std::min<u32>(event_len, 0x10000) * 8, "cellRudpPollWait")) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
     lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    std::unique_lock lk(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    auto p = lib.polls.find(poll_id);
-    if (p == lib.polls.end()) return error(CELL_RUDP_ERROR_INVALID_POLL_ID);
-    if (!event_len || event_len > kMaxPollSize || !guest_range(t, events, u64{event_len} * kPollEventSize))
-        return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-    const u64 cancels = p->second.cancels;
-    const u64 deadline = deadline_after(timeout);
-    for (;;) {
-        u32 n = 0;
-        for (const auto& [id, want] : p->second.entries) {
-            if (n == event_len) break;
-            const auto c = find(lib, id);
-            if (!c) continue;
-            const u16 got = ready_events(lib, *c) & (want | kPollError);
-            if (!got) continue;
-            const u32 e = events + kPollEventSize * n++;
-            ps_write32(base, e, static_cast<u32>(id));
-            ps_write16(base, e + 4, want);
-            ps_write16(base, e + 6, got);
+    u8* base = guest_base(ctx);
+    const u64 start = now_us();
+    // What the last wait handed out is looked at again: an error leaves the set, what is still ready queues again.
+    for (u32 i = 0; i < p->carried; i++) {
+        s32 id = -1;
+        if (!p->ring.empty() && (p->tail != p->head || p->full)) {
+            p->full = false;
+            id = p->ring[p->head];
+            if (++p->head == p->ring.size()) p->head = 0;
         }
-        if (n || !timeout) return static_cast<s32>(n);
-        if (!wait_change(lib, t, lk, deadline)) return 0;
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        p = lib.polls.find(poll_id);
-        if (p == lib.polls.end() || p->second.cancels != cancels) return error(CELL_RUDP_ERROR_CANCELLED);
+        if (id < 0) continue;
+        const auto it = p->entries.find(id);
+        if (it == p->entries.end()) continue;
+        PollSet::Entry& e = it->second;
+        if (e.ret & kPollError) {
+            mem_free(lib, e.mem);
+            p->entries.erase(it);
+            if (Ctx* x = ctx_find(net, id, true, nullptr)) x->poll = -1;
+            continue;
+        }
+        Ctx* x = ctx_find(net, id, true, nullptr);
+        const u16 ready = x ? ctx_ready(*x) : kPollError;
+        const u16 v = static_cast<u16>((e.req & ready) | e.ret);
+        e.ret = v;
+        if (!(v & 0x7FFF) || !p->push(id)) e.ret = static_cast<u16>(v & 0x7FFF);
     }
+    bool timed_out = false;
+    u32 count = 0;
+    for (;;) {
+        count = p->count();
+        if (count) break;
+        if (timed_out || p->cancelling || p->cancel) break;
+        u64 left = ~u64{0};
+        if (timeout != ~u64{0}) {
+            const u64 now = now_us();
+            left = now < start + timeout ? start + timeout - now : 0;
+        }
+        p->waiters++;
+        const bool woken = p->cond.wait(lib.lock, t, left ? left : 1);
+        if (!--p->waiters && p->cancelling > 0) p->cond.signal_all();
+        timed_out = !woken;
+        if (!poll_find(net, poll_id)) return err(CELL_RUDP_ERROR_CANCELLED);
+    }
+    u32 written = 0, looked = 0;
+    if (count && event_len) {
+        for (u32 i = 0; i < count && written < event_len; i++) {
+            looked = i + 1;
+            const s32 id = p->ring[(p->head + i) % p->ring.size()];
+            const u32 at = events + 8 * written;
+            const auto it = p->entries.find(id);
+            if (it == p->entries.end()) {
+                ps_write32(base, at, static_cast<u32>(id));
+                ps_write16(base, at + 4, 0);
+                ps_write16(base, at + 6, kPollError);
+                written++;
+            } else if (it->second.ret & 0x8000) {
+                ps_write32(base, at, static_cast<u32>(id));
+                ps_write16(base, at + 4, it->second.req);
+                ps_write16(base, at + 6, it->second.ret & 0x7FFF);
+                it->second.ret &= 0x8008;
+                written++;
+            }
+        }
+        p->carried = looked;
+        if (written) {
+            p->cancel = false;
+            return static_cast<s32>(written);
+        }
+    } else {
+        p->carried = 0;
+    }
+    const bool cancelled = p->cancelling || p->cancel;
+    p->cancel = false;
+    return cancelled ? err(CELL_RUDP_ERROR_CANCELLED) : 0;
 }
 
-// int cellRudpPollCancel(int poll_id): the waits on the set end with CANCELLED.
-s32 cellRudpPollCancel(PPUContext&, s32 poll_id)
+// int cellRudpPollCancel(int poll_id): the set's waits end with CANCELLED (the next one when nobody waits).
+s32 cellRudpPollCancel(PPUContext& ctx, s32 poll_id)
 {
-    Lib& lib = lib_of();
-    std::lock_guard lock(lib.m);
-    if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    const auto p = lib.polls.find(poll_id);
-    if (p == lib.polls.end()) return error(CELL_RUDP_ERROR_INVALID_POLL_ID);
-    p->second.cancels++;
-    notify(lib);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (poll_id < 0) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    PollSet* p = poll_find(*lib.net, poll_id);
+    if (!p) return err(CELL_RUDP_ERROR_INVALID_POLL_ID);
+    poll_cancel(lib, *p, true, false);
+    return 0;
 }
 
 // ------------------------------------------------------------------------------------------------- the API: I/O
 
 // int cellRudpNetReceived(int soc, const uint8_t *data, size_t datalen, const sys_net_sockaddr *addr, socklen_t
-// addrlen): a datagram the game received on a socket a context uses, from addr (D-632). MSG_MALFORMED for one that is
-// not RUDP; INVALID_SOCKET for a socket no context uses.
+// addrlen): a datagram the game received (without the internal I/O thread; THREAD_IN_USE with it).
 s32 cellRudpNetReceived(PPUContext& ctx, s32 soc, u32 data, u32 datalen, u32 addr, u32 addrlen)
 {
-    Lib& lib = lib_of();
-    lv2::PpuThread& t = thread_of(ctx);
-    u8* base = t.kernel.base();
-    Work w;
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-        if (!datalen || datalen > 0xFFFF || !guest_range(t, data, datalen) || addrlen < kSockaddrSize ||
-            !guest_range(t, addr, kSockaddrSize))
-            return error(CELL_RUDP_ERROR_INVALID_ARGUMENT);
-        if (!lib.sockets.contains(soc)) return error(CELL_RUDP_ERROR_INVALID_SOCKET);
-        w = work_of(lib);
-        const std::vector<u8> bytes(base + data, base + data + datalen);
-        if (!receive(lib, soc, endpoint_of(base + addr), bytes.data(), bytes.size(), now_us(), w))
-            return error(CELL_RUDP_ERROR_MSG_MALFORMED);
-    }
-    finish(ctx, lib, w);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    if (soc < 0) return err(CELL_RUDP_ERROR_INVALID_SOCKET);
+    if (!data) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!datalen) return 0;
+    if (!addr || addrlen >= 0x23) return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    if (!usable(ctx, data, datalen, "cellRudpNetReceived: data") || !usable(ctx, addr, addrlen, "cellRudpNetReceived: addr"))
+        return err(CELL_RUDP_ERROR_INVALID_ARGUMENT);
+    std::array<u8, 0x22> from{};
+    std::memcpy(from.data(), guest_base(ctx) + addr, std::min<u32>(addrlen, 0x22));
+    std::vector<u8> bytes(guest_base(ctx) + data, guest_base(ctx) + data + datalen);
+    return net_receive(lib, *lib.net, soc, bytes.data(), datalen, from, true);
 }
 
-// int cellRudpProcessEvents(uint64_t timeout): the library's I/O on the calling thread (D-632): the NORMAL-mode
-// sockets read, the timers due run, the handlers called; with a timeout (microseconds), up to that long for a datagram
-// or a timer first when nothing was there.
+// int cellRudpProcessEvents(uint64_t timeout): the scheduler on the calling thread (THREAD_IN_USE with the internal
+// I/O thread): the timers and events due, then up to `timeout` microseconds for more.
 s32 cellRudpProcessEvents(PPUContext& ctx, u64 timeout)
 {
-    Lib& lib = lib_of();
-    {
-        std::lock_guard lock(lib.m);
-        if (!lib.initialized) return error(CELL_RUDP_ERROR_NOT_INITIALIZED);
-    }
-    if (t_pumping) return error(CELL_RUDP_ERROR_THREAD_IN_USE); // from a handler the library's I/O called
-    std::lock_guard rx(lib.rx_m);
-    if (!lib.rx_block) lib.rx_block = HleProcess::current()->main_memory().alloc(kIoBlockSize, 16);
-    if (!lib.rx_block) return error(CELL_RUDP_ERROR_MEMORY);
-    pump(ctx, lib, lib.rx_block, timeout);
-    return lv2::CELL_OK;
+    Locked l(ctx);
+    Lib& lib = l.lib;
+    if (!l.ready()) return err(CELL_RUDP_ERROR_NOT_INITIALIZED);
+    Net& net = *lib.net;
+    if (net.io_enabled) return err(CELL_RUDP_ERROR_THREAD_IN_USE);
+    return sched_run(lib, net, timeout);
 }
 
 } // namespace
