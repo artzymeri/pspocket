@@ -52,6 +52,8 @@ u32 dmux(u32 p) { return p + pl::kDmux; }
 constexpr u8 kAspect[6][2] = {{4, 3}, {1, 1}, {16, 15}, {8, 9}, {64, 45}, {32, 27}};
 constexpr u32 kDoubled[9] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 5, 6, 7, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 
+} // namespace
+
 // The audio format the renderer is given (the entry's +0x78): the stream's, ATRAC3plus's channels folded to two for a
 // renderer that wants two, 48 kHz with audio parameter 32 when the renderer wants it (its frame 640 samples for the
 // 44.1 kHz family, else 480).
@@ -140,6 +142,8 @@ void video_out_format(PPUContext& ctx, u32 e, u32 slot)
     }
     w32(ctx, f + 8, static_cast<u32>(out));
 }
+
+namespace {
 
 // The dmux part added for an open (SDKs past 0x21FFFF): 0, or the error (INVALID_STATE, a pipeline not open, reads as
 // CANCEL) completing the open's first step with the record's one step.

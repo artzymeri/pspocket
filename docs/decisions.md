@@ -13069,6 +13069,43 @@ frames) compared with libsail running on pspocket, with no change to part 3's co
 - libsail's sound adapter copies a GetFrame's samples into a buffer of 2048 (0x2000 bytes per channel): a game asking
   for more overwrites what follows it (with SDKs before 4.0 the decoder's context after the adapter's block), kept.
 
+## D-919 · 2026-10-12 · cellSail's Next, the switch to the next descriptor, as libsail (part 5)
+
+cellSailPlayerNext (command 0xA7, call 12), the last of cellSail's 124 functions to be pspocket's (all registered now),
+with libsail's switch to the next descriptor (runtime/hle/src/cellSailPlay.cpp):
+- **Next** is refused (INVALID_STATE) unless the stream is open or started with no call running and a next descriptor
+  (+0x228), or with a deferred call other than an input's end; a command is the next descriptor's InquireCapability's
+  to refuse and is kept as the repeat information (with flag 0x10 it stays for later starts). Accepted: state 5, the
+  pause off; an open stream moves on at once, a started or ending one is stopped first (with start flag 1 ended,
+  flushed; 0xA9). A Next deferred behind a running step (the record's bit 4) runs when it is done.
+- **The switch** (records +0xD0, +0xE0): the next descriptor made ready as OpenStream does (0xAA), its start information
+  from the repeat command, the renderers' formats for it; a different source closed and the next one's opened, the
+  same one told of the descriptor (0xAB, 0xB2); the dmux pipeline reopened for a different kind (0xAC, 0xB3), else
+  kept with the new source. Each stream slot: kept when its next entry is chosen and compatible (the ES filter, for
+  PAMF the coding's fields; the decoder: coding, channels, rate, frame / coding, profile, specific bytes, picture and
+  format out; the renderer's format), its dmux part removed when it differs; otherwise the decoder or renderer (or both)
+  closed (0xAD-0xB1) and, the entry chosen, opened again with the new format (0xB7-0xBB), an AU receiver only closed
+  when its stream is not chosen; a slot not open completes its steps at once. Once all are in: the old descriptor's
+  open streams chosen again (event 10 each), it is closed for the player (state 1, event 5), the next one current
+  (the descriptor count one less), each stream kept or reopened open (its dmux part added again with the later SDKs,
+  event 9), event 4, and its streams start; Next completes (0xA8: state 6, the run type from the start type; a
+  failure: state 4). A failed switch takes the new stream down (closed, or stopped when streams had started) and
+  answers CANCEL (0xBC, 0xBD).
+- libsail's ways kept: an AU receiver's stop is answered only through the game's Get, and a graphics adapter's stop
+  waits for the frames the game holds to come back through GetFrame2, so a game must keep calling them for Next (and
+  Stop) to go on.
+- Still failing loudly: a repeat into the next descriptor (repeat mode 2, its seamless path and messages 0xCB-0xCF),
+  EP skipping, the elementary streams of a started stream, OpenStream or Next of a descriptor not opened (its header
+  read through the source), MP4 and AVI streams, libsail's sample rate converter.
+- **Compared** (tests/hle/test_sail.cpp, `[sail]`): part 19, an AU receiver: Next refused before a stream, without a next
+  descriptor and with a refused command; Next from the open stream (switched to and started), AUs; Next while playing
+  with a start command (stopped first, answered through Get) and refused while it runs; AUs; Stop. Part 20, a sound
+  and a graphics adapter: Next while playing from AVC 96x64 to AVC 128x64 on another channel (the audio stream kept,
+  the video decoder and the graphics adapter closed and opened again: the game's pictures given back and asked for
+  again), the new stream played to its end. 0 differences in three runs each; all 31 `[sail]` tests pass. A firmware-free
+  test checks part 19's answers on pspocket alone. The scripts' source now keeps its item table apart from the items
+  (from 14 items on, the table had overwritten the first items in parts 17 and 18; their firmware-free answers redone).
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
