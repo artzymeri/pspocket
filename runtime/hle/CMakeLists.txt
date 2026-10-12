@@ -154,9 +154,11 @@ add_library(pspocket_hle STATIC
     src/cellCelpEnc.cpp
     src/adec_celp.cpp
     src/celp_math.cpp
+    src/celp_mpe.cpp
     src/celp_rpe.cpp
     src/celp_rpe_enc.cpp
     src/celp_tables.cpp
+    src/celp_tables_nb.cpp
     src/cellRudp.cpp
     src/cellNetAoi.cpp
     src/libad.cpp

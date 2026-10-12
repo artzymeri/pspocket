@@ -7,8 +7,8 @@
 // would for libadec. Where no firmware module gives one, pspocket's own core on FFmpeg serves the codecs it has one of
 // (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3; D-621: Dolby Digital Plus, MPEG-2 AAC, MP3
 // Surround, ATRAC3 multichannel; D-622: TrueHD, DTS, DTS-HD, its core, DTS Express, WMA; adec_ffmpeg.hpp): firmware
-// first, as D-563 does for whole libraries, until each is compared with Sony's core on the Mac. CELP is pspocket's own
-// (adec_celp.cpp, D-932: libcelpdec's, compared with it); CELP 8 kHz has none yet (FFmpeg has no MPEG-4 CELP decoder).
+// first, as D-563 does for whole libraries, until each is compared with Sony's core on the Mac. CELP and CELP 8 kHz are
+// pspocket's own (adec_celp.cpp, D-932: libcelpdec's and libcelp8dec's, compared with them).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp/.h (get_core_ops, AdecContext, the notifications, the API).
 
 //
@@ -66,7 +66,6 @@ constexpr HostImport kImports[] = {
     {{}, "cellMPL1dec", 0xBBC70551, true},        // MPEG-1 layer I
     {{}, "cellMP3Sdec", 0x292CDF0A, true},        // MP3 surround
     {{}, "cellM4AacDec2chmod", 0xDBD26836, true}, // MPEG-4 AAC, 2 channels (mod)
-    {{}, "cellCelp8Dec", 0xF0190C6C, true},       // CELP 8 kHz
     {{}, "cellWMAPROdec", 0xA8BAC670, true},      // WMA Pro
     {{}, "cellWMALSLdec", 0x602AAB16, true},      // WMA Lossless
     {{}, "cellDTSHDCOREdec", 0x6C8F4F1C, true},   // DTS-HD core
@@ -84,7 +83,6 @@ constexpr HostImport kImports[] = {
     {{}, "cellDTSLBRdec", 0x185591D6, false},      // _SceAdecCorrectPtsValue_DtsLbr
     {{}, "cellMPL1dec", 0xA4A9A309, false},        // _SceAdecCorrectPtsValue_mpmcl1
     {{}, "cellMP3Sdec", 0x73A2C895, false},        // _SceAdecCorrectPtsValue_Mp3s
-    {{}, "cellCelp8Dec", 0x881583C3, false},       // _SceAdecCorrectPtsValue_Celp8
     {{}, "cellWMAPROdec", 0x8D45F21A, false},      // _SceAdecCorrectPtsValue_WmaPro
     {{}, "cellWMALSLdec", 0xF2F9C183, false},      // _SceAdecCorrectPtsValue_WmaLsl
     {{}, "cellDTSHDCOREdec", 0xD4C180D4, false},   // _SceAdecCorrectPtsValue_DtsHd_Core
@@ -233,12 +231,13 @@ private:
 };
 
 // pspocket's own core that serves a type before any firmware module's: LPCM (D-197), ATRAC3plus on FFmpeg (D-198) and
-// CELP (D-932, compared with libcelpdec's).
+// CELP at 16 and 8 kHz (D-932, compared with libcelpdec's and libcelp8dec's).
 std::unique_ptr<AdecCore> own_first_core(s32 type)
 {
     if (is_lpcm(type)) return make_lpcm_core();
     switch (type) {
     case CELL_ADEC_TYPE_CELP: return make_celp_core();
+    case CELL_ADEC_TYPE_CELP8: return make_celp8_core();
     case CELL_ADEC_TYPE_ATRACX:
     case CELL_ADEC_TYPE_ATRACX_8CH: return make_atracx_core(8);
     case CELL_ADEC_TYPE_ATRACX_2CH: return make_atracx_core(2);

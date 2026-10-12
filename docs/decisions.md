@@ -13984,3 +13984,55 @@ sys_dbg_get_console_type (985).
 A first reading took the table 26 entries early (into a list of exception names) and drew the wrong set; the
 comparison of every well-known call with its handler is the check that the table now starts where it does.
 Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS).
+
+### D-932, part 3: cellCelp8Dec, libcelp8dec's cellAdec core, pspocket's own
+
+libcelp8dec exports its cellAdec core's operation table (g_cell_adec_core_ops_Celp8, NID 0xF0190C6C) and
+_SceAdecCorrectPtsValue_Celp8 (0x881583C3). Its PPU side is libcelpdec's program (part 2) with other numbers; its SPU
+program decodes MPEG-4 CELP's narrowband coder (8 kHz, multi-pulse excitation: NEC's, with Matsushita's 22-bit LSP
+quantiser). pspocket's: adec_celp.cpp now holds both cores, one program with each library's numbers (a Spec), and
+celp_mpe.cpp the 8 kHz decoder (with the reference software's narrowband tables, celp_tables_nb.cpp: inc_lsp22.tbl,
+nec_gain_4m6b2d.tbl, fix_acb_int.tbl, which Sony's program holds unchanged).
+
+What libcelp8dec's core does that libcelpdec's does not:
+- Memory 0x42F00 bytes, version 0x04000000; its own codes: ARG 0x80612EA3, SEQ 0x80612EA4, BUSY 0x80612EA1, the SPU
+  program's failure 0x80612EB1 and SEQ 0x80612EB3; "_c8dm01", "_c8dc01", "_Celp8DecInputThrFunc". getMemSize checks
+  the SPU task's context save area (more than 0x36C00: 0x80612EB1); pspocket's has no task and always answers.
+- StartSeq (CellAdecParamCelp8): excitationMode 0 (MPE), sampleRate 5 (8 kHz), wordSize 0, and a configuration below
+  27 the library's table marks: 0, 2, 6, 9, 12, 15, 18, 21, 24 and 26 (3850, 4650, 5700, 6600, 7300, 8700, 9900,
+  10700, 11800 and 12200 bit/s), else ARG.
+- 16 decoders: the user data's low seven bits at most 15. A unit is the configuration's frame's bits in bytes (20, 24,
+  15, 17, 19, 22, 25, 27, 15 and 16 bytes). The output is always float: four PCM slots of 0x580 bytes (the frame, 80
+  to 320 samples, times 4; the information at +0x500); PCMOUT's PTS correction type 34, the frame 3600, 2700, 1800 or
+  900 ticks.
+
+The SPU program, as celp_mpe.cpp does it bit for bit (each operation in its order, the SPU's single precision): the
+frame's LSP indices, signal mode, RMS index, each subframe's lag, pulse positions and signs and gain index; the LSPs
+decoded and stabilised, interpolated per subframe, into LPC coefficients; each subframe's RMS; the adaptive codebook,
+the pulses, the comb filter and the gains; the synthesis filter. Where it differs from the reference software
+(nec_*.c, pan_*.c, att_lsf2pc.c):
+- Only those ten configurations: no fine rate control, no bandwidth scalability or enhancement layers, no silence
+  compression (the decoder's creation fails). No postfilter and no pitch enhancement.
+- The adaptive codebook's interpolation at a fractional lag takes 10 of the filter's 11 taps (k = -5 to 4).
+- The comb filter's gains are 0.6 and 0.8 (the reference: 19661/32768 and 26214/32768).
+- The RMS: 10^x as 2^(x log2 10) by the SDK's exp2 and log2 (log2 10 computed each frame), nwk / aa as
+  nwk * log10(1 + mu), the logarithms the SDK's log10f4.
+- The gains: gcb * sqrt(power / energy) (frsqest and one step), the power qxnorm^2 * samples * prod(1 - k^2) with the
+  reflection coefficients' product taken innermost first, 1 / (1 - k^2) the SDK's reciprocal times, not a division.
+- The predicted LSPs: (first stage + previous) * 0.5 plus or minus the second stage in one multiply-add (the fifth
+  dimension rounded twice); the stabilisation compares lsp + gap > next.
+- The LSP-to-LPC conversion (order 10) runs both halves' filters side by side in double precision, the last sum
+  ((w1 + x1) + x2) - w2.
+- The access unit's size is not checked (the PPU side does). Muting zeroes, in each subframe, the largest excitation
+  samples: a subframe's eighth in the first muted frame, one more eighth each muted frame in a row, at most three
+  quarters.
+
+Compared: in the scratch harness (Sony's SPU program under pspocket's SPU interpreter, inventory/, never in the
+repository), 6,000 random frames (300 in each configuration, with and without muting): every frame's LSPs, LPC
+coefficients, RMS, excitation, past excitation, synthesis memory and samples: 0 differences. Under cellAdec
+(tests/hle/test_celp_dec_compare.cpp, firmware 4.92), a decoder for each configuration, random units on decoders 0, 5
+and 15, resets, muting, missing PTS, StartSeq again in the middle, refusals (decoders 16 and 127, a unit a byte short
+and long, one before StartSeq, StartSeq's six checks), a unit after EndSeq: pspocket's cellAdec and core against Sony's
+libadec and libcelp8dec, and Sony's libadec on pspocket's core against the same: 0 differences in 1506 lines and 145
+PCM outputs (100,480 bytes) each. pspocket's cellAdec now serves CELP 8 kHz with this core before any firmware module's
+(no longer importing libcelp8dec's exports); test_adec_more.cpp's D-623 test expects it (memory 0x4368F, version 4.0).

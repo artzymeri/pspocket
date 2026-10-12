@@ -84,4 +84,37 @@ struct RpeEncoder {
 // The header libcelpenc's Start writes for a configuration (its SPU program's): 28 bytes.
 u32 rpe_header(u32 configuration, u8* out);
 
+// The narrowband coder (celp_mpe.cpp): MPE_Configuration 0 to 27, the ones Sony's programs take, and each pulse's
+// position bits and candidate positions.
+struct MpeConfig {
+    u32 frame_size, n_subframes, sbfrm_size, n_pulses;
+};
+extern const MpeConfig kMpeConfigs[28];
+bool mpe_supported(u32 configuration);
+bool mpe_pulses(u32 configuration, u32 bit[12], u8 pos[12][80]);
+void lsf_to_lpc10(const float lsf[10], float a[10]);
+void nb_lsp_decode(const u32 idx[5], const float prev[10], float out[10]);
+
+// The narrowband decoder: libcelp8dec's SPU program's state (as its decoder's memory has it) and frame decoding.
+struct MpeDecoder {
+    u32 config = 0;
+    MpeConfig cfg{};
+    u32 bit[12] = {};
+    u8 pos[12][80] = {};
+    float prev_lsp[10] = {}; // the previous frame's LSPs, normalised
+    float lsp[10] = {};      // this frame's
+    float lpc[4][10] = {};   // each subframe's LPC coefficients (the synthesis filter's, newest output first)
+    float exc[320] = {};     // the frame's excitation
+    float qxnorm[4] = {};    // each subframe's RMS
+    float pqxnorm = 0;       // the previous frame's last
+    float mem[230] = {};     // the past excitation (150 samples), then the adaptive codebook's subframe
+    float syn_mem[12] = {};  // the synthesis filter's last outputs, newest first
+    u32 mute_count = 0;      // muted frames in a row
+
+    void reset(u32 configuration);
+    // One frame into frame_size samples (in 16-bit units, unclamped); `mute` the frame's mute flag (the excitation's
+    // largest samples zeroed when not 0). Inside a spu::Scope.
+    void decode(const u8* au, u32 size, u32* consumed, float* y, u32 mute);
+};
+
 } // namespace pspocket::hle::celp
