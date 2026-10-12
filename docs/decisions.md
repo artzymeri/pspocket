@@ -13959,19 +13959,28 @@ after four), as pspocket's cellAdec does. test_adec_more.cpp's D-623 test now ex
 
 What a retail console's lv2 answers is now read from its kernel: lv2_kernel.self of the 4.93 system software (the
 official update's CORE_OS package, decrypted with RPCS3's key table as the other SELFs are, kept in
-inventory/firmware/kernel493 and never committed). Its syscall table (at 0x8000000000363B10, 1,024 descriptors) points
-366 slots at one not-implemented function (lis r3,0x8001; ori r3,r3,3; blr: CELL_ENOSYS). Of the 74 calls the kernel
-chart counted as RPCS3's (null slots answering CELL_OK with nothing written, or stubs), 53 are that slot on retail:
-sys_dbg_mat_set_condition (215); sys_dbg_* 906 to 925, 927, 930, 931, 933, 934, 938, 939, 941 to 957 and 975 (the
-thread, process, SPU, kernel-queue, object-list, scratch, page and exception-handler debugging calls); and the crypto
-engine's create, hasher and cipher calls and random_generate (976, 978 to 982, 984). They are a debug or development
-kernel's: pspocket answers CELL_ENOSYS as the retail kernel does (logged once each), where it answered CELL_OK before.
-No game pspocket has booted calls one (the boot logs record each first call). Sony's liblv2coredump calls two of them
-(909, 954) when it writes a crash dump: on pspocket it now meets what it meets on a retail console.
-The other 21 have handlers of their own on retail (216, 353, 356, 361, 900 to 903, 926, 928, 929, 932, 935 to 937,
-940, 970, 971, 977, 983, 985); they stay null slots until each is ported from the kernel's code (their RPCS3 names do
-not always fit what the code does: 356 checks its size like an address-space allocation, 985 looks a process up and
-checks its authority). Three unnamed slots the retail table also leaves out (958, 972, 974) keep their null slots: the
-name table that bindings are checked against has no name for them.
-Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS) and
-tests/lv2/test_process.cpp (976).
+inventory/firmware/kernel493 and never committed; inventory/firmware/tools/kernel_unself.py). Its syscall table, at
+0x8000000000363BE0 (1,024 function descriptors; the address the PS3 scene documents for 4.xx retail kernels, and the
+one where getpid, the thread, lwmutex, timer, memory and file calls all have handlers), points 392 slots at one
+not-implemented function (lis r3,0x8001; ori r3,r3,3; blr: CELL_ENOSYS). Of the 74 calls the kernel chart counted as
+RPCS3's (null slots answering CELL_OK with nothing written, or stubs), 41 are that slot on retail: the memory access
+trap conditions (215, 216); sys_dbg_continue_processes (901), write_thread_register (907), get_process_list (908),
+spu_thread_write_to_ls (912), kill_process (913); 915 to 932 (the SPU run control and exception cause, the kernel
+event queues, the event control flags, the module and raw SPU lists, the scratch areas, the memory statistics and
+attribute lists, the mutex list); the cond, rwlock, lwmutex, event queue, semaphore, kernel thread and lwcond lists
+(934, 936, 938, 942, 946, 948, 950), the DABR calls (939, 940), the kernel thread information (949), the scratch data
+area extension, page and VM information (952 to 954), the floating-point exception switches (955, 956) and the event
+flag list (970). They are a debug or development kernel's: pspocket answers CELL_ENOSYS as the retail kernel does
+(logged once each), where it answered CELL_OK before. No game pspocket has booted calls one (the boot logs record each
+first call). Sony's liblv2coredump calls sys_dbg_vm_get_info (954) when it writes a crash dump: it now meets what it
+meets on a retail console.
+The other 33 have handlers of their own on retail and stay as they were until each is ported from the kernel's code:
+353, 356 and 361 (the memory statistics and colored allocations), sys_dbg's stop_processes, stop/continue_threads,
+read_thread_register, get_thread_list and get_thread_info, spu_thread_read_from_ls, get_process_info, the mutex,
+cond, rwlock, lwmutex, event queue, semaphore, lwcond and event flag information calls, the PPU exception handler's
+initialize and finalize, get_process_memory_container_information and read_spu_thread_context2 (900, 902, 903, 906,
+909 to 911, 914, 933, 935, 937, 941, 943 to 945, 947, 951, 957, 971, 975), the crypto engine's nine (976 to 984) and
+sys_dbg_get_console_type (985).
+A first reading took the table 26 entries early (into a list of exception names) and drew the wrong set; the
+comparison of every well-known call with its handler is the check that the table now starts where it does.
+Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS).

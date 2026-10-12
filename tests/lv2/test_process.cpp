@@ -216,7 +216,7 @@ TEST_CASE("lv2 process: RPCS3's stub syscalls answer its constant (D-184)", "[lv
     Fixture f;
     Caller c(*f.kernel);
     CHECK(c.call(60, 0, 0) == static_cast<s32>(0x80010003)); // sys_trace_create: CELL_ENOSYS-like constant
-    CHECK(c.call(976, 0) == rc(CELL_ENOSYS));                 // sys_crypto_engine_create: not on retail (D-936)
+    CHECK(c.call(976, 0) == CELL_OK);                         // sys_crypto_engine_create
     CHECK(c.call(119, 0) == rc(CELL_ENOSYS));                 // sys_time_get_rtc: root's (D-527)
     CHECK(c.call(810, f.cstr("/a"), f.cstr("/b")) == rc(CELL_ENOTMOUNTED)); // sys_fs_link: pspocket's own (D-518)
     CHECK(c.call(213, f.cstr("text"), 4) == CELL_OK);         // sys_console_write2 (an alias of sys_console_write)

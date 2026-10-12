@@ -323,16 +323,14 @@ Result retail_absent(std::string_view name)
     return err(CELL_ENOSYS);
 }
 
+
 Result sys_dbg_mat_set_condition(PpuThread&) { return retail_absent("sys_dbg_mat_set_condition"); }
-Result sys_dbg_read_thread_register(PpuThread&) { return retail_absent("sys_dbg_read_thread_register"); }
+Result sys_dbg_mat_get_condition(PpuThread&) { return retail_absent("sys_dbg_mat_get_condition"); }
+Result sys_dbg_continue_processes(PpuThread&) { return retail_absent("sys_dbg_continue_processes"); }
 Result sys_dbg_write_thread_register(PpuThread&) { return retail_absent("sys_dbg_write_thread_register"); }
 Result sys_dbg_get_process_list(PpuThread&) { return retail_absent("sys_dbg_get_process_list"); }
-Result sys_dbg_get_thread_list(PpuThread&) { return retail_absent("sys_dbg_get_thread_list"); }
-Result sys_dbg_get_thread_info(PpuThread&) { return retail_absent("sys_dbg_get_thread_info"); }
-Result sys_dbg_spu_thread_read_from_ls(PpuThread&) { return retail_absent("sys_dbg_spu_thread_read_from_ls"); }
 Result sys_dbg_spu_thread_write_to_ls(PpuThread&) { return retail_absent("sys_dbg_spu_thread_write_to_ls"); }
 Result sys_dbg_kill_process(PpuThread&) { return retail_absent("sys_dbg_kill_process"); }
-Result sys_dbg_get_process_info(PpuThread&) { return retail_absent("sys_dbg_get_process_info"); }
 Result sys_dbg_set_run_control_bit_to_spu(PpuThread&) { return retail_absent("sys_dbg_set_run_control_bit_to_spu"); }
 Result sys_dbg_spu_thread_get_exception_cause(PpuThread&) { return retail_absent("sys_dbg_spu_thread_get_exception_cause"); }
 Result sys_dbg_create_kernel_event_queue(PpuThread&) { return retail_absent("sys_dbg_create_kernel_event_queue"); }
@@ -344,38 +342,29 @@ Result sys_dbg_get_spu_thread_group_event_cntl_flag(PpuThread&) { return retail_
 Result sys_dbg_set_spu_thread_group_event_cntl_flag(PpuThread&) { return retail_absent("sys_dbg_set_spu_thread_group_event_cntl_flag"); }
 Result sys_dbg_get_module_list(PpuThread&) { return retail_absent("sys_dbg_get_module_list"); }
 Result sys_dbg_get_raw_spu_list(PpuThread&) { return retail_absent("sys_dbg_get_raw_spu_list"); }
+Result sys_dbg_initialize_scratch_executable_area(PpuThread&) { return retail_absent("sys_dbg_initialize_scratch_executable_area"); }
 Result sys_dbg_terminate_scratch_executable_area(PpuThread&) { return retail_absent("sys_dbg_terminate_scratch_executable_area"); }
+Result sys_dbg_initialize_scratch_data_area(PpuThread&) { return retail_absent("sys_dbg_initialize_scratch_data_area"); }
+Result sys_dbg_terminate_scratch_data_area(PpuThread&) { return retail_absent("sys_dbg_terminate_scratch_data_area"); }
 Result sys_dbg_get_user_memory_stat(PpuThread&) { return retail_absent("sys_dbg_get_user_memory_stat"); }
 Result sys_dbg_get_shared_memory_attribute_list(PpuThread&) { return retail_absent("sys_dbg_get_shared_memory_attribute_list"); }
-Result sys_dbg_get_mutex_information(PpuThread&) { return retail_absent("sys_dbg_get_mutex_information"); }
+Result sys_dbg_get_mutex_list(PpuThread&) { return retail_absent("sys_dbg_get_mutex_list"); }
 Result sys_dbg_get_cond_list(PpuThread&) { return retail_absent("sys_dbg_get_cond_list"); }
+Result sys_dbg_get_rwlock_list(PpuThread&) { return retail_absent("sys_dbg_get_rwlock_list"); }
 Result sys_dbg_get_lwmutex_list(PpuThread&) { return retail_absent("sys_dbg_get_lwmutex_list"); }
 Result sys_dbg_get_address_from_dabr(PpuThread&) { return retail_absent("sys_dbg_get_address_from_dabr"); }
-Result sys_dbg_get_lwmutex_information(PpuThread&) { return retail_absent("sys_dbg_get_lwmutex_information"); }
+Result sys_dbg_set_address_to_dabr(PpuThread&) { return retail_absent("sys_dbg_set_address_to_dabr"); }
 Result sys_dbg_get_event_queue_list(PpuThread&) { return retail_absent("sys_dbg_get_event_queue_list"); }
-Result sys_dbg_get_event_queue_information(PpuThread&) { return retail_absent("sys_dbg_get_event_queue_information"); }
-Result sys_dbg_initialize_ppu_exception_handler(PpuThread&) { return retail_absent("sys_dbg_initialize_ppu_exception_handler"); }
-Result sys_dbg_finalize_ppu_exception_handler(PpuThread&) { return retail_absent("sys_dbg_finalize_ppu_exception_handler"); }
 Result sys_dbg_get_semaphore_list(PpuThread&) { return retail_absent("sys_dbg_get_semaphore_list"); }
-Result sys_dbg_get_semaphore_information(PpuThread&) { return retail_absent("sys_dbg_get_semaphore_information"); }
 Result sys_dbg_get_kernel_thread_list(PpuThread&) { return retail_absent("sys_dbg_get_kernel_thread_list"); }
 Result sys_dbg_get_kernel_thread_info(PpuThread&) { return retail_absent("sys_dbg_get_kernel_thread_info"); }
 Result sys_dbg_get_lwcond_list(PpuThread&) { return retail_absent("sys_dbg_get_lwcond_list"); }
-Result sys_dbg_get_lwcond_information(PpuThread&) { return retail_absent("sys_dbg_get_lwcond_information"); }
 Result sys_dbg_create_scratch_data_area_ext(PpuThread&) { return retail_absent("sys_dbg_create_scratch_data_area_ext"); }
 Result sys_dbg_vm_get_page_information(PpuThread&) { return retail_absent("sys_dbg_vm_get_page_information"); }
 Result sys_dbg_vm_get_info(PpuThread&) { return retail_absent("sys_dbg_vm_get_info"); }
 Result sys_dbg_enable_floating_point_enabled_exception(PpuThread&) { return retail_absent("sys_dbg_enable_floating_point_enabled_exception"); }
 Result sys_dbg_disable_floating_point_enabled_exception(PpuThread&) { return retail_absent("sys_dbg_disable_floating_point_enabled_exception"); }
-Result sys_dbg_get_process_memory_container_information(PpuThread&) { return retail_absent("sys_dbg_get_process_memory_container_information"); }
-Result sys_dbg_read_spu_thread_context2(PpuThread&) { return retail_absent("sys_dbg_read_spu_thread_context2"); }
-Result sys_crypto_engine_create(PpuThread&) { return retail_absent("sys_crypto_engine_create"); }
-Result sys_crypto_engine_hasher_prepare(PpuThread&) { return retail_absent("sys_crypto_engine_hasher_prepare"); }
-Result sys_crypto_engine_hasher_run(PpuThread&) { return retail_absent("sys_crypto_engine_hasher_run"); }
-Result sys_crypto_engine_hasher_get_hash(PpuThread&) { return retail_absent("sys_crypto_engine_hasher_get_hash"); }
-Result sys_crypto_engine_cipher_prepare(PpuThread&) { return retail_absent("sys_crypto_engine_cipher_prepare"); }
-Result sys_crypto_engine_cipher_run(PpuThread&) { return retail_absent("sys_crypto_engine_cipher_run"); }
-Result sys_crypto_engine_random_generate(PpuThread&) { return retail_absent("sys_crypto_engine_random_generate"); }
+Result sys_dbg_get_event_flag_list(PpuThread&) { return retail_absent("sys_dbg_get_event_flag_list"); }
 
 Result sys_deci3_open(PpuThread&) { return debug_kernel("sys_deci3_open"); }
 Result sys_deci3_create_event_path(PpuThread&) { return debug_kernel("sys_deci3_create_event_path"); }
@@ -626,15 +615,12 @@ void register_misc_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 370, sys_uart_get_params);
     // Not in a retail console's lv2 (D-936).
     PS_LV2_BIND(table, 215, sys_dbg_mat_set_condition);
-    PS_LV2_BIND(table, 906, sys_dbg_read_thread_register);
+    PS_LV2_BIND(table, 216, sys_dbg_mat_get_condition);
+    PS_LV2_BIND(table, 901, sys_dbg_continue_processes);
     PS_LV2_BIND(table, 907, sys_dbg_write_thread_register);
     PS_LV2_BIND(table, 908, sys_dbg_get_process_list);
-    PS_LV2_BIND(table, 909, sys_dbg_get_thread_list);
-    PS_LV2_BIND(table, 910, sys_dbg_get_thread_info);
-    PS_LV2_BIND(table, 911, sys_dbg_spu_thread_read_from_ls);
     PS_LV2_BIND(table, 912, sys_dbg_spu_thread_write_to_ls);
     PS_LV2_BIND(table, 913, sys_dbg_kill_process);
-    PS_LV2_BIND(table, 914, sys_dbg_get_process_info);
     PS_LV2_BIND(table, 915, sys_dbg_set_run_control_bit_to_spu);
     PS_LV2_BIND(table, 916, sys_dbg_spu_thread_get_exception_cause);
     PS_LV2_BIND(table, 917, sys_dbg_create_kernel_event_queue);
@@ -646,38 +632,29 @@ void register_misc_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 923, sys_dbg_set_spu_thread_group_event_cntl_flag);
     PS_LV2_BIND(table, 924, sys_dbg_get_module_list);
     PS_LV2_BIND(table, 925, sys_dbg_get_raw_spu_list);
+    PS_LV2_BIND(table, 926, sys_dbg_initialize_scratch_executable_area);
     PS_LV2_BIND(table, 927, sys_dbg_terminate_scratch_executable_area);
+    PS_LV2_BIND(table, 928, sys_dbg_initialize_scratch_data_area);
+    PS_LV2_BIND(table, 929, sys_dbg_terminate_scratch_data_area);
     PS_LV2_BIND(table, 930, sys_dbg_get_user_memory_stat);
     PS_LV2_BIND(table, 931, sys_dbg_get_shared_memory_attribute_list);
-    PS_LV2_BIND(table, 933, sys_dbg_get_mutex_information);
+    PS_LV2_BIND(table, 932, sys_dbg_get_mutex_list);
     PS_LV2_BIND(table, 934, sys_dbg_get_cond_list);
+    PS_LV2_BIND(table, 936, sys_dbg_get_rwlock_list);
     PS_LV2_BIND(table, 938, sys_dbg_get_lwmutex_list);
     PS_LV2_BIND(table, 939, sys_dbg_get_address_from_dabr);
-    PS_LV2_BIND(table, 941, sys_dbg_get_lwmutex_information);
+    PS_LV2_BIND(table, 940, sys_dbg_set_address_to_dabr);
     PS_LV2_BIND(table, 942, sys_dbg_get_event_queue_list);
-    PS_LV2_BIND(table, 943, sys_dbg_get_event_queue_information);
-    PS_LV2_BIND(table, 944, sys_dbg_initialize_ppu_exception_handler);
-    PS_LV2_BIND(table, 945, sys_dbg_finalize_ppu_exception_handler);
     PS_LV2_BIND(table, 946, sys_dbg_get_semaphore_list);
-    PS_LV2_BIND(table, 947, sys_dbg_get_semaphore_information);
     PS_LV2_BIND(table, 948, sys_dbg_get_kernel_thread_list);
     PS_LV2_BIND(table, 949, sys_dbg_get_kernel_thread_info);
     PS_LV2_BIND(table, 950, sys_dbg_get_lwcond_list);
-    PS_LV2_BIND(table, 951, sys_dbg_get_lwcond_information);
     PS_LV2_BIND(table, 952, sys_dbg_create_scratch_data_area_ext);
     PS_LV2_BIND(table, 953, sys_dbg_vm_get_page_information);
     PS_LV2_BIND(table, 954, sys_dbg_vm_get_info);
     PS_LV2_BIND(table, 955, sys_dbg_enable_floating_point_enabled_exception);
     PS_LV2_BIND(table, 956, sys_dbg_disable_floating_point_enabled_exception);
-    PS_LV2_BIND(table, 957, sys_dbg_get_process_memory_container_information);
-    PS_LV2_BIND(table, 975, sys_dbg_read_spu_thread_context2);
-    PS_LV2_BIND(table, 976, sys_crypto_engine_create);
-    PS_LV2_BIND(table, 978, sys_crypto_engine_hasher_prepare);
-    PS_LV2_BIND(table, 979, sys_crypto_engine_hasher_run);
-    PS_LV2_BIND(table, 980, sys_crypto_engine_hasher_get_hash);
-    PS_LV2_BIND(table, 981, sys_crypto_engine_cipher_prepare);
-    PS_LV2_BIND(table, 982, sys_crypto_engine_cipher_run);
-    PS_LV2_BIND(table, 984, sys_crypto_engine_random_generate);
+    PS_LV2_BIND(table, 970, sys_dbg_get_event_flag_list);
 }
 
 } // namespace pspocket::lv2
