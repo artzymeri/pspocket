@@ -12624,3 +12624,29 @@ at the access units' size.
 Tests: test_vdec_cores_compare.cpp: the comparison (hidden, [compare][vdec-cores]) and a firmware-free test of
 pspocket's core against the values Sony's gave; test_vdec_codecs_compare.cpp "The DivX 3.11 core under Sony's libvdec"
 (hidden, [compare][vdec-cores]).
+
+## D-920 · 2026-10-12 · DecodeAuEx2's access unit in two pieces, as Sony's libvdec's codec parts take it (part 3)
+
+Part 1 left cellVdecDecodeAuEx2 and its twin unverified: compared with the two words of CellVdecAuInfoEx2 that RPCS3
+calls unknown set to 0 only. Those words are the second piece of an access unit (a ring buffer's wrap): the structure
+is the two pieces' addresses, then their sizes, then the PTS, DTS, user data and codec specific data (Sony's DecodeAu
+converts its CellVdecAuInfo to it with no second piece). Read in libvdec's codec parts and compared:
+- **H.264**: libvdec hands both pieces to libavcdec's access unit call, on the game's thread. libavcdec refuses a second
+  piece of no address, and, for a game of SDK 2.4 or later (or of none: libvdec gives libavcdec all ones for a version
+  of 0), pieces past 0x1FFFFF80 bytes together: DecodeAuEx2 answers FATAL and the ring element stays free.
+- **VC-1**: libsvc1d's DecodePicture2 takes the pieces when libvdec's decoder thread decodes the access unit; a second
+  piece needs a first of whole 128-byte blocks and a 16-byte boundary, else it refuses the access unit: ERROR with
+  FATAL and the decoder does nothing more (as D-912's decode mode 3).
+- **MPEG-2** takes both too (libsmvd2's DecodePicture2: not compared, as the rest of MPEG-2); **DivX, DivX 3.11,
+  MPEG-4 part 2 and JVT** give their core the first piece alone.
+pspocket decodes the two pieces as one access unit where Sony's codec part takes them (H.264, VC-1, MPEG-2), with
+libavcdec's and libsvc1d's refusals, and the first piece alone for the others.
+
+Found with it: a decoder stopped by a fatal error (VC-1's) keeps every access unit and flush given to it in its input
+queue, so GetInputStatus shows them (full after four); pspocket dropped them.
+
+Compared (test_vdec_ext_compare.cpp, DecodeAuEx2 now giving odd access units in two pieces, and lives with a second
+piece of no address, a first piece not of whole 128-byte blocks and a second piece off a 16-byte boundary): 0 of 1,115
+(H.264), 1,117 (VC-1), 1,004 (DivX), 1,001 (MPEG-4) and 997 (DivX 3.11) observations differ. DecodeAuEx2 and
+libvdec_652B7BC0 lose their unverified marks (D-594); OpenExt and libvdec_20DA0CFA keep theirs.
+Tests: test_vdec.cpp (the unverified marks; DecodeAuEx2 in two pieces decodes as DecodeAu, and libavcdec's refusals).

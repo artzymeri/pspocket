@@ -27,10 +27,9 @@
 // (tests/hle/test_vdec_ext_compare.cpp): SetFrameRateExt and SetFrameRate's codes, StartSeqExt, GetPicItemExt and
 // GetPicItemEx, GetInputStatus, SetPts, DecodeAuEx2 and its twin export, _cell_vdec_prx_ver; and what they act on: the
 // ring's PTS correction (a picture whose access unit had none gets the last PTS plus the frame durations since) and the
-// information blocks' frame rate codes. cellVdecOpenExt (RPCS3's, D-596: it takes the game's SPURS), MVC's two-view
-// decode (libvdec_20DA0CFA: its dependent view is not decoded) and DecodeAuEx2 with its twin (an access unit's second
-// piece, which Sony's H.264 and VC-1 parts take, is not yet pspocket's) stay unverified (D-594), so a game importing one
-// still gets Sony's whole libvdec where the system software is installed.
+// information blocks' frame rate codes; DecodeAuEx2's access unit in two pieces. cellVdecOpenExt (RPCS3's, D-596: it
+// takes the game's SPURS) and MVC's two-view decode (libvdec_20DA0CFA: its dependent view is not decoded) stay
+// unverified (D-594), so a game importing one still gets Sony's whole libvdec where the system software is installed.
 //
 // Not yet (each fails loudly): VC-1's simple and main profiles (they open, as Sony's, but their access units are not
 // decoded: how libsvc1d is given their sequence header is not known, logged), MVC's views past the base one (FFmpeg
@@ -910,11 +909,12 @@ struct Command {
     s32 mode = 0;
     u32 au_addr = 0, au_size = 0;
     AuMeta meta;
-    // What the decoder is given when it is not the game's access unit as it is (MVC's base view, D-590): au_size
-    // bytes, then FFmpeg's zero padding. Empty with own_data: nothing to decode.
+    // What the decoder is given when it is not the game's access unit as it is (MVC's base view, D-590; an access unit
+    // in two pieces, D-920): au_size bytes, then FFmpeg's zero padding. Empty with own_data: nothing to decode.
     std::vector<u8> data;
     bool own_data = false;
     u32 second_slot = ~0u; // MVC's dependent view's ring element (D-920), freed when the access unit is done
+    bool refused = false;  // VC-1: libsvc1d refuses the access unit's pieces when it takes it (D-920): a fatal error
 };
 
 // The zero bytes FFmpeg reads past a packet's end (AV_INPUT_BUFFER_PADDING_SIZE).
@@ -970,7 +970,6 @@ struct Vdec {
     bool vc1_skip_logged = false;  // the decoder's thread
     bool vc1_other_logged = false; // under m
     bool mvc_logged = false;       // under m
-    bool au_ex2_logged = false;    // under m (D-596)
 #if PSPOCKET_HAVE_FFMPEG
     AVCodecContext* av = nullptr;
 #endif
@@ -1757,21 +1756,23 @@ void run(PPUContext& ctx, Vdec& v)
                     return c.seq != v.seq || v.held.size() + v.out.size() + v.awaiting.size() < v.plan.limit;
                 });
                 if (c.seq != v.seq || v.dead) {
-                    if (v.pending_aus) v.pending_aus--;
+                    // A stopped decoder's access units stay in its input queue (GetInputStatus, D-920).
+                    if (c.seq != v.seq && v.pending_aus) v.pending_aus--;
                     break;
                 }
             }
             u32 au_error = 0;
             bool decoded = false;
-            if (v.codec == CODEC_VC1 && c.mode == (DEC_MODE_B_SKIP | DEC_MODE_PB_SKIP)) {
-                // libsvc1d refuses the mode libvdec takes (B and PB pictures skipped): libvdec reports it as a fatal
-                // error (ERROR, CELL_VDEC_ERROR_FATAL) and its decoder does nothing more (no AUDONE, no SEQDONE).
-                PS_LOG_ERROR(kChan, "decoder {:#x}: VC-1 access unit {} in decode mode 3: refused by the codec, as "
-                                    "Sony's (a fatal error; the decoder stops)", v.handle, c.meta.index);
+            if (v.codec == CODEC_VC1 && (c.mode == (DEC_MODE_B_SKIP | DEC_MODE_PB_SKIP) || c.refused)) {
+                // libsvc1d refuses the mode libvdec takes (B and PB pictures skipped), and an access unit's second piece
+                // it cannot take (D-920): libvdec reports it as a fatal error (ERROR, CELL_VDEC_ERROR_FATAL) and its
+                // decoder does nothing more (no AUDONE, no SEQDONE).
+                PS_LOG_ERROR(kChan, "decoder {:#x}: VC-1 access unit {} {}: refused by the codec, as Sony's (a fatal "
+                                    "error; the decoder stops)", v.handle, c.meta.index,
+                    c.refused ? "in two pieces it cannot take" : "in decode mode 3");
                 {
                     std::lock_guard lk(v.m);
-                    v.dead = true;
-                    if (v.pending_aus) v.pending_aus--;
+                    v.dead = true; // the access unit stays in the input queue, as all after it (GetInputStatus)
                 }
                 callback(ctx, v, MSG_ERROR, CELL_VDEC_ERROR_FATAL);
                 break;
@@ -2208,8 +2209,9 @@ s32 cellVdecEndSeq(PPUContext& ctx, u32 handle)
 enum class AuForm { au, ex2, mvc };
 
 // DecodeAu and its other forms. `second_view`: MVC's dependent view was given (a second ring element, D-920).
+// `addr2`, `size2`: DecodeAuEx2's second piece of the access unit (D-920).
 s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::string& call, AuForm form = AuForm::au,
-    bool second_view = false)
+    bool second_view = false, u32 addr2 = 0, u32 size2 = 0)
 {
     const bool ex2 = form != AuForm::au;
     const std::shared_ptr<Vdec> v = live(ctx, handle);
@@ -2260,6 +2262,37 @@ s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::str
     c.au_addr = ps_read32(base, au_info);
     c.au_size = ps_read32(base, au_info + 4);
     if (!usable(ctx, c.au_addr, c.au_size, "the access unit")) return finish(error(CELL_VDEC_ERROR_ARG), call);
+    // DecodeAuEx2's second piece (D-920): the access unit's rest at another address (a ring buffer's start). Sony's
+    // H.264 and VC-1 parts take it (libavcdec's access unit call and libsvc1d's DecodePicture2 take two pieces), as
+    // MPEG-2's (libsmvd2's DecodePicture2, not compared); the DivX, DivX 3.11, MPEG-4 and JVT parts give their core the
+    // first piece alone. libavcdec refuses a second piece without an address, and (for a game of SDK 2.4 or later, or
+    // of none, as libvdec gives libavcdec its version) pieces past 0x1FFFFF80 bytes: libvdec answers FATAL. libsvc1d
+    // takes a second piece only after a first one of whole 128-byte blocks and at a 16-byte boundary, else it refuses
+    // the access unit when its thread decodes it: a fatal error then.
+    const bool two_pieces = form == AuForm::ex2 && size2 &&
+                            (v->codec == CODEC_AVC || v->codec == CODEC_VC1 || v->codec == CODEC_MPEG2);
+    if (two_pieces && v->codec == CODEC_AVC) {
+        const u32 sdk = thread_of(ctx).kernel.config().sdk_version;
+        const bool limited = (sdk ? sdk : ~0u) >= 0x240000;
+        if (!addr2 || (limited && (c.au_size > 0x1FFFFF80 || size2 > 0x1FFFFF80 - c.au_size))) {
+            PS_LOG_ERROR(kChan, "{}: libavcdec refuses the access unit's second piece ({:#x}, {:#x} bytes)", call,
+                addr2, size2);
+            return finish(error(CELL_VDEC_ERROR_FATAL), call);
+        }
+    }
+    if (two_pieces && v->codec == CODEC_VC1 && (!c.au_size || (c.au_size & 0x7F) || (addr2 & 0xF)))
+        c.refused = true;
+    if (two_pieces && !c.refused) {
+        if (!usable(ctx, addr2, size2, "the access unit's second piece")) return finish(error(CELL_VDEC_ERROR_ARG), call);
+        c.data.assign(base + c.au_addr, base + c.au_addr + c.au_size);
+        c.data.insert(c.data.end(), base + addr2, base + addr2 + size2);
+        c.own_data = true;
+        c.au_size += size2;
+        c.data.resize(c.data.size() + kPacketPadding, 0);
+    }
+    // What the stream's parsers read: the access unit whole.
+    const std::span<const u8> whole = c.own_data ? std::span<const u8>(c.data.data(), c.au_size)
+                                                 : std::span<const u8>(base + c.au_addr, c.au_size);
     c.meta.index = v->next_au++;
     c.meta.seq = v->seq;
     c.meta.pts_upper = ps_read32(base, au_info + 8);
@@ -2270,7 +2303,7 @@ s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::str
     c.meta.attr = mode == DEC_MODE_NORMAL ? 0 : 1;
     const bool mvc = v->codec == CODEC_MVC || v->codec == CODEC_MVC2;
     if (v->codec == CODEC_AVC || v->codec == CODEC_JVT || mvc)
-        scan_avc_au({base + c.au_addr, c.au_size}, c.meta.avc, v->sps); // MVC: the base view's (D-590)
+        scan_avc_au(whole, c.meta.avc, v->sps); // MVC: the base view's (D-590)
     c.meta.sps = v->sps;
     if (mvc) {
         // MVC (D-590): the decoder is given the base view, a copy made now (the game may reuse its buffer).
@@ -2284,14 +2317,14 @@ s32 decode_au(PPUContext& ctx, u32 handle, s32 mode, u32 au_info, const std::str
         c.data.resize(c.data.size() + kPacketPadding, 0);
     }
     if (v->codec == CODEC_MPEG4 || v->codec == CODEC_DIVX) {
-        scan_mpeg4_au({base + c.au_addr, c.au_size}, v->vol);
+        scan_mpeg4_au(whole, v->vol);
         c.meta.vol = v->vol;
     }
     if (v->codec == CODEC_VC1) {
         Vc1Picture pic;
         bool other_profile = false;
         u32 units = 0;
-        scan_vc1_au({base + c.au_addr, c.au_size}, v->vc1, pic, other_profile, units);
+        scan_vc1_au(whole, v->vc1, pic, other_profile, units);
         if (other_profile && !v->vc1_other_logged)
             PS_LOG_ERROR(kChan, "decoder {:#x}: a VC-1 sequence header of the simple or main profile is not decoded "
                                 "(D-589)", v->handle);
@@ -2324,7 +2357,7 @@ s32 cellVdecDecodeAu(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
 
 // ---- OpenExt, RPCS3's and unverified (D-594, D-596): rpcs3/Emu/Cell/Modules/cellVdec.cpp cellVdecOpenExt and the
 // structure RPCS3 calls speculative (cellVdec.h CellVdecResourceExt). SetPts and DecodeAuEx2 (CellVdecAuInfoEx2) are
-// Sony's libvdec's, compared (D-920; DecodeAuEx2 with its second piece not yet).
+// Sony's libvdec's, compared (D-920).
 
 // Open on CellVdecResourceExt: memAddr, memSize, ppuThreadPriority, ppuThreadStackSize, 12 bytes RPCS3 does not know,
 // numOfSpus (at 0x1C). RPCS3 opens with a CellVdecResource of those and an SPU priority of 0 (pspocket's decoder runs
@@ -2358,30 +2391,21 @@ s32 cellVdecSetPts(PPUContext& ctx, u32 handle, u32 pts)
     return finish(lv2::CELL_OK, call);
 }
 
-// DecodeAu on CellVdecAuInfoEx2: startAddr, a word, size, a word, pts, dts, userData, codecSpecificData (0x30 bytes).
-// Sony's libvdec decodes in this form (its DecodeAu converts its CellVdecAuInfo to it, the two words 0) and gives the
-// two words to its codec part (RPCS3 calls them unknown): the DivX, DivX 3.11 and MPEG-4 parts leave them, the H.264
-// and VC-1 parts take them as a second piece of the access unit, its address and size (libavcdec refuses one past its
-// limits: FATAL; D-920). pspocket decodes the first piece as DecodeAu does; the two words are logged once a decoder
-// when they are not 0 (unverified, D-594).
+// DecodeAu on CellVdecAuInfoEx2 (0x30 bytes, D-920): the access unit's two pieces' addresses, then their sizes, then
+// pts, dts, userData, codecSpecificData. Sony's libvdec decodes in this form (its DecodeAu converts its CellVdecAuInfo
+// to it, with no second piece) and hands the pieces to its codec part; RPCS3 calls the second piece's words unknown.
+// The second piece is the access unit's rest (decode_au: which codecs take it, and their refusals).
 s32 cellVdecDecodeAuEx2(PPUContext& ctx, u32 handle, s32 mode, u32 au_info)
 {
     const std::string call = std::format("cellVdecDecodeAuEx2({:#x}, {}, {:#x})", handle, mode, au_info);
     if (!au_info || !usable(ctx, au_info, 0x30, call)) return finish(error(CELL_VDEC_ERROR_ARG), call);
     u8* base = guest_base(ctx);
-    const u32 unknown[2] = {ps_read32(base, au_info + 4), ps_read32(base, au_info + 12)};
-    if (const std::shared_ptr<Vdec> v = live(ctx, handle); v && (unknown[0] || unknown[1])) {
-        std::lock_guard lk(v->m);
-        if (!v->au_ex2_logged)
-            PS_LOG_WARN(kChan, "{}: the words RPCS3 does not know are {:#x} and {:#x}: not used (logged once a decoder)",
-                call, unknown[0], unknown[1]);
-        v->au_ex2_logged = true;
-    }
     StackVar info(ctx, base, 0x28);
     ps_write32(base, info.addr() + 0, ps_read32(base, au_info + 0));
     ps_write32(base, info.addr() + 4, ps_read32(base, au_info + 8));
     for (u32 at = 0; at < 0x20; at += 4) ps_write32(base, info.addr() + 8 + at, ps_read32(base, au_info + 0x10 + at));
-    return decode_au(ctx, handle, mode, info.addr(), call, AuForm::ex2);
+    return decode_au(ctx, handle, mode, info.addr(), call, AuForm::ex2, false, ps_read32(base, au_info + 4),
+        ps_read32(base, au_info + 12));
 }
 
 // libvdec's export 0x652B7BC0 is cellVdecDecodeAuEx2 again (the same code in Sony's libvdec, D-920).
@@ -2539,9 +2563,10 @@ s32 cellVdecSetFrameRate(PPUContext& ctx, u32 handle, s32 frame_rate)
 }
 
 // GetInputStatus(handle, status): libvdec's input queue (access units and EndSeq's flush not yet done by its decoder's
-// thread; H.264's: libavcdec's) as two bytes and a half word: full (four or more: the next DecodeAu is BUSY) 1 0, empty
-// 0 1, else 0 0; then 0. No state is checked (a closed decoder answers as its queue is). MVC: Sony's libvdec reads a
-// word its MVC part never writes (a stack word), then FATAL unless that happens to be 0 to 2: FATAL here, logged.
+// thread; H.264's: libavcdec's; a decoder stopped by a fatal error does none of them any more) as two bytes and a half
+// word: full (four or more: the next DecodeAu is BUSY) 1 0, empty 0 1, else 0 0; then 0. No state is checked (a closed
+// decoder answers as its queue is). MVC: Sony's libvdec reads a word its MVC part never writes (a stack word), then
+// FATAL unless that happens to be 0 to 2: FATAL here, logged.
 s32 cellVdecGetInputStatus(PPUContext& ctx, u32 handle, u32 status)
 {
     const std::string call = std::format("cellVdecGetInputStatus({:#x}, {:#x})", handle, status);
@@ -2592,10 +2617,8 @@ void register_libvdec(Registry& r)
         PS_HLE_FUNC(0x8F6E2CA0, cellVdecGetPicItemEx),
         PS_HLE_FUNC(0x3ACF7FF8, cellVdecGetInputStatus),
         PS_HLE_FUNC(0x3CE2E4F8, cellVdecSetPts),
-        // Compared with Sony's with the two words of CellVdecAuInfoEx2 0 alone: given, Sony's H.264 and VC-1 parts take
-        // them as a second piece of the access unit, which pspocket's does not yet (D-920).
-        PS_HLE_UNVERIFIED(0x1533C6A9, cellVdecDecodeAuEx2),
-        PS_HLE_UNVERIFIED(0x652B7BC0, libvdec_652B7BC0),
+        PS_HLE_FUNC(0x1533C6A9, cellVdecDecodeAuEx2),
+        PS_HLE_FUNC(0x652B7BC0, libvdec_652B7BC0),
         // MVC's two views: the dependent view is not decoded (no MVC decoder, D-590), so not as Sony's (D-594).
         PS_HLE_UNVERIFIED(0x20DA0CFA, libvdec_20DA0CFA),
         // Made from RPCS3, not compared with Sony's libvdec (D-594, D-596).

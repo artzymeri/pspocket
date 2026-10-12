@@ -129,29 +129,59 @@ u32 open_decoder(Run& r, const std::string& what, const Codec& c)
 
 enum class Send { au, ex2, twin };
 
+// How DecodeAuEx2 gives an access unit (CellVdecAuInfoEx2's two pieces, D-920): whole; odd ones in two pieces (H.264
+// and VC-1 cut one of 0x100 bytes or more after whole 128-byte blocks, the second piece at a 16-byte boundary; the
+// others, whose codec parts give their core the first piece alone, get it whole and a second piece of zeros); or a
+// second piece the codec part refuses.
+enum class Pieces { whole, odd_split, no_address, unblocked_first, unaligned_second };
+
 // Access unit `i` of the codec's stream at `at`, with a PTS (none: both words all ones) and DTS: its answer.
 u64 send(Run& r, const std::string& key, u32 handle, const Codec& c, usize i, u32& at, std::optional<u64> pts,
-    Send how = Send::au, u32 mode = 0)
+    Send how = Send::au, u32 mode = 0, Pieces pieces = Pieces::odd_split)
 {
     u8* b = r.b;
     const std::vector<u8>& au = c.aus[i % c.aus.size()];
-    if (at + au.size() > kPicture) at = kStream;
-    std::memcpy(b + at, au.data(), au.size());
+    if (at + 2 * au.size() + 0x200 > kPicture) at = kStream;
+    const u32 size = static_cast<u32>(au.size());
+    const bool cuts = c.codec == CODEC_AVC || c.codec == CODEC_VC1;
+    u32 first = size, second_at = 0, second = 0;
+    if (how != Send::au && pieces == Pieces::odd_split && (i % 2) && (!cuts || size >= 0x100)) {
+        if (cuts) first = (size / 2) & ~0x7Fu;
+        second_at = (at + size + 0x110) & ~0xFu;
+        second = first < size ? size - first : 0x40;
+    } else if (how != Send::au && pieces == Pieces::no_address) {
+        second = 0x40;
+    } else if (how != Send::au && pieces == Pieces::unblocked_first && size >= 0x100) {
+        first = ((size / 2) & ~0x7Fu) - 0x10;
+        second_at = (at + size + 0x110) & ~0xFu;
+        second = size - first;
+    } else if (how != Send::au && pieces == Pieces::unaligned_second && size >= 0x100) {
+        first = (size / 2) & ~0x7Fu;
+        second_at = ((at + size + 0x110) & ~0xFu) + 8;
+        second = size - first;
+    }
+    const u32 at0 = at;
+    std::memcpy(b + at, au.data(), first);
+    if (second_at) {
+        if (first < size) std::memcpy(b + second_at, au.data() + first, size - first);
+        else std::memset(b + second_at, 0, second);
+    }
+    if (first < size || second_at) at = second_at + second;
     const u32 upper = pts ? static_cast<u32>(*pts >> 32) : kNone, lower = pts ? static_cast<u32>(*pts) : kNone;
     if (how == Send::au) {
-        ps_write32(b, kAu + 0, at);
-        ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
+        ps_write32(b, kAu + 0, at0);
+        ps_write32(b, kAu + 4, size);
         ps_write32(b, kAu + 8, upper);
         ps_write32(b, kAu + 12, lower);
         ps_write32(b, kAu + 16, kNone);
         ps_write32(b, kAu + 20, kNone);
         ps_write64(b, kAu + 24, 0x5500 + i);
         ps_write64(b, kAu + 32, 0);
-    } else { // CellVdecAuInfoEx2: startAddr, a word, size, a word, pts, dts, userData, codecSpecificData
-        ps_write32(b, kAuEx + 0, at);
-        ps_write32(b, kAuEx + 4, 0);
-        ps_write32(b, kAuEx + 8, static_cast<u32>(au.size()));
-        ps_write32(b, kAuEx + 12, 0);
+    } else { // CellVdecAuInfoEx2: the two pieces' addresses and sizes, pts, dts, userData, codecSpecificData
+        ps_write32(b, kAuEx + 0, at0);
+        ps_write32(b, kAuEx + 4, second_at);
+        ps_write32(b, kAuEx + 8, first);
+        ps_write32(b, kAuEx + 12, second);
         ps_write32(b, kAuEx + 16, upper);
         ps_write32(b, kAuEx + 20, lower);
         ps_write32(b, kAuEx + 24, kNone);
@@ -159,7 +189,7 @@ u64 send(Run& r, const std::string& key, u32 handle, const Codec& c, usize i, u3
         ps_write64(b, kAuEx + 32, 0x5500 + i);
         ps_write64(b, kAuEx + 40, 0);
     }
-    at = (at + static_cast<u32>(au.size()) + 15) & ~15u;
+    at = (at + size + 15) & ~15u;
     if (how == Send::au) return r.r("cellVdecDecodeAu", {handle, mode, kAu}, key);
     if (how == Send::ex2) return r.r("cellVdecDecodeAuEx2", {handle, mode, kAuEx}, key);
     const std::optional<u64> v = r.side.call_nid(0x652B7BC0, {handle, mode, kAuEx});
@@ -412,6 +442,52 @@ void input_queue(Run& r, const std::string& what, const Codec& c)
     r.r("cellVdecClose", {handle}, what + ": Close");
 }
 
+// DecodeAuEx2 with a second piece its codec part refuses (D-920): an access unit whole, then the refused one, then
+// another whole; the sequence's end and the callbacks. H.264's part refuses at once (FATAL); VC-1's core when its
+// thread decodes it (ERROR, and its decoder does nothing more); the DivX and MPEG-4 parts give their core the first
+// piece alone.
+void pieces_life(Run& r, const std::string& what, const Codec& c, Pieces pieces)
+{
+    if (!selected(what)) return;
+    u8* b = r.b;
+    const u32 handle = open_decoder(r, what, c);
+    if (!handle) return;
+    const auto status = [&](const std::string& when) {
+        std::memset(b + kStatus, 0xEE, 8);
+        r.r("cellVdecGetInputStatus", {handle, kStatus}, what + ": GetInputStatus " + when);
+        r.o.line(what + ": the input status " + when, compare::hex(b + kStatus, 8));
+    };
+    if (r.r("cellVdecStartSeq", {handle}, what + ": StartSeq") == 0) {
+        u32 at = kStream, taken = 0;
+        // The first access unit of the stream's size past 0x100 bytes goes second, cut where its pieces are refused.
+        usize big = 0;
+        while (big + 1 < c.aus.size() && c.aus[big].size() < 0x100) big++;
+        const usize order[3] = {0, big, 2};
+        for (u32 k = 0; k < 3; k++) {
+            const std::string key = std::format("{}: access unit {}", what, k);
+            const u64 got = send(r, key, handle, c, order[k], at, 0x1000 + 0x100 * k, Send::ex2, 0,
+                k == 1 ? pieces : Pieces::whole);
+            if (got == 0)
+                r.o.line(key + ": AUDONE",
+                    wait_until([&] { return count_of(b, 0) + count_of(b, 3) >= k + 1; }, std::chrono::seconds(10))
+                        ? "yes"
+                        : "none");
+            settle(b);
+            take(r, what, handle, c, taken);
+            status(std::format("after access unit {}", k));
+        }
+        r.r("cellVdecEndSeq", {handle}, what + ": EndSeq");
+        r.o.line(what + ": SEQDONE",
+            wait_until([&] { return count_of(b, 2) >= 1; }, std::chrono::seconds(10)) ? "yes" : "none");
+        settle(b);
+        take(r, what, handle, c, taken);
+        status("after the sequence");
+        callbacks(r, what);
+    }
+    r.r("cellVdecClose", {handle}, what + ": Close");
+    status("after Close");
+}
+
 // The lives every codec family goes through.
 void lives(Run& r, const Codec& c)
 {
@@ -457,6 +533,11 @@ void lives(Run& r, const Codec& c)
     life(r, n + ", DecodeAuEx2 and 0x652B7BC0", c,
         {{0x1000, {}, {}, {}, Send::ex2}, {none, {}, {}, {}, Send::twin}, {0x2000, {}, {}, {}, Send::twin},
             {none, {}, {}, {}, Send::ex2}});
+    pieces_life(r, n + ", a second piece with no address", c, Pieces::no_address);
+    if (c.codec == CODEC_AVC || c.codec == CODEC_VC1) { // the others decode the first piece alone: a cut access unit
+        pieces_life(r, n + ", a first piece not of 128-byte blocks", c, Pieces::unblocked_first);
+        pieces_life(r, n + ", a second piece off a 16-byte boundary", c, Pieces::unaligned_second);
+    }
     refusals(r, n + ", refusals", c);
     input_queue(r, n + ", the input queue", c);
 }
