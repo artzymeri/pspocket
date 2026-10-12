@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6527 of 6625 pspocket&#x27;s own (98.5%), 0 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6537 of 6625 pspocket&#x27;s own (98.7%), 0 answered as RPCS3</text>
 <g><title>sys_libc: 1119 own, 0 answered as RPCS3, 0 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -6623,18 +6623,18 @@
 <rect x="747.7" y="433.4" width="7.1" height="5.0" fill="#2da44e"/>
 <rect x="755.4" y="433.4" width="7.1" height="5.0" fill="#2da44e"/>
 </g>
-<g><title>cellCelpEnc: 0 own, 0 answered as RPCS3, 10 not yet, of 10</title>
+<g><title>cellCelpEnc: 10 own, 0 answered as RPCS3, 0 not yet, of 10</title>
 <rect x="771.7" y="315.0" width="22.3" height="25.0" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="772.7" y="316.0" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="779.4" y="316.0" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="786.2" y="316.0" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="772.7" y="321.8" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="779.4" y="321.8" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="786.2" y="321.8" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="772.7" y="327.5" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="779.4" y="327.5" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="786.2" y="327.5" width="6.2" height="5.1" fill="#8c959f"/>
-<rect x="772.7" y="333.3" width="6.2" height="5.1" fill="#8c959f"/>
+<rect x="772.7" y="316.0" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="779.4" y="316.0" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="786.2" y="316.0" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="772.7" y="321.8" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="779.4" y="321.8" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="786.2" y="321.8" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="772.7" y="327.5" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="779.4" y="327.5" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="786.2" y="327.5" width="6.2" height="5.1" fill="#2da44e"/>
+<rect x="772.7" y="333.3" width="6.2" height="5.1" fill="#2da44e"/>
 </g>
 <g><title>cellGameExec: 10 own, 0 answered as RPCS3, 0 not yet, of 10</title>
 <rect x="771.7" y="340.0" width="22.3" height="25.0" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
