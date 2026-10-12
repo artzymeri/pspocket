@@ -40,9 +40,9 @@ public:
 
 #if PSPOCKET_HAVE_FFMPEG
     // Opens FFmpeg's decoder `id` (the frame size for the codecs whose stream has none, DivX 3.11's; else 0), with
-    // `extradata` as its configuration (VC-1's sequence header and entry point). False when there is none or it
-    // refuses (the caller logs).
-    bool open(AVCodecID id, u32 width = 0, u32 height = 0, const std::vector<u8>& extradata = {})
+    // `extradata` as its configuration (VC-1's sequence header and entry point) and `idct` its IDCT (FF_IDCT_*, 0
+    // FFmpeg's choice). False when there is none or it refuses (the caller logs).
+    bool open(AVCodecID id, u32 width = 0, u32 height = 0, const std::vector<u8>& extradata = {}, int idct = 0)
     {
         close();
         const AVCodec* dec = avcodec_find_decoder(id);
@@ -51,6 +51,7 @@ public:
         av_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
         av_->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
         av_->thread_count = 1; // each picture out as soon as FFmpeg has it
+        if (idct) av_->idct_algo = idct;
         if (width && height) {
             av_->width = av_->coded_width = static_cast<int>(width);
             av_->height = av_->coded_height = static_cast<int>(height);

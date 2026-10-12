@@ -1424,10 +1424,10 @@ void write_divx311_info(u8* base, u32 info, const Picture& p)
 }
 
 // CellVdecDivxInfo of DivX (0x20 bytes): RPCS3's fields (rpcs3/Emu/Cell/Modules/cellVdec.h) from the stream's headers
-// as Sony's libdivxdec reports them (the video object layer's aspect ratio code and pixel sizes; the visual object's
-// colour description, 0s without one; the picture structure), the frame rate code (SetFrameRate's during the sequence,
-// else 0), then libdivxdec's own: the frame buffer's address, the size again, two bytes (0, 0x30) and a word (0 or
-// kDivxDamaged).
+// as Sony's libdivxdec reports them (the video object layer's aspect ratio code and pixel sizes; the colour
+// description 0s: libdivxdec does not report the visual object's, D-920; the picture structure), the frame rate code
+// (SetFrameRate's during the sequence, else 0), then libdivxdec's own: the frame buffer's address, the size again, two
+// bytes (0, 0x30) and a word (0 or kDivxDamaged).
 void write_divx_info(u8* base, u32 info, const Picture& p)
 {
 #if PSPOCKET_HAVE_FFMPEG
@@ -1442,10 +1442,7 @@ void write_divx_info(u8* base, u32 info, const Picture& p)
     ps_write8(base, info + 0x06, vol.aspect_ratio_info);
     ps_write8(base, info + 0x07, vol.par_width);
     ps_write8(base, info + 0x08, vol.par_height);
-    ps_write8(base, info + 0x09, vol.colour_description);
-    ps_write8(base, info + 0x0A, vol.colour_description ? vol.colour_primaries : 0);
-    ps_write8(base, info + 0x0B, vol.colour_description ? vol.transfer_characteristics : 0);
-    ps_write8(base, info + 0x0C, vol.colour_description ? vol.matrix_coefficients : 0);
+    for (u32 at = 0x09; at <= 0x0C; at++) ps_write8(base, info + at, 0); // the colour description: none reported
     ps_write8(base, info + 0x0D, !p.interlaced ? 0 : p.top_field_first ? 1 : 2); // FRAME, TOP_BTM, BTM_TOP
     ps_write16(base, info + 0x0E, p.divx_rate_code);
     ps_write32(base, info + 0x10, p.frame);
