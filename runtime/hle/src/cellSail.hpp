@@ -375,6 +375,8 @@ void video_out_format(PPUContext& ctx, u32 e, u32 slot);
 // down (its source closed, its open elementary streams closed, the dmux pipeline closed).
 void prepare_descriptor(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle);
 void close_stream(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle);
+// A descriptor's Close from the control thread (its stream closed, back to added or created).
+void close_descriptor_for(PPUContext& ctx, u32 d);
 // The control thread's messages of the elementary streams (their steps and the OpenEs, ReopenEs and CloseEs calls):
 // true when `code` was one of them.
 bool es_message(PPUContext& ctx, u32 p, u32 code, u32 a, u32 b, u32 c);

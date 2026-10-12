@@ -1570,6 +1570,7 @@ namespace sail {
 // The OpenStream steps the playback reuses (libsail's): a descriptor made ready, a stream taken down.
 void prepare_descriptor(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle) { stream_prepare(ctx, p, d, rec, handle); }
 void close_stream(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle) { stream_close(ctx, p, d, rec, handle); }
+void close_descriptor_for(PPUContext& ctx, u32 d) { close_descriptor(ctx, d, false); }
 
 } // namespace sail
 

@@ -48,6 +48,7 @@ u8 phase(PPUContext& ctx, u32 p) { return r8(ctx, p + kPhase); }
 bool playing(PPUContext& ctx, u32 p) { return static_cast<u8>(phase(ctx, p) - 3) <= 2; }
 bool slot_playing(PPUContext& ctx, u32 slot, u32 state_at) { return static_cast<u8>(r8(ctx, slot + state_at) - 3) <= 2; }
 bool has_next(PPUContext& ctx, u32 p) { return r32(ctx, p + kNextDescriptor) != 0; }
+bool subscribed(PPUContext& ctx, u32 p, u32 major) { return (r64(ctx, p + pl::kEventMask) >> major) & 1; }
 u32 entry(PPUContext& ctx, u32 d, u32 table, u32 stride, u32 i) { return r32(ctx, d + table) + i * stride; }
 
 void inc32(PPUContext& ctx, u32 a, u32 by = 1) { w32(ctx, a, r32(ctx, a) + by); }
@@ -827,7 +828,17 @@ void input_end(PPUContext& ctx, u32 p, u32 d)
         source_session(ctx, p, d, true, false, step(0xCA, rec));
         return;
     }
-    if (mode == 2 && has_next(ctx, p)) later_part(ctx, "the stream repeated into the next descriptor");
+    if (mode == 2 && has_next(ctx, p)) {
+        // On into the next descriptor: made ready first (0xCB), the record at +0x120 running (kind 4).
+        const u32 rec = p + 0x120;
+        std::memset(gb(ctx) + rec, 0, 0x40);
+        w32(ctx, rec, r32(ctx, rec) | 0x20);
+        w64(ctx, rec + 8, 0);
+        w32(ctx, p + kDeferred, rec);
+        w32(ctx, p + kDeferredKind, 4);
+        prepare_descriptor(ctx, p, r32(ctx, p + kNextDescriptor), rec + 0x10, step(0xCB, rec));
+        return;
+    }
     if (mode != 0 && mode != 2) return;
     stream_end(ctx, p, d, p + 0x110, 0, 0);
 }
@@ -1028,6 +1039,84 @@ void descriptor_switch(PPUContext& ctx, u32 p, u32 rec)
     }
     w32(ctx, rec + 4, steps);
     w32(ctx, p + pl::kDescriptorCount, r32(ctx, p + pl::kDescriptorCount) - 1);
+}
+
+// Whether a repeat can go on into the next descriptor without stopping (libsail's): each stream open now must be
+// chosen in the next descriptor and compatible (its dmux part, decoder and renderer's format; user streams need only
+// be chosen), a stream not chosen now must not be chosen next, one chosen but not open need only be compatible.
+bool seamless_next(PPUContext& ctx, u32 p, u32 od, u32 nd)
+{
+    const u32 type = r32(ctx, od + ds::kType);
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kAudio, ds::kAudioStride, i), ne = entry(ctx, nd, ds::kAudio, ds::kAudioStride, i);
+        const u8 o = r8(ctx, oe);
+        if (o == 0 ? r8(ctx, ne) != 0
+                   : (o == 2 && r8(ctx, ne) != 1) || !same_audio_part(ctx, type, oe, ne) ||
+                         !same_audio_decoder(ctx, oe, ne) || !same_audio_format(ctx, oe, ne))
+            return false;
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kVideo, ds::kVideoStride, i), ne = entry(ctx, nd, ds::kVideo, ds::kVideoStride, i);
+        const u8 o = r8(ctx, oe);
+        if (o == 0 ? r8(ctx, ne) != 0
+                   : (o == 2 && r8(ctx, ne) != 1) || !same_video_part(ctx, type, oe, ne) ||
+                         !same_video_decoder(ctx, oe, ne) || !same_video_format(ctx, oe, ne))
+            return false;
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+        const u8 o = r8(ctx, entry(ctx, od, ds::kUser, ds::kUserStride, i)),
+                 n = r8(ctx, entry(ctx, nd, ds::kUser, ds::kUserStride, i));
+        if ((o == 2 && n != 1) || (o == 0 && n != 0)) return false;
+    }
+    return true;
+}
+
+// The repeat's swap to the next descriptor without stopping (libsail's): the dmux pipeline given the next source, each
+// open or chosen stream's old entry chosen again (event 10) and its new entry open (event 9; a user stream's new entry
+// takes the old one's value and the old one is chosen, whatever they were), the old descriptor closed for the player
+// (1, event 5), the next one current (one descriptor fewer), `rec` running (kind 4), the source told of the descriptor
+// (0xCC).
+void seamless_swap(PPUContext& ctx, u32 p, u32 od, u32 nd, u32 rec)
+{
+    w32(ctx, dmux(p) + dmx::kSource, r32(ctx, nd + ds::kSource));
+    for (u32 i = 0; i < r32(ctx, p + pl::kAudioCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kAudio, ds::kAudioStride, i);
+        if (r8(ctx, oe) == 0) continue;
+        w8(ctx, oe, 1);
+        if (subscribed(ctx, p, 10)) {
+            notify_event(ctx, p, 10, 0, i);
+            if (r8(ctx, oe) != 1) continue; // looked at again after the game's handler
+        }
+        w8(ctx, entry(ctx, nd, ds::kAudio, ds::kAudioStride, i), 2);
+        notify_event(ctx, p, 9, 0, i);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kVideoCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kVideo, ds::kVideoStride, i);
+        if (r8(ctx, oe) == 0) continue;
+        w8(ctx, oe, 1);
+        if (subscribed(ctx, p, 10)) {
+            notify_event(ctx, p, 10, 1, i);
+            if (r8(ctx, oe) != 1) continue;
+        }
+        w8(ctx, entry(ctx, nd, ds::kVideo, ds::kVideoStride, i), 2);
+        notify_event(ctx, p, 9, 1, i);
+    }
+    for (u32 i = 0; i < r32(ctx, p + pl::kUserCount); i++) {
+        const u32 oe = entry(ctx, od, ds::kUser, ds::kUserStride, i);
+        w8(ctx, entry(ctx, nd, ds::kUser, ds::kUserStride, i), r8(ctx, oe));
+        w8(ctx, oe, 1);
+        notify_event(ctx, p, 10, 2, i);
+        notify_event(ctx, p, 9, 2, i);
+    }
+    w8(ctx, od + ds::kState, 1);
+    w32(ctx, p + kNextDescriptor, 0);
+    w32(ctx, p + pl::kDescriptorCount, r32(ctx, p + pl::kDescriptorCount) - 1);
+    w32(ctx, p + pl::kCurrentDescriptor, nd);
+    notify_event(ctx, p, 5, od, 0);
+    w32(ctx, p + kDeferred, rec);
+    w32(ctx, p + kDeferredKind, 4);
+    if (const u32 t = r32(ctx, nd + ds::kType); t == 1 || t == 2) container(ctx, nd, "a repeat's source open");
+    source_open(ctx, r32(ctx, nd + ds::kSource), nd, step(0xCC, rec));
 }
 
 // The next descriptor made ready (libsail's): `rec` (0x30 bytes) with its handle, the descriptor's preparation on its
@@ -1809,6 +1898,83 @@ bool play_message(PPUContext& ctx, u32 p, u32 code, s32 result, u32 b, u32 c)
     }
     case 0xBC: case 0xBD: // the next descriptor's stream taken down after a failed switch
         post_completion(ctx, p, error(CELL_SAIL_ERROR_CANCEL), r64(ctx, c + 8));
+        return true;
+    // ---- a repeat into the next descriptor
+    case 0xCB: { // the next descriptor made ready
+        const u32 od = current(ctx, p), nd = r32(ctx, p + kNextDescriptor);
+        if (result < 0) {
+            mark_failed(ctx, c);
+            notify_error(ctx, p, result);
+            w8(ctx, nd + ds::kState, 2);
+            close_descriptor_for(ctx, nd);
+            stream_end(ctx, p, od, p + 0x110, 0, 0);
+            w32(ctx, p + kDeferredKind, 0);
+            w32(ctx, p + kDeferred, 0);
+            if (r32(ctx, c) & 0x1E) run_deferred(ctx, p, od, c);
+            return true;
+        }
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w8(ctx, nd + ds::kState, 3);
+            run_deferred(ctx, p, od, c);
+            return true;
+        }
+        start_info(ctx, nd, 0, p + kStartInfo, false);
+        next_out_formats(ctx, p, nd);
+        if (r32(ctx, od + ds::kSource) == r32(ctx, nd + ds::kSource) &&
+            (r32(ctx, od + ds::kHeader) != r32(ctx, nd + ds::kHeader) || seamless_next(ctx, p, od, nd))) {
+            seamless_swap(ctx, p, od, nd, c);
+            return true;
+        }
+        w32(ctx, p + kDeferredKind, 4);
+        w32(ctx, p + kDeferred, c);
+        stream_end(ctx, p, od, p + 0x110, step(0xCE, c), 0);
+        return true;
+    }
+    case 0xCC: { // the swapped-to descriptor's source told: its session started
+        const u32 d = current(ctx, p);
+        notify_event(ctx, p, 4, d, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w32(ctx, p + kDeferred, 0);
+            w32(ctx, p + kDeferredKind, 0);
+            run_deferred(ctx, p, d, c);
+            return true;
+        }
+        source_session(ctx, p, d, true, false, step(0xCD, c));
+        if (r8(ctx, p + kRepeatSet) && !(r32(ctx, p + kRepeatInfo + 0xC) & 0x10)) w8(ctx, p + kRepeatSet, 0);
+        return true;
+    }
+    case 0xCD: // the swapped-to descriptor's session started
+        w8(ctx, p + kPhase, 4);
+        notify_event(ctx, p, 6, r32(ctx, p + kSession) & 0x3FF, 0);
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) run_deferred(ctx, p, current(ctx, p), c);
+        return true;
+    case 0xCE: // the old stream ended: switched to the next descriptor
+        w32(ctx, p + kDeferredKind, 0);
+        w32(ctx, p + kDeferred, 0);
+        if (r32(ctx, c) & 0x1E) {
+            w8(ctx, r32(ctx, p + kNextDescriptor) + ds::kState, 3);
+            run_deferred(ctx, p, current(ctx, p), c);
+            return true;
+        }
+        std::memset(gb(ctx) + c, 0, 0x40);
+        w32(ctx, c, r32(ctx, c) | 0x20);
+        w64(ctx, c + 0x18, step(0xCF, c));
+        descriptor_switch(ctx, p, c + 0x10);
+        return true;
+    case 0xCF: // the repeat into the next descriptor done
+        if (result < 0) {
+            w8(ctx, p + kPhase, 0);
+            w8(ctx, p + pl::kState, 4);
+            notify_event(ctx, p, 3, 4, 0);
+            w8(ctx, p + pl::kState, 2);
+            notify_event(ctx, p, 3, 2, 0);
+        } else if (r8(ctx, p + kRepeatSet) && !(r32(ctx, p + kRepeatInfo + 0xC) & 0x10)) {
+            w8(ctx, p + kRepeatSet, 0);
+        }
         return true;
     case 0xD0: {
         const u32 d = current(ctx, p);

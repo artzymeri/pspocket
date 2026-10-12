@@ -13140,6 +13140,28 @@ Stop and CloseStream refused until Finalize.
   the call left running), Stop and CloseStream refused, Finalize: 0 differences in three runs; all 35 `[sail]` tests
   pass; a firmware-free test checks its answers on pspocket alone.
 
+## D-919 · 2026-10-12 · cellSail's repeat into the next descriptor, as libsail (part 8)
+
+Repeat mode 2 (SetRepeatMode 2) with a next descriptor (runtime/hle/src/cellSailPlay.cpp): at the source's end of
+input the next descriptor is made ready (as OpenStream does; the record at +0x120 running, kind 4; message 0xCB). A
+refused preparation marks the record, is an error event, takes the next descriptor back to added and closes it, and
+the stream ends as without a repeat. Ready: its start information (no command) and the renderers' formats; when it has
+the same source and either another dmux kind or every stream compatible (an open stream chosen again and its dmux
+part, decoder and renderer format the same; a stream not chosen staying unchosen; user streams only chosen), it is
+swapped to without stopping: the dmux pipeline given its source, each open or chosen stream's old entry chosen again
+(event 10, the old entry looked at again after the game's handler) and its new entry open (event 9; user entries take
+the old ones' values), the old descriptor closed for the player and the next one current (one descriptor fewer), then
+event 5, the source told of the descriptor (0xCC: event 4) and a new session started on it (0xCD: event 6). Otherwise
+the stream ends (0xCE) and the player switches to the next descriptor as Next does (0xCF; a failure leaves the player
+open: state 4, then 2). A call deferred meanwhile runs instead (the next descriptor left opened).
+- **Compared** (tests/hle/test_sail.cpp part 23, `[sail]`): an AU receiver with repeat mode 2: the input's end with a
+  compatible next descriptor (swapped to, a new session, AUs), then with a next descriptor that chooses no streams (the
+  stream ended through Get, switched to); Stop: 0 differences in three runs; all 37 `[sail]` tests pass; a
+  firmware-free test checks its answers on pspocket alone.
+- Still failing loudly with a log: EP skipping (start type 16, libsail's entry point walk), MP4 and AVI streams (the
+  firmware libraries libmp4 and libsail_avi behind their descriptors, demuxing and cancel), and the audio sample rate
+  converter (libapostsrc_mini, audio parameter 32).
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in
