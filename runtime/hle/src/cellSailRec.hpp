@@ -30,6 +30,7 @@
 //   +0x870 the control thread's stack top less 2000 (u64), +0x878 the highest stack pointer the event handler was
 //          called with (u64)
 
+#include <cstdint>
 #include <initializer_list>
 #include <string_view>
 
@@ -62,6 +63,13 @@ using sail::CELL_SAIL_ERROR_UNSUPPORTED_STREAM;
 using sail::CELL_SAIL_ERROR_USING;
 
 inline u16 r16(PPUContext& ctx, u32 a) { return ps_read16(gb(ctx), a); }
+
+// Arithmetic as the PPU does it: a division by zero answers 0 (divwu, divdu: the interpreter's, as RPCS3's).
+inline u32 divu(u32 a, u32 b) { return b ? a / b : 0; }
+inline u64 divu64(u64 a, u64 b) { return b ? a / b : 0; }
+inline s32 divs(s32 a, s32 b) { return b == 0 || (a == INT32_MIN && b == -1) ? 0 : a / b; }
+inline s64 divs64(s64 a, s64 b) { return b == 0 || (a == INT64_MIN && b == -1) ? 0 : a / b; }
+inline u64 sx32(u32 v) { return static_cast<u64>(static_cast<s64>(static_cast<s32>(v))); }
 
 namespace rc {
 constexpr u32 kOpenRecord = 0x400, kOpenSteps = 0x410, kCloseRecord = 0x420, kStopRecord = 0x450,
@@ -97,6 +105,17 @@ constexpr u32 kFeeder = 0x48, kPipeline = 0x50, kConverter = 0x408, kComposerStr
               kP80 = 0x450, kP81 = 0x458;
 }
 
+// A profile (one block from the game's allocator, the control thread's): +0 its state (1 free, 2 a stream uses it), +4
+// OpenStream's a, +8 the path (0x421 bytes, its length at +0x42C), +0x430 OpenStream's b, +0x438 the composer type,
+// +0x43C 1 while the stream parameters are the defaults, +0x440 the composer's delay, +0x444 the buffer size, +0x450
+// the stream parameters, +0x550, +0x554, +0x558 the audio (0x108 bytes each), video (0x220) and user (0x18) parameters,
+// +0x55C the recorder, +0x560 the next profile.
+namespace pf {
+constexpr u32 kState = 0, kPath = 8, kPathLen = 0x42C, kType = 0x438, kDefaults = 0x43C, kDelay = 0x440,
+              kBuffer = 0x444, kBuffer2 = 0x448, kStream = 0x450, kAudio = 0x550, kVideo = 0x554, kUser = 0x558,
+              kRecorder = 0x55C, kNext = 0x560;
+}
+
 // The feeders (0x200 bytes, the game's): the stream's side at +0 (eleven of libsail_rec's own callbacks, their
 // argument the feeder, the recorder at +0x34, the index at +0x30, the state at +0x40), the game's callbacks at +0xC0
 // (audio) or +0xD0 (video) and their argument at +0xEC or +0xFC.
@@ -107,13 +126,48 @@ constexpr u32 kIndex = 0x30, kRecorder = 0x34, kState = 0x40, kAudioDiag = 0x98,
 }
 
 // The game's composer (0x140 bytes): the recorder at +0, the game's 17 callbacks at +4, their argument at +0x48,
-// libsail_rec's composer table at +0x4C, the state at +0x50, the type at +0x54, the streams, two locks ("_saimx0" at
-// +0xB0, "_saimx1" at +0xD0, each an lwmutex and an lwcond).
+// libsail_rec's composer table at +0x4C, the state at +0x50 (1 closed, 2 open, 3 recording, 4 opening, 5 closing, 6
+// starting, 7 stopping), the type at +0x54, the session at +0x58, the streams (counts, and four entries each), the stop's
+// result (+0x98) and the streams still recording (+0x9C), the pending call's handle (+0xA0), the stream parameters
+// (+0xA8), two locks ("_saimx0" at +0xB0 for audio, "_saimx1" at +0xD0 for video and user, each an lwmutex and an
+// lwcond).
 namespace cp {
-constexpr u32 kRecorder = 0, kFuncs = 4, kArg = 0x48, kTable = 0x4C, kState = 0x50, kType = 0x54, kAudioCount = 0x5C,
-              kVideoCount = 0x60, kUserCount = 0x64, kAudio = 0x68, kVideo = 0x78, kUser = 0x88, kPending = 0xA0,
-              kStreamParam = 0xA8, kLockA = 0xB0, kCondA = 0xC8, kLockB = 0xD0, kCondB = 0xE8, kDiag = 0xF4,
-              kDiagArg = 0xF8, kSize = 0x140;
+constexpr u32 kRecorder = 0, kFuncs = 4, kArg = 0x48, kTable = 0x4C, kState = 0x50, kType = 0x54, kSession = 0x58,
+              kAudioCount = 0x5C, kVideoCount = 0x60, kUserCount = 0x64, kAudio = 0x68, kVideo = 0x78, kUser = 0x88,
+              kStopResult = 0x98, kRecording = 0x9C, kPending = 0xA0, kStreamParam = 0xA8, kLockA = 0xB0, kCondA = 0xC8,
+              kLockB = 0xD0, kCondB = 0xE8, kDiag = 0xF4, kDiagArg = 0xF8, kSize = 0x140;
+// The game's callbacks (each a descriptor at kFuncs + 4 * index, none when 0).
+constexpr u32 kMakeup = 0, kCleanup = 1, kOpen = 2, kClose = 3, kStart = 4, kStop = 5, kAddAudio = 7, kAddVideo = 8,
+              kAudioArrived = 9, kVideoArrived = 10, kEndAudio = 11, kEndVideo = 12;
+}
+
+// A stream the composer was given (the composer's stream object, from the size its table asks): the stream entry it
+// belongs to, its index, its state (9 removed, 10 added, 11 ended, 12 recording, 13 ended with nothing left), the
+// parameters the game reads (0x50 bytes at +0x18), its timescale, and its ring of access units (+0x6C the ring, +0x70
+// its size, +0x74 the units in it, +0x78 where the next goes, +0x7C which is read next; the ring itself from +0x80).
+namespace so {
+constexpr u32 kEntry = 0, kIndex = 4, kState = 8, kParams = 0x18, kTimescale = 0x68, kRing = 0x6C, kRingSize = 0x70,
+              kCount = 0x74, kWrite = 0x78, kRead = 0x7C, kRingStart = 0x80;
+constexpr u32 kRemoved = 9, kAdded = 10, kEnded = 11, kRecording = 12, kDone = 13;
+}
+
+// The recorder's composers (+0x770, 0x34 bytes): the composer tables by type (four) and their arguments, the instance of
+// the one in use (its open's allocation), the stream entries given to it (a list linked at +0x14) and their number, the
+// type in use (-1 none), the recorder.
+namespace cs {
+constexpr u32 kTables = 0, kArgs = 0x10, kInstance = 0x20, kStreams = 0x24, kCount = 0x28, kType = 0x2C,
+              kRecorder = 0x30, kSize = 0x34;
+// A composer table's functions (each a descriptor at 4 * index).
+constexpr u32 kMakeup = 0, kCleanup = 1, kInstanceSize = 2, kStreamSize = 3, kOpen = 4, kClose = 5, kAddAudio = 6,
+              kAddVideo = 7, kAddUser = 8, kRemoveAudio = 9, kRemoveVideo = 10, kRemoveUser = 11, kStart = 12,
+              kStop = 13, kEndAudio = 14, kEndVideo = 15, kEndUser = 16, kNothing = 17, kCapacity = 18, kAudioAu = 19,
+              kVideoAu = 20, kUserAu = 21, kCompleted = 22, kReleased = 23;
+}
+
+// A stream entry (0x1C bytes in a slot: audio +0x278, video +0x410): the units the composer can still take, the
+// composer's stream object, the pipeline, a flag, the next entry of the composers' list.
+namespace se {
+constexpr u32 kCapacity = 0, kObject = 8, kPipeline = 0xC, kFlag = 0x10, kNext = 0x14, kSize = 0x1C;
 }
 
 // A video converter (0x100 bytes from the game's allocator, after the conversion's work area): the next converter of
@@ -196,5 +250,79 @@ void destroy_converters(PPUContext& ctx, u32 rec);
 void converter_done(PPUContext& ctx, u32 converter, u32 result);
 void converter_notified(PPUContext& ctx, u32 converter);
 s32 converter_start_next(PPUContext& ctx, u32 converter);
+
+// ------------------------------------------------------------------------------------------------- D-918 part 6 on
+
+// One of libsail_rec's internal functions (a registered internal function of cellSailRec) as a guest descriptor.
+u32 internal(std::string_view name);
+
+// sysPrxForUser's strncpy and strlen on guest memory, as libsail_rec calls them.
+void guest_strncpy(PPUContext& ctx, u32 dst, u32 src, u32 n);
+u32 guest_strlen(PPUContext& ctx, u32 s);
+
+// The command the game waits on completed (event 2, when it is the one pending at +0x500).
+void command_completed(PPUContext& ctx, u32 rec, u32 command, s32 result);
+
+// The streams (cellSailRecStream.cpp): the control thread's messages 5 (OpenStream), 7 (CloseStream), 9 (Start), 0xB
+// (Stop), 0xC (the composer's flushing stop), 0x2E (a composer's session error); everything closed or stopped; and
+// Finalize's stop by the state.
+void open_stream(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void close_stream(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void start(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void stop(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void stop_flush(PPUContext& ctx, u32 rec, u32 block, u32 record);
+void composer_session_error(PPUContext& ctx, u32 rec, u32 err);
+void close_all(PPUContext& ctx, u32 rec, u32 record, u64 parent);
+void stop_all(PPUContext& ctx, u32 rec, u32 record, u32 flag, u64 parent);
+void finalize_by_state(PPUContext& ctx, u32 rec);
+s32 profile_composer_release(PPUContext& ctx, u32 rec, u32 profile);
+
+// The composers (cellSailRecCompose.cpp; `cs` the recorder's +0x770): register and unregister a composer table by
+// type, reset, and each step through the table of the composer in use (each ends with a completion for `handle`).
+s32 composer_register(PPUContext& ctx, u32 cs, u32 type, u64 table, u32 arg);
+s32 composer_unregister(PPUContext& ctx, u32 cs, u32 type, u32 table_out, u32 arg_out);
+void composers_reset(PPUContext& ctx, u32 cs, u32 rec);
+void composer_completed(PPUContext& ctx, u32 cs, s32 status);
+void composer_open(PPUContext& ctx, u32 cs, u32 type, u32 path, u32 profile_type, u64 handle);
+void composer_close(PPUContext& ctx, u32 cs, u64 handle);
+void composer_remove(PPUContext& ctx, u32 cs, u32 entry, u64 handle, bool video);
+void composer_free_stream(PPUContext& ctx, u32 cs, u32 entry);
+void composer_detach_instance(PPUContext& ctx, u32 cs);
+void composer_add(PPUContext& ctx, u32 cs, u32 entry, u32 params, u32 pipeline, u32 flag, u64 handle, bool video);
+void composer_start(PPUContext& ctx, u32 cs, u32 path, u32 session, u64 handle);
+void composer_stop(PPUContext& ctx, u32 cs, u32 flag, u64 handle);
+void composer_end(PPUContext& ctx, u32 cs, u32 entry, u64 handle, bool video);
+void composer_capacity(PPUContext& ctx, u32 cs, u32 entry);
+void composer_released(PPUContext& ctx, u32 cs, u32 entry, u32 n);
+s32 composer_au(PPUContext& ctx, u32 cs, u32 entry, u32 au, bool video);
+// The game's composer: attached at OpenStream (its makeup, registered), detached at the close (unregistered, its
+// cleanup), and cellSailComposerNotifyCallCompleted's work.
+s32 composer_attach(PPUContext& ctx, u32 composer, u32 rec, u32 cs);
+void composer_detach(PPUContext& ctx, u32 composer, u32 cs);
+u64 composer_notify_completed(PPUContext& ctx, u64 composer, s32 result);
+// The MP4 composer (type 1, libmp4's): made or counted at OpenStream with its modules loaded; destroyed by libmp4.
+s32 mp4_composer_attach(PPUContext& ctx, u32 rec);
+void mp4_composer_destroy(PPUContext& ctx, u32 rec, u32 mp4);
+
+// The feeders' stream side (cellSailRecFeed.cpp): each step on the feeder `f` ends with a completion for `handle`.
+void feeder_audio_open(PPUContext& ctx, u32 f, u32 pipeline, u32 slot, u32 format, u64 handle);
+void feeder_video_open(PPUContext& ctx, u32 f, u32 pipeline, u32 slot, u32 format, u64 handle);
+void feeder_audio_start(PPUContext& ctx, u32 f, u32 session, u64 start, u64 end, u64 handle);
+void feeder_video_start(PPUContext& ctx, u32 f, u32 session, u64 start, u64 end, u64 handle);
+void feeder_audio_stop(PPUContext& ctx, u32 f, u32 flag, u64 end, u64 handle);
+void feeder_video_stop(PPUContext& ctx, u32 f, u32 flag, u64 end, u64 handle);
+void feeder_audio_close(PPUContext& ctx, u32 f, u64 handle);
+void feeder_video_close(PPUContext& ctx, u32 f, u64 handle);
+
+// The pipelines (cellSailRecAudio.cpp, cellSailRecVideo.cpp; `p` a slot's +0x50).
+void audio_pipeline_start(PPUContext& ctx, u32 p, u64 handle);
+void audio_pipeline_stop(PPUContext& ctx, u32 p, u32 flag, u64 handle);
+void audio_pipeline_close(PPUContext& ctx, u32 p, u64 handle);
+void video_pipeline_start(PPUContext& ctx, u32 p, u32 slot, u32 params, u64 handle);
+void video_pipeline_stop(PPUContext& ctx, u32 p, u32 flag, u64 handle);
+void video_pipeline_close(PPUContext& ctx, u32 p, u64 handle);
+
+// The recorder's clock (+0x710 in mode 0): reset at each Start.
+void clock_reset(PPUContext& ctx, u32 clock);
 
 } // namespace pspocket::hle::sailrec

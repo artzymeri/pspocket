@@ -156,6 +156,23 @@ void write_code(u8* b)
     c.emit(as::stw(8, 0, 7));
     c.emit(as::lwz(3, 0, 2));
     c.emit(as::blr());
+    while (c.pc() < kCode + 0x600) c.emit(as::nop());
+    // the full recording callback: a record {its TOC (r2, which names it), r3, r4, r5}, the word at r2 its answer
+    c.emit(as::lis(7, static_cast<s32>(kEvents >> 16)));
+    c.emit(as::ori(7, 7, kEvents & 0xFFFF));
+    c.emit(as::lwz(8, 0, 7));
+    c.emit(as::andi_(10, 8, kEventRecs));
+    c.emit(as::slwi(10, 10, 5));
+    c.emit(as::add(10, 10, 7));
+    c.emit(as::std_(2, 16, 10));
+    c.emit(as::std_(3, 24, 10));
+    c.emit(as::std_(4, 32, 10));
+    c.emit(as::std_(5, 40, 10));
+    c.emit(as::lwsync());
+    c.emit(as::addi(8, 8, 1));
+    c.emit(as::stw(8, 0, 7));
+    c.emit(as::lwz(3, 0, 2));
+    c.emit(as::blr());
     const std::vector<u8> code = c.finish();
     std::memcpy(b + kCode, code.data(), code.size());
     ps_write32(b, kAllocDesc, kCode);
@@ -270,12 +287,19 @@ struct H : Half<> {
             o.line(std::format("{}: allocator {}", key, allocs_seen),
                 std::format("{} {:#x} {:#x} {:#x}", r32(at), r32(at + 4), r32(at + 8), r32(at + 12)));
         }
+        // A step's handle a callback is given (a record in the recorder or in its block from the heap, << 32) carries
+        // a continuation's descriptor: each half's own code (its low word masked).
+        const auto handle = [](u64 v) {
+            const u64 hi = v >> 32;
+            return (hi >= kRec && hi < kRec + 0x2000) || (hi >= kHeap && hi < kHeapEnd) ? (v & ~u64{0xFFFFFFFF}) | 0x5A5A5A5A
+                                                                                        : v;
+        };
         const u32 ne = r32(kEvents);
         for (; events_seen < ne; events_seen++) {
             const u32 at = kEvents + 16 + 32 * (events_seen & kEventRecs);
             o.line(std::format("{}: event {}", key, events_seen),
-                std::format("{:#x} {:#x} {:#x} {:#x}", ps_read64(b, at), ps_read64(b, at + 8), ps_read64(b, at + 16),
-                    ps_read64(b, at + 24)));
+                std::format("{:#x} {:#x} {:#x} {:#x}", ps_read64(b, at), ps_read64(b, at + 8),
+                    handle(ps_read64(b, at + 16)), handle(ps_read64(b, at + 24))));
         }
     }
 
@@ -1413,6 +1437,217 @@ void script_converters(H& h)
     finish_spurs(h);
 }
 
+// ------------------------------------------------------------------------------------------------- streams
+
+constexpr u32 kComposerFuncs = kBoot + 0x800;   // the game's composer's 17 callbacks
+constexpr u32 kComposerDescs = kBoot + 0x900;   // their descriptors (the full recording callback, TOC: its answer)
+constexpr u32 kComposerAnswers = kBoot + 0xA00; // and their answers
+
+// The composer's callbacks: callback i the full recording callback named by its answer word (answering 0); the
+// reserved 13 to 15 none.
+void tagged_composer(H& h)
+{
+    for (u32 i = 0; i < 17; i++) {
+        const u32 d = kComposerDescs + 8 * i;
+        h.w32(d, kCode + 0x600);
+        h.w32(d + 4, kComposerAnswers + 4 * i);
+        h.w32(kComposerAnswers + 4 * i, 0);
+        h.w32(kComposerFuncs + 4 * i, i >= 13 && i <= 15 ? 0 : d);
+    }
+}
+u32 composer_answer(u32 callback) { return kComposerAnswers + 4 * callback; }
+// The composer's callback `i` in place (the composer copies its callbacks: these are the composer's own words).
+void composer_callback(H& h, u32 i, bool present) { h.w32(kComposer + 4 + 4 * i, present ? kComposerDescs + 8 * i : 0); }
+
+// Waits (10 s at most) for the composer's callback `i` to have been called since the last look at the records.
+void wait_callback(H& h, u32 i, const std::string& what)
+{
+    for (int n = 0; n < 10000; n++) {
+        for (u32 k = h.events_seen; k < h.r32(kEvents); k++)
+            if (ps_read64(h.b, kEvents + 16 + 32 * (k & kEventRecs)) == composer_answer(i)) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    FAIL(what << ": the composer's callback " << i << " was not called");
+}
+
+// A recorder with streams: what booted() masks, and each record's handle's continuation (the low word: each half's own
+// code), the composers table's game composer table (libsail_rec's, or pspocket's).
+void streams_recorder(H& h, const std::string& key)
+{
+    std::vector<u8> v(h.b + kRec, h.b + kRec + 0x2000);
+    for (const auto& [off, n] : std::vector<std::pair<u32, u32>>{{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4},
+             {0x510, 4}, {0x518, 8}, {0x580, 4}, {0x5F0, 8}, {0x730, 4}, {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3},
+             {0x870, 16}, {0x40C, 4}, {0x41C, 4}, {0x42C, 4}, {0x45C, 4}, {0x46C, 4}, {0x47C, 4}, {0x48C, 4},
+             {0x77C, 4}})
+        for (u32 i = 0; i < n; i++) v[off + i] = 0x5A;
+    h.o.bytes(key + ": the recorder", std::move(v));
+}
+// The game's composer (its table, its lock's sleep queues and the pending handle's continuation masked) and the
+// instance the recorder holds for it.
+void streams_composer(H& h, const std::string& key)
+{
+    h.mem(key + ": the composer", kComposer, 0x140, {{0x4C, 4}, {0xA4, 4}, {0xC0, 4}, {0xCC, 4}, {0xE0, 4}, {0xEC, 4}});
+    const u32 instance = h.r32(kRec + 0x790);
+    if (instance >= kHeap && instance < kHeapEnd) h.mem(key + ": the instance", instance, 0x10);
+    else h.o.line(key + ": the instance", std::format("{:#x}", instance));
+}
+
+// A booted recorder without audio or video streams (`user` user streams), the game's composer registered.
+void boot_streams(H& h, u32 user)
+{
+    tagged_composer(h);
+    attribute(h, 0, 0, 0, user);
+    REQUIRE(h.call("Initialize", "cellSailRecorderInitialize", {kRec, kAllocObj, kHandlerDesc, 0x77, kAttr, kRes}) == 0);
+    h.call("ComposerInitialize", "cellSailComposerInitialize", {kComposer, kComposerFuncs, 0x5A5A});
+    h.call("RegisterComposer(3)", "cellSailRecorderRegisterComposer", {kRec, 3, kComposer});
+    h.call("Boot", "cellSailRecorderBoot", {kRec, 0x99});
+    wait_event(h, u64{2} << 32 | 0x20, "Boot");
+    wait_idle(h, "Boot");
+    h.logs("Boot");
+}
+
+// Writes a path into the arguments' area (kArgs + 0x800, at most 0x7FF bytes) and gives its address.
+u32 path_arg(H& h, const std::string& path)
+{
+    const u32 at = kArgs + 0x800;
+    std::memset(h.b + at, 0, 0x800);
+    std::memcpy(h.b + at, path.data(), std::min<usize>(path.size(), 0x7FF));
+    return at;
+}
+
+// OpenStream on `profile` with `path`; the composer's open completed by the script with `open_result` when the
+// composer has its open callback (and its close callback after a failed open); the command's completion awaited.
+void open_round(H& h, const std::string& k, u32 profile, const std::string& path, bool callbacks, u32 open_result)
+{
+    const u32 p = path_arg(h, path);
+    h.call(k + ": OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 0x11, p, 0x22, 0x33, 0x4455});
+    if (callbacks) {
+        wait_callback(h, 2, k + ": the composer's open");
+        h.call(k + ": NotifyCallCompleted(open)", "cellSailComposerNotifyCallCompleted",
+            {kComposer, static_cast<u64>(static_cast<s64>(static_cast<s32>(open_result)))});
+        if (static_cast<s32>(open_result) < 0) {
+            wait_callback(h, 3, k + ": the composer's close");
+            h.call(k + ": NotifyCallCompleted(close)", "cellSailComposerNotifyCallCompleted", {kComposer, 0});
+        }
+    }
+    wait_event(h, u64{2} << 32 | 0x21, k + ": OpenStream's completion");
+    wait_idle(h, k + ": OpenStream");
+    h.logs(k + ": OpenStream");
+    streams_recorder(h, k + ": OpenStream");
+    streams_composer(h, k + ": OpenStream");
+    h.mem(k + ": OpenStream: the profile", profile, 0x1000 + 0x200);
+}
+
+void close_round(H& h, const std::string& k, u32 profile, bool callbacks)
+{
+    h.call(k + ": CloseStream", "cellSailRecorderCloseStream", {kRec, 0x6677});
+    if (callbacks) {
+        wait_callback(h, 3, k + ": the composer's close");
+        h.call(k + ": NotifyCallCompleted(close)", "cellSailComposerNotifyCallCompleted", {kComposer, 0});
+    }
+    wait_event(h, u64{2} << 32 | 0x22, k + ": CloseStream's completion");
+    wait_idle(h, k + ": CloseStream");
+    h.logs(k + ": CloseStream");
+    streams_recorder(h, k + ": CloseStream");
+    streams_composer(h, k + ": CloseStream");
+    h.mem(k + ": CloseStream: the profile", profile, 0x1000 + 0x200);
+}
+
+// OpenStream and CloseStream on a recorder without audio or video streams through the game's composer: its callbacks
+// answered by the script (and an open that fails), none, the paths; the commands' refusals around them; DumpImage of
+// an open stream; Finalize of a recorder with its stream open.
+void script_streams(H& h)
+{
+    h.tr.lightweight = false;
+    make_spurs(h);
+    boot_streams(h, 1);
+    const u32 out = kArgs + 0x400;
+    h.w32(out, 0xEEEEEEEE);
+    h.call("CreateProfile(3)", "cellSailRecorderCreateProfile", {kRec, 3, out});
+    const u32 profile = h.r32(out);
+    h.o.line("the profile's place", std::format("{:#x}", profile - kHeap));
+    h.logs("CreateProfile(3)");
+    h.call("CloseStream before OpenStream", "cellSailRecorderCloseStream", {kRec, 1});
+    h.call("Start before OpenStream", "cellSailRecorderStart", {kRec, 0, kArgs, 2});
+    h.call("Stop before OpenStream", "cellSailRecorderStop", {kRec, 0, 3});
+    open_round(h, "callbacks", profile, "/dev_hdd0/game/REC", true, 0);
+    // An open stream: DumpImage with the profile; the commands refused.
+    std::memset(h.b + kDump, 0xEE, 0x2000);
+    h.call("DumpImage of an open stream", "cellSailRecorderDumpImage", {kRec, kDump, 0x2000});
+    // The image: the version at +0, the flag at +0x40, the recorder's first 0x880 bytes at +0x80 (masked as above),
+    // the profile at +0x900, its user parameters at +0xE80.
+    h.mem("DumpImage of an open stream: the image", kDump, 0x2000, {{0x80 + 0x40C, 4}, {0x80 + 0x41C, 4},
+        {0x80 + 0x42C, 4}, {0x80 + 0x4A0, 8}, {0x80 + 0x4BC, 8}, {0x80 + 0x4F0, 4}, {0x80 + 0x4FC, 4}, {0x80 + 0x510, 4},
+        {0x80 + 0x518, 8}, {0x80 + 0x580, 4}, {0x80 + 0x5F0, 8}, {0x80 + 0x730, 4}, {0x80 + 0x77C, 4}, {0x80 + 0x7AC, 4},
+        {0x80 + 0x7B4, 20}, {0x80 + 0x7D0, 12}, {0x80 + 0x870, 16}});
+    h.call("OpenStream while open", "cellSailRecorderOpenStream", {kRec, profile, 1, path_arg(h, "/x"), 2, 3, 4});
+    h.call("CreateProfile(1) while open", "cellSailRecorderCreateProfile", {kRec, 1, out});
+    const u32 profile2 = h.r32(out);
+    h.call("OpenStream on another profile while open", "cellSailRecorderOpenStream",
+        {kRec, profile2, 1, path_arg(h, "/x"), 2, 3, 4});
+    h.call("DestroyProfile(the second)", "cellSailRecorderDestroyProfile", {kRec, profile2});
+    std::memset(h.b + kArgs + 0x100, 0, 0x40);
+    h.w32(kArgs + 0x100, 0x17);
+    h.call("Start(size 0x17)", "cellSailRecorderStart", {kRec, kArgs + 0x100, path_arg(h, "a.mp4"), 5});
+    h.w32(kArgs + 0x100, 0x18);
+    h.w32(kArgs + 0x104, 1);
+    h.call("Start(word 1 set)", "cellSailRecorderStart", {kRec, kArgs + 0x100, path_arg(h, "a.mp4"), 5});
+    h.mem("Start refused: its parameter", kArgs + 0x100, 0x18);
+    h.call("Stop while open", "cellSailRecorderStop", {kRec, 0, 6});
+    h.logs("refusals");
+    streams_recorder(h, "refusals");
+    close_round(h, "callbacks", profile, true);
+    h.call("CloseStream when closed", "cellSailRecorderCloseStream", {kRec, 1});
+    // The composer's open failing: everything closed again, OpenStream's completion CANCEL.
+    open_round(h, "open failing", profile, "/dev_hdd0/x/", true, 0x80610777);
+    // Without the composer's open and close callbacks: completed at once; the paths.
+    composer_callback(h, 2, false);
+    composer_callback(h, 3, false);
+    for (const auto& [name, path] : std::vector<std::pair<std::string, std::string>>{{"no path", ""},
+             {"a path with its slash", "/dev_hdd0/rec/"}, {"a long path", std::string(0x430, 'p')},
+             {"a path of 0x41F", std::string(0x41F, 'q')}, {"a path of 0x420", std::string(0x420, 'r')}}) {
+        open_round(h, name, profile, path, false, 0);
+        close_round(h, name, profile, false);
+    }
+    // Finalize with the stream open: closed, then the loop ends.
+    open_round(h, "open at the end", profile, "/dev_hdd0/end", false, 0);
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    h.mem("Finalize: the recorder", kRec, 0x2000, {{0x4A0, 8}, {0x4BC, 8}, {0x4F0, 4}, {0x4FC, 4}, {0x518, 8},
+        {0x580, 4}, {0x5F0, 8}, {0x7AC, 4}, {0x7B4, 4 * 5}, {0x7D0, 4 * 3}, {0x870, 16}, {0x40C, 4}, {0x41C, 4},
+        {0x42C, 4}, {0x45C, 4}, {0x46C, 4}, {0x47C, 4}, {0x48C, 4}, {0x77C, 4}});
+    streams_composer(h, "Finalize");
+    finish_spurs(h);
+}
+
+// A recorder with every event unsubscribed: OpenStream and CloseStream complete with no event (the control thread's
+// state awaited instead).
+void script_streams_quiet(H& h)
+{
+    h.tr.lightweight = false;
+    make_spurs(h);
+    boot_streams(h, 0);
+    for (u64 e = 0; e < 12; e++) h.call(std::format("UnsubscribeEvent({})", e), "cellSailRecorderUnsubscribeEvent", {kRec, e});
+    composer_callback(h, 2, false);
+    composer_callback(h, 3, false);
+    const u32 out = kArgs + 0x400;
+    h.call("CreateProfile(3)", "cellSailRecorderCreateProfile", {kRec, 3, out});
+    const u32 profile = h.r32(out);
+    h.call("OpenStream", "cellSailRecorderOpenStream", {kRec, profile, 1, path_arg(h, "/q"), 2, 3, 4});
+    for (int i = 0; i < 10000 && h.r32(kRec + 0x704) != 4; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    wait_idle(h, "OpenStream");
+    h.logs("OpenStream");
+    streams_recorder(h, "OpenStream");
+    h.call("CloseStream", "cellSailRecorderCloseStream", {kRec, 5});
+    for (int i = 0; i < 10000 && h.r32(kRec + 0x704) != 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    wait_idle(h, "CloseStream");
+    h.logs("CloseStream");
+    streams_recorder(h, "CloseStream");
+    h.call("Finalize", "cellSailRecorderFinalize", {kRec});
+    h.logs("Finalize");
+    finish_spurs(h);
+}
+
 Observed half_initialize(const Setup& s, bool sony)
 {
     H h(s, sony);
@@ -1466,6 +1701,20 @@ Observed half_boot(const Setup& s, bool sony)
 {
     H h(s, sony);
     script_boot(h);
+    return std::move(h.o);
+}
+
+Observed half_streams(const Setup& s, bool sony)
+{
+    H h(s, sony, true);
+    script_streams(h);
+    return std::move(h.o);
+}
+
+Observed half_streams_quiet(const Setup& s, bool sony)
+{
+    H h(s, sony, true);
+    script_streams_quiet(h);
     return std::move(h.o);
 }
 
@@ -1552,4 +1801,16 @@ TEST_CASE("cellSailRec against Sony's libsail_rec: video converters' conversions
             CHECK(o.value("4 to 1: CreateVideoConverter") == "0x0");
             CHECK(o.value("4 to 1: results") == "2");
         });
+}
+
+TEST_CASE("cellSailRec against Sony's libsail_rec: streams through the game's composer", "[hle][lle][compare][sailrec]")
+{
+    const Setup s = setup();
+    run(s, "cellSailRec: OpenStream and CloseStream", [&](bool sony) { return half_streams(s, sony); },
+        [](const Observed& o) {
+            CHECK(o.value("callbacks: OpenStream") == "0x0");
+            CHECK(o.value("OpenStream while open") == "0x80610702");
+        });
+    run(s, "cellSailRec: streams with no event", [&](bool sony) { return half_streams_quiet(s, sony); },
+        [](const Observed&) {});
 }

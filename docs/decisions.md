@@ -12730,3 +12730,53 @@ Found by the comparison: kind 2's argument (above). The comparison's pspocket ha
 itself: the loader's link_host_imports passes over a firmware-first library's, whose firmware module imports for
 itself. The streams (OpenStream, CloseStream, Start, Stop and their messages, the pipelines, encoders and composers)
 are the later parts, so cellSailRec stays firmware-first.
+
+### D-918, part 6: cellSailRec's streams over the composers: OpenStream, CloseStream, Start, Stop, Finalize's stops
+
+libsail_rec's stream control and composers, natively (runtime/hle/src/cellSailRecStream.cpp, cellSailRecCompose.cpp),
+as fw 4.92's module runs them on its control thread:
+- **The steps**: each command is a tree of asynchronous steps over the composer in use, each stream's feeder and its
+  pipeline; a step's record {flags, steps out, its parent's handle} at the recorder's +0x400 (the command), +0x410 (its
+  streams' step, +0x420 the next), +0x450 (Finalize, +0x460), +0x470 (a session error, +0x480), each slot's start (its
+  own record) and +0x30 (its stop), the handles' continuations libsail_rec's internal functions (pspocket's own here).
+- **OpenStream** (message 5): booted, no command pending, the profile free; the path kept in the profile with a '/'
+  after it (0x421 bytes at most; none added past 0x41F), the command 0x21 pending, the state 3, answered at once; then
+  the profile in use, its composer attached (the game's: its makeup callback with the recorder and the composers table,
+  registered under its type) and its stream parameters' defaults (90000 and half of it, the buffer at least 1 MB), the
+  composer opened (its instance of the size its table asks; the game's open callback with the path); its continuation
+  opens every closed slot, video first, each its own record, the feeder asked to open with the profile's format (the
+  defaults for the game's and the MP4 composer: video coding 3 with MPEG-4, audio coding 1, 1024 samples a frame, 48
+  kHz, AAC); the first stream marked as the one the composer follows. A composer that cannot be had is an error event
+  and everything closed (the completion carries CANCEL).
+- **CloseStream** (7): open, no command; closing, answered; each slot out of the composer and its pipeline and feeder
+  closed, the composer closed (its close callback gets the step's handle in r5), its instance freed, the game's composer
+  detached (unregistered, its cleanup callback), the profile free again, event 5.
+- **Start** (9): open, no command; the start parameter {0x18, 0, start, duration} (its second word set to 0x100 in the
+  game's copy; another size or a word set: INVALID_ARG), the end time (all ones without a duration), the file name
+  after the profile's path (a leading '/' dropped when there is a path); starting, answered; a new session, the clock
+  reset, the composer started (its start callback with the path and the session) and each open slot's pipeline, then
+  each slot's feeder with the session and the times. **Stop** (0xB): recording, no command; the stop parameter {0x10,
+  0, the end time} or none (0); each slot's feeder stopped at the end time, then its pipeline, then its composer stream
+  ended; the composer's stop completes when its last stream ends and has given back its units, which completes Stop.
+  The flushing stop (0xC, posted by libmp4) and a composer's session error (0x2E: an error event; a terminating one
+  while recording stops everything) stop every slot and the composer at once.
+- **Finalize** by the state: recording stopped and closed, an open stream closed, then the loop's end.
+- **The game's composer** (the table libsail_rec gives it): the states (1 closed, 2 open, 3 recording, 4 opening, 5
+  closing, 6 starting, 7 stopping) moved on by the recorder's continuations; its streams (10 added, 12 recording, 11
+  ended, 13 done, 9 removed) with their parameters copied for the game, their ring sized from the stream parameters
+  (the units for the parameters' time, and 4), the game told by its callbacks (add, end, an access unit arrived with
+  1); an access unit kept in the ring while the stream records and the game has its callback, else given straight back
+  (a release message); the game's callbacks find in their registers what libsail_rec leaves there (the makeup the
+  recorder and the composers table, the cleanup zeros, close and end the step's handle, the stop its caller's word).
+User streams: libsail_rec never gives them to a composer (its user-stream functions are unreachable); only their
+parameters' "first stream" flag is set. Not reproduced, by nature: libsail_rec's faults, where pspocket stops the
+process with the call site (rule 5): a composer whose instance cannot be allocated or whose makeup refuses leaves the
+type in use at -1, and libsail_rec then reads its composer table at the session counter. A recorder without audio and
+video streams can start but never stop (no stream ends to end the composer's stop), as libsail_rec.
+Compared (tests/hle/test_sail_rec_compare.cpp, a recorder without audio and video streams and the game's composer,
+its callbacks recording r2 to r5): OpenStream and CloseStream with the callbacks answered by the script, with an open
+that fails, without callbacks, with paths of 0, 0x41F, 0x420 and 0x430 bytes and one ending in '/'; the commands
+refused around them (Start's parameter checks, Stop, a second OpenStream, CloseStream when closed); DumpImage of an
+open stream; Finalize with the stream open; the same with every event unsubscribed: 0 of 229 and 0 of 52 observations
+differ (each half's continuations' descriptors masked in the records and the callbacks' handles). The feeders'
+stream side, the pipelines and the MP4 composer stop the process with the call site until their parts.

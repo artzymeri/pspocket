@@ -30,15 +30,12 @@ namespace pspocket::hle::sailrec {
 
 namespace {
 
-u32 internal(std::string_view name)
-{
-    return HleProcess::current()->link_function(kChan, recomp::nid_of(name), name);
-}
-
 s32 lv2(PPUContext& ctx, std::string_view name, std::initializer_list<u64> args)
 {
     return static_cast<s32>(sail::lv2_lib(ctx, name, args));
 }
+
+} // namespace
 
 // ------------------------------------------------------------------------------------------------- events
 
@@ -52,6 +49,8 @@ void command_completed(PPUContext& ctx, u32 rec, u32 command, s32 result)
     if (!(r64(ctx, rec + rc::kEventMask) & 4)) return;
     event(ctx, rec, 2, command, static_cast<u64>(static_cast<s64>(result)), arg);
 }
+
+namespace {
 
 // The state changed (event 3), when subscribed.
 void state_event(PPUContext& ctx, u32 rec, u32 state)
@@ -148,6 +147,16 @@ void clock_fini(PPUContext& ctx, u32 c)
     sail::destroy_lwmutex(ctx, c + 0x10);
     std::memset(gb(ctx) + c, 0, 0x58);
 }
+
+} // namespace
+
+void clock_reset(PPUContext& ctx, u32 c)
+{
+    w32(ctx, c + 8, 0);
+    w32(ctx, c + 4, 0);
+}
+
+namespace {
 
 // The composers' table (+0x770, 0x34 bytes): none in use (-1), the recorder.
 void composers_init(PPUContext& ctx, u32 rec)
@@ -271,21 +280,6 @@ void completion(PPUContext& ctx, u32 rec, s32 result, u32 record, u32 continuati
     post_completion(ctx, rec, answer, r64(ctx, record + 8));
 }
 
-// Finalize's stop by the state (libsail_rec's): recording (6) is stopped, an open stream (4) closed, a booted recorder
-// (2) only told to end its loop (message 0x31).
-void finalize_by_state(PPUContext& ctx, u32 rec)
-{
-    switch (r32(ctx, rec + rc::kState)) {
-    case rc::kStarted: later(ctx, "Finalize of a recording recorder"); break;
-    case rc::kOpen: later(ctx, "Finalize of a recorder with an open stream"); break;
-    case rc::kBooted:
-        w32(ctx, rec + rc::kState, rc::kBooted);
-        post(ctx, rec, 0x31, 0, 0);
-        break;
-    default: break;
-    }
-}
-
 // The message loop: until message 0x31. +0x510 is 200 while it waits for a message, then the message's first word.
 void message_loop(PPUContext& ctx, u32 rec)
 {
@@ -313,6 +307,12 @@ void message_loop(PPUContext& ctx, u32 rec)
         case 2: destroy_profile(ctx, rec, m2, m3); break;
         case 3: create_converter(ctx, rec, m2, m3); break;
         case 4: destroy_converter(ctx, rec, m2, m3); break;
+        case 5: open_stream(ctx, rec, m2, m3); break;
+        case 7: close_stream(ctx, rec, m2, m3); break;
+        case 9: start(ctx, rec, m2, m3); break;
+        case 0xB: stop(ctx, rec, m2, m3); break;
+        case 0xC: stop_flush(ctx, rec, m2, m3); break;
+        case 0x2E: composer_session_error(ctx, rec, m3); break;
         case 0xE:
             // Cancel: each feeder's cancel call (the game's callback 6).
             for (u32 i = 0; i < r32(ctx, rec + rc::kAudioCount); i++)
@@ -432,7 +432,10 @@ void control_thread(PPUContext& ctx, u64 recorder)
             audio_pipeline_fini(ctx, s + as::kPipeline);
         }
         if (clock) clock_fini(ctx, clock);
-        if (r32(ctx, rec + rc::kProfile)) later(ctx, "the end of a recorder with a profile in use");
+        if (const u32 profile = r32(ctx, rec + rc::kProfile)) {
+            profile_composer_release(ctx, rec, profile);
+            w32(ctx, rec + rc::kProfile, 0);
+        }
         for (u32 p = r32(ctx, rec + rc::kProfiles); p;) {
             const u32 next = r32(ctx, p + 0x560);
             free_profile(ctx, rec, p);
@@ -655,30 +658,6 @@ SAILREC_LATER(_pspocket_cellSailRec_FsNone, "the MP4 composer's file calls")
 SAILREC_LATER(_pspocket_cellSailRec_FsWrite, "the MP4 composer's file calls")
 SAILREC_LATER(_pspocket_cellSailRec_FsRename, "the MP4 composer's file calls")
 SAILREC_LATER(_pspocket_cellSailRec_FsUnlink, "the MP4 composer's file calls")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerMakeup, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerCleanup, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerAlign, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerStreamSize, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerOpen, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerClose, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerAddAudio, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerAddVideo, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerAddUser, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerRemoveUser, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerRemoveVideo, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerRemoveAudio, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerStart, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerStop, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerEndAudio, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerEndVideo, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerEndUser, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerNone, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerTimescale, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerAudioAu, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerVideoAu, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerUserAu, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerCompleted, "the game's composer's table")
-SAILREC_LATER(_pspocket_cellSailRec_ComposerFlushed, "the game's composer's table")
 
 #undef SAILREC_LATER
 
@@ -722,30 +701,6 @@ void register_control(Registry& r)
         SAILREC_INTERNAL(_pspocket_cellSailRec_VideoGet),
         SAILREC_INTERNAL(_pspocket_cellSailRec_VideoRelease),
         SAILREC_INTERNAL(_pspocket_cellSailRec_VideoClose),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerMakeup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerCleanup),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerAlign),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerStreamSize),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerOpen),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerClose),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerAddAudio),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerAddVideo),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerAddUser),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerRemoveUser),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerRemoveVideo),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerRemoveAudio),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerStart),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerStop),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerEndAudio),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerEndVideo),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerEndUser),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerNone),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerTimescale),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerAudioAu),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerVideoAu),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerUserAu),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerCompleted),
-        SAILREC_INTERNAL(_pspocket_cellSailRec_ComposerFlushed),
     });
 }
 

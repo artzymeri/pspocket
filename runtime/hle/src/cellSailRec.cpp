@@ -29,6 +29,15 @@ namespace pspocket::hle::sailrec {
 
 // ------------------------------------------------------------------------------------------------- shared helpers
 
+u32 internal(std::string_view name)
+{
+    return HleProcess::current()->link_function(kChan, recomp::nid_of(name), name);
+}
+
+void guest_strncpy(PPUContext& ctx, u32 dst, u32 src, u32 n) { sail::lv2_lib(ctx, "_sys_strncpy", {dst, src, n}); }
+
+u32 guest_strlen(PPUContext& ctx, u32 s) { return static_cast<u32>(sail::lv2_lib(ctx, "_sys_strlen", {s})); }
+
 u32 alloc(PPUContext& ctx, u32 rec, u32 boundary, u32 size)
 {
     return static_cast<u32>(
@@ -760,6 +769,11 @@ s32 cellSailRecorderDumpImage(PPUContext& ctx, u32 rec, u32 buffer, u32 size)
 void register_objects(Registry& r);
 void register_control(Registry& r);
 void register_convert(Registry& r);
+void register_compose(Registry& r);
+void register_stream(Registry& r);
+void register_feed(Registry& r);
+void register_audio(Registry& r);
+void register_video(Registry& r);
 
 } // namespace pspocket::hle::sailrec
 
@@ -795,6 +809,11 @@ void register_cellSailRec(Registry& r)
     register_objects(r);
     register_control(r);
     register_convert(r);
+    register_compose(r);
+    register_stream(r);
+    register_feed(r);
+    register_audio(r);
+    register_video(r);
     // Until the control thread and the recording are pspocket's too (later parts of D-918), a game gets Sony's
     // libsail_rec where the system software is installed (D-563).
     r.firmware_first(kChan);

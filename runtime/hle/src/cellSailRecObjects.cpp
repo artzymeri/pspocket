@@ -24,11 +24,6 @@
 namespace pspocket::hle::sailrec {
 namespace {
 
-u32 internal(std::string_view name)
-{
-    return HleProcess::current()->link_function(kChan, recomp::nid_of(name), name);
-}
-
 // libsail_rec's message to the recorder a feeder or composer holds (+0x34 for a feeder, +0 for a composer): before the
 // recorder sets it there is none, and libsail_rec reads the queue at address 0x4A8 and faults.
 s32 post_from(PPUContext& ctx, std::string_view what, u32 rec, u32 code, u32 object, u32 arg)
@@ -150,20 +145,6 @@ u64 cellSailFeederVideoNotifySessionError(PPUContext& ctx, u32 f, s32 err, u32 t
 
 // ------------------------------------------------------------------------------------------------- the composer
 
-constexpr std::string_view kComposerCalls[24] = {"_pspocket_cellSailRec_ComposerMakeup",
-    "_pspocket_cellSailRec_ComposerCleanup", "_pspocket_cellSailRec_ComposerAlign",
-    "_pspocket_cellSailRec_ComposerStreamSize", "_pspocket_cellSailRec_ComposerOpen",
-    "_pspocket_cellSailRec_ComposerClose", "_pspocket_cellSailRec_ComposerAddAudio",
-    "_pspocket_cellSailRec_ComposerAddVideo", "_pspocket_cellSailRec_ComposerAddUser",
-    "_pspocket_cellSailRec_ComposerRemoveUser", "_pspocket_cellSailRec_ComposerRemoveVideo",
-    "_pspocket_cellSailRec_ComposerRemoveAudio", "_pspocket_cellSailRec_ComposerStart",
-    "_pspocket_cellSailRec_ComposerStop", "_pspocket_cellSailRec_ComposerEndAudio",
-    "_pspocket_cellSailRec_ComposerEndVideo", "_pspocket_cellSailRec_ComposerEndUser",
-    "_pspocket_cellSailRec_ComposerNone", "_pspocket_cellSailRec_ComposerTimescale",
-    "_pspocket_cellSailRec_ComposerAudioAu", "_pspocket_cellSailRec_ComposerVideoAu",
-    "_pspocket_cellSailRec_ComposerUserAu", "_pspocket_cellSailRec_ComposerCompleted",
-    "_pspocket_cellSailRec_ComposerFlushed"};
-
 // libsail_rec's lwmutex and lwcond pair at `at` (the lwcond at +0x18) named `name`; the lwmutex destroyed again when
 // the lwcond cannot be made.
 s32 make_lock(PPUContext& ctx, u32 at, const char* name)
@@ -254,13 +235,7 @@ s32 cellSailComposerGetEsAudioParameter(PPUContext& ctx, u32 c, s32 index, u32 o
 // queue's unlock, or the composer as given (none pending).
 u64 cellSailComposerNotifyCallCompleted(PPUContext& ctx, u64 composer, s32 result)
 {
-    const u32 c = static_cast<u32>(composer);
-    if (const u32 diag = r32(ctx, c + cp::kDiag))
-        return call_guest(ctx, diag, {r32(ctx, c + cp::kDiagArg), 0, static_cast<u64>(static_cast<s64>(result)), 0});
-    const u64 handle = r64(ctx, c + cp::kPending);
-    w64(ctx, c + cp::kPending, 0);
-    if (!handle) return composer;
-    return static_cast<u64>(static_cast<s64>(post_completion(ctx, r32(ctx, c + cp::kRecorder), result, handle)));
+    return composer_notify_completed(ctx, composer, result);
 }
 
 s32 cellSailComposerNotifySessionError(PPUContext& ctx, u32 c, s32 err, u32 terminated)
@@ -411,15 +386,6 @@ s32 cellSailComposerGetEsAudioAu(PPUContext& ctx, u32 c, u32 index, u32 out, s32
 }
 
 // ------------------------------------------------------------------------------------------------- profiles
-
-// A profile (0x568 bytes, the control thread's): +0 its state (2 while a stream uses it), +8 the path, +0x438 the
-// composer type, +0x43C 1 while the stream parameters are the defaults, +0x444 the buffer size, +0x450 the stream
-// parameters, +0x550, +0x554, +0x558 the audio (0x108 bytes each), video (0x220) and user (0x18) parameters,
-// +0x55C the recorder.
-namespace pf {
-constexpr u32 kState = 0, kType = 0x438, kDefaults = 0x43C, kBuffer = 0x444, kBuffer2 = 0x448, kStream = 0x450,
-              kAudio = 0x550, kVideo = 0x554, kRecorder = 0x55C;
-}
 
 // The video encoders' option IDs a profile may carry (the MPEG-4 encoder's four and the AVC encoder's seventeen, as
 // libsail_rec accepts them).
@@ -703,21 +669,6 @@ s32 cellSailVideoConverterProcess(PPUContext& ctx, u32 v, u32 a, u32 b, u32 c, u
 }
 
 } // namespace
-
-// libsail_rec's composer table for the game's composer (24 of its internal functions), made once per process.
-u32 composer_table(PPUContext& ctx)
-{
-    struct Table {
-        u32 addr = 0;
-    };
-    Table& t = HleProcess::current()->state<Table>();
-    if (!t.addr) {
-        t.addr = HleProcess::current()->main_memory().alloc(4 * 24, 16);
-        if (!t.addr) PS_FATAL(kChan, "no main memory left for libsail_rec's composer table");
-        for (u32 i = 0; i < 24; i++) w32(ctx, t.addr + 4 * i, internal(kComposerCalls[i]));
-    }
-    return t.addr;
-}
 
 void register_objects(Registry& r)
 {
