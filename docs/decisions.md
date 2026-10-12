@@ -12668,3 +12668,55 @@ bad pointer logs the call site, answers CELL_EFAULT and gives back what the requ
   among the lv2 calls): 0 differences.
 - **Outside the module's file:** sysutil_cxml.hpp and cellSysutilCxml.cpp (cxmlutil's CheckElementName, GetFloat and
   GetString with host outputs), sysutil_more.cpp (the registration).
+
+## D-926 · 2026-10-12 · cellPesmUtility from libsysutil_pesm; the system software's shared memory in lv2
+
+The front end of the system software's PSP movie recorder (copy to a PSP or Memory Stick: device, entry, recording,
+sample encryption, the MP4 protection box), read from libsysutil_pesm.sprx (4.92): runtime/hle/src/cellPesmUtility.cpp,
+its fifteen functions RPCS3 leaves stubs and two exports nothing names (0x6312A6CC writes the version 0x30001 and 1;
+0x8AB3156B answers -1, as LoadAsync and UnloadAsync do).
+
+- **The module's way, mirrored.** One object made at the first call (operator new, as the module's: the request in
+  flight, a state 0 to 5, a list of the shared memories it opened). A request object begins packet 0x13D on channel 0
+  (its answer not looked at), takes FixedMemory 0, builds an element named after the command ("PesmCmdInitialize" ...)
+  with the function's fields from the module's table (ints and strings, magic "PESM") and writes it (its answer not
+  looked at). The reply is read into FixedMemory; when its root is the command's, the reply's fields are read over the
+  values the function put there (a missing one keeps its value: often an argument, e.g. Initialize's second container,
+  OpenDevice's name address), the request deleted and "PesmResult" answered. A root of another name answers 0x80861001
+  and keeps the request (with its packet and FixedMemory): the next call reads its reply instead of sending. The state
+  checks are the module's (0x80862001; InitEntry and InitEntry2 answer 1), as are the calls left in state 3 by an early
+  answer (no shared memory 0x80862002, PrepareRec's missing info -19, a sample past 1 MB 0x80861002); GetSinf answers 0
+  whatever the reply; EncryptSample's address is the reply's offset into the shared memory.
+- **On pspocket's console** (closed channels, D-534) a failed read leaves the request's own document, so each request
+  reads itself back: its command's root, none of the reply's fields. Sony's module run on pspocket answers the same.
+- **libsysutil's exports, as they answer.** The module calls the cxml functions through libsysutil's exports, which
+  catch guest memory that is not there (a reply that is no document: GetDocumentElement and CheckElementName read
+  address 0), log it and answer; the module goes on to 0x80861001. pspocket's makes the same calls through
+  sysutil_sub.hpp's as_export, which answers as the export does, instead of ending the call.
+- **The recorder's shared memory.** Initialize opens 2 MB of 64 KB pages under the key 0x8086000000000200 through
+  cellSysutilSharedMemoryAlloc, which the system software makes: libsysutil tries again every 100 ms while lv2 has none,
+  so Sony's module would wait for ever on pspocket's console. pspocket's opens it only when lv2 has it, and otherwise
+  goes on as the module goes on when the opening fails (logged once): the calls that need it answer 0x80862002. The
+  module's stack word that EncryptSample2's reply values start from is not reproducible; pspocket's start from 0.
+- **lv2: the system software's shared memory** (RPCS3 init_system_shared_memory, lv2_memory::system_handle):
+  Kernel::create_system_shared_memory(key, size, flags) makes one as the system software does, charged to none of the
+  process's containers and kept by the kernel; the process's sys_mmapper_allocate_shared_memory of its key, other than
+  newly created, opens it, one handle at a time (a second answers EEXIST, as RPCS3's handle count does), and freeing the
+  handle leaves the object and its key. Kernel::shared_memory_key_exists(key) tells an HLE module whether one is there.
+  pspocket's console makes none; a test's system side does. Test: tests/lv2/test_memory.cpp "the system software's
+  shared memory".
+- **Compared** with Sony's module (tests/hle/test_sysutil_more.cpp, `[sysutil]`): the version and loads, every call
+  before initialization, the closed channel without and with the system's shared memory (Initialize opening it,
+  Finalize giving it back, the calls left in a call), then a system side answering: results, missing fields, strings,
+  replies of another root (the request kept and answered later), a reply that is no document, a truncated one, the
+  system going away; the shared memory's contents after the copies. 80 calls, 948 lv2 calls, 31 requests answered: 0
+  differences. Without the firmware: "cellPesmUtility on pspocket's console".
+
+## D-927 · 2026-10-12 · cellFiber's two-worker comparison waits for both workers
+
+The gate under the agents' load failed cellFiber's comparison (D-914) once: "a worker control's fibers on two workers"
+saw pspocket's worker 1 answer 0x8076000F (CELL_FIBER_ERROR_STAT) from RunFibers where Sony's run answered 0. Each
+worker is a host thread calling RunFibers; one that started after the six fibers had run and the control was shut down
+met the shutdown, so the observation depended on when the machine let the thread start. The script now waits (at most
+a minute) until libfiber counts both workers in its word's top byte before it finalizes and shuts the control down;
+both runs then see the same. Alone the comparison agreed every time (0 of 31 observations).

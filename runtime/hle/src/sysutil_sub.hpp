@@ -216,6 +216,22 @@ private:
     StackVar frame_;
 };
 
+// A call into libsysutil made as a module makes it, through libsysutil's export: guest memory that is not there ends
+// the call, logged with the call site, and it answers `on_fault`, as pspocket's exports answer it (cellSysutilCxml.cpp,
+// whose guarded() catches what libsysutil itself would fault on); the module goes on. (Sony's module run on pspocket's
+// libsysutil goes on the same way.)
+template <class R, class F>
+R as_export(PPUContext& ctx, std::string_view what, R on_fault, F&& f)
+{
+    try {
+        return f();
+    } catch (const Fault& e) {
+        log_call_site(ctx, guest_base(ctx),
+            std::format("{}: guest memory at {:#010x} is not there (libsysutil faults there)", what, e.addr));
+        return on_fault;
+    }
+}
+
 // A function body: guest memory that is not there ends it (Sony's module faults there), logged with the call site and
 // answered CELL_EFAULT; `on_fault` ends what the body had begun.
 template <class Body, class OnFault>
@@ -253,5 +269,6 @@ s32 with_request(PPUContext& ctx, std::string_view module, std::string_view what
 
 // The libraries' registrations (each file's), called by register_sysutil_more.
 void register_print(Registry& r);
+void register_pesm(Registry& r);
 
 } // namespace pspocket::hle::sysutil::sub

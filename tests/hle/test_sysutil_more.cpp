@@ -141,6 +141,172 @@ void script_print(Script& s)
     s.call("cellSysutilPrintShutdown", {});
 }
 
+// ------------------------------------------------------------------------------------------------- cellPesmUtility
+
+constexpr u64 kPesmMemory = 0x8086000000000200ull; // the recorder's shared memory, the system software's
+
+void script_pesm(Script& s)
+{
+    const u32 dev = kOut, dst = kOut + 8, size = kOut + 0xC, sinf = kOut + 0x10, sinf_size = kOut + 0x14,
+              ver = kOut + 0x18, one = kOut + 0x1C, info = kOut + 0x40, ret = kOut + 0x100, sample = kBuf,
+              seen = kBuf + 0x2000;
+    s.str(S(0), "/dev_usb000");
+    s.str(S(1), "PSP-2000");
+    s.str(S(2), "profile");
+    for (u32 i = 0; i < 0x2000; i++) s.w8(sample + i, static_cast<u8>(i * 7 + 3));
+    const auto set_info = [&](u32 device, u32 movie, u32 seed, u32 bytes) {
+        for (u32 i = 0; i < 0x30; i++) s.w8(info + i, static_cast<u8>(0x40 + i));
+        s.w32(info, device);
+        s.w32(info + 4, movie);
+        s.w32(info + 8, seed);
+        s.w32(info + 12, bytes);
+    };
+    // The shared memory's first bytes (its address the module's answers give) where the script's memory is compared.
+    const auto look = [&](u32 at) {
+        std::memcpy(s.base() + seen, s.base() + at, 0x400);
+        s.step(std::format("the shared memory at {:#x}", at));
+    };
+    set_info(0x1234, 7, 0xABCDEF01, 0x400);
+    // The version and the loads; nothing made.
+    s.call("cellPesmUtility_6312A6CC", {ver, one});
+    s.call("cellPesmUtility_6312A6CC", {0, 0});
+    s.call("cellPesmLoadAsync", {});
+    s.call("cellPesmUnloadAsync", {});
+    s.call("cellPesmUtility_8AB3156B", {});
+    // Not initialized.
+    s.call("cellPesmOpenDevice", {S(1), dev});
+    s.call("cellPesmCloseDevice", {3});
+    s.call("cellPesmInitEntry", {0, S(0), ret});
+    s.call("cellPesmInitEntry2", {0, S(0), S(2), ret});
+    s.call("cellPesmPrepareRec", {0, info});
+    s.call("cellPesmStartMovieRec", {0, info});
+    s.call("cellPesmEncryptSample", {0, sample, dst, info, size});
+    s.call("cellPesmEncryptSample2", {0, sample, 0x100, dst});
+    s.call("cellPesmGetSinf", {0, 1, sinf, sinf_size});
+    // pspocket's console (closed channels): each request reads itself back.
+    s.call("cellPesmEndMovieRec", {0, info});
+    s.call("cellPesmFinalize", {});
+    s.call("cellPesmFinalize", {});
+    s.call("cellPesmFinalize2", {1});
+    s.call("cellPesmEndMovieRec", {0, info});
+    // The system software's shared memory for the recorder (Sony's module would wait for it for ever without it).
+    REQUIRE(s.fixture().kernel->create_system_shared_memory(kPesmMemory, 0x200000, 0x200));
+    s.call("cellPesmInitialize", {0x11111111, 0x22222222});
+    s.call("cellPesmInitialize", {1, 2});
+    s.call("cellPesmOpenDevice", {S(1), dev});
+    s.call("cellPesmCloseDevice", {3});
+    s.call("cellPesmInitEntry", {0, S(0), ret});
+    s.call("cellPesmInitEntry2", {0, S(0), S(2), ret});
+    s.call("cellPesmPrepareRec", {0, info});
+    s.call("cellPesmStartMovieRec", {0, info});
+    s.call("cellPesmEncryptSample", {0, sample, dst, info, size});
+    look(s.r32(dst));
+    s.call("cellPesmGetSinf", {0, 5, sinf, sinf_size});
+    s.call("cellPesmGetSinf", {0, 0, sinf, sinf_size});
+    s.call("cellPesmEndMovieRec", {0, info});
+    s.call("cellPesmFinalize2", {0});
+    // Left in a call: the checks past the state.
+    s.call("cellPesmInitialize", {0x11111111, 0});
+    s.call("cellPesmPrepareRec", {0, 0});
+    s.call("cellPesmOpenDevice", {S(1), dev});
+    s.call("cellPesmInitialize", {0x11111111, 0}); // again: the memory is open (one handle)
+    set_info(0x1234, 7, 0xABCDEF01, 0x100001);
+    s.call("cellPesmEncryptSample", {0, sample, dst, info, size});
+    s.call("cellPesmInitialize", {0x11111111, 0});
+    s.call("cellPesmEncryptSample2", {0, sample, 0xFFF81, dst});
+    s.call("cellPesmInitialize", {0x11111111, 0});
+    s.call("cellPesmFinalize", {});
+    // A system that answers.
+    SystemSide& sys = s.system();
+    sys.open(0);
+    set_info(0x55, 9, 0x13579BDF, 0x300);
+    sys.reply(0, reply("PesmCmdInitialize", {{"PesmResult", 0}}));
+    s.call("cellPesmInitialize", {0x11111111, 0x22222222});
+    sys.reply(0, reply("PesmCmdOpenDevice", {{"PesmResult", 0}, {"PesmDevice", 7}}));
+    s.call("cellPesmOpenDevice", {S(1), dev});
+    sys.reply(0, reply("PesmCmdOpenDevice", {{"PesmResult", -3}}));
+    s.call("cellPesmOpenDevice", {S(1), dev});
+    sys.reply(0, reply("PesmCmdCloseDevice", {{"PesmResult", 0}}));
+    s.call("cellPesmCloseDevice", {7});
+    const auto entry = [&](const char* root, s32 result, const char* name) {
+        Cxml c;
+        const int e = c.element(root);
+        c.i32(e, "PesmResult", result);
+        if (name) c.str(e, "PesmInitentryRetname", name);
+        sys.reply(0, c);
+    };
+    entry("PesmCmdInitEntry", 0, "ms0:/VIDEO/MOVIE.MP4");
+    s.call("cellPesmInitEntry", {0, S(0), ret});
+    entry("PesmCmdInitEntry", 4, nullptr);
+    s.call("cellPesmInitEntry", {0, S(0), ret});
+    entry("PesmCmdInitEntry2", 0, "ms0:/MP_ROOT/100MNV01/M4V00001.MP4");
+    s.call("cellPesmInitEntry2", {0, S(0), 2, ret});
+    entry("PesmCmdInitEntry2", -1, "");
+    s.call("cellPesmInitEntry2", {0, S(0), 2, ret});
+    sys.reply(0, reply("PesmCmdPrepareRec", {{"PesmResult", 0}}));
+    s.call("cellPesmPrepareRec", {0, info});
+    sys.reply(0, reply("PesmCmdPrepareRec", {}));
+    s.call("cellPesmPrepareRec", {0, info});
+    sys.reply(0, reply("PesmCmdStartMovieRec", {{"PesmResult", 0}}));
+    s.call("cellPesmStartMovieRec", {0, info}); // 20 bytes of the shared memory over the info
+    sys.reply(0, reply("PesmCmdStartMovieRec", {{"PesmResult", 2}}));
+    s.call("cellPesmStartMovieRec", {0, info});
+    set_info(0x55, 9, 0x13579BDF, 0x300);
+    sys.reply(0, reply("PesmCmdEncryptSample", {{"PesmResult", 0}, {"PesmEncryptDstoffset", 0x100},
+        {"PesmEncryptSize", 0x2F0}}));
+    s.call("cellPesmEncryptSample", {0, sample + 0x10, dst, info, size});
+    look(s.r32(dst) - 0x100);
+    sys.reply(0, reply("PesmCmdEncryptSample", {{"PesmResult", -7}}));
+    s.call("cellPesmEncryptSample", {0, sample, dst, info, size});
+    sys.reply(0, reply("PesmCmdEncryptSample2", {{"PesmResult", 0}, {"PesmEncryptDstoffset", 0x80}}));
+    s.call("cellPesmEncryptSample2", {0, sample + 0x20, 0x200, dst});
+    look(s.r32(dst) - 0x80);
+    sys.reply(0, reply("PesmCmdEncryptSample2", {{"PesmResult", -2}, {"PesmEncryptDstoffset", 0x40}}));
+    s.call("cellPesmEncryptSample2", {0, sample, 0x10, dst});
+    // The size and its header past 4 GB: 0x70 bytes copied. (Its reply always has both values here: the module starts
+    // them from a word its stack happens to hold.)
+    sys.reply(0, reply("PesmCmdEncryptSample2", {{"PesmResult", 0}, {"PesmEncryptDstoffset", 0x10}}));
+    s.call("cellPesmEncryptSample2", {0, sample + 0x30, 0xFFFFFFF0, dst});
+    look(s.r32(dst) - 0x10);
+    sys.reply(0, reply("PesmCmdGetSinf", {{"PesmResult", 0}, {"PesmSinfSize", 0x40}}));
+    s.call("cellPesmGetSinf", {0, 1, sinf, sinf_size});
+    s.w32(sinf, 0);
+    sys.reply(0, reply("PesmCmdGetSinf", {{"PesmResult", -1}, {"PesmSinfSize", 0x40}}));
+    s.call("cellPesmGetSinf", {0, 1, sinf, sinf_size});
+    sys.reply(0, reply("PesmCmdGetSinf", {{"PesmResult", 0}, {"PesmSinfSize", 0}}));
+    s.call("cellPesmGetSinf", {0, 1, sinf, sinf_size});
+    sys.reply(0, reply("PesmCmdGetSinf", {{"PesmResult", 0}}));
+    s.call("cellPesmGetSinf", {0, 3, sinf, sinf_size});
+    sys.reply(0, reply("PesmCmdEndMovieRec", {{"PesmResult", 0}}));
+    s.call("cellPesmEndMovieRec", {0, info});
+    // A reply of another root: 0x80861001 and the request kept, whose reply the next calls read for it.
+    sys.reply(0, reply("PesmCmdOther", {{"PesmResult", 0}}));
+    s.call("cellPesmCloseDevice", {7});
+    sys.reply(0, reply("PesmCmdCloseDevice", {{"PesmResult", 5}}));
+    s.call("cellPesmOpenDevice", {S(1), dev}); // reads the close's reply: not its root
+    sys.reply(0, reply("PesmCmdCloseDevice", {{"PesmResult", 6}}));
+    s.call("cellPesmCloseDevice", {8}); // the kept one's: answered
+    // A reply that is no document, a truncated one, and the system going away.
+    sys.reply(0, records(0x40, 1, 0x30));
+    s.call("cellPesmCloseDevice", {8});
+    sys.reply(0, records(0x6100, 1, 0));
+    s.call("cellPesmCloseDevice", {8});
+    sys.open(0);
+    s.call("cellPesmCloseDevice", {9}); // no reply: the channel closes; the request reads itself
+    sys.open(0);
+    sys.reply(0, reply("PesmCmdFinalize2", {{"PesmResult", 0}}));
+    s.call("cellPesmFinalize2", {1});
+    sys.reply(0, reply("PesmCmdInitialize", {{"PesmResult", -4}}));
+    s.call("cellPesmInitialize", {0x11111111, 0x22222222});
+    sys.reply(0, reply("PesmCmdFinalize", {}));
+    s.call("cellPesmFinalize", {});
+    sys.reply(0, reply("PesmCmdOther", {}));
+    s.call("cellPesmInitialize", {0x11111111, 0x22222222}); // another root: left initializing
+    s.call("cellPesmInitialize", {0x11111111, 0x22222222});
+    s.call("cellPesmEndMovieRec", {0, info}); // reads the kept request's reply: none, the channel closes
+    sys.open(0);
+}
+
 } // namespace
 
 TEST_CASE("cellPrintUtility against libsysutil_print", "[hle][lle][sysutil]")
@@ -163,4 +329,44 @@ TEST_CASE("cellPrintUtility on pspocket's console: each request meets the closed
     CHECK(t.call("cellPrintGetStatus", kOut) == r3_of_code(CLOSED));
     CHECK(t.call("cellPrintSendBand", kBuf, 16, kOut + 0x40) == r3_of_code(CLOSED));
     CHECK(t.call("cellPrintGetStatus", kOut) == r3_of_code(CLOSED)); // the channel given back each time
+}
+
+TEST_CASE("cellPesmUtility against libsysutil_pesm", "[hle][lle][sysutil]")
+{
+    compare_script("cellPesmUtility", {"cellPesmUtility"}, script_pesm);
+}
+
+TEST_CASE("cellPesmUtility on pspocket's console: its requests read themselves back, no shared memory waited for",
+    "[hle][sysutil]")
+{
+    Fixture f;
+    GuestThread t(f, 0, "ppu");
+    REQUIRE(f.hle->initialize_tls({0, 0, 0x100}));
+    u8* b = f.base();
+    std::memcpy(b + S(0), "/dev_usb000", 12);
+    std::memcpy(b + S(1), "PSP", 4);
+    CHECK(t.call("cellPesmUtility_6312A6CC", kOut, kOut + 4) == 0);
+    CHECK(ps_read32(b, kOut) == 0x30001);
+    CHECK(ps_read32(b, kOut + 4) == 1);
+    CHECK(t.call("cellPesmLoadAsync") == r3_of_code(0xFFFFFFFF));
+    CHECK(t.call("cellPesmUnloadAsync") == r3_of_code(0xFFFFFFFF));
+    CHECK(t.call("cellPesmOpenDevice", S(1), kOut) == r3_of_code(0x80862001)); // not initialized
+    CHECK(t.call("cellPesmInitEntry", 0, S(0), kBuf) == 1);
+    // Its request read back as the reply: no result in it, so the value it started from (the second container's).
+    CHECK(t.call("cellPesmInitialize", 0x11111111, 0) == 0);
+    CHECK(t.call("cellPesmInitialize", 0x11111111, 0) == r3_of_code(0x80862001));
+    CHECK(t.call("cellPesmOpenDevice", S(1), kOut) == r3_of_code(S(1))); // the name's address, also the device
+    CHECK(ps_read32(b, kOut) == S(1));
+    CHECK(t.call("cellPesmCloseDevice", 3) == 3);
+    // No system software made the recorder's shared memory: not waited for, and the calls that need it say so.
+    CHECK_FALSE(f.kernel->shared_memory_key_exists(0x8086000000000200ull));
+    CHECK(t.call("cellPesmGetSinf", 0, 1, kOut, kOut + 4) == r3_of_code(0x80862002));
+    CHECK(t.call("cellPesmCloseDevice", 3) == r3_of_code(0x80862001)); // left in the call, as Sony's module leaves it
+    CHECK(t.call("cellPesmInitialize", 0x11111111, 0) == 0);
+    ps_write32(b, kOut + 0x40, 0);
+    ps_write32(b, kOut + 0x44, 0x77);
+    CHECK(t.call("cellPesmEndMovieRec", 0, kOut + 0x40) == 0x77);
+    CHECK(t.call("cellPesmFinalize") == 100); // its request ID
+    CHECK(t.call("cellPesmFinalize") == r3_of_code(0x80862001));
+    CHECK(t.call("cellPesmEndMovieRec", 0, kOut + 0x40) == r3_of_code(0x80862001));
 }

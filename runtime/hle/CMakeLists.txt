@@ -145,6 +145,7 @@ add_library(pspocket_hle STATIC
     src/stdcxx_facets.cpp
     src/sysutil_more.cpp
     src/cellPrintUtility.cpp
+    src/cellPesmUtility.cpp
     src/sys_fs.cpp
     src/sys_io.cpp
     src/sys_net.cpp
