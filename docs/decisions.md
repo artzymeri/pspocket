@@ -13912,3 +13912,24 @@ interpreter (inventory/, never in the repository), every intermediate of the enc
 the quantiser, each subframe's targets, energies, lag candidates, searches and states) for every subframe of 30 to 60
 frames in each configuration: 0 differences. Without the firmware, test_celp_compare.cpp encodes speech through the
 library and decodes it with pspocket's CELP decoder (part 2): about 6 dB SNR in each configuration.
+
+## D-936 · 2026-10-12 · The calls a retail console's lv2 does not have answer its CELL_ENOSYS
+
+What a retail console's lv2 answers is now read from its kernel: lv2_kernel.self of the 4.93 system software (the
+official update's CORE_OS package, decrypted with RPCS3's key table as the other SELFs are, kept in
+inventory/firmware/kernel493 and never committed). Its syscall table (at 0x8000000000363B10, 1,024 descriptors) points
+366 slots at one not-implemented function (lis r3,0x8001; ori r3,r3,3; blr: CELL_ENOSYS). Of the 74 calls the kernel
+chart counted as RPCS3's (null slots answering CELL_OK with nothing written, or stubs), 53 are that slot on retail:
+sys_dbg_mat_set_condition (215); sys_dbg_* 906 to 925, 927, 930, 931, 933, 934, 938, 939, 941 to 957 and 975 (the
+thread, process, SPU, kernel-queue, object-list, scratch, page and exception-handler debugging calls); and the crypto
+engine's create, hasher and cipher calls and random_generate (976, 978 to 982, 984). They are a debug or development
+kernel's: pspocket answers CELL_ENOSYS as the retail kernel does (logged once each), where it answered CELL_OK before.
+No game pspocket has booted calls one (the boot logs record each first call). Sony's liblv2coredump calls two of them
+(909, 954) when it writes a crash dump: on pspocket it now meets what it meets on a retail console.
+The other 21 have handlers of their own on retail (216, 353, 356, 361, 900 to 903, 926, 928, 929, 932, 935 to 937,
+940, 970, 971, 977, 983, 985); they stay null slots until each is ported from the kernel's code (their RPCS3 names do
+not always fit what the code does: 356 checks its size like an address-space allocation, 985 looks a process up and
+checks its authority). Three unnamed slots the retail table also leaves out (958, 972, 974) keep their null slots: the
+name table that bindings are checked against has no name for them.
+Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS) and
+tests/lv2/test_process.cpp (976).
