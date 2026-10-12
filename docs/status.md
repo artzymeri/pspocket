@@ -385,9 +385,9 @@ to playing; Start, Stop and the other playback calls are its next part, read fro
   (two cores of 24 voices over 2 MB of sound memory: VAG ADPCM, pitch and its modulation, ADSR, noise, the voice mixes
   and each core's reverb), behind libsd's calls and register numbers. A comparison with Sony's libsynth2 is ready for
   the Mac ("[compare][synth2]"); the first thing to check is what Generate puts in the surround outputs.
-- cellRudp whole, firmware-first (D-630 to D-633): reliable connections over lv2's network, ordered or not,
+- cellRudp whole (D-630 to D-633; since D-916 as Sony's librudp, wire format included, no longer firmware-first): reliable connections over lv2's network, ordered or not,
   windows, retransmission, keep-alive, polling, the internal I/O thread or the game's own; its wire format is
-  pspocket's own (rudp.hpp), so it talks to pspocket only. Fixed on the way: a socket closed under its contexts made
+  pspocket's own (rudp.hpp), so it talks to pspocket only (D-916 replaced it with librudp's). Fixed on the way: a socket closed under its contexts made
   the I/O thread spin. libsnd3, firmware-first (D-640 to D-644): HD3 banks bound into libsynth2's memory, notes by
   tone and by program, voices and their allocation, the request queue, a Standard MIDI File player, all through
   libsynth2's exports; the HD3 tone and program records are inferred (D-641: the first thing to check on the Mac).
@@ -426,12 +426,13 @@ Left (307, 2026-10-11). What each part needs (a session without the firmware cou
 - The 82 functions still answered as RPCS3's stubs, in libraries pspocket always serves (the NP family, printing,
   fs_utility_init, DTCP-IP and PESM: being made in the cloud session, D-660 to D-664, D-680 to D-684); where no
   signature is public, their arguments and answers from the libraries' modules.
-- To compare on the Mac, then drop their firmware-first markers (D-563): libmixer, cellVpost, cellKey2char, cellPngEnc,
-  cellFiber, the codec cores' version queries; and cellVdec's DivX 3.11, VC-1 and MVC. The comparisons are written
-  (D-597: tests/hle/test_*_compare.cpp over compare_util.hpp, hidden from ctest until each matches): on the Mac,
-  `PSPOCKET_TEST_DEV_FLASH=$PWD/inventory/firmware/installed/dev_flash build/host/tests/hle/test_hle "[compare]"`
-  prints each library's differences from Sony's module. Writing them found a bug in cellPngEnc: a picture with more
-  than one text chunk aborted its stream (D-598, fixed).
+- The comparisons with Sony's modules ran on the Mac (2026-10-11/12, D-911 to D-916) and now agree: cellVdec's DivX 3.11,
+  DivX/MPEG-4, VC-1 and MVC (D-912), cellFiber, cellKey2char and libsre's Task2 functions (D-914), cellPngEnc,
+  cellJpgEnc and cellVpost (D-913, the last two reading their tables from the installed firmware as cellFont does),
+  cellRudp (D-916, which also made the loader run a firmware module's module_prologue before module_start). cellFiber,
+  cellKey2char, cellPngEnc, cellJpgEnc, cellVpost and cellRudp are no longer firmware-first; their comparisons run in
+  the Mac gate. Still firmware-first: libmixer, libsynth2 and libsnd3 (firmware 4.92 has no module to compare with;
+  their comparisons skip) and the codec cores (only their version queries are pspocket's own).
 Kernel calls (2026-10-09): every named slot of the 634 is bound, 560 as pspocket's own (D-527 parts 1-4: devices,
 services, root managers, PRX and overlays through the module loader, sys_rsxaudio; D-528: raw and isolated SPUs and
 interrupt threads, their problem-state registers as guest MMIO decoded in the fault handler), the other 74 answered
