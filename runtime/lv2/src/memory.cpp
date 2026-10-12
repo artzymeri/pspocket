@@ -573,6 +573,17 @@ Result create_shared_memory(PpuThread& t, bool pshared, u64 ipc_key, u64 size, u
         if (it != s.ipc.end()) {
             if (const auto existing = std::static_pointer_cast<SharedMemory>(it->second.lock())) {
                 if (existing->size != size || existing->align != align) return err(CELL_EPERM);
+                // RPCS3 lv2_memory::on_id_create: the system software's object (system_handle) takes one handle of the
+                // process's besides its own; opened, not made, so nothing is charged.
+                if (existing->system && mode != SYS_SYNC_NEWLY_CREATED) {
+                    std::lock_guard lock(s.memory.mutex);
+                    if (existing->id) return err(CELL_EEXIST);
+                    const u32 id = s.objects.insert(SharedMemory::kIdBase, existing);
+                    if (!id) return err(CELL_EAGAIN);
+                    existing->id = id;
+                    s.guest.w32(mem_id, id);
+                    return CELL_OK;
+                }
                 return err(CELL_EEXIST);
             }
         }
@@ -610,6 +621,30 @@ Result check_granularity(u64 size, u64 flags)
 }
 
 } // namespace
+
+bool Kernel::create_system_shared_memory(u64 key, u32 size, u64 flags)
+{
+    if (key == SYS_MMAPPER_NO_SHM_KEY || check_granularity(size, flags) != CELL_OK) return false;
+    Impl& s = *impl_;
+    std::lock_guard ipc_lock(s.ipc_mutex);
+    const auto it = s.ipc.find({SharedMemory::kIdBase, key});
+    if (it != s.ipc.end() && !it->second.expired()) return false;
+    const u32 align = (flags & SYS_MEMORY_PAGE_SIZE_64K) ? 0x10000 : 0x100000;
+    auto mem = std::make_shared<SharedMemory>(size, align, flags & SYS_MEMORY_GRANULARITY_MASK, nullptr);
+    mem->system = true;
+    mem->ipc_key = key;
+    mem->refs = 1;
+    s.ipc[{SharedMemory::kIdBase, key}] = mem;
+    s.system_memories.push_back(std::move(mem));
+    return true;
+}
+
+bool Kernel::shared_memory_key_exists(u64 key) const
+{
+    std::lock_guard ipc_lock(impl_->ipc_mutex);
+    const auto it = impl_->ipc.find({SharedMemory::kIdBase, key});
+    return it != impl_->ipc.end() && !it->second.expired();
+}
 
 Result sys_mmapper_allocate_shared_memory(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 mem_id)
 {
@@ -690,6 +725,10 @@ Result sys_mmapper_free_shared_memory(PpuThread& t, u32 mem_id)
         std::lock_guard lock(s.memory.mutex);
         if (mem->mappings) return err(CELL_EBUSY);
         if (!s.objects.remove(SharedMemory::kIdBase, mem_id)) return err(CELL_ESRCH);
+        if (mem->system) {
+            mem->id = 0; // the system software keeps its object and its key: the process may open it again
+            return CELL_OK;
+        }
         s.memory.container_or_default(mem->container).give_back(mem->size);
     }
     if (mem->ipc_key) {

@@ -234,6 +234,55 @@ TEST_CASE("lv2 mmapper: IPC keys", "[lv2][mmapper]")
     REQUIRE(c.call(kMmFreeShm, f.r32(out)) == CELL_OK);
 }
 
+TEST_CASE("lv2 mmapper: the system software's shared memory, opened by its key one handle at a time", "[lv2][mmapper]")
+{
+    Fixture f;
+    Caller c(*f.kernel);
+    const u32 out = f.alloc(4), got = f.alloc(4);
+    const u64 key = 0x8086000000000200ull;
+    const u64 open_only = k64K, create_any = k64K | 0x8000, create_new = k64K | 0xC000;
+    CHECK_FALSE(f.kernel->shared_memory_key_exists(key));
+    CHECK(c.call(kMmAllocateShm, key, 0x200000, open_only, out) == rc(CELL_ESRCH));
+    CHECK_FALSE(f.kernel->create_system_shared_memory(key, 0x200800, k64K)); // not whole pages
+    CHECK_FALSE(f.kernel->create_system_shared_memory(kNoShmKey, 0x200000, k64K));
+    const u32 avail = user_size(f, c).available;
+    REQUIRE(f.kernel->create_system_shared_memory(key, 0x200000, k64K));
+    CHECK_FALSE(f.kernel->create_system_shared_memory(key, 0x200000, k64K)); // the key is taken
+    CHECK(f.kernel->shared_memory_key_exists(key));
+    CHECK(user_size(f, c).available == avail);
+
+    // The process opens it (not as newly created), once; the geometry must be the system's.
+    CHECK(c.call(kMmAllocateShm, key, 0x200000, create_new, out) == rc(CELL_EEXIST));
+    CHECK(c.call(kMmAllocateShm, key, 0x100000, open_only, out) == rc(CELL_EPERM));
+    REQUIRE(c.call(kMmAllocateShm, key, 0x200000, open_only, out) == CELL_OK);
+    const u32 mem = f.r32(out);
+    CHECK((mem >> 24) == 0x08);
+    CHECK(user_size(f, c).available == avail); // opened, not made: nothing charged
+    CHECK(c.call(kMmAllocateShm, key, 0x200000, create_any, out) == rc(CELL_EEXIST)); // one handle at a time
+
+    // Mapped, written, unmapped through that handle; freed, the system keeps it with what it holds.
+    REQUIRE(c.call(kMmAllocateAddress, 0x10000000, k64K, 0x10000000, out) == CELL_OK);
+    const u32 area = f.r32(out);
+    REQUIRE(c.call(kMmSearchAndMap, area, mem, 0, out) == CELL_OK);
+    const u32 at = f.r32(out);
+    f.w32(at + 0x1FFFFC, 0x5A5A0001);
+    CHECK(c.call(kMmFreeShm, mem) == rc(CELL_EBUSY));
+    REQUIRE(c.call(kMmUnmap, at, got) == CELL_OK);
+    CHECK(f.r32(got) == mem);
+    REQUIRE(c.call(kMmFreeShm, mem) == CELL_OK);
+    CHECK(c.call(kMmFreeShm, mem) == rc(CELL_ESRCH));
+    CHECK(f.kernel->shared_memory_key_exists(key));
+    CHECK(user_size(f, c).available == avail);
+    REQUIRE(c.call(kMmAllocateShm, key, 0x200000, create_any, out) == CELL_OK); // opened again
+    const u32 again = f.r32(out);
+    REQUIRE(c.call(kMmSearchAndMap, area, again, 0, out) == CELL_OK);
+    CHECK(f.r32(f.r32(out) + 0x1FFFFC) == 0x5A5A0001);
+    REQUIRE(c.call(kMmUnmap, f.r32(out), got) == CELL_OK);
+    CHECK(f.r32(got) == again);
+    REQUIRE(c.call(kMmFreeShm, again) == CELL_OK);
+    REQUIRE(c.call(kMmFreeAddress, area) == CELL_OK);
+}
+
 TEST_CASE("lv2 sys_vm: map the whole virtual size, charge the physical size, paging calls validate ranges", "[lv2][vm]")
 {
     // GTA V's first sys_vm call (docs/runs/006): 32 MB virtual, 0x1260000 physical, default container, 64 KB pages.
