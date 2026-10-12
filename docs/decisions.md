@@ -13106,6 +13106,25 @@ with libsail's switch to the next descriptor (runtime/hle/src/cellSailPlay.cpp):
   test checks part 19's answers on pspocket alone. The scripts' source now keeps its item table apart from the items
   (from 14 items on, the table had overwritten the first items in parts 17 and 18; their firmware-free answers redone).
 
+## D-919 · 2026-10-12 · cellSail's descriptors the game never opened, as libsail (part 6)
+
+A descriptor added without cellSailDescriptorOpen (state 2) is opened by the player when OpenStream or Next makes it
+ready (runtime/hle/src/cellSailControl.cpp): opening (4), its stream opened on the control thread as Open's command
+does (the protocol's source found by the URI, made up by its first user, libpamf loaded), then its header read through
+the source's asynchronous Read: 2 KB into a buffer from the player's allocator, the read's handle kept at the
+source's +0x60 so the game's NotifyCallCompleted completes it (message 0x4A). The read done: a header longer than what
+was read is read again whole; else it is parsed (stream offset and size, cellPamfReader, a stream without entry points
+flagged (+0x18 bit 0), the mux rate, the duration), the streams chosen and the descriptor in use (5). A refused Read
+closes the descriptor's stream again and the preparation fails (the descriptor left opening, libsail's); a read that
+fails closes the descriptor (back to added) and the call fails; a failure after the read frees the buffer (when a second
+read was refused, the first buffer a second time, as libsail does). Its total size goes to a word on libsail's stack.
+- **Compared** (tests/hle/test_sail.cpp part 21, `[sail]`): a descriptor with a header of two units added unopened and
+  OpenStream (read in 2 KB, then whole), a start and AUs, Next to another unopened descriptor (made ready the same way,
+  switched to while playing), AUs, Stop, CloseStream, and a descriptor whose source's Read fails (OpenStream completes
+  with CANCEL after an error event): 0 differences in three runs; all 33 `[sail]` tests pass. A firmware-free test checks
+  its answers on pspocket alone. The test's source answers its Read at once (ReadSync's copy, then
+  NotifyCallCompleted from the control thread).
+
 ## D-920 · 2026-10-12 · libvdec's last functions, its PTS correction and frame rates, as Sony's libvdec (part 1)
 
 libvdec's six functions RPCS3 names that pspocket lacked, and Sony's two unnamed exports, are pspocket's own, read in

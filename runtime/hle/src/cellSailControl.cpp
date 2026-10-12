@@ -635,8 +635,102 @@ namespace {
 constexpr u32 kStreamPhase = 0x160, kRateShown = 0x162; // 1 opening, 2 open, 7 closing, 0 none
 constexpr u32 kCallRunning = 0x250;
 
+// A source's Read (libsail's): the call's handle kept for the source's NotifyCallCompleted to complete (+0x60), then its
+// read(arg, stream type, media info, URI, offset, buffer, size, u64* total size).
+s32 source_read(PPUContext& ctx, u32 source, s32 type, u32 media, u32 uri, u64 offset, u32 buf, u32 size, u32 total,
+    u64 handle)
+{
+    w64(ctx, source + 0x60, handle);
+    return static_cast<s32>(call_guest(ctx, source_func(ctx, source, src::kRead),
+        {r32(ctx, source + src::kArg), static_cast<u64>(static_cast<s64>(type)), media, uri, offset, buf, size, total}));
+}
+
+// A descriptor's header read through its source (libsail's): the buffer it had freed, `size` bytes asked for into a
+// new one from the player's allocator (MEMORY without), the source's Read completing message 0x4A on `rec` (+4 the
+// descriptor); the buffer and the size asked kept (+0xC8, +0xCC) once the read is under way, freed when it is refused.
+// Its total size goes to a stack word of libsail's that is gone by then.
+s32 read_header(PPUContext& ctx, u32 d, u32 size, u32 rec)
+{
+    w32(ctx, rec + 4, d);
+    const u32 type = r32(ctx, d + ds::kType);
+    if (type == 1 || type == 2) unsupported_container(ctx, d);
+    if (type != 0) return error(CELL_SAIL_ERROR_UNSUPPORTED_STREAM);
+    const u32 p = r32(ctx, d + ds::kPlayer), old = r32(ctx, d + ds::kBuffer);
+    w32(ctx, d + ds::kBuffer, 0);
+    if (old) player_free(ctx, p, 0x80, old);
+    const u32 buf = player_alloc(ctx, p, 0x80, size);
+    if (!buf) return error(CELL_SAIL_ERROR_MEMORY);
+    s32 r;
+    {
+        StackVar total(ctx, gb(ctx), 16);
+        r = source_read(ctx, r32(ctx, d + ds::kSource), static_cast<s32>(type), r32(ctx, d + ds::kMediaInfo),
+            r32(ctx, d + ds::kUri), 0, buf, size, total.addr(), step(0x4A, rec));
+    }
+    if (r < 0) {
+        player_free(ctx, p, 0x80, buf);
+        return r;
+    }
+    w32(ctx, d + ds::kHeaderSize, size);
+    w32(ctx, d + ds::kBuffer, buf);
+    return r;
+}
+
+// The header read (message 0x4A, libsail's): a failed read closes the descriptor's stream (back to added) and fails
+// the preparation; a header longer than what was read is read again whole; else it is parsed (the stream's size, a
+// stream without entry points flagged (+0x18 bit 0), the mux rate, the duration), the streams chosen, the descriptor in
+// use (5). A failure after the read frees the buffer (the old one again when a second read was refused, as libsail).
+void header_read(PPUContext& ctx, u32 p, s32 result, u32 rec)
+{
+    const u32 d = r32(ctx, rec + 4);
+    if (result < 0) {
+        close_descriptor(ctx, d, false);
+        post_completion(ctx, p, result, r64(ctx, rec + 8));
+        return;
+    }
+    const u32 type = r32(ctx, d + ds::kType);
+    if (type != 0) unsupported_container(ctx, d);
+    const u32 rd = d + ds::kReader, buf = r32(ctx, d + ds::kBuffer);
+    StackVar out(ctx, gb(ctx), 0x40); // +0 the header's size, +0x10 the stream's, +0x20 / +0x30 the start and end
+    s32 r = static_cast<s32>(module_call(ctx, "cellPamf", "cellPamfGetStreamOffsetAndSize",
+        {buf, 0, out.addr(), out.addr() + 0x10}));
+    if (r >= 0) {
+        const u64 header = r64(ctx, out.addr());
+        if (u64{r32(ctx, d + ds::kHeaderSize)} < header) {
+            r = read_header(ctx, d, static_cast<u32>(header), rec);
+            if (r >= 0) return;
+        } else {
+            w32(ctx, d + ds::kHeaderSize, static_cast<u32>(header));
+            w64(ctx, d + ds::kStreamSize, r64(ctx, out.addr() + 0x10));
+            r = static_cast<s32>(module_call(ctx, "cellPamf", "cellPamfReaderInitialize", {rd, buf, 0, 1}));
+            if (r >= 0) {
+                if (static_cast<s32>(module_call(ctx, "cellPamf", "cellPamfReaderGetNumberOfEp", {rd})) == 0)
+                    w32(ctx, d + 0x18, r32(ctx, d + 0x18) | 1);
+                const u32 mux = static_cast<u32>(module_call(ctx, "cellPamf", "cellPamfReaderGetMuxRateBound", {rd}));
+                w32(ctx, d + ds::kMuxRate, mux * 400);
+                const u32 start = out.addr() + 0x20, end = out.addr() + 0x30;
+                module_call(ctx, "cellPamf", "cellPamfReaderGetPresentationStartTime", {rd, start});
+                module_call(ctx, "cellPamf", "cellPamfReaderGetPresentationEndTime", {rd, end});
+                w64(ctx, d + ds::kDuration, u64{r32(ctx, end) - r32(ctx, start)} << 32 |
+                    (r32(ctx, end + 4) - r32(ctx, start + 4)));
+                select_streams(ctx, d);
+                w8(ctx, d + ds::kState, 5);
+                post_completion(ctx, p, 0, r64(ctx, rec + 8));
+                return;
+            }
+        }
+    }
+    if (buf) {
+        player_free(ctx, p, 0x80, buf);
+        w32(ctx, d + ds::kHeaderSize, 0);
+        w32(ctx, d + ds::kBuffer, 0);
+    }
+    post_completion(ctx, p, r, r64(ctx, rec + 8));
+}
+
 // The current descriptor's stream made ready for OpenStream (libsail's): one opened already (3) has its streams chosen
-// and is in use (5); one only added (2) is opened and its header read first (a later part); others complete at once.
+// and is in use (5); one only added (2) is opened (4: its source found and made up) and its header read through the
+// source (message 0x4A goes on; a refused read closes the stream again, the descriptor left opening); others complete
+// at once.
 void stream_prepare(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
 {
     std::memset(gb(ctx) + rec, 0, 0x20);
@@ -648,7 +742,17 @@ void stream_prepare(PPUContext& ctx, u32 p, u32 d, u32 rec, u64 handle)
         post_completion(ctx, p, error(CELL_SAIL_ERROR_FATAL), handle);
         return;
     }
-    if (st == 2) later_part(ctx, "OpenStream of a descriptor not opened (its header read through the source)");
+    if (st == 2) {
+        w8(ctx, d + ds::kState, 4);
+        s32 r = open_stream(ctx, d);
+        if (r >= 0) {
+            r = read_header(ctx, d, 0x800, rec);
+            if (r >= 0) return;
+            close_stream(ctx, d);
+        }
+        post_completion(ctx, p, r, handle);
+        return;
+    }
     if (st == 3) {
         select_streams(ctx, d);
         w8(ctx, d + ds::kState, 5);
@@ -909,6 +1013,10 @@ void message_loop(PPUContext& ctx, u32 p)
         }
         if (code == 0x29) {
             source_call_completed(ctx, m.b, static_cast<s32>(m.c));
+            continue;
+        }
+        if (code == 0x4A) {
+            header_read(ctx, p, static_cast<s32>(m.a), m.c);
             continue;
         }
         if (code == 0x4C || code == 0x5D) {
