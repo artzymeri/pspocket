@@ -1608,8 +1608,7 @@ Observed half(const Setup& s, bool sony_half)
 
 } // namespace
 
-TEST_CASE("cellRudp's comparison calls Sony's exports by their names; pspocket's library, firmware first",
-    "[hle][rudp]")
+TEST_CASE("cellRudp's comparison calls Sony's exports by their names; pspocket's library", "[hle][rudp]")
 {
     check_names("cellRudp", {"cellRudpInit", "cellRudpEnd", "cellRudpEnableInternalIOThread", "cellRudpSetEventHandler",
                                 "cellRudpSetMaxSegmentSize", "cellRudpGetMaxSegmentSize", "cellRudpCreateContext",
@@ -1619,11 +1618,13 @@ TEST_CASE("cellRudp's comparison calls Sony's exports by their names; pspocket's
                                 "cellRudpTerminate", "cellRudpRead", "cellRudpWrite", "cellRudpGetSizeReadable",
                                 "cellRudpGetSizeWritable", "cellRudpFlush", "cellRudpPollCreate", "cellRudpPollDestroy",
                                 "cellRudpPollControl", "cellRudpPollWait", "cellRudpPollCancel", "cellRudpNetReceived",
-                                "cellRudpProcessEvents"});
+                                "cellRudpProcessEvents"},
+        /*marked=*/false);
 }
 
+// It matches (D-916): no longer hidden, it runs wherever the firmware is (the Mac's gate) and skips elsewhere.
 TEST_CASE("cellRudp against Sony's librudp: answers, options, structures, a connection over each kind of I/O",
-    "[.][hle][lle][compare][rudp]")
+    "[hle][lle][compare][rudp]")
 {
     const Setup s = setup();
     run(s, "cellRudp against Sony's librudp", [&](bool sony) { return half(s, sony); }, [](const Observed& o) {

@@ -310,6 +310,7 @@ TEST_CASE("cellRudp: every call before Init, the argument checks and the options
     "[hle][rudp]")
 {
     Rudp r;
+    CHECK_FALSE(registry().is_firmware_first("cellRudp")); // pspocket's, Sony's module installed or not (D-916)
     CHECK(r.call("cellRudpCreateContext", kCtxOpd, kCtxRing, kArgs) == code(NOT_INITIALIZED));
     CHECK(r.call("cellRudpEnd") == code(NOT_INITIALIZED));
     CHECK(r.call("cellRudpProcessEvents", 0) == code(NOT_INITIALIZED));

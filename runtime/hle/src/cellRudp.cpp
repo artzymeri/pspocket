@@ -5248,7 +5248,7 @@ void register_cellRudp(Registry& r)
         PS_HLE_FUNC(0xFADE48B2, cellRudpProcessEvents),
         PS_HLE_INTERNAL(0x03024A36, _pspocket_rudp_io_thread),
     });
-    r.firmware_first(kModule);
+    // No longer firmware-first (D-916 part 5): it matches librudp call for call.
 }
 
 } // namespace pspocket::hle

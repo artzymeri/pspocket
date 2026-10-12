@@ -12501,3 +12501,16 @@ The internal I/O thread's part now also waits on a second PPU thread, as a game'
 without a timeout ended by PollCancel (CANCELLED), a blocking listener's Accept returning the child of a connection
 made meanwhile, and a blocking Accept still waiting when cellRudpEnd comes (CANCELLED, and End returns 0). All three
 agree with librudp as they are; the comparison: 0 of 2,649 observations differ.
+
+## D-916 · 2026-10-12 · cellRudp no longer firmware-first (part 5)
+
+cellRudp matches Sony's librudp call for call (parts 2 to 4: 0 of 2,649 observations differ, run after run: every
+answer and check, the options, both status structures with the library's memory, the wire format datagram by
+datagram through cookies, handshakes, data, loss, reordering, full windows, keep-alive, failures and resets, the game's
+allocator call by call, the internal I/O thread with blocking calls on two threads), so its firmware-first marker goes
+(D-563): where the system software is installed, a game importing cellRudp now gets pspocket's, not librudp.sprx. Not
+reproduced, by nature: the random values (initial sequence numbers, tokens, cookies' random words and secrets) and the
+times (round trips, acknowledgement delays, time stamps), which the comparison masks; and where librudp keeps the part
+of a packet header that fitted a full datagram, pspocket drops the header whole (part 3; only below a 0x40-byte segment
+size). Its comparison (test_rudp_compare.cpp) loses its [.]: it runs in the Mac's gate with the firmware (about 110 s)
+and skips without it; the name check and test_rudp.cpp check the library is pspocket's and unmarked.
