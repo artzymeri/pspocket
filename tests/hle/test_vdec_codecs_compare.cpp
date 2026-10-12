@@ -720,6 +720,16 @@ Setup libvdec_setup()
     return s;
 }
 
+// pspocket's codec cores driven by Sony's libvdec, as a game gets them when it imports one of libvdec's unverified
+// functions and so Sony's libvdec (D-594): the same lives with Sony's libvdec in both halves, over pspocket's cores in
+// the first and Sony's in the second (D-920).
+Setup cores_setup()
+{
+    Setup s = libvdec_setup();
+    s.ours_on_firmware = true;
+    return s;
+}
+
 } // namespace
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: DivX 3.11", "[.][hle][lle][compare][vdec]")
@@ -747,6 +757,13 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: DivX 3.11", "[.][hle][l
             CHECK(o.value("OpenEx DivX 3.11 with 1 bytes less than its codec's part") == "0x80610101");
             CHECK(o.value("OpenEx DivX 3.11 with 0 bytes less than its codec's part") == "0x0");
         });
+}
+
+TEST_CASE("The DivX 3.11 core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    if (!avcodec_find_encoder(AV_CODEC_ID_MSMPEG4V3)) SKIP(kNoDivx);
+    const Setup s = cores_setup();
+    run(s, "libdivx311dec under Sony's libvdec", [&](bool sony) { return divx311(s, sony); }, [](const Observed&) {});
 }
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX and as MPEG-4",

@@ -12584,3 +12584,43 @@ codes, SetFrameRateExt's codes and rate/scale forms, a rate before the sequence,
 the refusals, the input queue held until DecodeAu is BUSY; the input status right after EndSeq is a note, the threads'
 timing); test_vdec_codecs_compare.cpp's VC-1 comparison (its held pictures now in Sony's frame buffers); test_vdec.cpp
 (the unverified marks).
+
+## D-920 · 2026-10-12 · libdivx311dec, the DivX 3.11 core, pspocket's own (part 2)
+
+The codec cores Sony's libvdec drives had only their version queries (D-575); their decoding APIs were Sony's modules'
+alone. libdivx311dec's nine functions are now pspocket's own (runtime/hle/src/vdec_cores.cpp, over vdec_ffmpeg.hpp: an
+FFmpeg decoder for the cores), compared with Sony's module two ways, samples within one step (D-912's IDCT rounding):
+- called directly, as libvdec calls it and past what libvdec ever sends (tests/hle/test_vdec_cores_compare.cpp: each
+  half makes a SPURS instance and a taskset with pspocket's cellSpurs and gives it to the core): 0 of 419 observations
+  differ;
+- driven by Sony's libvdec, as a game importing one of libvdec's unverified functions gets it (D-594): D-912's DivX 3.11
+  lives with Sony's libvdec in both halves, over pspocket's core and over Sony's (test_vdec_codecs_compare.cpp, part 1's
+  Setup::ours_on_firmware): 0 of 542 differ.
+libdivx311dec is not firmware-first: Sony's libvdec loaded for a game links to pspocket's core.
+
+The core's PPU side is reproduced as Sony's module runs it; its SPU program's part (decoding an access unit into the
+frame buffer the PPU side picked and reporting what it did) is done on FFmpeg:
+- **QueryAttr(param {type, width, height, frame buffers}, *size, *version)**: two frame buffers only; type 15 sizes for
+  1920x1088 (0x68EC00), else 16 to 1920 by 16 to 1088 (two frames plus 0x4D800); version 0x103; else ARG (0x80615502).
+- **Open(param, memory, size, taskset)**: the frame buffers past the decoder's 0x3D77F bytes (128-byte aligned at
+  +0x3D700); no memory, memory holding an open decoder (its mark 0xBABEFACE at +0x3D64C), no taskset or other than two
+  frame buffers ARG; the taskset's cellSpurs errors as they are. **Close** leaves the mark 0x88888888 (a second Close ARG).
+- **DecodeAu(handle, au {address, size, width, height, four words}, mode 0x20/0x21/0x22, *status)**: the first frame
+  buffer neither held by the game nor the reference to come; none, or no picture entry free (two), BUSY (0x80615510).
+  A picture is shown one access unit late (the next DecodeAu or FlushPicture makes it ready, with the frame decoded
+  before); mode 0x21 skips all but I pictures, shown at once with no frame (GetPicture's frame 0, its skip byte 1); a P
+  picture with no reference: AU (0x80615520), status 0x40020000; the status word from the SPU side's error bits (a
+  picture FFmpeg concealed errors in: 0x11, as D-912).
+- **GetNumOfPictures, GetPicture** (its frame, the frame's size, the access unit's four words, width and height, type,
+  0x30, status, skip byte; PIC 0x80615540 when the status has errors), **ReleasePicture** (the frame held longest),
+  **FlushPicture** (the waiting picture ready; Sony's counts its entry once more, kept), **Reset** (every frame and entry
+  free, the references gone): their states and answers as Sony's, including GetPicture's taking the head entry off when
+  none is ready.
+
+Different, and a note in the comparison: a core opened for one size and given access units of another (libvdec always
+gives both the same) — Sony's SPU program decodes the first picture otherwise (up to three steps off); pspocket decodes
+at the access units' size.
+
+Tests: test_vdec_cores_compare.cpp: the comparison (hidden, [compare][vdec-cores]) and a firmware-free test of
+pspocket's core against the values Sony's gave; test_vdec_codecs_compare.cpp "The DivX 3.11 core under Sony's libvdec"
+(hidden, [compare][vdec-cores]).
