@@ -157,6 +157,7 @@ add_library(pspocket_hle STATIC
     src/vdec_avc.cpp
     src/cellCelpEnc.cpp
     src/cellCelp8Enc.cpp
+    src/sys_lv2coredump.cpp
     src/adec_celp.cpp
     src/celp_math.cpp
     src/celp_mpe.cpp

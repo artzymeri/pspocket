@@ -228,6 +228,9 @@ struct Config {
     u32 main_area_end = 0x10000000;
     // Title ID for _sys_process_get_paramsfo (empty: ENOENT).
     std::string title_id;
+    // The executable's sys_process_param crash_dump_param_addr (SYS_PROCESS_CRASH_DUMP_ENABLED's declaration; 0 for
+    // none): the retail kernel's _sys_process_get_paramsfo gives it to liblv2coredump (D-943).
+    u32 crash_dump_param_addr = 0;
     // The executable's guest path, as lv2 keeps it for the process (sys_dbg_get_process_info): argv[0].
     std::string executable_path;
     // Debug/root process permissions (allows negative thread priorities and root-only syscalls).

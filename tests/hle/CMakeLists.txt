@@ -64,6 +64,10 @@ target_sources(test_hle PRIVATE test_vdec_avc_compare.cpp)
 # their comparisons with Sony's modules "[compare][celp]".
 target_sources(test_hle PRIVATE test_celp_compare.cpp test_celp8_compare.cpp test_celp_dec_compare.cpp)
 
+# liblv2coredump's crash dump writer (D-943): test_hle "[lv2coredump]", its comparison with Sony's module
+# "[compare][lv2coredump]".
+target_sources(test_hle PRIVATE test_lv2coredump_compare.cpp)
+
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE
     test_netaoi.cpp
