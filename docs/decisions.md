@@ -14771,3 +14771,152 @@ libvdec's H.264 lives: as a game that imports libvdec's unverified functions get
 firmware, some of the lives run through pspocket's core against Sony's recorded answers. Shared files changed:
 codec_cores.cpp (libavcdec no longer firmware-first), modules.cpp, test_codec_cores.cpp and
 test_codec_cores_compare.cpp (that mark), test_vdec_ext_compare.cpp (Sony's libvdec over pspocket's core).
+
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 1: their sizes, and MP3 call for call as libmp3dec)
+
+cellAdec's cores on FFmpeg (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3) were RPCS3's structures
+read by their names and served only where the firmware has no module (firmware first). They are now compared with
+Sony's: tests/hle/test_adec_cores.cpp's "the cores on FFmpeg against Sony's cores (D-944)" runs each feed through
+cellAdec twice, over pspocket's core and over Sony's core module from the user's firmware (FirmwareCores: libadec's
+front end is pspocket's in both, so only the cores differ), and compares every call's answer, the callbacks, the PCM
+items (handle, status, size, PTS, user data), the information blocks byte for byte and the PCM. It stays hidden
+([.compare-adec]) until every core agrees.
+
+Sony's answers taken for every core (Spec in adec_*.cpp): getMemSize (MP3 0x27300, layer I 0x64000, layer II 0x3E400,
+MPEG-4 AAC 0x299A9A, its 2-channel 0x1A2CF0 and 2-channel modified 0xBAC70, AC-3 0x5EB2F, ATRAC3 0x3CB80; a core
+fails loudly if FFmpeg's state does not fit, which it does), the versions (MP3 0x01030000, layer I 0x01080000, layer
+II 0x02040000, AAC 0x03070000, AC-3 0x20070323, ATRAC3 0x01020000; layers I and II and AAC also write theirs into the
+attribute at +8, as their getMemSize does), and the PCM handle counts (MP3 and ATRAC3 3, the MPEG layers and AAC 4,
+AC-3 8).
+
+MP3, as libmp3dec does it (adec_mp3.cpp):
+- The bit reservoir is the core's own: FFmpeg's ADU decoder (mp3adufloat, added to scripts/build-ffmpeg.sh) gets each
+  frame with its main data (main_data_begin bytes back from what the frames before left, then its own) right after its
+  side information. A frame whose main data begin before what the reservoir holds (a stream entered mid-way) gives a
+  PCM item of size 0 and no error, and its whole main data area stays for the frames after. After a frame whose main
+  data the decoder refuses, the reservoir is empty and the decoder silent (FFmpeg flushed: libmp3dec's next frame
+  starts from silence).
+- CellAdecMP3Info: ui_header the header's low 20 bits; ui_main_data_remain_size the reservoir held before the frame
+  (what the frame before left after its main data, uncapped: 820 seen); ui_main_data_now_size 0. The block lives from
+  frame to frame: a unit refused leaves the last frame's (zeros before any) and writes i_error_code as libmp3dec's own
+  number for the error. Its table (libmp3dec.sprx, 0x4998) pairs -1 to -7 with CELL_ADEC_ERROR_MP3_ERROR to
+  BAD_BLKTYPE, -10 to -12 with BAD_VERSION to BAD_MODE_EXT, -15 to -23 with HUFFMAN_NUM to PCMOUT.
+- Versions: a clear MPEG-2.5 bit is MPEG-2.5 whatever the version bit beside it, so the reserved version decodes as
+  MPEG-2.5 (FFmpeg gets the header as MPEG-2.5's); nothing is BAD_VERSION. The PTS correction is by the rate's index
+  (48, 44.1, 32 kHz and their halves and quarters: every frame steps 2160, 2351 or 3240 ticks).
+- A unit shorter than its frame is decoded, zeros past its end (libmp3dec reads its own buffer there; the same while
+  the main data are inside the unit). A wrong CRC is flagged and the frame decoded.
+- The PCM: floats as decoded (past 1 where the stream goes: 4.98 seen), 16-bit rounded half away from zero and held in
+  range (55,296 samples of Sony's float and 16-bit outputs: every one not at full scale rounds so). write_pcm has
+  Rounding::Nearest for it; the other cores keep libatxdec's (floats held below 1, integers floored).
+
+Not reproduced (documented tolerance): the padding byte before i_error_code, where libmp3dec leaves a byte of its own
+after an error (0x16 or 0x08 seen); libmp3dec's checks of the main data (HUFFMAN_NUM and the others), as FFmpeg decodes
+what it refuses; a unit shorter than a header (libmp3dec reads the rest from what its buffer held); the floats differ
+from libmp3dec's in their last bits (3.6e-7 at most, 121 dB), so a 16-bit sample at a rounding boundary can differ by
+one step.
+
+Compared (the user's firmware 4.92): MP3 float and 16-bit, the bit reservoir (in use, full past 511, entered
+mid-way with a refused unit), each header error and block type 0 between good frames, an error first, MPEG-2, MPEG-2.5
+and the reserved version, MPEG-2.5 without PTS, units of 0 bytes, of part of their frame and of two frames, CRC: 11 of
+11 agree. Still differing (part 2): layers I and II (the information's channel count and frame size), ATRAC3 (its
+first output and the information), MPEG-4 AAC (the PCM at 63.5 dB, a frame counter in the information), AC-3 (its
+first frame).
+
+
+## D-943 · 2026-10-13 · sys_lv2coredump_D725F320 pspocket's own: a retail console's core file
+
+liblv2coredump.sprx is the module that writes a game's crash dumps. libsysmodule loads it as a process starts when
+the executable declares SYS_PROCESS_CRASH_DUMP_ENABLED (sys_process_param's crash_dump_param_addr). It exports
+sys_lv2coredump_D725F320(fd), the library chart's last function, and sys_crashdump's two log area functions
+(pspocket's own since D-607). pspocket's sys_lv2coredump (runtime/hle/src/sys_lv2coredump.cpp) does what Sony's module
+does on a retail console, step for step: the same lv2 calls, the same calls into the libraries it imports (liblv2's
+heap, lightweight mutex, thread and printf functions; cellGame; cellSysutil), the same heap blocks and the same bytes.
+
+**lv2.** _sys_process_get_paramsfo now reports the declaration as the retail kernel does: flag 0x10 at +0x10 and the
+declaration's address at +0x38 (the loader passes crash_dump_param_addr from the executable). +0x20 holds a debugging
+console's crash dump settings; it is 0, because pspocket's console is a retail one.
+
+**Start.** lv2coredump_start is the module_start that libsysmodule runs with no arguments. It reads the paramsfo and
+checks the declaration, which must be readable and hold {0x20, "dump", 1, 0, 0, 0}. A bad declaration prints the
+module's error and leaves the module idle. Otherwise start makes, in Sony's order:
+- the lightweight mutex "_l2cMTX";
+- the 64 KB heap "_LIBLV2COREDUMP_";
+- the event queue "_l2cDBG", registered as the PPU exception handler (944);
+- a sys_fsw_connect_event call;
+- the title information read through libsysutil_game: title ID, title, version, SDK version;
+- the thread "__COREDUMP_HANDLER__" (priority 1001, 16 KB stack), which waits on the queue.
+The configuration is the declaration's: crash reports to /dev_hdd0, no extra parts.
+
+**D725F320(fd)** writes an ELF64 core file (OS ABI 0x66, PPC64) into the open file: the program headers, then one
+PT_NOTE note per part.
+- SYSTEM_INFO: the console's OpenPSID and the system software version the module was built with.
+- DUMP_CAUSE_INFO: the handler's exception records (none here).
+- PROCESS_INFO: sys_dbg_get_process_info, the PPU thread and SPU thread group counts (from sys_dbg_get_thread_list),
+  and the PPU GUID.
+- GAME_APP_INFO: the title information start read.
+- The memory part, which is empty on a retail console.
+The ELF header's program header count grows as each note ends. The TTY gets the progress report: "Generating Core Dump
+File", one dot per 4 %, then " Done." or the error. The call answers CELL_ENOSPC when /dev_hdd0 has 10 KB or less
+free, or when start never configured the module.
+
+**Never written.** A debugging console's settings add parts: the PPU and SPU threads and registers, the SPU local
+stores, the synchronisation objects, memory, modules, the RSX state and SPURS. pspocket's lv2 reports no such
+settings, so pspocket never writes those parts and does not implement them, as Sony's module on a retail console never
+writes them.
+
+**Left as follow-ups:**
+- The user's log areas (USER_LOG_INFO, filled by sys_crash_dump_set_user_log_area). Sony's module keeps the areas
+  itself; pspocket's sys_crashdump, firmware-first, keeps them apart.
+- The handler thread's crash report after an exception. pspocket's lv2 sends the queue no exception yet. The handler
+  logs any event it gets (a game's 959 or 972, the queue's last from 945 or 988) and goes on waiting.
+- The libsysmodule hook, left out because it does not follow from what is known. RPCS3's cellSysmodule start
+  (rpcs3/Emu/Cell/Modules/cellSysmodule.cpp) loads liblv2coredump when bit 4 of paramsfo +0x10 is set. pspocket's
+  cellSysmodule has no start of its own to hang that on. Sony's module also serves the firmware-first sys_crashdump,
+  so which module a process gets (pspocket's or the firmware's) is a loader decision still to make. Until then the
+  start runs only where a test calls it, and a game's D725F320 answers CELL_ENOSPC, as the unstarted module does.
+
+**Compared** in tests/hle/test_lv2coredump_compare.cpp (firmware 4.92). The same process runs both halves: the
+declaration in memory, /dev_hdd0 on a directory of the test's. Sony's module is started by the LLE loader and
+pspocket's by lv2coredump_start; then D725F320 writes into a file.
+- With the declaration: the answer and the core file match byte for byte, note by note. 0 of 13 observations differ.
+- Without it: CELL_ENOSPC and an empty file in both. 0 of 4 observations differ.
+Without the firmware, the same file checks pspocket's start (the handler's queue hears a game's 959 only with the
+declaration) and the four notes. tests/lv2/test_process.cpp checks the paramsfo.
+
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 2: MPEG audio layers I and II, ATRAC3, MPEG-4 AAC)
+
+Part 1's comparison (tests/hle/test_adec_cores.cpp, [.compare-adec]) over the other cores. What each does as Sony's
+does now:
+
+- MPEG audio layers I and II (adec_mpeg.cpp, libmpl1dec and libm2bcdec): the output is the stream's own channels
+  whatever channelNumber says up to 2; past 2 every frame is refused (libmpl1dec 0x80613112, libm2bcdec's
+  OPENBS_EX 0x80612B21), as a multichannel extension is asked for. libmpl1dec has its own error range, libm2bcdec's
+  numbers from 0x80613100 (RPCS3 lists none). Refusals: no 12-bit sync (MPEG-2.5 and the reserved version too) SYNCF,
+  free format and bit rate 15 BITRATE, the reserved rate SAMPLEFREQ, the other layer's header, a unit shorter than its
+  frame and a frame the decoder refuses SYNCF_EX (0x22); emphasis 2 decodes. A refused unit gives an item of 1152
+  samples of silence in the information block's channels (libmpl1dec copies only a layer I frame's 384 of them out:
+  Decoded::copied) and leaves the block as the last frame decoded left it; before any frame the block reads stereo,
+  48 kHz, bit rate index 14, 1152 stereo samples, L_R. channelNumber in the block is the output's channel count, and
+  outputFrameSize 1152 samples of the channels in bytes (layer I's too). Floats are not held below 1. StartSeq refuses
+  a downmix flag past 1 only.
+- ATRAC3 (adec_atrac3.cpp, libat3dec): the sound is FFmpeg's with its sign turned over (FFmpeg's ATRAC3 decoder has the
+  opposite polarity: -6.0 dB against Sony's until turned, 116 dB after); a sequence's first frame, and the first after
+  a refused unit, comes out empty (decoded all the same: the frames after overlap it); the information's nbytes is a
+  channel's (nbytes / nch). Floats held below 1 and integers floored, as before (round to nearest made 16-bit worse).
+- MPEG-4 AAC (adec_aac.cpp, libm4aacdec and its 2-channel forms): the block lives from frame to frame (a refused unit
+  leaves the last frame's) and its word at +0x74, past RPCS3's structure, counts the frames decoded since the start or
+  the last refusal. A refused unit gives a frame of silence in the last frame's channels and starts the decoder
+  afresh (FFmpeg's opened again: its overlap and window shapes as at a sequence's start, which a flush alone does not
+  reset); a frame FFmpeg refuses is INVALID_SECTION_DATA (0x8061241C, libm4aacdec's for raw data that are not AAC's).
+  An ADTS frame its unit cuts short waits for the next unit, whose bytes complete it (libm4aacdec reads the two as one
+  frame, whatever the second holds).
+
+Not reproduced (documented tolerance): perceptual noise substitution's noise in AAC (each decoder's own random
+numbers: the comparison's AAC streams are encoded without it); an AAC unit without its sync whose bytes hold a false
+one (libm4aacdec reads on from it into the next unit); ATRAC3's frame after next when a sequence's first frame is
+refused (up to 12 16-bit steps: libat3dec's state after its partial decode of the bad frame).
+
+Compared: 45 cases of MP3, layers I and II, ATRAC3 and AAC agree, each in every answer, callback, item, information
+byte and PCM sample (floats within their last bits, 16-bit within one step). Still differing (part 3): AC-3.
+

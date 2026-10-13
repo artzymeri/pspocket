@@ -8,12 +8,14 @@
 // libatrac3plus fills the parameters from the file (cellAtrac.cpp: its channels, its joint stereo flag, its block size,
 // float PCM). RPCS3 runs Sony's module, so what follows is pspocket's reading, to compare with libat3dec on the Mac:
 // - One frame of nbytes (all channels) per access unit, 1024 samples per channel out, interleaved, in the four formats
-//   as libatxdec writes them (adec_atracx.cpp: floats held below 1, the 24-bit in a word's low three bytes).
+//   as libatxdec writes them (adec_atracx.cpp: floats held below 1, the 24-bit in a word's low three bytes). As
+//   libat3dec (D-944): the sound is FFmpeg's with its sign turned over, and a sequence's first frame, and the first
+//   after a refused unit, comes out empty (decoded: the frames after overlap it).
 // - FFmpeg takes the configuration as a WAV file's 14 extra bytes (joint stereo or single channels) and frames of 96,
 //   152 or 192 bytes a channel (ATRAC3's rates): StartSeq refuses (ARG) another size, as it does channels other than 1
 //   or 2, joint stereo of one channel, or another word size.
 // - A unit shorter than its frame, or one FFmpeg refuses: AT3_ERROR.
-// - CellAdecAtrac3Info: the sequence's nch, isJoint and nbytes.
+// - CellAdecAtrac3Info: the sequence's nch and isJoint, and a channel's bytes of a frame (nbytes / nch, libat3dec's).
 // - PTS: the front end's step for ATRAC3 (correctPtsValueType 6, whatever the rate, as Sony's front end has it).
 //
 // ATRAC3 multichannel (CELL_ADEC_TYPE_ATRAC3MULTI, for cellAtrac3multidec's table 0xC20C6BD7, D-621), which
@@ -102,6 +104,7 @@ public:
         nbytes_ = ps_ld32(param + prm::nbytes);
         format_ = format_of(ps_ld32(param + prm::bw_pcm));
         configured_ = open_atrac3(ff_, "ATRAC3", nch_, joint_, nbytes_);
+        held_ = false;
         return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_AT3_ERROR);
     }
 
@@ -111,7 +114,7 @@ public:
         d.pts_type = CORRECT_PTS_ATRAC3;
         ps_write32(base, bsi + prm::nch, nch_);
         ps_write32(base, bsi + prm::is_joint, joint_);
-        ps_write32(base, bsi + prm::nbytes, nbytes_);
+        ps_write32(base, bsi + prm::nbytes, nch_ ? nbytes_ / nch_ : nbytes_); // a channel's bytes, as libat3dec's
         if (!configured_) {
             PS_LOG_ERROR("cellAdec", "ATRAC3: a decode without a sequence started with valid parameters");
             d.error = error(CELL_ADEC_ERROR_AT3_ERROR);
@@ -120,6 +123,7 @@ public:
         if (size < nbytes_) {
             PS_LOG_ERROR("cellAdec", "ATRAC3: an access unit of {} bytes for {}-byte frames", size, nbytes_);
             d.error = error(CELL_ADEC_ERROR_AT3_ERROR);
+            held_ = false; // the frame after a refused one comes out empty, as a sequence's first (D-944)
             return d;
         }
         if (size > nbytes_)
@@ -129,9 +133,15 @@ public:
         if (const int e = ff_.decode(base + au, nbytes_, pcm_, 1024); e < 0 || !pcm_.samples) {
             PS_LOG_ERROR("cellAdec", "ATRAC3: FFmpeg refused a frame ({}): the game sent invalid data", e);
             d.error = error(CELL_ADEC_ERROR_AT3_ERROR);
+            held_ = false;
             return d;
         }
-        d.size = write_pcm(base, out, pcm_, straight(pcm_.channels()), format_);
+        // libat3dec's first frame of a sequence comes out empty (decoded: the frames after overlap it), and its sound
+        // is FFmpeg's with the sign turned over.
+        const bool first = !held_;
+        held_ = true;
+        if (first) return d;
+        d.size = write_pcm(base, out, pcm_, straight(pcm_.channels()), format_, -1.0f);
         return d;
     }
 
@@ -139,7 +149,7 @@ private:
     FfDecoder ff_;
     Planar pcm_;
     u32 nch_ = 2, nbytes_ = 0;
-    bool joint_ = false, configured_ = false;
+    bool joint_ = false, configured_ = false, held_ = false;
     Format format_ = Format::F32;
 };
 
@@ -242,8 +252,9 @@ s32 check_multi(const u8* p)
 
 // libat3dec's version is not known (pspocket's word); the information block is CellAdecAtrac3Info's size. Two channels
 // of a frame's 1024 samples, 32 bits each at most.
-const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }};
+// libatrac3dec's answers (D-944): its version, getMemSize 0x3cb80, three PCM handles.
+const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01020000,
+    CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }, 0x3cb80, 3, false};
 // ATRAC3 multichannel (D-621): eight tracks of 1024 samples, 32 bits each at most; libadec's error codes.
 const Spec kAtrac3Multi = {CELL_ADEC_TYPE_ATRAC3MULTI, "ATRAC3 multichannel", mprm::size, kMultiInfoSize,
     1024 * kMaxTracks * 4, 0x01000000, CELL_ADEC_ERROR_BUSY, check_multi,

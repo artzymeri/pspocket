@@ -472,14 +472,21 @@ Ref reference(const char* decoder, const std::vector<std::vector<u8>>& aus,
 }
 
 // A unit as the cores write it: interleaved big-endian floats held below 1, or 16-bit samples floored.
-std::vector<u8> pcm_of(const Unit& unit, bool sixteen = false)
+std::vector<u8> pcm_of(const Unit& unit, bool sixteen = false, bool nearest = false)
 {
     std::vector<u8> v;
     const usize n = unit.empty() ? 0 : unit[0].size();
     for (usize i = 0; i < n; i++) {
         for (const auto& ch : unit) {
             const float s = ch[i];
-            if (sixteen) {
+            if (sixteen && nearest) { // the MP3 core's: rounded half away from zero, held in range (D-944)
+                const s32 q = static_cast<s32>(std::clamp(std::round(static_cast<double>(s) * 32768.0), -32768.0, 32767.0));
+                v.push_back(static_cast<u8>(static_cast<u32>(q) >> 8));
+                v.push_back(static_cast<u8>(q));
+            } else if (nearest) { // floats as decoded
+                const u32 bits = std::bit_cast<u32>(s);
+                for (u32 k = 0; k < 4; k++) v.push_back(static_cast<u8>(bits >> (24 - 8 * k)));
+            } else if (sixteen) {
                 const s32 q = s >= 1.f ? 0x7FFF : s <= -1.f ? -0x8000 : static_cast<s32>(std::floor(s * 32768.f));
                 v.push_back(static_cast<u8>(static_cast<u32>(q) >> 8));
                 v.push_back(static_cast<u8>(q));
@@ -1272,8 +1279,8 @@ TEST_CASE("cellAdec: MP3 Surround on FFmpeg, its stereo MP3 frames built here: P
     for (u32 k = 0; k < 8; k++) {
         INFO("access unit " << k);
         const Out& o = run.outs[k];
-        CHECK(o.pcm == pcm_of(ref.units[k]));
-        CHECK(be32(o.bsi, 0x00) == be32(feed.aus[k], 0)); // the header
+        CHECK(o.pcm == pcm_of(ref.units[k], false, true));
+        CHECK(be32(o.bsi, 0x00) == (be32(feed.aus[k], 0) & 0xFFFFF)); // the header's low 20 bits, as MP3's (D-944)
         CHECK(o.bsi[0x10] == 1);                           // no CRC
         CHECK(o.bsi[0x11] == 0);                           // stereo
         CHECK(be32(o.bsi, 0x18) == 0);
@@ -1288,7 +1295,7 @@ TEST_CASE("cellAdec: MP3 Surround on FFmpeg, its stereo MP3 frames built here: P
     CHECK(flow_ok(e, 3, {{1, kFatal}}));
     REQUIRE(e.outs.size() == 3);
     CHECK(be32(e.outs[1].bsi, 0x18) == kFatal);
-    CHECK(e.outs[0].pcm == pcm_of(ref.units[0], true));
+    CHECK(e.outs[0].pcm == pcm_of(ref.units[0], true, true));
     const CoreRun r = run_core(f.base(), hle_calls(f, t), kTypeMp3s, be32s({5}), Feed{});
     CHECK(std::find(r.lines.begin(), r.lines.end(), "cellAdecStartSeq -> 0x80610003") != r.lines.end());
 }

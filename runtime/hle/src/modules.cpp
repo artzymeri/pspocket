@@ -94,6 +94,7 @@ void register_avcdec(Registry& r);
 }
 void register_cellCelpEnc(Registry& r);
 void register_cellCelp8Enc(Registry& r);
+void register_sys_lv2coredump(Registry& r);
 void register_cellCelpDec(Registry& r);
 void register_cellCelp8Dec(Registry& r);
 void register_cellRudp(Registry& r);
@@ -202,6 +203,7 @@ void register_all_modules(Registry& r)
     vdec::avc::register_avcdec(r);
     register_cellCelpEnc(r);
     register_cellCelp8Enc(r);
+    register_sys_lv2coredump(r);
     register_cellCelpDec(r);
     register_cellCelp8Dec(r);
     register_cellRudp(r);

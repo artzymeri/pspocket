@@ -46,7 +46,7 @@ constexpr u32 cmd_front = 0x100, cmd_back = 0x104, cmd_size = 0x108, queue_mutex
               output_mutex = 0x114, output_consumed = 0x118, output_locked = 0x11C, run_thread_mutex = 0x120,
               run_thread = 0x124, notify = 0x128, thread_id = 0x148, tls = 0x150, type = 0x154, output = 0x158,
               pcm_size = 0x15C, prev_pts = 0x160, prev_duration = 0x168, duration = 0x16C, param = 0x170,
-              notify_guest = 0x1A0, size = 0x200;
+              notify_guest = 0x1A0, copy_size = 0x1A4, size = 0x200;
 } // namespace fx
 
 // What a codec made of one access unit.
@@ -55,6 +55,9 @@ struct Decoded {
     s32 error = 0;    // CELL_OK, or the codec's error: notified first, then given with the PCM (none, or what came)
     s8 pts_type = -1; // the correctPtsValueType the front end gets (adec.hpp)
     u32 duration = 0; // the frame's length in 90 kHz ticks, for the cores' own PTS correction (AdecCore::correct_pts)
+    // The bytes cellAdecGetPcm copies out (realign): `size`, unless the codec copies fewer (libmpl1dec's refused units:
+    // an item of 1152 samples, 384 of them copied, D-944).
+    u32 copied = ~0u;
 };
 
 // One codec's decoding, on the decoder's thread: a sequence's start, then its access units.
@@ -84,6 +87,12 @@ struct Spec {
     // StartSeq's check of the parameters on the game's thread: CELL_OK or the error cellAdecStartSeq gives.
     s32 (*check)(const u8* param);
     std::unique_ptr<Codec> (*make)();
+    // Sony's core's answers where pspocket's take them (D-944, its module asked): getMemSize (0: pspocket's own
+    // need), getPcmHandleNum, and whether getMemSize also writes the version into the attributes (CellAdecAttr's
+    // adecVerLower), as libm2bcdec's and libm4aacdec's do.
+    u32 mem_size = 0;
+    s32 pcm_handles = 3;
+    bool version_in_attr = false;
 };
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -130,6 +139,8 @@ public:
     bool open(const char* decoder, std::string_view name, const std::function<void(AVCodecContext*)>& setup = {});
     void close();
     bool is_open() const { return av_ != nullptr; }
+    // Forgets what the decoder carries from packet to packet (avcodec_flush_buffers): MP3's overlap and filter bank.
+    void flush();
     // One packet (copied, with FFmpeg's padding): every frame it gives appended to `out`, at most `max_samples` samples
     // per channel (more is left out, logged). FFmpeg's planar or interleaved floats, 16- and 32-bit samples become
     // planar floats (exactly, for samples of up to 24 bits: the lossless codecs' 16 and 24, D-620). 0, or FFmpeg's
@@ -153,10 +164,16 @@ private:
 enum class Format : u8 { F32, S16, S24, S32 };
 constexpr u32 bytes_of(Format f) { return f == Format::S16 ? 2 : 4; }
 
+// How a core's floats become its PCM.
+enum class Rounding : u8 {
+    Floor,   // libatxdec's (adec_atracx.cpp): floats held below 1, integers floored and held in range
+    Nearest, // libmp3dec's (D-944): floats as decoded, integers rounded half away from zero and held in range
+};
+
 // Writes `in` interleaved to the guest at `out`: output channel c of each sample from `in`'s channel map[c] (-1:
-// silence), times `gain`, converted as libatxdec converts (adec_atracx.cpp: floats held below 1, integers floored and
-// held in range). Returns the bytes written.
-u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain = 1.0f);
+// silence), times `gain`, converted as `rounding` says. Returns the bytes written.
+u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain = 1.0f,
+    Rounding rounding = Rounding::Floor);
 
 // The identity map for `n` channels.
 std::vector<int> straight(u32 n);

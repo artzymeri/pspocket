@@ -158,6 +158,8 @@ public:
     virtual s32 pcm_handle_num(PPUContext& ctx) = 0;
     virtual u32 bsi_info_size(PPUContext& ctx) = 0;
     virtual u32 version(PPUContext& ctx) = 0;
+    // The version getMemSize also writes into CellAdecAttr's adecVerLower, as some of Sony's cores do; 0: none.
+    virtual u32 version_in_attr(PPUContext&) { return 0; }
     // `notify`: whom the core notifies (front_end_notify from pspocket's front end; open's arguments when it is called
     // through an operation table). `res`: a CellAdecResource; `spurs_res`: a CellAdecResourceSpurs
     // (cellAdecOpenEx/OpenExt, openExt) or 0.

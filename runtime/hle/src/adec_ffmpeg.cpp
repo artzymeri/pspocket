@@ -185,6 +185,7 @@ void decode_au(PPUContext& ctx, u32 h, const Spec& spec, Codec& codec, const Cmd
     ps_write32(base, h + fx::output_locked, 1);
     unlock(ctx, h, fx::output_mutex);
     ps_write32(base, h + fx::pcm_size, d.size);
+    ps_write32(base, h + fx::copy_size, std::min(d.copied, d.size));
     ps_write32(base, h + fx::duration, d.duration);
     notify.pcm_out(cmd.pcm_handle, output, d.size, bsi.addr(), d.pts_type, d.error);
 }
@@ -244,12 +245,18 @@ class FfCore final : public AdecCore {
 public:
     explicit FfCore(const Spec& spec) : spec_(spec) {}
 
-    // The context, the output buffer, and room for the front end's alignment of the core's memory (up to 0x7F bytes
-    // past what it asks for, as libatxdec's and LPCM's sizes allow).
-    u32 mem_size(PPUContext&) override { return ((fx::size + spec_.output_bytes + 0x7F) & ~0x7Fu) + 0x80; }
-    s32 pcm_handle_num(PPUContext&) override { return 3; } // as libatxdec's (adec_atracx.cpp)
+    // Sony's core's size where it is known (D-944), else the context, the output buffer, and room for the front end's
+    // alignment of the core's memory (up to 0x7F bytes past what it asks for, as libatxdec's and LPCM's sizes allow).
+    u32 mem_size(PPUContext&) override
+    {
+        const u32 need = ((fx::size + spec_.output_bytes + 0x7F) & ~0x7Fu) + 0x80;
+        if (spec_.mem_size && spec_.mem_size < need) PS_FATAL(kChan, "{}: Sony's size {:#x} is below pspocket's need {:#x}", spec_.name, spec_.mem_size, need);
+        return spec_.mem_size ? spec_.mem_size : need;
+    }
+    s32 pcm_handle_num(PPUContext&) override { return spec_.pcm_handles; }
     u32 bsi_info_size(PPUContext&) override { return spec_.bsi_size; }
     u32 version(PPUContext&) override { return spec_.version; }
+    u32 version_in_attr(PPUContext&) override { return spec_.version_in_attr ? spec_.version : 0; }
 
     s32 open(PPUContext& ctx, u32 h, const CoreNotify& notify, u32 res, u32) override
     {
@@ -353,7 +360,7 @@ public:
     {
         if (!out_buffer) return lv2::CELL_OK;
         u8* base = guest_base(ctx);
-        const u32 size = ps_read32(base, h + fx::pcm_size);
+        const u32 size = ps_read32(base, h + fx::copy_size);
         if (!pcm_start || !guest_readable(thread(ctx), out_buffer, size)) {
             log_call_site(ctx, base, std::format("cellAdecGetPcm: the buffer ({:#x}, {} bytes) or the PCM ({:#x}) is not "
                 "guest memory", out_buffer, size, pcm_start));
@@ -469,6 +476,11 @@ void FfDecoder::close()
     av_packet_free(&packet_);
     av_frame_free(&frame_);
     avcodec_free_context(&av_);
+}
+
+void FfDecoder::flush()
+{
+    if (av_) avcodec_flush_buffers(av_);
 }
 
 int FfDecoder::decode(const u8* data, u32 size, Planar& out, u32 max_samples)
@@ -702,9 +714,16 @@ std::vector<int> straight(u32 n)
     return m;
 }
 
-u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain)
+u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain, Rounding rounding)
 {
     const u32 nch = static_cast<u32>(map.size()), bytes = bytes_of(fmt);
+    const bool nearest = rounding == Rounding::Nearest;
+    // An integer sample of `scale` steps per unit, rounded as `rounding` says and held in [lo, hi].
+    const auto integer = [&](f32 s, double scale, s64 lo, s64 hi) {
+        const double v = static_cast<double>(s) * scale;
+        const double r = nearest ? std::round(v) : std::floor(v);
+        return r >= static_cast<double>(hi) ? hi : r <= static_cast<double>(lo) ? lo : static_cast<s64>(r);
+    };
     for (u32 c = 0; c < nch; c++) {
         const int from = map[c];
         const float* src = from >= 0 && static_cast<u32>(from) < in.channels() ? in.ch[static_cast<usize>(from)].data() : nullptr;
@@ -713,20 +732,18 @@ u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, For
             const u32 at = out + bytes * (i * nch + c);
             switch (fmt) {
             case Format::F32:
-                if (s >= std::bit_cast<f32>(std::bit_cast<u32>(1.f) - 1)) ps_write32(base, at, 0x3F7FFFFF);
+                if (nearest) ps_write32(base, at, std::bit_cast<u32>(s));
+                else if (s >= std::bit_cast<f32>(std::bit_cast<u32>(1.f) - 1)) ps_write32(base, at, 0x3F7FFFFF);
                 else ps_write32(base, at, std::bit_cast<u32>(s <= -1.f ? -1.f : s));
                 break;
             case Format::S16:
-                ps_write16(base, at, static_cast<u16>(s >= 1.f ? 0x7FFF : s <= -1.f ? -0x8000 :
-                    static_cast<s16>(std::floor(s * 32768.f))));
+                ps_write16(base, at, static_cast<u16>(integer(s, 32768.0, -0x8000, 0x7FFF)));
                 break;
             case Format::S24:
-                ps_write32(base, at, s >= 1.f ? 0x007FFFFFu : s <= -1.f ? 0x00800000u :
-                    static_cast<u32>(static_cast<s32>(std::floor(s * 8388608.f))) & 0x00FFFFFFu);
+                ps_write32(base, at, static_cast<u32>(integer(s, 8388608.0, -0x800000, 0x7FFFFF)) & 0x00FFFFFFu);
                 break;
             case Format::S32:
-                ps_write32(base, at, s >= 1.f ? 0x7FFFFFFFu : s <= -1.f ? 0x80000000u :
-                    static_cast<u32>(static_cast<s32>(std::floor(static_cast<double>(s) * 2147483648.0))));
+                ps_write32(base, at, static_cast<u32>(integer(s, 2147483648.0, -0x80000000LL, 0x7FFFFFFF)));
                 break;
             }
         }

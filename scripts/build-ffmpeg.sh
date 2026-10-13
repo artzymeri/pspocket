@@ -56,11 +56,12 @@ fi
 
 # What pspocket's media libraries decode: the PS3's video (AVC/H.264, also MVC's base view; MPEG-2; MPEG-4 part 2 as in
 # DivX; VC-1; DivX 3.11, which is Microsoft's MPEG-4 version 3, D-588) and audio (ATRAC3, ATRAC3plus and their "AL"
-# forms, MP3 and MPEG-1/2 audio, AAC, AC-3 and E-AC-3, DTS with its HD and LBR extensions, Dolby TrueHD, WMA 1 and 2,
-# WMA Pro and WMA Lossless (D-620), big- and little-endian PCM), with the parsers that split their streams. The HEVC
+# forms, MP3 and MPEG-1/2 audio, MP3's ADU form for the MP3 core that keeps the bit reservoir itself (D-944), AAC, AC-3
+# and E-AC-3, DTS with its HD and LBR extensions, Dolby TrueHD, WMA 1 and 2, WMA Pro and WMA Lossless (D-620), big- and
+# little-endian PCM), with the parsers that split their streams. The HEVC
 # parser is there only for its SEI code: 7.1.1's H.264 decoder calls ff_aom_uninit_film_grain_params (h2645_sei.c),
 # whose aom_film_grain.o only HEVC's SEI selects, so an H.264 build without it does not link (D-195).
-DECODERS=h264,mpeg2video,mpeg1video,mpeg4,vc1,msmpeg4v3,atrac3,atrac3al,atrac3p,atrac3pal,mp3,mp3float,mp2,mp2float,mp1,mp1float,aac,ac3,eac3,dca,truehd,wmav1,wmav2,wmapro,wmalossless,pcm_s16be,pcm_s16le,pcm_s24be,pcm_f32be
+DECODERS=h264,mpeg2video,mpeg1video,mpeg4,vc1,msmpeg4v3,atrac3,atrac3al,atrac3p,atrac3pal,mp3,mp3float,mp3adufloat,mp2,mp2float,mp1,mp1float,aac,ac3,eac3,dca,truehd,wmav1,wmav2,wmapro,wmalossless,pcm_s16be,pcm_s16le,pcm_s24be,pcm_f32be
 PARSERS=h264,hevc,mpegvideo,mpeg4video,vc1,aac,ac3,mpegaudio,dca,mlp
 COMMON=(--disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect
     --disable-gpl --disable-nonfree --disable-version3 --disable-avformat --disable-avdevice --disable-avfilter

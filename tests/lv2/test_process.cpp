@@ -48,6 +48,28 @@ TEST_CASE("lv2 process: _sys_process_get_paramsfo with a title", "[lv2][process]
     for (u32 i = 10; i < 0x40; i++) CHECK(f.base()[buf + i] == 0);
 }
 
+// D-943: an executable that declares SYS_PROCESS_CRASH_DUMP_ENABLED (sys_process_param's crash_dump_param_addr) is
+// marked with flag 0x10 at +0x10 and the declaration's address at +0x38, as the retail kernel does; +0x20, a debugging
+// console's crash dump settings, stays 0.
+TEST_CASE("lv2 process: _sys_process_get_paramsfo reports a crash dump declaration", "[lv2][process]")
+{
+    Config config;
+    config.title_id = "BLES00229";
+    config.crash_dump_param_addr = 0x00012340;
+    Fixture f(config);
+    Caller c(*f.kernel);
+    const u32 buf = f.alloc(0x40);
+    std::memset(f.base() + buf, 0xAA, 0x40);
+    REQUIRE(c.call(kGetParamSfo, buf) == CELL_OK);
+    CHECK(std::string(reinterpret_cast<const char*>(f.base() + buf + 1), 9) == "BLES00229");
+    CHECK(f.r64(buf + 0x10) == 0x10);
+    CHECK(f.r64(buf + 0x18) == 0);
+    CHECK(f.r64(buf + 0x20) == 0);
+    CHECK(f.r64(buf + 0x28) == 0);
+    CHECK(f.r64(buf + 0x30) == 0);
+    CHECK(f.r64(buf + 0x38) == 0x00012340);
+}
+
 TEST_CASE("lv2 tty: writes go to the tty log channel", "[lv2][tty]")
 {
     Fixture f;

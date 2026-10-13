@@ -28,6 +28,8 @@
 // - PTS: this core's own correction (AdecCore::correct_pts), the previous frame's PTS plus its length.
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <format>
 
 #include "adec_ffmpeg.hpp"
@@ -40,18 +42,19 @@
 namespace pspocket::hle::adec::ffcore {
 namespace {
 
+// The errors: libm2bcdec's CELL_ADEC_ERROR_M2BC_* (0x80612Bxx), and libmpl1dec's, the same numbers from 0x80613100
+// (D-944: its own range, which RPCS3 does not list).
+constexpr u32 kM2bcBase = 0x80612B00, kMpl1Base = 0x80613100;
 enum : u32 {
-    CELL_ADEC_ERROR_M2BC_FATAL = 0x80612B01,
-    CELL_ADEC_ERROR_M2BC_ARG = 0x80612B03,
-    CELL_ADEC_ERROR_M2BC_BUSY = 0x80612B04,
-    CELL_ADEC_ERROR_M2BC_SYNCF = 0x80612B11,
-    CELL_ADEC_ERROR_M2BC_LAYER = 0x80612B12,
-    CELL_ADEC_ERROR_M2BC_BITRATE = 0x80612B13,
-    CELL_ADEC_ERROR_M2BC_SAMPLEFREQ = 0x80612B14,
-    CELL_ADEC_ERROR_M2BC_VERSION = 0x80612B15,
-    CELL_ADEC_ERROR_M2BC_UNSUPPORT = 0x80612B17,
-    CELL_ADEC_ERROR_M2BC_SAMPLE = 0x80612B35,
-    CELL_ADEC_ERROR_M2BC_OPENBS = 0x80612B36,
+    ERR_FATAL = 0x01,
+    ERR_ARG = 0x03,
+    ERR_BUSY = 0x04,
+    ERR_SYNCF = 0x11,      // no 12-bit sync (MPEG-2.5's and the reserved version's 11 bits too), a unit under 4 bytes
+    ERR_CHANNELS_L1 = 0x12, // libmpl1dec: channelNumber past 2
+    ERR_BITRATE = 0x13,    // bit rate 15, or free format
+    ERR_SAMPLEFREQ = 0x14, // the reserved rate
+    ERR_OPENBS_EX = 0x21,  // libm2bcdec: channelNumber past 2 (a multichannel extension asked for)
+    ERR_SYNCF_EX = 0x22,   // the other layer's header, a unit shorter than its frame, a frame the decoder refuses
 };
 enum : u32 { M2BC_CH_CONFIG_MONO = 0, M2BC_CH_CONFIG_DUAL = 1, M2BC_CH_CONFIG_L_R = 2 };
 
@@ -70,55 +73,49 @@ public:
     s32 start(const u8* param) override
     {
         channel_number_ = ps_ld32(param);
-        if (channel_number_ > CELL_ADEC_CH_STEREO)
-            log_once("MPEG multichannel", std::format("MPEG audio: channel layout {} asked for: MPEG-2's multichannel "
-                "extension is not decoded, its stereo base is", channel_number_));
+        reset_info();
         configured_ = ff_.open(layer_ == 1 ? "mp1float" : "mp2float", name());
-        return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_M2BC_FATAL);
+        return configured_ ? lv2::CELL_OK : error(code(ERR_FATAL));
     }
 
     Decoded decode(u8* base, u32 au, u32 size, u32 out, u32 bsi) override
     {
         Decoded d;
         d.pts_type = layer_ == 1 ? CORRECT_PTS_MPEG_L1 : CORRECT_PTS_MPEG_L2;
-        const auto fail = [&](u32 code) {
-            d.error = error(code);
+        // A unit refused: an item of 1152 samples of silence in the channels of the information block, which stays as
+        // the last frame decoded left it (D-944); libmpl1dec's gives out a layer I frame's 384 of them.
+        const auto fail = [&](u32 number) {
+            d.error = error(code(number));
+            const u32 nch = std::clamp<u32>(ps_ld32(info_.data() + info::channel_number), 1, 2);
+            pcm_.clear();
+            pcm_.ch.assign(nch, std::vector<float>(1152, 0.0f));
+            pcm_.samples = 1152;
+            d.size = write_pcm(base, out, pcm_, straight(nch), Format::F32, 1.0f, Rounding::Nearest);
+            if (layer_ == 1) d.copied = 384 * nch * 4;
+            std::memcpy(base + bsi, info_.data(), info_.size());
             return d;
         };
         if (!configured_) {
             PS_LOG_ERROR("cellAdec", "{}: a decode without a sequence started with valid parameters", name());
-            return fail(CELL_ADEC_ERROR_M2BC_FATAL);
+            return fail(ERR_FATAL);
         }
-        if (size < 4) return fail(CELL_ADEC_ERROR_M2BC_SYNCF);
+        if (size < 4) return fail(ERR_SYNCF);
         const MpegHeader h = parse_mpeg_header(ps_read32(base, au));
-        if (!h.sync || h.version == 0) return fail(CELL_ADEC_ERROR_M2BC_SYNCF);
-        if (h.version == 1) return fail(CELL_ADEC_ERROR_M2BC_VERSION);
-        if (h.layer != layer_) return fail(CELL_ADEC_ERROR_M2BC_LAYER);
-        if (h.bitrate_index == 15) return fail(CELL_ADEC_ERROR_M2BC_BITRATE);
-        if (h.bitrate_index == 0) return fail(CELL_ADEC_ERROR_M2BC_UNSUPPORT);
-        if (!h.rate) return fail(CELL_ADEC_ERROR_M2BC_SAMPLEFREQ);
+        if (!h.sync || h.version == 0 || h.version == 1) return fail(ERR_SYNCF);
+        if (h.layer != layer_) return fail(ERR_SYNCF_EX);
+        if (h.bitrate_index == 15 || h.bitrate_index == 0) return fail(ERR_BITRATE);
+        if (!h.rate) return fail(ERR_SAMPLEFREQ);
         d.duration = ticks(h.samples, h.rate); // a frame refused past here keeps its length
-        const u32 out_channels = channel_number_ == CELL_ADEC_CH_MONO ? 1 : channel_number_ == CELL_ADEC_CH_STEREO ? 2 :
-                                                                                                                    h.channels();
-        ps_write32(base, bsi + info::channel_number, out_channels == 1 ? CELL_ADEC_CH_MONO : CELL_ADEC_CH_STEREO);
-        ps_write32(base, bsi + info::sample_freq, h.rate_index);
-        ps_write32(base, bsi + info::error_protection, h.crc);
-        ps_write32(base, bsi + info::bitrate_index, h.bitrate_index);
-        ps_write32(base, bsi + info::stereo_mode, h.mode);
-        ps_write32(base, bsi + info::stereo_mode_extension, h.mode_extension);
-        ps_write32(base, bsi + info::emphasis, h.emphasis);
-        ps_write32(base, bsi + info::copyright, h.copyright);
-        ps_write32(base, bsi + info::original, h.original);
-        // No multichannel extension decoded: no surround, centre, mix or LFE; MCExtension 2CH.
-        for (const u32 field : {info::surround_mode, info::center_mode, info::audio_mix, info::multi_codec_mode,
-                 info::lfe_present})
-            ps_write32(base, bsi + field, 0);
-        ps_write32(base, bsi + info::output_frame_size, h.samples);
-        ps_write32(base, bsi + info::channel_configuration,
-            h.mode == 3 ? M2BC_CH_CONFIG_MONO : h.mode == 2 ? M2BC_CH_CONFIG_DUAL : M2BC_CH_CONFIG_L_R);
+        // channelNumber 0 to 2 leave the stream's channels as they are; past 2 asks for a multichannel extension
+        // pspocket does not decode, refused frame by frame as Sony's cores refuse it without one.
+        if (channel_number_ > 2) {
+            log_once("MPEG multichannel", std::format("{}: channelNumber {} (a multichannel output) asked for: refused "
+                "as Sony's core refuses a stream without MPEG-2's multichannel extension", name(), channel_number_));
+            return fail(layer_ == 1 ? ERR_CHANNELS_L1 : ERR_OPENBS_EX);
+        }
         if (size < h.frame_bytes) {
             PS_LOG_ERROR("cellAdec", "{}: an access unit of {} bytes for a {}-byte frame", name(), size, h.frame_bytes);
-            return fail(CELL_ADEC_ERROR_M2BC_OPENBS);
+            return fail(ERR_SYNCF_EX);
         }
         if (size > h.frame_bytes)
             log_once(std::format("{} longer", name()), std::format("{}: an access unit of {} bytes holds more than its "
@@ -126,44 +123,77 @@ public:
         pcm_.clear();
         if (const int e = ff_.decode(base + au, h.frame_bytes, pcm_, h.samples); e < 0 || !pcm_.samples) {
             PS_LOG_ERROR("cellAdec", "{}: FFmpeg refused a frame ({}): the game sent invalid data", name(), e);
-            return fail(CELL_ADEC_ERROR_M2BC_SAMPLE);
+            return fail(ERR_SYNCF_EX);
         }
-        if (out_channels == 1 && pcm_.channels() == 2) {
-            for (u32 i = 0; i < pcm_.samples; i++) pcm_.ch[0][i] = (pcm_.ch[0][i] + pcm_.ch[1][i]) * 0.5f;
-            pcm_.ch.resize(1);
-        }
-        const std::vector<int> map = out_channels == 2 && pcm_.channels() == 1 ? std::vector<int>{0, 0} :
-                                                                                 straight(pcm_.channels());
-        d.size = write_pcm(base, out, pcm_, map, Format::F32);
+        const u32 nch = pcm_.channels();
+        const auto field = [&](u32 at, u32 v) { ps_st32(info_.data() + at, v); };
+        field(info::channel_number, nch);
+        field(info::sample_freq, h.rate_index);
+        field(info::error_protection, h.crc);
+        field(info::bitrate_index, h.bitrate_index);
+        field(info::stereo_mode, h.mode);
+        field(info::stereo_mode_extension, h.mode_extension);
+        field(info::emphasis, h.emphasis);
+        field(info::copyright, h.copyright);
+        field(info::original, h.original);
+        // No multichannel extension decoded: no surround, centre, mix or LFE; MCExtension 2CH.
+        for (const u32 at : {info::surround_mode, info::center_mode, info::audio_mix, info::multi_codec_mode,
+                 info::lfe_present})
+            field(at, 0);
+        field(info::output_frame_size, 1152 * nch * 4);
+        field(info::channel_configuration,
+            h.mode == 3 ? M2BC_CH_CONFIG_MONO : h.mode == 2 ? M2BC_CH_CONFIG_DUAL : M2BC_CH_CONFIG_L_R);
+        std::memcpy(base + bsi, info_.data(), info_.size());
+        d.size = write_pcm(base, out, pcm_, straight(nch), Format::F32, 1.0f, Rounding::Nearest);
         return d;
     }
 
 private:
     std::string_view name() const { return layer_ == 1 ? "MPEG layer I" : "MPEG layer II"; }
+    u32 code(u32 number) const { return (layer_ == 1 ? kMpl1Base : kM2bcBase) + number; }
+
+    // The block before a sequence's first frame, as Sony's cores have it: stereo, 48 kHz, bit rate index 14, 1152
+    // stereo samples, L_R.
+    void reset_info()
+    {
+        info_.fill(0);
+        ps_st32(info_.data() + info::channel_number, 2);
+        ps_st32(info_.data() + info::sample_freq, 1);
+        ps_st32(info_.data() + info::bitrate_index, 14);
+        ps_st32(info_.data() + info::output_frame_size, 1152 * 2 * 4);
+        ps_st32(info_.data() + info::channel_configuration, M2BC_CH_CONFIG_L_R);
+    }
 
     u32 layer_;
     FfDecoder ff_;
     Planar pcm_;
     u32 channel_number_ = 0;
+    std::array<u8, info::size> info_{};
     bool configured_ = false;
 };
 
-// cellAdecStartSeq: channelNumber a CellAdecChannel layout (or 0), downmix and lfeUpSample flags.
+// cellAdecStartSeq, as Sony's cores check it (D-944): the downmix flag only (channelNumber any: past 2 the frames are
+// refused; lfeUpSample any).
+template <u32 Base>
 s32 check(const u8* param)
 {
-    const u32 channels = ps_ld32(param), downmix = ps_ld32(param + 4), lfe = ps_ld32(param + 8);
-    if (channels <= CELL_ADEC_CH_3_4_LFE && downmix <= 1 && lfe <= 1) return lv2::CELL_OK;
-    PS_LOG_ERROR("cellAdec", "MPEG audio: parameters channelNumber {}, downmix {}, lfeUpSample {}", channels, downmix, lfe);
-    return error(CELL_ADEC_ERROR_M2BC_ARG);
+    const u32 downmix = ps_ld32(param + 4);
+    if (downmix <= 1) return lv2::CELL_OK;
+    PS_LOG_ERROR("cellAdec", "MPEG audio: downmix {}", downmix);
+    return error(Base + ERR_ARG);
 }
 
 } // namespace
 
 // The cores' versions are not known (pspocket's word); the information block is CellAdecMpmcInfo's size.
-const Spec kMpegL1 = {CELL_ADEC_TYPE_MPEG_L1, "MPEG layer I", 12, info::size, 384 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(1)); }};
-const Spec kMpegL2 = {CELL_ADEC_TYPE_MPEG_L2, "MPEG layer II", 12, info::size, 1152 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(2)); }};
+// The answers of Sony's cores (D-944): libmpl1dec's and libm2bcdec's versions, getMemSize 0x64000 and 0x3e400 (with the
+// version written into the attributes too), four PCM handles.
+const Spec kMpegL1 = {CELL_ADEC_TYPE_MPEG_L1, "MPEG layer I", 12, info::size, 1152 * 2 * 4, 0x01080000,
+    kMpl1Base + ERR_BUSY, check<kMpl1Base>, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(1)); }, 0x64000, 4,
+    true};
+const Spec kMpegL2 = {CELL_ADEC_TYPE_MPEG_L2, "MPEG layer II", 12, info::size, 1152 * 2 * 4, 0x02040000,
+    kM2bcBase + ERR_BUSY, check<kM2bcBase>, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(2)); }, 0x3e400, 4,
+    true};
 
 } // namespace pspocket::hle::adec::ffcore
 

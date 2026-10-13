@@ -141,7 +141,10 @@ template <Table T>
 s32 op_get_mem_size(PPUContext& ctx, u32 attr) // CellAdecAttr: the core writes workMemSize
 {
     if (!usable(ctx, T, attr, 4, "the attributes")) return error(CELL_ADEC_ERROR_ARG);
-    ps_write32(guest_base(ctx), attr, core_of_table(T)->mem_size(ctx));
+    const std::unique_ptr<AdecCore> core = core_of_table(T);
+    ps_write32(guest_base(ctx), attr, core->mem_size(ctx));
+    // libm2bcdec's and libm4aacdec's also write their version (D-944).
+    if (const u32 v = core->version_in_attr(ctx); v && usable(ctx, T, attr, 12, "the attributes")) ps_write32(guest_base(ctx), attr + 8, v);
     return lv2::CELL_OK;
 }
 

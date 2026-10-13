@@ -66,6 +66,7 @@ enum : u32 {
     CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM = 0x80612407,
     CELL_ADEC_ERROR_M4AAC_INVALID_LAYER_ID = 0x80612414,
     CELL_ADEC_ERROR_M4AAC_ADTS_SYNCWORD_ERROR = 0x80612415,
+    CELL_ADEC_ERROR_M4AAC_INVALID_SECTION_DATA = 0x8061241C,
     CELL_ADEC_ERROR_M4AAC_INVALID_ADIF_HEADER_ID = 0x80612425,
     CELL_ADEC_ERROR_M4AAC_NOT_SUPPORTED_PROFILE = 0x80612426,
     CELL_ADEC_ERROR_M4AAC_PROG_NUMBER_NOT_FOUND = 0x80612427,
@@ -80,7 +81,9 @@ constexpr u32 kRates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 220
 namespace info {
 constexpr u32 sampling_freq = 0x00, number_of_channels = 0x04, front = 0x08, front_mono = 0x0C, side = 0x10, back = 0x14,
               lfe = 0x18, enable_sbr = 0x1C, sbr_factor = 0x20, is_bsi_valid = 0x24, config_number = 0x28, bsi = 0x2C,
-              matrix_mixdown_present = 0x68, mixdown_index = 0x6C, pseudo_surround = 0x70, size = 0x80;
+              matrix_mixdown_present = 0x68, mixdown_index = 0x6C, pseudo_surround = 0x70,
+              frames = 0x74, // libm4aacdec's (past RPCS3's structure): the frames decoded since the sequence's start
+              size = 0x80;   // or the last unit refused, before this one (D-944)
 // The ADIF header's fields (bsi.adif) and the ADTS header's (bsi.adts).
 constexpr u32 adif_copyright_present = 0x2C, adif_copyright_id = 0x30, adif_original = 0x3C, adif_home = 0x40,
               adif_bitstream_type = 0x44, adif_bitrate = 0x48, adif_pce_count = 0x4C, adif_buffer_fullness = 0x50;
@@ -247,6 +250,9 @@ public:
         ff_.close();
         adif_read_ = false;
         configured_ = true;
+        info_.fill(0);
+        frames_ = 0;
+        pending_.clear();
         return lv2::CELL_OK;
     }
 
@@ -254,8 +260,20 @@ public:
     {
         Decoded d;
         d.pts_type = mpeg2_ ? CORRECT_PTS_M2AAC : CORRECT_PTS_M4AAC;
+        // A unit refused (D-944): libm4aacdec gives a frame of silence in the last frame's channels, its information
+        // block as the last frame left it, and starts afresh (its decoder as at the sequence's start, its overlap and
+        // window shapes too, the frame count from 0).
         const auto fail = [&](u32 code) { // MPEG-2 AAC: libadec's FATAL for every unit refused (D-621)
             d.error = error(mpeg2_ ? CELL_ADEC_ERROR_FATAL : code);
+            const u32 nch = ps_ld32(info_.data() + info::number_of_channels);
+            const u32 out_ch = nch > 2 && (downmix_ || max_channels_ == 2) ? 2 : nch;
+            pcm_.clear();
+            pcm_.samples = 1024 * std::max<u32>(1, ps_ld32(info_.data() + info::sbr_factor));
+            pcm_.ch.assign(out_ch, std::vector<float>(pcm_.samples, 0.0f));
+            d.size = out_ch ? write_pcm(base, out, pcm_, straight(out_ch), Format::F32) : 0;
+            std::memcpy(base + bsi, info_.data(), info_.size());
+            ff_.close(); // opened again by the next unit, as at the sequence's start
+            frames_ = 0;
             return d;
         };
         if (!configured_) {
@@ -265,6 +283,17 @@ public:
         ps_write32(base, bsi + info::config_number, config_);
         const u8* data = base + au;
         u32 bytes = size;
+        // An ADTS frame its unit cut short waits for the next unit, whose bytes complete it (D-944: libm4aacdec reads
+        // the two as one frame, whatever the second holds).
+        bool joined = false;
+        if (config_ == ADTS_HEADER && !pending_.empty()) {
+            pending_.insert(pending_.end(), base + au, base + au + size);
+            joined_.swap(pending_);
+            pending_.clear();
+            data = joined_.data();
+            size = bytes = static_cast<u32>(joined_.size());
+            joined = true;
+        }
         u32 core_rate = 0;
         std::optional<Pce> pce;
         if (config_ == ADTS_HEADER) {
@@ -287,9 +316,16 @@ public:
             if (profile == 2) return fail(CELL_ADEC_ERROR_M4AAC_NOT_SUPPORTED_PROFILE);
             core_rate = kRates[sfi];
             d.duration = ticks(1024, core_rate); // a frame refused past here keeps its length
-            if (frame_length < 7 || frame_length > size) {
-                PS_LOG_ERROR("cellAdec", "{}: an ADTS frame of {} bytes in an access unit of {}", name_, frame_length, size);
+            if (frame_length < 7) {
+                PS_LOG_ERROR("cellAdec", "{}: an ADTS frame of {} bytes", name_, frame_length);
                 return fail(CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM);
+            }
+            if (frame_length > size && !joined) {
+                log_once("AAC cut", std::format("{}: an ADTS frame of {} bytes in an access unit of {}: completed by the "
+                    "next unit's bytes, as Sony's core takes them", name_, frame_length, size));
+                pending_.assign(data, data + size);
+                std::memcpy(base + bsi, info_.data(), info_.size());
+                return d;
             }
             if (frame_length < size)
                 log_once("AAC longer", std::format("{}: an access unit of {} bytes holds more than its {}-byte ADTS "
@@ -297,7 +333,7 @@ public:
             if (raw_blocks)
                 log_once("AAC raw blocks", std::format("{}: ADTS frames of several raw data blocks: FFmpeg decodes the "
                     "first", name_));
-            bytes = frame_length;
+            bytes = std::min(frame_length, size);
             if (!ff_.is_open() && !ff_.open("aac", name_)) return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
         } else if (config_ == ADIF_HEADER) {
             if (!adif_read_) {
@@ -306,6 +342,9 @@ public:
                 data = base + au + (size - bytes);
             } else {
                 std::memcpy(base + bsi + info::bsi, adif_info_.data(), adif_info_.size());
+                if (!ff_.is_open() && !open_with(audio_specific_config(adif_pce_->object_type + 1, adif_pce_->sfi, 0,
+                                          &*adif_pce_)))
+                    return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
             }
             pce = adif_pce_;
             core_rate = adif_pce_ && adif_pce_->sfi < 13 ? kRates[adif_pce_->sfi] : 0;
@@ -333,8 +372,9 @@ public:
         if (!bytes) return fail(CELL_ADEC_ERROR_M4AAC_END_OF_BITSTREAM);
         pcm_.clear();
         if (const int e = ff_.decode(data, bytes, pcm_, 2048); e < 0 || !pcm_.samples) {
+            // FFmpeg does not say which syntax error; libm4aacdec's for a frame whose raw data are not AAC's.
             PS_LOG_ERROR("cellAdec", "{}: FFmpeg refused a frame ({}): the game sent invalid data", name_, e);
-            return fail(CELL_ADEC_ERROR_M4AAC_FATAL);
+            return fail(CELL_ADEC_ERROR_M4AAC_INVALID_SECTION_DATA);
         }
         // The stream's channels by position (FFmpeg's layout).
         u32 front = 0, front_mono = 0, side = 0, back = 0, lfe = 0;
@@ -359,8 +399,10 @@ public:
         const std::pair<u32, u32> fields[] = {{info::sampling_freq, core_rate}, {info::number_of_channels, pcm_.channels()},
             {info::front, front}, {info::front_mono, front_mono}, {info::side, side}, {info::back, back},
             {info::lfe, lfe}, {info::enable_sbr, sbr ? 1u : 0u}, {info::sbr_factor, sbr ? 2u : 1u},
-            {info::is_bsi_valid, 1}};
+            {info::is_bsi_valid, 1}, {info::frames, frames_}};
         for (const auto& [at, v] : fields) ps_write32(base, bsi + at, v);
+        frames_++;
+        std::memcpy(info_.data(), base + bsi, info_.size());
         if (pcm_.channels() > 2 && (downmix_ || max_channels_ == 2)) stereo_downmix(pcm_);
         d.size = write_pcm(base, out, pcm_, straight(pcm_.channels()), Format::F32);
         d.duration = ticks(pcm_.samples, pcm_.rate);
@@ -431,6 +473,9 @@ private:
     bool downmix_ = false, configured_ = false, adif_read_ = false;
     std::optional<Pce> adif_pce_;
     std::vector<u8> adif_info_;
+    std::array<u8, info::size> info_{}; // the information block as the last frame decoded left it
+    u32 frames_ = 0;                    // frames decoded since the start or the last refusal
+    std::vector<u8> pending_, joined_;  // an ADTS frame cut short, and it completed
 };
 
 // cellAdecStartSeq: the configuration's type; for raw blocks a sampling frequency index and a profile FFmpeg decodes
@@ -452,12 +497,17 @@ s32 check_m2(const u8* param) { return check_params(param, true); }
 
 // The cores' versions are not known (pspocket's word); the information block is CellAdecM4AacInfo's size. Up to 8
 // channels of 2048 samples (SBR's) for the full core, 2 for the others.
-const Spec kM4Aac = {CELL_ADEC_TYPE_M4AAC, "MPEG-4 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, false)); }};
-const Spec kM4Aac2ch = {CELL_ADEC_TYPE_M4AAC_2CH, "MPEG-4 AAC 2ch", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
-const Spec kM4Aac2chMod = {CELL_ADEC_TYPE_M4AAC_2CH_MOD, "MPEG-4 AAC 2ch mod", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
+// libm4aacdec's and libm4aacdec2ch's answers (D-944): their version, getMemSize (the version written into the
+// attributes too), four PCM handles.
+const Spec kM4Aac = {CELL_ADEC_TYPE_M4AAC, "MPEG-4 AAC", 16, info::size, 2048 * 8 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, false)); }, 0x299a9a,
+    4, true};
+const Spec kM4Aac2ch = {CELL_ADEC_TYPE_M4AAC_2CH, "MPEG-4 AAC 2ch", 16, info::size, 2048 * 2 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }, 0x1a2cf0,
+    4, true};
+const Spec kM4Aac2chMod = {CELL_ADEC_TYPE_M4AAC_2CH_MOD, "MPEG-4 AAC 2ch mod", 16, info::size, 2048 * 2 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }, 0xbac70,
+    4, true};
 // MPEG-2 AAC (D-621): MPEG-4 AAC's parameters and information block, libadec's error codes.
 const Spec kM2Aac = {CELL_ADEC_TYPE_M2AAC, "MPEG-2 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000, CELL_ADEC_ERROR_BUSY,
     check_m2, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, true)); }};
