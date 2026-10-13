@@ -197,6 +197,8 @@ public:
     usize size() const { return items_.size(); }
     // Removes and returns every waiter, in the order pop(protocol) would have returned them.
     std::vector<Waiter*> take_all(u32 protocol);
+    // Every waiter in the order pop(protocol) would return them, the queue left as it is (the debugging calls' lists).
+    std::vector<Waiter*> ordered(u32 protocol) const;
     const std::vector<Waiter*>& items() const { return items_; }
 
 private:

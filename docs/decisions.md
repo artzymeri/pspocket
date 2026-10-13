@@ -14148,3 +14148,46 @@ Ported in this part (runtime/lv2/src/dbg.cpp, crypto_engine.cpp):
   size is asked (less than 16: CELL_EINVAL).
 Tests: tests/lv2/test_misc_calls.cpp. Left: 353, 356, 361 and sys_dbg's 900, 902, 903, 906, 909 to 911, 914, 933, 935,
 937, 941, 943 to 945, 947, 951, 957, 971 and 975 (the next parts).
+
+### D-937, part 2: the information calls on each lock and queue, and the PPU exception handler's queue
+
+Ported from the retail kernel (runtime/lv2/src/dbg.cpp), with what the handlers show:
+- **The access check.** A call names a process; on a retail console (its target ID 0x83 to 0x9F, which the kernel
+  reads from the hypervisor's repository) the kernel lets a process name itself and no other, whatever its privileges
+  (another ID: CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS, 0x80010409). pspocket runs one process, ID 1.
+- **sys_dbg_get_{mutex, cond, rwlock, lwmutex, event_queue, semaphore, lwcond, event_flag}_information (933, 935,
+  937, 941, 943, 947, 951, 971).** Each copies the caller's structure in, fills it and copies it back whole: the words
+  it does not set (an attribute's flags and padding, the event queue's last word) keep the caller's values, and a
+  structure it cannot read or write is CELL_EFAULT. Each list comes as an address and a capacity; the kernel writes as
+  many thread IDs (64 bits each) as fit, in queue order, and turns the capacity into the count written; no address or
+  no room writes nothing and counts 0; a list it cannot write fails the call before the structure is written. It
+  takes a list's room from its heap, whose largest piece is 128 KB: a longer list panics a retail kernel, so pspocket
+  fails the call there (CELL_LV2DBG_ERROR_DENOMEM) and logs why. What each reports: the attribute as created (names
+  kept to seven characters and a NUL, as every create keeps them; pshared and the IPC key from the object's
+  registration; the mutex's adaptive word as given, now kept with it), then the owner, the re-locks beyond the first
+  and the condition variables bound (mutex); the mutex's ID (cond); the writer, the readers' list and count, the
+  writers' (rwlock: the kernel queues readers in arrival order whatever the protocol, writers by it); the owner and
+  recursion count read from the process's own sys_lwmutex_t, an lwmutex not made with sysPrxForUser's kind 1
+  (_sys_lwmutex_create's fourth argument, 0x80000001, without its top bits, now kept) answering CELL_EINVAL; the IPC
+  key, the size, the receivers' list and the queued events (32 bytes each) (event queue); the maximum and the value
+  (semaphore); the sys_lwmutex_t address from the process's sys_lwcond_t (lwcond); the bit pattern and, in two lists
+  that go together, the waiters' IDs and the bits and mode each waits for (event flag).
+- **sys_dbg_initialize_ppu_exception_handler (944)** asks no privilege: it registers an event queue for the process's
+  PPU exceptions (CELL_ESRCH without it; a second time CELL_LV2DBG_ERROR_DEHANDLERALREADYREGISTERED).
+  **sys_dbg_finalize_ppu_exception_handler (945)** (any process on a retail console): nothing registered
+  DEHANDLENOTREGISTERED, no such queue CELL_ESRCH, another queue DEINVALIDHANDLER; else the queue gets a last event
+  from the kernel's port 0x8000111100000001 with data1 all ones (the handler's thread ends on it) and the
+  registration ends. pspocket does not yet send an exception to that queue: a fault in translated code stops the run
+  as before (engine work: the PPU exception path).
+- WaitQueue::ordered gives a queue's waiters in the order its pop would take them.
+Tests: tests/lv2/test_dbg.cpp (threads waiting on each object, the lists' order, room, faults). Left: 353, 356, 361,
+900, 902, 903, 906, 909 to 911, 914, 957 and 975.
+
+Seen on the way, for the retail conformance pass (not changed here): the retail kernel queues waiters of a
+SYS_SYNC_RETRY lwmutex in arrival order (pspocket and RPCS3 by priority); sys_semaphore_create does not refuse a
+negative initial value; sys_dbg_read_process_memory and sys_dbg_write_process_memory (904, 905) point at the table's
+not-implemented slot on a retail console (pspocket answers them).
+
+The rudp comparison's last step is a note now: after cellRudpEnd, Sony's I/O thread delivers the two SOCKET_RELEASED
+events End queued only when End finds it past its check of the stop request (1 run in 9), so what it delivered
+follows the clock (tests/hle/test_rudp_compare.cpp).

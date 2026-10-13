@@ -28,6 +28,7 @@ public:
     const u32 protocol;
     const bool recursive;
     const u64 name;
+    u32 adaptive = SYS_SYNC_NOT_ADAPTIVE; // the attribute's word as given, set at creation (reported, not used)
 
     // Guarded by lock.
     u32 owner = 0;      // owning thread ID, 0 = free
@@ -234,6 +235,9 @@ public:
     const u32 protocol;
     const u32 control; // guest address of the sys_lwmutex_t
     const u64 name;
+    // _sys_lwmutex_create's fourth argument without its top four bits, set at creation: sysPrxForUser passes
+    // 0x80000001 (bit 31: a name follows). The retail kernel's debugging call describes only kind 1 (D-937).
+    u32 kind = 1;
 
     // Guarded by lock.
     s32 signaled = 0;

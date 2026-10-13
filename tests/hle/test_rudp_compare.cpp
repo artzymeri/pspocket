@@ -1570,7 +1570,12 @@ void io_thread(Run& h, u16 port)
         th.join();
         h.o.line(w + "the other thread's Accept when End came", answer(got->load()));
     }
+    // End queues each socket's SOCKET_RELEASED as its last context goes; Sony's I/O thread delivers them when End
+    // finds it past its check of the stop request (1 run in 9: event 2 from ports 7500 and 7501), else they go with
+    // the library. Where the thread is follows the clock: what it delivered is a note.
+    h.lines_per_direction = 0;
     h.pump(w + "after End", 100ms);
+    h.lines_per_direction = ~0u;
     h.events(w + "after End");
     h.close(sa);
     h.close(sb);

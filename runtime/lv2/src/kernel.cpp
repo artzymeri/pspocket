@@ -256,6 +256,18 @@ std::vector<Waiter*> WaitQueue::take_all(u32 protocol)
     return out;
 }
 
+std::vector<Waiter*> WaitQueue::ordered(u32 protocol) const
+{
+    // select()'s order: the lowest priority value first, the earliest among equals; FIFO as pushed.
+    std::vector<Waiter*> out = items_;
+    if (protocol != SYS_SYNC_FIFO) {
+        std::stable_sort(out.begin(), out.end(), [](const Waiter* a, const Waiter* b) {
+            return a->prio.load(std::memory_order_relaxed) < b->prio.load(std::memory_order_relaxed);
+        });
+    }
+    return out;
+}
+
 // ------------------------------------------------------------------------------------------------- parking
 
 void prepare_wait(Waiter& w)

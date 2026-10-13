@@ -544,6 +544,9 @@ struct Kernel::Impl {
     RsxDevice rsx;
     TimerService timers;
     std::mutex tty_mutex;
+    // The event queue sys_dbg_initialize_ppu_exception_handler registered for the process's PPU exceptions (dbg.cpp).
+    std::mutex dbg_mutex;
+    std::shared_ptr<EventQueue> dbg_exception_queue; // under dbg_mutex
 
     SyscallTable table;
     std::atomic<Kernel::SyscallObserver> syscall_observer{nullptr}; // Kernel::set_syscall_observer (tests)

@@ -353,7 +353,12 @@ Result sys_mutex_create(PpuThread& t, u32 mutex_id, u32 attr)
 
     u32 id = 0;
     const Result r = create_object<Mutex>(k, pshared, pshared == SYS_SYNC_PROCESS_SHARED ? ipc_key : 0, flags,
-        [&] { return std::make_shared<Mutex>(protocol, recursive == SYS_SYNC_RECURSIVE, name); }, id);
+        [&] {
+            auto m = std::make_shared<Mutex>(protocol, recursive == SYS_SYNC_RECURSIVE, name);
+            m->adaptive = adaptive;
+            return m;
+        },
+        id);
     if (r != CELL_OK) return r;
     g.w32(mutex_id, id);
     return CELL_OK;

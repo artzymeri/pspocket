@@ -171,6 +171,7 @@ Result _sys_lwmutex_create(PpuThread& t, u32 lwmutex_id, u32 protocol, u32 contr
     }
     if (!s.guest.valid(lwmutex_id, 4)) return err(CELL_EFAULT);
     auto m = std::make_shared<LwMutex>(protocol, control, has_name < 0 ? name : 0);
+    m->kind = static_cast<u32>(has_name) & 0x0FFFFFFF;
     m->refs = 1;
     const u32 id = s.objects.insert(LwMutex::kIdBase, m);
     if (!id) return err(CELL_EAGAIN);
