@@ -1,14 +1,15 @@
 // cellVdec's newest codecs against Sony's libvdec (D-588 to D-590, D-597, D-912): DivX 3.11, MPEG-4 part 2 (as DivX
 // and as MPEG-4), VC-1's advanced profile and MVC, the streams test_vdec_codecs.cpp decodes (vdec_streams.hpp,
 // vc1_writer.hpp, h264_writer.hpp), each family in a process of its own per half. Sony's libvdec loads Sony's codec
-// cores (libdivx311dec, libdivxdec, libsmvd4, libsvc1d, libmvcdec: firmware-first or Sony's only, D-575).
+// cores (libdivx311dec, libdivxdec, libsmvd4, libsvc1d, libmvcdec: firmware-first or Sony's only, D-575). And pspocket's
+// codec cores under Sony's libvdec against Sony's (D-920), MPEG-2 among them (mpeg2_writer.hpp's streams).
 //
 // Each family: QueryAttrEx over levels and codec specific information (and their refusals); OpenEx with the codec's part
 // of what was asked for and one byte less; decoders' lives as a game lives them (each access unit's AUDONE, then the
 // pictures announced taken at once: decode()), by a game that does not take its pictures (how many a decoder holds
 // before it holds an access unit back: hold()), and with items taken ahead of their pictures (items_ahead()). For each
 // picture: its item (the frame buffer's address as an offset into the decoder's memory), its information block (the
-// codec's size: DivX 0x20, DivX 3.11 0x18, MPEG-4 0x38, VC-1 0x170), its frame buffer (each core's own layout) and its
+// codec's size: DivX 0x20, DivX 3.11 0x18, MPEG-4 0x38, VC-1 0x170, MPEG-2 0x1C8), its frame buffer (each core's own layout) and its
 // samples; the callbacks in order. The decoder's memory is filled with 0xA5 before each OpenEx, so the bytes a decoder
 // leaves unwritten show.
 //
@@ -30,6 +31,7 @@
 
 #include "compare_util.hpp"
 #include "h264_writer.hpp"
+#include "mpeg2_writer.hpp"
 #include "vc1_writer.hpp"
 #include "vdec_streams.hpp"
 #include "vdec_test_util.hpp"
@@ -40,6 +42,7 @@ using namespace pspocket::hle::test::compare;
 using namespace pspocket::hle::test::vdec_test;
 namespace v1 = pspocket::hle::test::vc1;
 namespace h = pspocket::hle::test::h264;
+namespace m2 = pspocket::hle::test::mpeg2;
 
 TEST_CASE("cellVdec's comparison calls Sony's exports by their names; pspocket's library", "[hle][vdec]")
 {
@@ -56,13 +59,14 @@ using namespace pspocket::hle::test::vdec_streams;
 
 namespace {
 
-constexpr u32 CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9, CODEC_MVC = 11,
+constexpr u32 CODEC_MPEG2 = 0, CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9, CODEC_MVC = 11,
               CODEC_MVC2 = 13;
 
 // Sony's information block of each codec (RPCS3's VDEC_SCE_DECODER attributes).
 u32 info_size(u32 codec)
 {
     switch (codec) {
+    case CODEC_MPEG2: return 0x1C8;
     case CODEC_MPEG4: return 0x38;
     case CODEC_DIVX: return 0x20;
     case CODEC_DIVX3_11: return 0x18;
@@ -155,6 +159,8 @@ Region frame_region(u32 codec, u32 width, u32 height)
 {
     const u32 w16 = (width + 15) & ~15u, h16 = (height + 15) & ~15u, hc = ((height + 1) / 2 + 7) & ~7u;
     switch (codec) {
+    case CODEC_MPEG2: // libsmvd2's: macroblock after macroblock (16 lines of luma, then 8 of Cb and Cr: 0x180 bytes)
+        return {0, (w16 / 16) * (h16 / 16) * 0x180};
     case CODEC_MPEG4: // libsmvd4's strips: the start address is the first luma sample, after the left edge strip
         return {(h16 + 32) * 16 + 16 * 16, (w16 + 32) * (h16 + hc + 48)};
     case CODEC_DIVX:
@@ -237,13 +243,37 @@ struct Life {
     }
 };
 
-// Puts access unit `i` of `s` in guest memory at `at` and calls DecodeAu: its answer.
+// CellVdecAuInfoEx2 (D-920 part 3): the two pieces' addresses and sizes, PTS, DTS, user data, codec specific data.
+constexpr u32 kAuEx2 = kArgs + 0x1A0;
+
+// Puts access unit `i` of `s` in guest memory at `at` and calls DecodeAu: its answer. A stream sent by DecodeAuEx2
+// (Stream::ex2) gives its odd access units in two pieces, as at a ring buffer's end: a first of whole 16-byte blocks
+// (libsmvd2's slice program reads on to the next 16-byte boundary, D-920 part 6), the rest at the next 16-byte
+// boundary 0x40 bytes on.
 u64 send_au(Run& r, const std::string& key, u32 handle, const Stream& s, usize i, u32& at)
 {
     u8* b = r.b;
     const std::vector<u8>& au = s.aus[i];
-    if (at + au.size() > kPicture) at = kStream;
-    REQUIRE(at + au.size() <= kPicture);
+    if (at + au.size() + 0x80 > kPicture) at = kStream;
+    REQUIRE(at + au.size() + 0x80 <= kPicture);
+    if (s.ex2) {
+        const u32 size = static_cast<u32>(au.size()), first = i % 2 ? (size / 2) & ~15u : size;
+        const u32 second_at = first < size ? (at + first + 0x40) & ~15u : 0;
+        std::memcpy(b + at, au.data(), first);
+        if (second_at) std::memcpy(b + second_at, au.data() + first, size - first);
+        ps_write32(b, kAuEx2 + 0, at);
+        ps_write32(b, kAuEx2 + 4, second_at);
+        ps_write32(b, kAuEx2 + 8, first);
+        ps_write32(b, kAuEx2 + 12, size - first);
+        ps_write32(b, kAuEx2 + 16, 0);
+        ps_write32(b, kAuEx2 + 20, 0x1000 + 3003 * static_cast<u32>(i));
+        ps_write32(b, kAuEx2 + 24, 0);
+        ps_write32(b, kAuEx2 + 28, 0x800 + 3003 * static_cast<u32>(i));
+        ps_write64(b, kAuEx2 + 32, 0xABCD0000 + static_cast<u64>(i));
+        ps_write64(b, kAuEx2 + 40, 0);
+        at = ((second_at ? second_at + size - first : at + size) + 15) & ~15u;
+        return r.r("cellVdecDecodeAuEx2", {handle, static_cast<u64>(static_cast<u32>(s.mode)), kAuEx2}, key);
+    }
     std::memcpy(b + at, au.data(), au.size());
     ps_write32(b, kAu + 0, at);
     ps_write32(b, kAu + 4, static_cast<u32>(au.size()));
@@ -759,6 +789,126 @@ Observed mvc(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// MPEG-2 and MPEG-1 (mpeg2_writer.hpp's streams), under Sony's libvdec only (D-920 part 6): pspocket's own cellVdec
+// decodes them with FFmpeg and fills their information as RPCS3 does, not compared with Sony's libvdec yet.
+Observed mpeg2_family(const Setup& s, bool sony_half)
+{
+    Run r(s, sony_half, "libvdec");
+    for (u32 level = 0; level <= 4; level++) {
+        query(r, std::format("MPEG-2 level {}", level), CODEC_MPEG2, level, {});
+        query(r, std::format("MPEG-2 level {} 96x64", level), CODEC_MPEG2, level, spec8(8, 96, 64));
+        query(r, std::format("MPEG-2 level {} 1920x1088", level), CODEC_MPEG2, level, spec8(8, 1920, 1088));
+    }
+    query(r, "MPEG-2 level 1, the information 12 bytes", CODEC_MPEG2, 1, spec8(12, 96, 64));
+    query(r, "MPEG-2 level 1 0x64", CODEC_MPEG2, 1, spec8(8, 0, 64));
+    query(r, "MPEG-2 level 1 97x64", CODEC_MPEG2, 1, spec8(8, 97, 64));
+    using Edit = void (*)(m2::Picture&, int);
+    const Rule exact = Rule::exact();
+    const m2::Sequence seq;
+    m2::Sequence il, m1, small, shown;
+    il.progressive = false;
+    m1.mpeg1 = true;
+    small.width = 80;
+    small.height = 48;
+    shown.aspect = 3;
+    shown.frame_rate = 4;
+    shown.display_width = 90;
+    shown.display_height = 60;
+    shown.colour_primaries = 5;
+    shown.transfer = 6;
+    shown.matrix = 7;
+    const std::vector<std::vector<u8>> ippp = m2::stream(seq, "IPPPP", true),
+                                       ibbp = m2::stream(seq, "IBBPBBP", true, 1),
+                                       motion = m2::stream(seq, "IPBBPBBP", true, 2,
+                                           Edit{[](m2::Picture& p, int) { p.motion = true; }});
+    decode(r, "MPEG-2 96x64 IPPPP", stream(CODEC_MPEG2, 0, ippp), 96, 64, exact);
+    decode(r, "MPEG-2 96x64 IBBPBBP", stream(CODEC_MPEG2, 0, ibbp), 96, 64, exact);
+    decode(r, "MPEG-2 96x64, macroblocks of every kind", stream(CODEC_MPEG2, 0, motion), 96, 64, exact);
+    decode(r, "MPEG-2 96x64 interlaced",
+        stream(CODEC_MPEG2, 0, m2::stream(il, "IPBPB", true, 3, Edit{[](m2::Picture& p, int) { p.motion = true; }})),
+        96, 64, exact);
+    decode(r, "MPEG-1 96x64", stream(CODEC_MPEG2, 0, m2::stream(m1, "IPBPB", true, 4, Edit{[](m2::Picture& p, int) {
+        p.motion = true;
+        p.f_code = 2;
+    }})), 96, 64, exact);
+    decode(r, "MPEG-2 80x48", stream(CODEC_MPEG2, 0, m2::stream(small, "IPBP", true, 5)), 80, 48, exact);
+    // Pictures shown for two and three frames, each with its frame centre offsets (one, two or three); then with one
+    // where two or three are called for (the program reads the first slice's start code as the others: damaged
+    // pictures, not decoded).
+    decode(r, "MPEG-2 96x64, 16:9 at 30000/1001 with a display extension",
+        stream(CODEC_MPEG2, 0, m2::stream(shown, "IPBP", true, 6, Edit{[](m2::Picture& p, int i) {
+            p.repeat_first_field = i % 2;
+            p.top_field_first = i % 3 == 0;
+            p.display_offsets = {{i * 16, -i * 8}};
+            if (p.repeat_first_field) p.display_offsets.push_back({i * 8, 4});
+            if (p.repeat_first_field && p.top_field_first) p.display_offsets.push_back({-16, -i});
+            p.vbv_delay = 0x1234 + i;
+        }})), 96, 64, exact);
+    decode(r, "MPEG-2 96x64 with too few frame centre offsets",
+        stream(CODEC_MPEG2, 0, m2::stream(shown, "IPBP", true, 6, Edit{[](m2::Picture& p, int i) {
+            p.repeat_first_field = i % 2;
+            p.top_field_first = i % 3 == 0;
+            p.display_offsets = {{i * 16, -i * 8}};
+        }})), 96, 64, exact);
+    // Field pictures: both fields in one access unit, then one field an access unit.
+    {
+        const auto field_pic = [&](m2::Type type, int frame, int structure) {
+            m2::Picture p;
+            p.type = type;
+            p.temporal_reference = frame;
+            p.structure = structure;
+            p.top_field_first = true;
+            p.progressive_frame = false;
+            p.frame_pred_frame_dct = false;
+            p.seed = frame;
+            p.ac = true;
+            return m2::picture(il, p);
+        };
+        std::vector<std::vector<u8>> both, one;
+        const m2::Type types[] = {m2::I, m2::P, m2::P};
+        for (int frame = 0; frame < 3; frame++) {
+            std::vector<u8> head;
+            if (frame == 0) head = m2::join({m2::sequence_header(il), m2::gop_header(0)});
+            both.push_back(m2::join({head, field_pic(types[frame], frame, 1), field_pic(types[frame], frame, 2)}));
+            one.push_back(m2::join({head, field_pic(types[frame], frame, 1)}));
+            one.push_back(field_pic(types[frame], frame, 2));
+        }
+        decode(r, "MPEG-2 field pictures, a frame an access unit", stream(CODEC_MPEG2, 0, both), 96, 64, exact);
+        decode(r, "MPEG-2 field pictures, a field an access unit", stream(CODEC_MPEG2, 0, one), 96, 64, exact);
+    }
+    // Closed captions: DVD's in the sequence's user data, ATSC's in the pictures'.
+    {
+        m2::Sequence cc;
+        cc.user_data = {'C', 'C', 0x01, 0xF8, 0x84, 0xFF, 0x94, 0x20, 0xFE, 0x80, 0x80, 0xFF, 0x94, 0x2C, 0xFE, 0x80,
+            0x80};
+        decode(r, "MPEG-2 96x64 with closed captions",
+            stream(CODEC_MPEG2, 0, m2::stream(cc, "IPBP", true, 7, Edit{[](m2::Picture& p, int i) {
+                if (i % 2)
+                    p.user_data = {'G', 'A', '9', '4', 3, 0x42, 0xFF, 0xFC, static_cast<u8>(0x94 + i), 0x2C, 0xFD, 0x10,
+                        0x20, 0xFF};
+            }})), 96, 64, exact);
+    }
+    // The end of the sequence in the last access unit.
+    {
+        std::vector<std::vector<u8>> ended = ibbp;
+        ended.back() = m2::join({ended.back(), m2::sequence_end()});
+        decode(r, "MPEG-2 96x64 with a sequence end code", stream(CODEC_MPEG2, 0, ended), 96, 64, exact);
+    }
+    decode(r, "MPEG-2 96x64, SetFrameRate 25", stream(CODEC_MPEG2, 0, ippp, {}, 0x82), 96, 64, exact);
+    decode(r, "MPEG-2 96x64 told 96x64", stream(CODEC_MPEG2, 0, ibbp, spec8(8, 96, 64)), 96, 64, exact);
+    for (const s32 mode : {1, 2})
+        decode(r, std::format("MPEG-2 96x64 in mode {}", mode), stream(CODEC_MPEG2, 0, ibbp, {}, 0, mode), 96, 64,
+            exact);
+    {
+        Stream pieces = stream(CODEC_MPEG2, 0, ibbp);
+        pieces.ex2 = true;
+        decode(r, "MPEG-2 96x64 by DecodeAuEx2, odd access units in two pieces", pieces, 96, 64, exact);
+    }
+    hold(r, "MPEG-2 96x64, pictures not taken", stream(CODEC_MPEG2, 0, ibbp), 96, 64, exact);
+    items_ahead(r, "MPEG-2 96x64, items ahead of their pictures", stream(CODEC_MPEG2, 0, ibbp));
+    return std::move(r.o);
+}
+
 // The comparison's setup: Sony's libvdec over Sony's codec cores, which pspocket now has its own of (D-920).
 Setup libvdec_setup()
 {
@@ -819,6 +969,12 @@ TEST_CASE("The DivX and MPEG-4 cores under Sony's libvdec: pspocket's against So
     const Setup s = cores_setup();
     run(s, "libdivxdec and libsmvd4 under Sony's libvdec", [&](bool sony) { return mpeg4(s, sony); },
         [](const Observed&) {});
+}
+
+TEST_CASE("The MPEG-2 core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    const Setup s = cores_setup();
+    run(s, "libsmvd2 under Sony's libvdec", [&](bool sony) { return mpeg2_family(s, sony); }, [](const Observed&) {});
 }
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MPEG-4 part 2 as DivX and as MPEG-4",

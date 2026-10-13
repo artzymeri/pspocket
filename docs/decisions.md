@@ -13425,6 +13425,90 @@ Tests: test_vdec_cores_compare.cpp ("The MPEG-4 core (libsmvd4) against Sony's",
 against Sony's values); test_vdec_codecs_compare.cpp ("The DivX and MPEG-4 cores under Sony's libvdec", hidden);
 test_codec_cores.cpp and test_codec_cores_compare.cpp (libsmvd4 no longer firmware-first).
 
+## D-920 · 2026-10-13 · libsmvd2, the MPEG-1 and MPEG-2 core, pspocket's own, with a decoder of its own (part 6)
+
+libsmvd2's twenty decoding functions (smvd2GetMemorySize, GetMemorySize2, CreateInstance2, ReleaseInstance, Initialize,
+DecodePicture, DecodePicture2, FlushPicture, Discontinue, CancelDecode, SetDecodeMode, GetPicture, GetNumPicture,
+ReleasePicture, GetSideInfoPic, GetAuxData, GetBnrData, GetSideInfoSeq, GetExistenceFlag, SetAuxData) are pspocket's
+own (runtime/hle/src/vdec_smvd2.cpp, on part 5's vdec_score.hpp), with its version query (D-575) the whole library:
+no longer firmware-first. Compared with Sony's module called directly (tests/hle/test_vdec_score_compare.cpp: 0 of
+7,970 observations differ, every sample of every frame buffer exact) and driven by Sony's libvdec
+(test_vdec_codecs_compare.cpp's MPEG-2 family, Sony's libvdec over pspocket's core and over Sony's: 0 of 1,560 differ).
+
+**The decoder is pspocket's own** (runtime/hle/src/vdec_mpeg2.cpp, .hpp), not FFmpeg's: FFmpeg's samples are within a
+step of Sony's (D-912), and its error handling and buffers are its own. Written from ISO/IEC 13818-2 and 11172-2 (the
+standards' code tables, cross-checked with FFmpeg's) and from what Sony's SPU slice program was seen to compute:
+- its inverse DCT: the AP-922 row transform (row constants 2^14 x sqrt2 cos(r pi/16) x sqrt2 cos(u pi/16), r 4, 1, 2, 3
+  for the row pairs 0/4, 1/7, 2/6, 3/5, rounded at 2^11 and shifted by 12 to 16 bits), then a column transform in
+  16-bit arithmetic on the tangent constants' high product halves, shifted by 5;
+- MPEG-1 blocks reconstructed as MPEG-2's (saturation and mismatch control, not MPEG-1's odd values);
+- the frame buffers in Sony's layout (macroblock after macroblock, 16 lines of luma then 8 of Cb and Cr: 0x180 bytes),
+  field pictures in their lines, prediction (frame, field, 16x8, dual prime) from the references the program takes;
+- the BNR data (smvd2GetBnrData): two histograms over bands of slice rows (a slice's band its vertical position over
+  rows / 4 + 1): words 4 to 7 a P or B picture's residual (each slice: 10240 an intra macroblock, else 128 plus its
+  luma coefficients' magnitudes as dequantised before saturation, the sum >> 8), words 0 to 3 the motion (each
+  non-intra macroblock's vector differences' sizes, weighted 4 for one vector a direction, 2 for two, halved for both
+  directions, 4 for dual prime forward);
+- damage: a code no table has, a coefficient past the block's end, a macroblock past its row or the picture, data
+  ending inside a macroblock, a slice outside the picture, missing or out of order (below).
+
+**What the program does, read in the module and checked against it** (the details are vdec_smvd2.cpp's head):
+- Memory: levels 0 to 4 and 16 (1920x1152, 352x288, 720x576, 1440x1152, 1920x1152, 1280x720); a line store and four
+  frames (width to 16, at least 48; height to 32, at least 64), 0x500 bytes per SPU task plus 0x2B500 of tasks and
+  queues (two SPURS queues of two entries: part 5's QueuePlaces now has a depth), 0x4600 of its own; GetMemorySize2's
+  size within the level's; CreateInstance2 clears 0x3C00 bytes; no taskset SEQ, too little memory NO_MEMORY.
+- The side information (0xBC bytes a picture) is the program's record of the headers, kept in its SPU's local store:
+  a field a picture's headers leave out keeps its value, from picture to picture and from instance to instance on the
+  same SPURS instance (a new SPURS instance's SPUs start with none: libvdec makes one per decoder; a taskset that
+  clears local stores, none either). A picture header resets its flags and writes MPEG-1's coding extension values,
+  which an MPEG-2 coding extension overwrites; Initialize, Discontinue, CancelDecode and a broken link in an open GOP
+  clear the GOP's flag and parity and the picture flags, and the references; FlushPicture clears the picture type.
+- Closed captions into the record: ATSC's (GA94, type 3: flags, em_data, the triples, marker and the rest to the next
+  start code) and DVD's (CC: the user data as it came, 9 + 3 x (attributes & 63) bytes, none past 128 or when a start
+  code comes first), with where the user data was (sequence, GOP, picture).
+- A header whose flags call for more fields than it has (a picture display extension with one frame centre offset
+  where repeat_first_field calls for two or three) reads them from what follows, start codes too: the parse goes on
+  after what it read, so a user data start code read that way is never seen, and a first slice's makes the picture
+  damaged, with nothing of it decoded.
+- Pictures: a frame, or a field that is not the other of the last one's, takes the first free slot; I and P frames wait
+  for the next anchor or FlushPicture, B frames go out when both fields are decoded (or not decoded at all in the mode
+  that skips them: 0x80, GetPicture 0x..28). References from the picture queue: a P picture the newest anchor, a B
+  picture the two; one gone (Initialize, CancelDecode, FlushPicture) is the queue's 0xFF, which the program takes for
+  the last slot, whose frame it reads as it is (0x800); a reference with a warning 0x400. A field of the parity already
+  decoded is no picture; an MPEG-2 picture without its coding extension is damaged and not decoded (its slot keeps
+  its frame, the BNR data the last picture's). A marker bit that is not 1 is a warning (0x10: 0x80615001). A sequence
+  end code after a picture is used with it, then flushes. A picture too large for the instance kills it.
+- DecodePicture2's two pieces are joined as the program's DMA joins them: the second lands at the first address after
+  the first piece whose low four bits are the second's, so (a2 - a1 - s1) & 15 bytes of whatever follows the first
+  piece in memory come between; the used count is mapped back.
+- **Slices**: the picture starts at its first slice of vertical position 1 (slices before it are passed over; with none
+  the picture is damaged and nothing of it decoded, its BNR data 0). A slice that starts where the one before it ended
+  (or in that one's row: another slice of the row) is written in its place; one that does not damages the picture and
+  is written from where the one before ended, predicted from its own place, until a macroblock is written at the
+  picture's end or past it (into the memory after the frame, as on a PS3: the next frame buffer's first macroblock);
+  the next slice is then expected after its own last macroblock. A slice outside the picture is not decoded. After a
+  slice in error the next start code is looked for from where the reading stopped (a macroblock in error reads on
+  through start codes: those slices are lost), and the macroblock in error counts as passed, not written.
+
+Not reproduced (notes in the comparison): what a macroblock in error leaves for the next. The program keeps what it had
+parsed in its coefficient buffers, so the next macroblock coding those blocks has it too, and counts it in the BNR
+data; how far it parses (into the bytes after the slice) is its own. Here each block starts from no coefficients, so
+the first macroblock after one in error can be off, and with it what is predicted from it: such pictures' samples
+(GetPicture's 0x..11 to 0x..13, or 0x400) are notes, but the streams whose damage is their slices' order, whose frame
+buffers are cleared first and compared to the sample. Probes with slices cut short got their slices placed as Sony's
+and differed in that one macroblock (and the BNR data of the slice in error).
+
+cellVdec's own MPEG-2 decoding (FFmpeg, its information block as RPCS3 fills it) is not Sony's libvdec with libsmvd2:
+not changed; the comparison under Sony's libvdec shows what Sony's gives (its information block is 0x1C8 bytes).
+
+Tests: test_vdec_score_compare.cpp ("The MPEG-2 core (libsmvd2) against Sony's", hidden; its firmware-free twin against
+Sony's values; "The MPEG-2 core's inverse DCT is Sony's slice program's"), mpeg2_writer.hpp (MPEG-1 and MPEG-2
+streams written bit by bit: every kind of macroblock, field pictures, extensions, user data),
+test_vdec_cores_compare.cpp ("The tests' MPEG-2 streams decode with FFmpeg": the writer checked against another
+decoder), test_vdec_codecs_compare.cpp ("The MPEG-2 core under Sony's libvdec", hidden: DecodeAu and DecodeAuEx2 in two
+pieces, the decode modes, held pictures, items ahead), test_codec_cores.cpp and test_codec_cores_compare.cpp (libsmvd2
+no longer firmware-first).
+
 ## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
 
 sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole

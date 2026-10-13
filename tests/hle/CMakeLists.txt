@@ -55,7 +55,7 @@ target_sources(test_hle PRIVATE
 
 # libvdec's last functions (D-920) against Sony's libvdec: test_hle "[compare][vdec-ext]". The video codec cores
 # pspocket's own (D-920): test_hle "[vdec-cores]", their comparisons with Sony's "[compare][vdec-cores]".
-target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compare.cpp)
+target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compare.cpp test_vdec_score_compare.cpp)
 
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE

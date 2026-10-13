@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "compare_util.hpp"
+#include "mpeg2_writer.hpp"
 #include "vdec_streams.hpp"
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -1897,6 +1898,164 @@ TEST_CASE("The MPEG-4 core (libsmvd4) against Sony's", "[.][hle][lle][compare][v
     if (!avcodec_find_encoder(AV_CODEC_ID_MPEG4)) SKIP("this FFmpeg has no mpeg4 encoder (build-ffmpeg.sh)");
     const Setup s = setup();
     run(s, "libsmvd4 against Sony's", [&](bool sony) { return smvd4(s, sony); }, [](const Observed&) {});
+}
+
+// The MPEG-2 writer's streams (mpeg2_writer.hpp) as FFmpeg's decoder reads them: every picture, in display order, the
+// I pictures' blocks flat at their levels, no errors; and its other kinds (MPEG-1, interlaced frames, field pictures,
+// the coding options and extensions) without errors.
+std::vector<std::vector<u8>> ffmpeg_mpeg2(const std::vector<std::vector<u8>>& aus, int w, int h, std::vector<int>* types,
+    bool explode = true)
+{
+    const AVCodec* dec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
+    REQUIRE(dec);
+    AVCodecContext* av = avcodec_alloc_context3(dec);
+    av->err_recognition = explode ? AV_EF_EXPLODE : 0; // field pictures: FFmpeg's EXPLODE refuses a second field
+    REQUIRE(avcodec_open2(av, dec, nullptr) == 0);
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* f = av_frame_alloc();
+    std::vector<std::vector<u8>> lumas;
+    const auto drain = [&] {
+        while (avcodec_receive_frame(av, f) == 0) {
+            CHECK(f->decode_error_flags == 0);
+            CHECK(f->width == w);
+            CHECK(f->height == h);
+            std::vector<u8> y(static_cast<usize>(w * h));
+            for (int r = 0; r < h; r++) std::memcpy(y.data() + r * w, f->data[0] + r * f->linesize[0], static_cast<usize>(w));
+            lumas.push_back(std::move(y));
+            if (types) types->push_back(f->pict_type);
+            av_frame_unref(f);
+        }
+    };
+    for (const auto& au : aus) {
+        std::vector<u8> padded(au);
+        padded.resize(au.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+        pkt->data = padded.data();
+        pkt->size = static_cast<int>(au.size());
+        CHECK(avcodec_send_packet(av, pkt) == 0);
+        drain();
+    }
+    avcodec_send_packet(av, nullptr);
+    drain();
+    av_frame_free(&f);
+    av_packet_free(&pkt);
+    avcodec_free_context(&av);
+    return lumas;
+}
+
+TEST_CASE("The tests' MPEG-2 streams decode with FFmpeg", "[hle][vdec-cores]")
+{
+    if (!avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO)) SKIP("this FFmpeg has no MPEG-2 decoder");
+    mpeg2::Sequence seq;
+    for (const bool ac : {false, true}) {
+        INFO(ac);
+        std::vector<int> types;
+        const std::vector<std::vector<u8>> lumas = ffmpeg_mpeg2(mpeg2::stream(seq, "IPPBBPIBBP", ac), 96, 64, &types);
+        REQUIRE(lumas.size() == 10);
+        CHECK(types[0] == AV_PICTURE_TYPE_I);
+        CHECK(types[3] == AV_PICTURE_TYPE_B);
+        CHECK(types[6] == AV_PICTURE_TYPE_I);
+        if (!ac) {
+            mpeg2::Picture first;
+            for (int mby = 0; mby < 4; mby++)
+                for (int mbx = 0; mbx < 6; mbx++)
+                    for (int b = 0; b < 4; b++) {
+                        const int x = mbx * 16 + (b & 1) * 8 + 3, y = mby * 16 + (b >> 1) * 8 + 5;
+                        CHECK(lumas[0][static_cast<usize>(y * 96 + x)] == mpeg2::block_level(first, mbx, mby, b));
+                    }
+            // A P picture's macroblocks that are not coded are the I picture's (the second picture's first is not),
+            // the coded ones not.
+            CHECK(lumas[1][2] == lumas[0][2]);
+            CHECK(lumas[1][16 + 2] != lumas[0][16 + 2]);
+        }
+    }
+    SECTION("MPEG-1")
+    {
+        mpeg2::Sequence m1;
+        m1.mpeg1 = true;
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(m1, "IPBPB", true), 96, 64, nullptr).size() == 5);
+    }
+    SECTION("macroblocks of every kind")
+    {
+        mpeg2::Sequence plain, m1, il, big;
+        m1.mpeg1 = true;
+        il.progressive = false;
+        big.width = 176;
+        big.height = 144;
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(plain, "IPBBPBBP", true, 0, [](mpeg2::Picture& p, int) { p.motion = true; }),
+                  96, 64, nullptr).size() == 8);
+        using Edit = void (*)(mpeg2::Picture&, int);
+        for (const Edit edit : {Edit{[](mpeg2::Picture& p, int) { p.motion = true; p.f_code = 2; }},
+                 Edit{[](mpeg2::Picture& p, int) { p.motion = true; p.f_code = 3; }},
+                 Edit{[](mpeg2::Picture& p, int i) { p.motion = true; p.q_scale_type = true; p.intra_vlc = i % 2; }}}) {
+            CHECK(ffmpeg_mpeg2(mpeg2::stream(plain, "IPBPBP", true, 3, edit), 96, 64, nullptr).size() == 6);
+            CHECK(ffmpeg_mpeg2(mpeg2::stream(big, "IPBPBP", true, 5, edit), 176, 144, nullptr).size() == 6);
+        }
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(m1, "IPBPB", true, 0, [](mpeg2::Picture& p, int) { p.motion = true; p.f_code = 2; }),
+                  96, 64, nullptr).size() == 5);
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(il, "IPBPB", true, 0, [](mpeg2::Picture& p, int) { p.motion = true; }), 96, 64,
+                  nullptr).size() == 5);
+    }
+    SECTION("interlaced frames")
+    {
+        mpeg2::Sequence il;
+        il.progressive = false;
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(il, "IPBPB", true), 96, 64, nullptr).size() == 5);
+    }
+    SECTION("coding options and extensions")
+    {
+        mpeg2::Sequence ex;
+        ex.display_width = 90;
+        ex.display_height = 60;
+        ex.colour_primaries = 5;
+        ex.transfer = 6;
+        ex.matrix = 7;
+        ex.user_data = {'s', 'e', 'q'};
+        ex.intra_matrix.assign(64, 16);
+        ex.non_intra_matrix.assign(64, 20);
+        const auto edit = [](mpeg2::Picture& p, int i) {
+            p.dc_precision = i % 3;
+            p.q_scale_type = i % 2;
+            p.intra_vlc = i % 2;
+            p.alternate_scan = i % 3 == 1;
+            p.display_offsets = {{i * 16, -i * 8}};
+            p.copyright = i == 1;
+            p.composite = i == 2;
+            p.burst_amplitude = 5;
+            if (i == 3) p.quant_intra_matrix.assign(64, 24);
+            p.user_data = {'p', static_cast<u8>('0' + i)};
+        };
+        CHECK(ffmpeg_mpeg2(mpeg2::stream(ex, "IPBPBIP", true, 0, edit), 96, 64, nullptr).size() == 7);
+    }
+    SECTION("field pictures")
+    {
+        mpeg2::Sequence il;
+        il.progressive = false;
+        std::vector<std::vector<u8>> aus;
+        for (int frame = 0; frame < 3; frame++) {
+            std::vector<u8> au;
+            if (frame == 0) au = mpeg2::join({mpeg2::sequence_header(il), mpeg2::gop_header(0)});
+            for (const int structure : {1, 2}) {
+                mpeg2::Picture p;
+                p.type = frame == 0 ? mpeg2::I : mpeg2::P;
+                p.temporal_reference = frame;
+                p.structure = structure;
+                p.top_field_first = true;
+                p.progressive_frame = false;
+                p.frame_pred_frame_dct = false;
+                p.seed = frame;
+                p.ac = true;
+                const std::vector<u8> pic = mpeg2::picture(il, p);
+                au.insert(au.end(), pic.begin(), pic.end());
+            }
+            aus.push_back(std::move(au));
+        }
+        const std::vector<std::vector<u8>> lumas = ffmpeg_mpeg2(aus, 96, 64, nullptr, false);
+        REQUIRE(lumas.size() == 3);
+        // The I frame's fields: the top field's lines its blocks' levels, the bottom field's its own.
+        mpeg2::Picture first;
+        CHECK(lumas[0][2 * 96 + 3] == mpeg2::block_level(first, 0, 0, 0));
+        CHECK(lumas[0][3 * 96 + 3] == mpeg2::block_level(first, 0, 7, 0));
+    }
 }
 
 #endif

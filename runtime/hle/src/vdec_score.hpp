@@ -215,9 +215,11 @@ struct Instances {
 
 // ---- the SPURS queues
 
-// Where a core keeps its two queues in the instance's memory (each 128-byte aligned, a 0x80-byte buffer after it).
+// Where a core keeps its two queues in the instance's memory (each 128-byte aligned, a buffer after it), and their
+// depth (entries of 0x80 bytes).
 struct QueuePlaces {
     u32 to_ppu = 0, to_ppu_buffer = 0, to_spu = 0, to_spu_buffer = 0; // offsets in the instance's memory
+    u32 depth = 1;
 };
 
 // The queues an instance's making makes on the caller's taskset, in Sony's order (SPU to PPU, its lv2 event queue,
@@ -227,12 +229,12 @@ inline s32 make_queues(PPUContext& ctx, u32 mem, u32 taskset, const QueuePlaces&
     using vdec_core::call_import;
     constexpr u32 kInit = 0x082BFB09, kAttach = 0xE5443BE7, kDetach = 0x039D70B7;
     s32 r = static_cast<s32>(call_import(ctx, "cellSpurs", kInit, {0, taskset, mem + q.to_ppu, mem + q.to_ppu_buffer,
-        0x80, 1, 1}));
+        0x80, q.depth, 1}));
     if (r != lv2::CELL_OK) return r;
     r = static_cast<s32>(call_import(ctx, "cellSpurs", kAttach, {mem + q.to_ppu}));
     if (r != lv2::CELL_OK) return r;
     r = static_cast<s32>(call_import(ctx, "cellSpurs", kInit, {0, taskset, mem + q.to_spu, mem + q.to_spu_buffer,
-        0x80, 1, 2}));
+        0x80, q.depth, 2}));
     if (r == lv2::CELL_OK) r = static_cast<s32>(call_import(ctx, "cellSpurs", kAttach, {mem + q.to_spu}));
     if (r != lv2::CELL_OK) call_import(ctx, "cellSpurs", kDetach, {mem + q.to_ppu});
     return r;

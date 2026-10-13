@@ -3,7 +3,8 @@
 // calls them, and games do not import them. What RPCS3 knows of each is its version and, for the AVC and MVC cores, two
 // numbers of their characteristics; their decoding calls need Sony's modules, so each library whose decoding calls
 // pspocket does not have yet is firmware-first (D-563): a module that imports one gets Sony's where the system
-// software is installed. libsmvd4's decoding calls are pspocket's own (vdec_smvd4.cpp, D-920).
+// software is installed. libsmvd4's and libsmvd2's decoding calls are pspocket's own (vdec_smvd4.cpp, vdec_smvd2.cpp,
+// D-920).
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/libavcdec.cpp, libmvcdec.cpp, libsjvtd.cpp, libsmvd2.cpp, libsmvd4.cpp,
 // libsvc1d.cpp and their headers (the versions, the characteristics, the ARG error codes). A pointer that is not guest
 // memory gets the ARG error here, where RPCS3 checks only for null.
@@ -82,7 +83,7 @@ void register_codec_cores(Registry& r)
     r.add("libsmvd2", {PS_HLE_FUNC(0x52BB9416, smvd2GetVersionNumber)});
     r.add("libsmvd4", {PS_HLE_FUNC(0xC1D6771B, smvd4GetVersionNumber)});
     r.add("libsvc1d", {PS_HLE_FUNC(0x6C366C43, svc1dGetVersionNumber)});
-    for (const std::string_view library : {"libavcdec", "libmvcdec", "libsjvtd", "libsmvd2", "libsvc1d"})
+    for (const std::string_view library : {"libavcdec", "libmvcdec", "libsjvtd", "libsvc1d"})
         r.firmware_first(library);
 }
 
