@@ -403,19 +403,26 @@ inline void read_strips(const u8* base, u32 frame, const Plan& p, u32 w, u32 h, 
 }
 
 // A picture (planar 4:2:0, no padding) in a frame laid out in strips with edges: every sample past the picture repeats
-// its nearest one; with `edges` false the picture's samples alone (a picture no other is predicted from, whose edges a
-// decoder leaves as they were, D-920).
+// its nearest one (with `fields`, its nearest one of the same field: a field picture's edges); with `edges` false the
+// picture's samples alone (a picture no other is predicted from, whose edges a decoder leaves as they were, D-920).
 inline void write_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h, const u8* y, const u8* u, const u8* v,
-    bool edges = true)
+    bool edges = true, bool fields = false)
 {
     const u32 hl = p.lines32 ? align(h, 32) : align(h, 16);
     const u32 strips = align(w, 16) / 16 + 2, lines = hl + 2 * p.edge_y, clines = hl / 2 + 2 * p.edge_c;
     const u32 cw = w / 2, ch = h / 2;
+    // The line a line past the picture repeats.
+    const auto nearest = [fields](s32 rr, u32 rows) {
+        if (!fields || rows < 2) return static_cast<u32>(std::clamp<s32>(rr, 0, static_cast<s32>(rows) - 1));
+        if (rr < 0) return static_cast<u32>(rr & 1);
+        if (rr >= static_cast<s32>(rows)) return rows - 1 - ((rows - 1 + static_cast<u32>(rr)) & 1);
+        return static_cast<u32>(rr);
+    };
     u8* out = base + frame;
     for (u32 s = 0; s < strips; s++)
         for (u32 r = 0; r < lines; r++) {
             const s32 rr = static_cast<s32>(r) - static_cast<s32>(p.edge_y);
-            const u32 row = static_cast<u32>(std::clamp<s32>(rr, 0, static_cast<s32>(h) - 1));
+            const u32 row = nearest(rr, h);
             for (u32 k = 0; k < 16; k++, out++) {
                 const s32 xx = static_cast<s32>(s * 16 + k) - 16;
                 if (!edges && (xx < 0 || xx >= static_cast<s32>(w) || rr < 0 || rr >= static_cast<s32>(h))) continue;
@@ -425,7 +432,7 @@ inline void write_strips(u8* base, u32 frame, const Plan& p, u32 w, u32 h, const
     for (u32 s = 0; s < strips; s++)
         for (u32 r = 0; r < clines; r++) {
             const s32 rr = static_cast<s32>(r) - static_cast<s32>(p.edge_c);
-            const u32 row = static_cast<u32>(std::clamp<s32>(rr, 0, static_cast<s32>(ch) - 1));
+            const u32 row = nearest(rr, ch);
             for (u32 k = 0; k < 8; k++) {
                 const s32 xx = static_cast<s32>(s * 8 + k) - 8;
                 if (!edges && (xx < 0 || xx >= static_cast<s32>(cw) || rr < 0 || rr >= static_cast<s32>(ch))) continue;

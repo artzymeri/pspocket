@@ -155,7 +155,7 @@ void settle(u8* b)
 struct Region {
     u32 before = 0, size = 0;
 };
-Region frame_region(u32 codec, u32 width, u32 height)
+Region frame_region(u32 codec, u32 width, u32 height, bool lines16 = false)
 {
     const u32 w16 = (width + 15) & ~15u, h16 = (height + 15) & ~15u, hc = ((height + 1) / 2 + 7) & ~7u;
     switch (codec) {
@@ -167,8 +167,9 @@ Region frame_region(u32 codec, u32 width, u32 height)
     case CODEC_DIVX3_11: // libdivxdec's, libdivx311dec's: the start address is the frame's
         return {0, (w16 + 32) * (h16 + hc + 48)};
     case CODEC_VC1: { // libsvc1d's: 64 lines of edge above and below the luma, 32 the chroma, the height to 32 lines
-        const u32 h32 = (height + 31) & ~31u;
-        return {(h32 + 128) * 16 + 64 * 16, (w16 + 32) * (h32 + 128) * 3 / 2};
+                      // (to 16 for a simple or main profile sequence's frames set up so, `lines16`)
+        const u32 hl = lines16 ? h16 : (height + 31) & ~31u;
+        return {(hl + 128) * 16 + 64 * 16, (w16 + 32) * (hl + 128) * 3 / 2};
     }
     default: { // libavcdec's (D-196): two strips of edge each side, no lines of edge; the start is the frame's
         const u32 strips = w16 / 16 + 4;
@@ -187,6 +188,7 @@ struct Life {
     // stream (its own concealment), and which of them a decoder reports damaged (the item's status, the information's
     // error word, the PICOUT's data) is its own. Those are notes; the rest (answers, places, sizes) is compared.
     bool damaged = false;
+    bool lines16 = false; // VC-1's frames laid out to 16 lines (frame_region)
 
     // Takes the pictures announced and not yet taken (each item, its places, information, frame buffer, then the
     // samples by GetPicture), at most `limit`; `when` names the step for the answer that ends it (EMPTY).
@@ -228,9 +230,25 @@ struct Life {
             } else {
                 r.o.line(key + ": the information", "not in guest memory");
             }
-            const Region fb = frame_region(codec, width, height);
-            if (!damaged && start >= kMem + fb.before && start - fb.before + u64{fb.size} <= kMem + kMemSize)
-                r.o.bytes(key + ": its frame buffer", b + start - fb.before, fb.size, rule);
+            const Region fb = frame_region(codec, width, height, lines16);
+            if (!damaged && start >= kMem + fb.before && start - fb.before + u64{fb.size} <= kMem + kMemSize) {
+                std::vector<u8> frame(b + start - fb.before, b + start - fb.before + fb.size);
+                // A VC-1 field picture's (its information's two fields): its edge strips' lines above and below the
+                // picture left out, which libsvc1d's program pads racing with itself (D-920).
+                if (codec == CODEC_VC1 && r.readable(info, info_bytes) && ps_read8(b, info + 0x20) == 2) {
+                    const u32 w16 = (width + 15) & ~15u, hl = lines16 ? (height + 15) & ~15u : (height + 31) & ~31u;
+                    const u32 lines = hl + 128, strips = w16 / 16 + 2, clines = hl / 2 + 64;
+                    for (const u32 strip : {0u, strips - 1}) {
+                        for (u32 line = 0; line < lines; line++)
+                            if (line < 64 || line >= 64 + hl)
+                                std::memset(frame.data() + (strip * lines + line) * 16, 0, 16);
+                        for (u32 line = 0; line < clines; line++)
+                            if (line < 32 || line >= 32 + hl / 2)
+                                std::memset(frame.data() + (strips * lines + strip * clines + line) * 16, 0, 16);
+                    }
+                }
+                r.o.bytes(key + ": its frame buffer", frame.data(), frame.size(), rule);
+            }
             ps_write32(b, kFormat, 3); // YUV 4:2:0 planar
             ps_write32(b, kFormat + 4, 0);
             ps_write8(b, kFormat + 8, 0);
@@ -365,19 +383,31 @@ void open_with_less(Run& r, const std::string& what, u32 codec, u32 level, const
 // A decoder's life over `s` as a game lives it: each access unit decoded (DecodeAu, its AUDONE), then the pictures
 // announced taken at once (GetPicItem, GetPicture), the end of the sequence and the last pictures, the callbacks in
 // order, Close.
-void decode(Run& r, const std::string& what, const Stream& s, u32 width, u32 height, Rule rule, bool damaged = false)
+void decode(Run& r, const std::string& what, const Stream& s, u32 width, u32 height, Rule rule, bool damaged = false,
+    const std::vector<s32>& modes = {})
 {
     if (!selected(what)) return;
     u8* b = r.b;
     const u32 handle = open_decoder(r, what, s);
     if (!handle) return;
     Life life{r, what, handle, s.codec, width, height, 0, rule, damaged};
+    // (A VC-1 stream that begins with the simple and main profiles' sequence command: a new instance's frames, laid
+    // out to 16 lines.)
+    life.lines16 = s.codec == CODEC_VC1 && !modes.empty() && modes[0] == 3;
     if (s.frame_rate) r.r("cellVdecSetFrameRate", {handle, s.frame_rate}, what + ": SetFrameRate");
     if (r.r("cellVdecStartSeq", {handle}, what + ": StartSeq") == 0) {
         u32 at = kStream, accepted = 0;
         for (usize i = 0; i < s.aus.size(); i++) {
             const std::string key = std::format("{}: DecodeAu {}", what, i);
-            if (send_au(r, key, handle, s, i, at) != 0) continue;
+            Stream one = s;
+            if (i < modes.size()) one.mode = modes[i];
+            if (send_au(r, key, handle, one, i, at) != 0) continue;
+            if (s.codec == CODEC_VC1 && one.mode == 3) {
+                // The simple and main profiles' sequence command: libvdec sends no AUDONE for it.
+                settle(b);
+                r.o.line(key + ": AUDONEs by then", std::format("{}", count_of(b, 0)));
+                continue;
+            }
             accepted++;
             r.o.line(key + ": AUDONE", wait_for([&] { return count_of(b, 0) >= accepted; }) ? "yes" : "none");
             settle(b);
@@ -734,10 +764,119 @@ Observed vc1_family(const Setup& s, bool sony_half)
     decode(r, "VC-1 64x48 told 64x48",
         stream(CODEC_VC1, 6, {concat({headers, v1::intra_frame(a, seq)}), v1::skipped_frame(seq)}, spec8(8, 64, 48)), 64,
         48, Rule::exact());
-    decode(r, "VC-1 64x48 in mode 3 (B and PB skipped)",
+    decode(r, "VC-1 64x48 in mode 3 (the simple and main profiles' sequence command)",
         stream(CODEC_VC1, 5, {concat({plain_headers, v1::intra_frame(d, plain)})}, {}, 0, 3), 64, 48, Rule::exact());
     decode(r, "VC-1 64x48 in mode 2", stream(CODEC_VC1, 5, {concat({plain_headers, v1::intra_frame(d, plain)})}, {}, 0, 2),
         64, 48, Rule::exact());
+    if (s.ours_on_firmware) {
+        // libsvc1d under Sony's libvdec only (D-920 part 7): pictures of every kind (P, B, BI, skipped, intensity
+        // compensation), interlaced frames and field pictures; and the simple and main profiles.
+        const v1::Header h0;
+        v1::Header ic;
+        ic.intensity = true;
+        ic.lumscale = 16;
+        ic.lumshift = 10;
+        decode(r, "VC-1 64x48 I, P, I, B, BI, P, skipped",
+            stream(CODEC_VC1, 5,
+                {concat({plain_headers, v1::intra_frame(dc_levels(64, 48, 5), plain, entry, h0)}),
+                    v1::skipped_mbs_p_frame(plain, entry, h0, 4, 3),
+                    v1::intra_frame(dc_levels(64, 48, 6), plain, entry, h0), v1::direct_b_frame(plain, entry, h0, 4, 3),
+                    v1::intra_frame(dc_levels(64, 48, 7), plain, entry, h0, true),
+                    v1::skipped_mbs_p_frame(plain, entry, ic, 4, 3), v1::skipped_frame(plain, entry, h0)}),
+            64, 48, Rule::exact());
+        v1::Sequence si;
+        si.width = 64;
+        si.height = 32;
+        si.interlace = true;
+        const std::vector<u8> hdi = concat({v1::sequence_header(si), v1::entry_point(entry, si)});
+        const auto fl = [](int seed) { return dc_levels(64, 16, seed); };
+        decode(r, "VC-1 64x32 interlaced frames",
+            stream(CODEC_VC1, 5,
+                {concat({hdi, v1::interlaced_intra_frame(dc_levels(64, 32, 8), si, entry, h0)}),
+                    v1::interlaced_skipped_p_frame(si, entry, h0, 4, 2),
+                    v1::interlaced_intra_frame(dc_levels(64, 32, 9), si, entry, h0),
+                    v1::interlaced_direct_b_frame(si, entry, h0, 4, 2), v1::skipped_frame(si, entry, h0)}),
+            64, 32, Rule::exact());
+        decode(r, "VC-1 64x32 field pictures",
+            stream(CODEC_VC1, 5,
+                {concat({hdi, v1::field_picture(0, fl(10), fl(11), si, entry, h0)}),
+                    v1::field_picture(1, fl(12), fl(13), si, entry, h0),
+                    v1::field_picture(3, fl(0), fl(0), si, entry, h0), v1::field_picture(4, fl(0), fl(0), si, entry, h0)}),
+            64, 32, Rule::exact());
+        // The simple and main profiles: DecodeAu's mode 3 is their sequence's command. Sony's libvdec reads four words
+        // at the access unit's address: the height, the width (libsvc1d's SetPictureSize takes them), the sequence
+        // header's address and size (DecodeSeqHeader: STRUCT_C behind a sequence header's start code); the frames
+        // follow as BDUs of their own (a frame's start code, escaped). The decoder's instance is new: its frames laid
+        // out to 16 lines.
+        constexpr u32 kSequenceBytes = kArgs + 0x800;
+        const auto bdu = [](u8 code, const std::vector<u8>& payload) {
+            std::vector<u8> out = {0x00, 0x00, 0x01, code};
+            int zeros = 0;
+            for (const u8 c : payload) {
+                if (zeros >= 2 && c <= 3) {
+                    out.push_back(3);
+                    zeros = 0;
+                }
+                out.push_back(c);
+                zeros = c == 0 ? zeros + 1 : 0;
+            }
+            return out;
+        };
+        const auto command = [&](u32 width, u32 height, const std::vector<u8>& sequence) {
+            std::memcpy(r.b + kSequenceBytes, sequence.data(), sequence.size());
+            std::vector<u8> au(16);
+            const u32 words[4] = {height, width, kSequenceBytes, static_cast<u32>(sequence.size())};
+            for (u32 k = 0; k < 4; k++) ps_write32(au.data(), 4 * k, words[k]);
+            return au;
+        };
+        // (`damaged`: the pictures left out, as a sync markers sequence's are, D-920.)
+        const auto simple = [&](const std::string& what, u32 level, const v1::SimpleSequence& ms,
+                                const v1::SimpleHeader& mh, bool framed = true, u32 width = 64, u32 height = 48,
+                                bool damaged = false) {
+            if (!selected(what)) return;
+            const int w = static_cast<int>(std::min(width, 64u)), h = static_cast<int>(std::min(height, 64u));
+            const auto levels = [&](int seed) {
+                v1::DcPicture p = dc_levels(w, h, seed);
+                for (auto* plane : {&p.y, &p.cb, &p.cr})
+                    for (int& v : *plane) v += 100;
+                return p;
+            };
+            const std::vector<u8> sc = v1::struct_c(ms);
+            std::vector<std::vector<u8>> aus = {command(width, height, framed ? bdu(0x0F, sc) : sc),
+                bdu(0x0D, v1::simple_intra_frame(levels(20), ms, mh)),
+                bdu(0x0D, v1::simple_skipped_mbs_p_frame(ms, mh, w / 16, h / 16)),
+                bdu(0x0D, v1::simple_intra_frame(levels(21), ms, mh))};
+            if (ms.maxbframes) {
+                aus.push_back(bdu(0x0D, v1::simple_direct_b_frame(ms, mh, w / 16, h / 16)));
+                aus.push_back(bdu(0x0D, v1::simple_intra_frame(levels(22), ms, mh, true)));
+            }
+            v1::SimpleHeader mi = mh;
+            mi.intensity = true;
+            mi.lumscale = 16;
+            mi.lumshift = 10;
+            aus.push_back(bdu(0x0D, v1::simple_skipped_mbs_p_frame(ms, mi, w / 16, h / 16)));
+            decode(r, what, stream(CODEC_VC1, level, aus), static_cast<u32>(w), static_cast<u32>(h), Rule::exact(),
+                damaged, {3});
+        };
+        v1::SimpleSequence main_profile, simple_profile, with_b, reduced;
+        simple_profile.profile = 0;
+        with_b.maxbframes = 1;
+        reduced.rangered = true;
+        v1::SimpleHeader reduced_frames;
+        reduced_frames.rangeredfrm = true;
+        simple("VC-1 main profile 64x48", 2, main_profile, {});
+        simple("VC-1 main profile 64x64", 3, main_profile, {}, true, 64, 64);
+        simple("VC-1 simple profile 64x48", 0, simple_profile, {});
+        simple("VC-1 main profile 64x48 with B pictures", 3, with_b, {});
+        // Range reduction: the main profile's tool (libsvc1d warns of it at the other profiles' levels, so libvdec
+        // reports those pictures in error).
+        simple("VC-1 main profile 64x48, range reduction", 2, reduced, reduced_frames);
+        simple("VC-1 main profile 64x48, range reduction at the simple profile's level", 1, reduced, reduced_frames);
+        simple("VC-1 main profile 64x48, range reduction at an advanced profile's level", 5, reduced, reduced_frames);
+        // (No start code: libsvc1d's default sequence, of sync markers.)
+        simple("VC-1 main profile 64x48, STRUCT_C without its start code", 2, main_profile, {}, false, 64, 48, true);
+        simple("VC-1 main profile, a size past the level's", 2, main_profile, {}, true, 1920, 1088);
+    }
     return std::move(r.o);
 }
 
@@ -1019,10 +1158,17 @@ TEST_CASE("cellVdec's new codecs against Sony's libvdec: VC-1's advanced profile
             CHECK(o.value("VC-1 64x48 with an access unit before the headers: callback 0") ==
                 "type 0 data 0x80610105 handle the decoder's memory +0x0");
             CHECK(o.value("VC-1 64x48 in mode 2: DecodeAu 0") == "0x80610101");
-            CHECK(o.value("VC-1 64x48 in mode 3 (B and PB skipped): callback 0") ==
+            CHECK(o.value("VC-1 64x48 in mode 3 (the simple and main profiles' sequence command): callback 0") ==
                 "type 3 data 0x80610180 handle the decoder's memory +0x0");
             CHECK(o.value("VC-1 64x48, pictures not taken: DecodeAu 4: AUDONE (0 taken)") == "none");
         });
+}
+
+TEST_CASE("The VC-1 core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
+    const Setup s = cores_setup();
+    run(s, "libsvc1d under Sony's libvdec", [&](bool sony) { return vc1_family(s, sony); }, [](const Observed&) {});
 }
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MVC", "[.][hle][lle][compare][vdec]")

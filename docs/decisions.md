@@ -13509,6 +13509,90 @@ decoder), test_vdec_codecs_compare.cpp ("The MPEG-2 core under Sony's libvdec", 
 pieces, the decode modes, held pictures, items ahead), test_codec_cores.cpp and test_codec_cores_compare.cpp (libsmvd2
 no longer firmware-first).
 
+## D-920 · 2026-10-13 · libsvc1d, the VC-1 core, pspocket's own: simple, main and advanced profiles (part 7)
+
+libsvc1d's twenty-one decoding functions (svc1dGetMemorySize, GetMemorySize2, CreateInstance2, ReleaseInstance,
+Initialize, DecodePicture, DecodePicture2, DecodeSeqHeader, SetPictureSize, FlushPicture, Discontinue, CancelDecode,
+SetDecodeMode, GetPicture, GetNumPicture, ReleasePicture, GetSideInfoPic, GetAuxData, GetSideInfoSeq,
+GetExistenceFlag, SetAuxData) are pspocket's own (runtime/hle/src/vdec_svc1d.cpp, on part 5's vdec_score.hpp), with
+its version query (D-575) the whole library: no longer firmware-first. Compared with Sony's module called directly
+(tests/hle/test_vdec_score_compare.cpp: 0 of 26,805 observations differ, every sample of every frame buffer exact but
+where noted below) and driven by Sony's libvdec (test_vdec_codecs_compare.cpp's VC-1 family, Sony's libvdec over
+pspocket's core and over Sony's: 0 of 1,276 differ).
+
+**The samples are FFmpeg's VC-1 decoder's** (VC-1's reconstruction is exact by the standard; Sony's four SPU programs,
+headers and pictures, blocks, prediction, deblocking, gave the same samples in every stream compared), written into
+Sony's frame buffers (16-sample strips, 64 lines of edge above and below the luma, 16 samples each side, Cb and Cr in
+each strip's halves; field pictures' edges each field's, vdec_layout.hpp) and given out through Sony's picture queue.
+What FFmpeg reads otherwise than the standard is changed in the bits it is given (pan-scan windows it does not read
+left out, DQUANT 2 given as DQUANT 1 with each picture's VOPDQUANT to match, a progressive P picture's DMVRANGE in an
+interlaced sequence of extended differential vectors); the simple and main profiles go through FFmpeg's VC-1 decoder
+(pspocket's build has no WMV3 one) as STRUCT_C behind a sequence header's start code, an entry point made from its
+coding tools, and the frames as BDUs. Where the program predicts from other frames than FFmpeg would (after
+FlushPicture, a skipped picture, a P picture with no anchor before it), FFmpeg's references are rewritten with the
+program's (vdec_ffmpeg.hpp keeps the decoded pictures for it), or the anchor's access unit decoded again first. FFmpeg
+is opened again at Initialize (its intensity compensation tables are its own state).
+
+**What the program does, read in the module and checked against it** (the details are vdec_svc1d.cpp's):
+- Levels 0 to 10 (0 the largest, 2048x2048; 1 and 2 the simple profile's, 3 to 5 the main profile's, 6 to 10 the
+  advanced profile's): nine frame buffers at level 0 and the main profile's levels, six at the others. GetMemorySize2
+  takes types 3 to 5 (type 5: a size within the level's, to 16); CreateInstance2 takes 0x480 bytes less than asked for
+  (the PPU side's own state), types 4 and 5 a taskset, type 3 the core's own SPU threads or taskset (below).
+- The PPU side's state word: a picture size past the instance's (SetPictureSize, a sequence header) stops the program
+  for good (0x80615381, then 0x80615380 from every call that looks at the word; GetNumPicture, GetPicture,
+  ReleasePicture, GetAuxData and GetSideInfoPic do not). DecodePicture2 checks a second piece (at a 128-byte boundary,
+  after a first one of 16-byte blocks) before the state.
+- After Initialize the first access unit must begin with a sequence header (else no picture, its bytes passed over to
+  the next start code); after the advanced profile's CancelDecode (the pictures dropped) or Discontinue (kept) the
+  stream goes on at its next entry point; the simple and main profiles' Discontinue leaves the next P picture no anchor.
+- The bytes used: to the frame's stop bit's byte; an end of sequence after the frame taken (the anchor then given out,
+  the flush's flag); user data after the frame used only when it is the access unit's last; a frame's user data before
+  it ends the access unit with no picture, a sequence's or entry point's flags it (0x10, 0x1000) and the BDU after it is
+  passed over with it; the simple and main profiles' frames to their header's end when no macroblock is coded, else to
+  the frame's last byte.
+- The records (GetSideInfoSeq's 0x38 bytes, GetSideInfoPic's 0x100 a field): a field a header leaves out keeps the value
+  an earlier one gave it, across Initialize (which clears the first-entry flag alone). A new instance's are its
+  program's own, zeroed: a simple profile's (so SetPictureSize before the first sequence header lays the frames out to
+  16 lines, and a simple or main profile sequence's size is 2x2 until it comes). The advanced profile's entry point's
+  fields and whether it was the first since Initialize; the picture header's: types, quantizer, motion vector modes and
+  tables (codes as the program writes them), VOPDQUANT, transform types, interlaced frames' and field pictures' fields
+  (a field picture two records), pan-scan windows, range mapping. A simple or main profile picture writes the coding
+  tools and size into the entry point's part and keeps the rest (flags, broken link, closed entry, pan-scan, reference
+  distance, coded size flag, extended differential vectors, range mapping).
+- Statuses: a P picture with no anchor (0x800), predicted since an anchor with a warning (0x400), a picture the decode
+  mode skips (0x80: its frame buffer left as it was); GetPicture's 0x11, 0x12, 0x14, 0x18 for them and the warnings.
+- The simple and main profiles: DecodeSeqHeader takes STRUCT_C behind a sequence header's start code (none: a default
+  sequence of no tool but sync markers, the warnings 0xC); a frame of at most one byte is a skipped P picture; range
+  reduction is a warning (0x2, the record's picture not valid) but at level 0 and the main profile's levels, its P and
+  B pictures given out expanded; sync markers a warning at every level; the frames are laid out to 32 lines when
+  SetPictureSize comes after an advanced profile sequence, else to 16.
+- Sony's libvdec (read in the module, its calls traced): Initialize when it opens a decoder, CancelDecode and
+  SetDecodeMode {0, 0} at StartSeq, SetAuxData before each command, GetPicture, GetAuxData, GetSideInfoSeq,
+  GetSideInfoPic and ReleasePicture for each picture; a picture whose GetPicture answers a warning is given out in
+  error (0x80610106). DecodeAu's mode 3 is the simple and main profiles' sequence command: libvdec reads four words at
+  the access unit's address, the height and the width (SetPictureSize(width, height), its answer not looked at) and the
+  sequence header's address and size (DecodeSeqHeader; its warnings ignored, its errors fatal). An advanced profile
+  access unit in mode 3 so gives a size past the instance's: the fatal error part 1 saw.
+
+**Not reproduced** (logged where it can come; the comparisons leave each out where Sony's program does it):
+- Field pictures' corner padding: Sony's program pads the edge strips' lines outside the picture racing with itself
+  (they keep a frame buffer's earlier samples now and then).
+- A simple or main profile picture in frames laid out to 32 lines whose height is not a multiple of 32: Sony's program
+  decodes the macroblock rows to 32 lines, the last from the bytes after the frame's.
+- Sync markers' frames and bytes used (Sony's program reads such frames otherwise than FFmpeg), and the bytes used of a
+  simple or main profile frame whose macroblocks end on a byte's boundary (Sony's count one more: pspocket does not read
+  the macroblock layer).
+- RESPIC pictures (multiresolution) and intra macroblocks in range reduced P pictures (expanded twice); logged.
+- CreateInstance2 type 3 (the core's own SPU threads, or its taskset in a SPURS instance given): refused (SEQ) and
+  logged; libvdec gives a taskset (type 5).
+
+Tests: tests/hle/vc1_writer.hpp's streams (interlaced frames, field pictures, slices, user data, bitplanes of every
+mode, VOPDQUANT, the simple and main profiles' frames and STRUCT_C); "The VC-1 core (libsvc1d) against Sony's" (the
+call-for-call comparison, `[.]`) and "The VC-1 core (libsvc1d): pspocket's own, answering as Sony's did (D-920)" (its
+own half with Sony's values, firmware-free); "The VC-1 core under Sony's libvdec: pspocket's against Sony's" (`[.]`,
+with the simple and main profiles through mode 3); test_vdec_cores_compare.cpp's FFmpeg checks of the writer's streams.
+pspocket's own libvdec still answers mode 3 with a fatal error and does not decode the simple and main profiles: next.
+
 ## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
 
 sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole

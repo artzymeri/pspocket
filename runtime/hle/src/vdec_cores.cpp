@@ -1525,6 +1525,7 @@ void register_vdec_cores(Registry& r)
 {
     vdec_core::register_smvd4(r);
     vdec_core::register_smvd2(r);
+    vdec_core::register_svc1d(r);
     r.add("libdivx311dec", {
         PS_HLE_FUNC(0xA1521D39, divx311DecQueryAttr),
         PS_HLE_FUNC(0xBD6092C4, divx311DecOpen),
