@@ -1,10 +1,13 @@
 // lv2's debugging calls as the retail kernel has them (D-937): the information calls on each kind of lock and queue,
 // with threads waiting on them, and the PPU exception handler's registration.
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <thread>
 
 #include "lv2_test_util.hpp"
+#include "pspocket/recomp/spu/asm.hpp"
 
 using namespace pspocket;
 using namespace pspocket::lv2;
@@ -614,4 +617,225 @@ TEST_CASE("lv2 sys_dbg: the thread list, each thread's information, the process'
 
     REQUIRE(c.call(kSemPost, sem, 1) == CELL_OK);
     th.join();
+}
+
+TEST_CASE("lv2 retail memory calls: colored allocations and the process's memory counts", "[lv2][dbg]")
+{
+    enum : u32 { kStat = 353, kColored = 356, kColoredFromContainer = 361, kShmExt = 339, kGroupCreate = 170 };
+    constexpr u64 k1M = 0x400, k64K = 0x200;
+    Fixture f;
+    Caller c(*f.kernel, "main");
+    const u32 out = f.alloc(4), stat = f.alloc(0x1C);
+    const auto count = [&](u32 i) { return f.r32(stat + i * 4); };
+
+    REQUIRE(c.call(kStat, stat) == CELL_OK);
+    for (u32 i = 0; i < 7; i++) CHECK(count(i) == 0); // a thread made by attach has no stack of the kernel's
+    CHECK(c.call(kStat, 0) == rc(CELL_EFAULT));
+
+    // Colors 0 and 1 are the system's; another color allocates as sys_memory_allocate does.
+    CHECK(c.call(kColored, 0x100000, k1M, 0, out) == rc(CELL_EINVAL));
+    CHECK(c.call(kColored, 0x100000, k1M, 1, out) == rc(CELL_EINVAL));
+    CHECK(c.call(kColored, 0, k1M, 2, out) == rc(CELL_EALIGN));
+    CHECK(c.call(kColored, 0x100000, 0x300, 2, out) == rc(CELL_EINVAL));
+    CHECK(c.call(kColored, 0x10000, k1M, 2, out) == rc(CELL_EALIGN));
+    REQUIRE(c.call(kColored, 0x100000, k1M, 2, out) == CELL_OK);
+    const u32 a = f.r32(out);
+    CHECK(a % 0x100000 == 0);
+    REQUIRE(c.call(kStat, stat) == CELL_OK);
+    CHECK(count(2) == 0x100000);
+    REQUIRE(c.call(kMemFree, a) == CELL_OK);
+
+    // From a container: the color, then the container, then the size.
+    REQUIRE(c.call(kContainerCreate, out, 0x200000) == CELL_OK);
+    const u32 ct = f.r32(out);
+    CHECK(c.call(kColoredFromContainer, 0x10000, ct, k64K, 1, out) == rc(CELL_EINVAL));
+    CHECK(c.call(kColoredFromContainer, 0, 0x3F00FFFF, k64K, 5, out) == rc(CELL_ESRCH));
+    CHECK(c.call(kColoredFromContainer, 0, ct, k64K, 5, out) == rc(CELL_EALIGN));
+    REQUIRE(c.call(kColoredFromContainer, 0x10000, ct, k64K, 5, out) == CELL_OK);
+
+    // Shared memory: made with the _ext call it is counted apart.
+    const u32 entries = f.alloc(0x18, 8);
+    REQUIRE(c.call(kMmAllocateShm, 0xFFFF000000000000ull, 0x100000, k1M, out) == CELL_OK);
+    REQUIRE(c.call(kShmExt, 0x1234, 0x10000, k64K, entries, 1, out) == CELL_OK);
+    REQUIRE(c.call(kStat, stat) == CELL_OK);
+    CHECK(count(0) == 0x10000);
+    CHECK(count(2) == 0x10000 + 0x100000);
+
+    // An SPU thread group's local stores, 256 KB a thread.
+    const u32 gattr = f.alloc(16);
+    REQUIRE(c.call(kGroupCreate, out, 3, 100, gattr) == CELL_OK);
+    REQUIRE(c.call(kStat, stat) == CELL_OK);
+    CHECK(count(6) == 3 * 0x40000);
+}
+
+TEST_CASE("lv2 sys_dbg: threads stopped and continued, their registers, an SPU thread's local store and context",
+    "[lv2][dbg]")
+{
+    enum : u32 {
+        kStopProcesses = 900,
+        kStopThreads = 902,
+        kContinueThreads = 903,
+        kReadRegister = 906,
+        kThreadInfo = 910,
+        kReadLs = 911,
+        kSpuContext = 975,
+        kGroupCreate = 170,
+        kSpuInitialize = 172,
+        kGroupStart = 173,
+        kGroupTerminate = 177,
+        kYield = 43,
+    };
+    Fixture f;
+    Caller c(*f.kernel, "main");
+    const u32 out = f.alloc(4);
+
+    // A worker making calls in a loop, a sleeper waiting on a semaphore; r20 marked in each.
+    std::atomic<u64> laps{0};
+    std::atomic<bool> quit{false};
+    u32 worker = 0, sleeper = 0;
+    REQUIRE(c.call(kSemCreate, out, sync_attr(f, SYS_SYNC_FIFO), 0, 1) == CELL_OK);
+    const u32 sem = f.r32(out);
+    std::thread tw([&] {
+        Caller me(*f.kernel, "worker");
+        me.ctx.gpr[20] = 0x2020;
+        worker = me.id();
+        while (!quit.load()) {
+            me.call(kYield);
+            laps++;
+        }
+    });
+    std::thread ts([&] {
+        Caller me(*f.kernel, "sleeper");
+        me.ctx.gpr[20] = 0x5151;
+        sleeper = me.id();
+        THREAD_REQUIRE(me.call(kSemWait, sem, 0) == CELL_OK);
+    });
+    REQUIRE(eventually([&] { return laps.load() > 10 && queued<Semaphore>(*f.kernel, sem) == 1; }));
+
+    // Stop: the worker, the sleeper, the caller itself (CELL_EDEADLK), no such thread, an unknown type.
+    const u32 list = f.alloc(0x18 * 5, 8);
+    const auto entry = [&](u32 i, u32 type, u64 id) {
+        f.w32(list + i * 0x18, type);
+        f.w64(list + i * 0x18 + 8, id);
+        f.w32(list + i * 0x18 + 0x10, 0xEEEEEEEE);
+    };
+    entry(0, 0, worker);
+    entry(1, 0, sleeper);
+    entry(2, 0, c.id());
+    entry(3, 0, 0x01FFFFFF);
+    entry(4, 9, 0);
+    CHECK(c.call(kStopThreads, list, 5) == kDeInvalidArguments);
+    CHECK(f.r32(list + 0x10) == 0);
+    CHECK(f.r32(list + 0x18 + 0x10) == 0);
+    CHECK(f.r32(list + 0x30 + 0x10) == static_cast<u32>(rc(CELL_EDEADLK)));
+    CHECK(f.r32(list + 0x48 + 0x10) == 0x80010402);
+    CHECK(c.call(kStopThreads, list, 0) == kDeInvalidArguments);
+
+    // The worker stops at its next call: its state reads stopped (6) and it makes no more.
+    const u32 tid = f.alloc(16, 8), info = f.alloc(0x40, 8);
+    f.w32(tid, 0);
+    f.w64(tid + 8, worker);
+    f.w32(info + 0x14, 0);
+    REQUIRE(eventually([&] { return c.call(kThreadInfo, tid, info) == CELL_OK && f.r32(info + 4) == 6; }));
+    const u64 at_stop = laps.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(laps.load() == at_stop);
+
+    // Its registers; the sleeper's too (asked to stop, waiting); not the caller's (running).
+    const u32 reg = f.alloc(8, 8), val = f.alloc(16, 8);
+    const auto read = [&](u64 id, u32 kind, u32 index) {
+        f.w32(tid, 0);
+        f.w64(tid + 8, id);
+        f.w32(reg, kind);
+        f.w32(reg + 4, index);
+        std::memset(f.base() + val, 0xEE, 16);
+        return c.call(kReadRegister, tid, reg, val);
+    };
+    REQUIRE(read(worker, 3, 20) == CELL_OK);
+    CHECK(f.r64(val) == 0x2020);
+    CHECK(f.r64(val + 8) == 0);
+    REQUIRE(read(worker, 3, 11) == CELL_OK);
+    CHECK(f.r64(val) == kYield); // r11 holds the call's number
+    REQUIRE(read(sleeper, 3, 20) == CELL_OK);
+    CHECK(f.r64(val) == 0x5151);
+    REQUIRE(read(worker, 0, 0) == CELL_OK); // CR: 32 bits
+    CHECK(f.r32(val + 4) == 0);
+    CHECK(read(c.id(), 3, 20) == static_cast<s32>(0x8001040D));
+    CHECK(read(worker, 11, 0) == static_cast<s32>(0x80010403));
+    CHECK(read(worker, 3, 32) == static_cast<s32>(0x80010404));
+
+    // Continue: the worker goes on.
+    const u32 two = f.alloc(0x18 * 2, 8);
+    f.w32(two, 0);
+    f.w64(two + 8, worker);
+    f.w32(two + 0x18, 0);
+    f.w64(two + 0x18 + 8, sleeper);
+    REQUIRE(c.call(kContinueThreads, two, 2) == CELL_OK);
+    REQUIRE(eventually([&] { return laps.load() > at_stop + 5; }));
+    CHECK(read(worker, 3, 20) == static_cast<s32>(0x8001040D));
+
+    // Stopping the process stops every thread but the caller; another process is refused in its entry.
+    const u32 procs = f.alloc(16, 8);
+    f.w32(procs, 1);
+    f.w32(procs + 8, 2);
+    REQUIRE(c.call(kStopProcesses, procs, 2) == CELL_OK);
+    CHECK(f.r32(procs + 4) == 0);
+    CHECK(f.r32(procs + 12) == static_cast<u32>(kDeInvalidArguments));
+    f.w32(tid, 0);
+    f.w64(tid + 8, worker);
+    REQUIRE(eventually([&] { return c.call(kThreadInfo, tid, info) == CELL_OK && f.r32(info + 4) == 6; }));
+    f.w64(tid + 8, c.id());
+    REQUIRE(c.call(kThreadInfo, tid, info) == CELL_OK);
+    CHECK(f.r32(info + 4) == 2); // the caller runs on
+    REQUIRE(c.call(kContinueThreads, two, 2) == CELL_OK);
+
+    // An SPU thread group running a loop: stopped, its registers, local store and context read, continued.
+    const u32 gattr = f.alloc(16);
+    REQUIRE(c.call(kGroupCreate, out, 1, 100, gattr) == CELL_OK);
+    const u32 group = f.r32(out);
+    const u32 code = f.alloc(16, 16), segs = f.alloc(0x18, 8), img = f.alloc(16), args = f.alloc(32, 8);
+    f.w32(code, pspocket::recomp::spu::as::br(0)); // a branch to itself
+    f.w32(segs, 1);
+    f.w32(segs + 8, 16);
+    f.w32(segs + 0x10, code);
+    f.w32(img + 8, segs);
+    f.w32(img + 12, 1);
+    f.w64(args, 0xA1A1A1A1);
+    REQUIRE(c.call(kSpuInitialize, out, group, 0, img, f.alloc(12), args) == CELL_OK);
+    const u32 spu = f.r32(out);
+    const u32 ctx2 = f.alloc(0xB48, 16);
+    CHECK(c.call(kSpuContext, spu, ctx2) == static_cast<s32>(0x80010414)); // not stopped
+    REQUIRE(c.call(kGroupStart, group) == CELL_OK);
+    const u32 g1 = f.alloc(0x18, 8);
+    f.w32(g1, 2);
+    f.w32(g1 + 8, group);
+    REQUIRE(c.call(kStopThreads, g1, 1) == CELL_OK);
+    CHECK(f.r32(g1 + 0x10) == 0);
+    f.w32(tid, 1);
+    f.w32(tid + 8, spu);
+    f.w32(tid + 12, 0);
+    f.w32(reg, 12); // NPC
+    f.w32(reg + 4, 0);
+    REQUIRE(c.call(kReadRegister, tid, reg, val) == CELL_OK);
+    CHECK(f.r32(val) == 0);
+    f.w32(reg, 11); // GPR3: the first argument, in the preferred word
+    f.w32(reg + 4, 3);
+    REQUIRE(c.call(kReadRegister, tid, reg, val) == CELL_OK);
+    CHECK(f.r64(val) == 0xA1A1A1A1);
+    const u32 ls = f.alloc(16, 16);
+    REQUIRE(c.call(kReadLs, spu, 0, 4, ls) == CELL_OK);
+    CHECK(f.r32(ls) == pspocket::recomp::spu::as::br(0));
+    CHECK(c.call(kReadLs, spu, 0x3FFFC, 8, ls) == static_cast<s32>(0x80010426));
+    REQUIRE(c.call(kSpuContext, spu, ctx2) == CELL_OK);
+    CHECK(f.r64(ctx2 + 3 * 16) == 0xA1A1A1A1);
+    CHECK(f.r32(ctx2 + 0x800) == 0);
+    CHECK(f.r32(ctx2 + 0x828) == 0x400); // the inbound mailbox: four free
+    REQUIRE(c.call(kContinueThreads, g1, 1) == CELL_OK);
+    CHECK(c.call(kSpuContext, spu, ctx2) == static_cast<s32>(0x80010414));
+    REQUIRE(c.call(kGroupTerminate, group, 0) == CELL_OK);
+
+    quit = true;
+    REQUIRE(c.call(kSemPost, sem, 1) == CELL_OK);
+    tw.join();
+    ts.join();
 }

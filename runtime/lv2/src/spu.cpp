@@ -599,7 +599,7 @@ void SpuThread::run()
         {
             std::unique_lock lock(group.lock);
             const auto ending = [&] { return group.set_terminate || s.exiting.load(std::memory_order_relaxed); };
-            group.state_cv.wait(lock, [&] { return ending() || !suspended(group.state); });
+            group.state_cv.wait(lock, [&] { return ending() || !(suspended(group.state) || group.dbg_stopped); });
             if (ending()) break;
             ps_spu_clear_stop(&ctx);
         }

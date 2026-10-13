@@ -14218,3 +14218,52 @@ Ported from the retail kernel (runtime/lv2/src/dbg.cpp):
   size, free bytes, ID, parent's ID, the process's own container first (named -1, as the memory calls name it), then
   those made from it.
 Tests: tests/lv2/test_dbg.cpp. Left: 353, 356, 361, 900, 902, 903, 906, 911 and 975.
+
+### D-937, part 4: the memory calls a retail kernel adds (colors, the process's memory counts)
+
+Ported from the retail kernel (runtime/lv2/src/memory.cpp):
+- **sys_memory_allocate_colored (356), sys_memory_allocate_from_container_colored (361):** colors 0 and 1 are the
+  system's (CELL_EINVAL); a process whose colors the kernel counts (its own system processes; none pspocket runs) may
+  use those below its count. Otherwise the allocation is sys_memory_allocate's, the container looked up first for 361
+  (CELL_ESRCH) as its handler does.
+- **sys_memory_get_user_memory_stat (353):** seven 32-bit counts the kernel keeps as memory comes and goes: [0]
+  shared memory the process made with the _ext calls (SharedMemory now knows it came from one), [1] such memory of
+  another process's (none), [2] sys_memory_allocate* and sys_mmapper_allocate_shared_memory* memory, [3] to [5] (and
+  part of [6]) the segments the kernel maps for modules by their attributes (pspocket's loader places those: not
+  counted), [6] PPU thread stacks and SPU thread groups' local stores (256 KB a thread).
+Tests: tests/lv2/test_dbg.cpp.
+
+### D-937, part 5: stopping and continuing threads for a debugger, their registers, SPU local stores and contexts
+
+The retail kernel stops a thread by flagging it and taking it off the processor; pspocket's PPU threads run guest code
+on host threads of their own, so a stop takes effect where pspocket can see the thread: **at its next call into lv2 or
+into one of pspocket's library functions, or as such a call returns** (dbg_stop_point, in Kernel::syscall and the
+HLE import trampoline), where every register is in its PPUContext. A thread waiting in a call stays where it is and
+stops as the wait ends. A thread that makes no call at all does not stop (a game's threads call lv2 or its libraries
+every frame); this is the one way pspocket's stop differs. Ported (runtime/lv2/src/dbg.cpp):
+- **sys_dbg_stop_threads (902), sys_dbg_continue_threads (903):** entries of 24 bytes (type, ID, result): a PPU thread
+  (type 0; the caller cannot stop itself, CELL_EDEADLK; a thread that ended, CELL_ESTAT) or an SPU thread group (type
+  2: its threads park as a suspended group's do; one not started is left); another type makes the call's answer
+  CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS while the others are done. Continue clears the request and wakes a stopped
+  thread; an SPU thread group a debugger stopped goes on.
+- **sys_dbg_stop_processes (900):** every PPU thread of the process but the caller's, and its SPU thread groups; the
+  result per entry (another process: CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS). sys_dbg_continue_processes is not in a
+  retail kernel (D-936): a process continues its threads with 903.
+- **sys_dbg_read_thread_register (906):** a PPU thread stopped, or asked to stop and waiting in a call (else
+  CELL_LV2DBG_ERROR_DEINVALIDTHREADSTATUS): kinds 0 CR, 1 LR, 2 CTR, 3 GPR, 4 XER, 5 FPR, 6 FPSCR, 7 VR, 8 VSCR, 9 the
+  instruction address, 10 the MSR (a game thread's: SF, VEC, EE, PR, FP, ME, IR, DR, RI). The kernel gives a thread
+  stopped inside a call its non-volatile registers only; pspocket's threads stop between calls with every register
+  known, so it gives them all. An SPU thread whose group a debugger stopped (else
+  CELL_LV2DBG_ERROR_DETHREADSTATEISNOTSTOPPED): kinds 11 GPR, 12 NPC, 13 FPSCR, 14 SRR0, 15 decrementer, 16 the
+  inbound mailbox, 17 the outbound one, 18 mailbox status, 19 SPU status, 20 configuration, 21 the MFC queue's save
+  area. The value fills the 16 bytes from the start, the rest zero.
+- **sys_dbg_spu_thread_read_from_ls (911):** any SPU thread's local store, 1 byte to 256 KB inside it (else
+  CELL_LV2DBG_ERROR_DEINVALIDLSADDRESS), its group stopped or not.
+- **sys_dbg_read_spu_thread_context2 (975):** a stopped SPU thread's context (0xB48 bytes, RPCS3's
+  sys_dbg_spu_thread_context2_t). pspocket's MFC runs each transfer as it is issued, so the MFC queue's save area is
+  empty.
+A thread stopped for a debugger reads as stopped (6) in sys_dbg_get_thread_info; a stopped SPU thread group as 7.
+Tests: tests/lv2/test_dbg.cpp (a thread making calls stops and goes on, registers of a stopped and of a waiting
+thread, the process stopped but its caller, an SPU loop stopped and read). With this part every one of the 634
+syscalls the kernel chart counts is pspocket's own; the retail table's unnamed slots (958, 959, 972, 974, 988) are
+the next pass (D-936's conformance sweep).

@@ -15,8 +15,11 @@
 // - sys_memory_get_page_attribute reports SYS_MEMORY_ACCESS_RIGHT_ANY for everything but stacks (as RPCS3).
 
 #include <algorithm>
+#include <array>
+#include <set>
 
 #include "internal.hpp"
+#include "spu.hpp"
 #include "pspocket/core/memory_map.h"
 
 #if defined(__APPLE__)
@@ -687,6 +690,18 @@ Result check_ext_entries(PpuThread& t, u32 entries, s32 entry_count)
     return CELL_OK;
 }
 
+// An _ext call's new shared memory is counted apart (sys_memory_get_user_memory_stat).
+Result mark_ext(PpuThread& t, Result r, u32 mem_id)
+{
+    if (r != CELL_OK) return r;
+    Kernel::Impl& s = t.kernel.impl();
+    if (const auto mem = s.objects.get<SharedMemory>(s.guest.r32(mem_id))) {
+        std::lock_guard lock(s.memory.mutex);
+        mem->ext = true;
+    }
+    return r;
+}
+
 } // namespace
 
 // sys_mmapper_allocate_shared_memory_ext(ipc_key, size, flags, entries, entry_count, mem_id) and
@@ -701,7 +716,8 @@ Result sys_mmapper_allocate_shared_memory_ext(PpuThread& t, u64 ipc_key, u64 siz
     if (flags & ~SYS_MEMORY_GRANULARITY_MASK) return err(CELL_EINVAL);
     if (const Result r = check_ext_entries(t, entries, entry_count); r != CELL_OK) return r;
     const u32 align = (flags & SYS_MEMORY_PAGE_SIZE_64K) ? 0x10000 : 0x100000;
-    return create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, nullptr, mem_id);
+    return mark_ext(t, create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, nullptr, mem_id),
+        mem_id);
 }
 
 Result sys_mmapper_allocate_shared_memory_from_container_ext(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 cid,
@@ -713,7 +729,8 @@ Result sys_mmapper_allocate_shared_memory_from_container_ext(PpuThread& t, u64 i
     const auto ct = t.kernel.impl().containers.get<MemoryContainer>(cid);
     if (!ct) return err(CELL_ESRCH);
     const u32 align = (flags & SYS_MEMORY_PAGE_SIZE_64K) ? 0x10000 : 0x100000;
-    return create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, ct, mem_id);
+    return mark_ext(t, create_shared_memory(t, true, ipc_key, size, align, flags, SYS_SYNC_NEWLY_CREATED, ct, mem_id),
+        mem_id);
 }
 
 Result sys_mmapper_free_shared_memory(PpuThread& t, u32 mem_id)
@@ -805,6 +822,70 @@ Result sys_mmapper_unmap_shared_memory(PpuThread& t, u32 addr, u32 mem_id)
     return CELL_OK;
 }
 
+// The memory colors (D-937, from the retail kernel's 0x800000000007A550 and 0x800000000007A4DC): colors 0 and 1 are
+// the system's (CELL_EINVAL); a process with its colors counted (none that pspocket runs: the kernel turns that on for
+// the system's own processes) may use those below its count. A color changes nothing else of an allocation here.
+namespace {
+
+Result check_color(u32 color)
+{
+    return color < 2 ? err(CELL_EINVAL) : CELL_OK;
+}
+
+} // namespace
+
+// sys_memory_allocate_colored(size, flags, color, alloc_addr) (356): the color, then as sys_memory_allocate.
+Result sys_memory_allocate_colored(PpuThread& t, u64 size, u64 flags, u32 color, u32 alloc_addr)
+{
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_memory_allocate(t, size, flags, alloc_addr);
+}
+
+// sys_memory_allocate_from_container_colored(size, cid, flags, color, alloc_addr) (361): the color, the container
+// (CELL_ESRCH), then the size and page checks and the allocation as sys_memory_allocate_from_container.
+Result sys_memory_allocate_from_container_colored(PpuThread& t, u64 size, u32 cid, u64 flags, u32 color, u32 alloc_addr)
+{
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    const auto ct = t.kernel.impl().containers.get<MemoryContainer>(cid);
+    if (!ct) return err(CELL_ESRCH);
+    if (!size) return err(CELL_EALIGN);
+    return allocate(t, size, flags, alloc_addr, ct); // the page size, then the alignment
+}
+
+// sys_memory_get_user_memory_stat(stat) (353), the retail kernel's 0x8000000000079D14: seven 32-bit counts of the
+// process's memory in bytes, which the kernel keeps as memory comes and goes: [0] shared memory it made with the _ext
+// calls (sys_mmapper_allocate_shared_memory_ext, ..._from_container_ext), [1] such memory another process made (none:
+// pspocket runs one process), [2] memory from sys_memory_allocate* and sys_mmapper_allocate_shared_memory*, [3] to [5]
+// and part of [6] the segments the kernel maps for modules by their attributes (pspocket's loader places those: not
+// counted), [6] PPU thread stacks and SPU thread groups' local stores (256 KB a thread).
+Result sys_memory_get_user_memory_stat(PpuThread& t, u32 stat)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    std::array<u64, 7> n{};
+    {
+        std::lock_guard lock(s.memory.mutex);
+        for (const auto& [addr, a] : s.memory.user_allocs) n[2] += a.size;
+    }
+    std::set<const Object*> seen;
+    for (const auto& [id, obj] : s.objects.list(SharedMemory::kIdBase)) {
+        const auto& mem = static_cast<const SharedMemory&>(*obj);
+        if (mem.system || !seen.insert(obj.get()).second) continue;
+        std::lock_guard lock(s.memory.mutex);
+        n[mem.ext ? 0 : 2] += mem.size;
+    }
+    for (const auto& [id, obj] : s.threads.list(PpuThread::kIdBase)) {
+        const auto& th = static_cast<const PpuThread&>(*obj);
+        std::lock_guard lk(s.join_mutex);
+        if (!th.finished) n[6] += th.stack_size;
+    }
+    for (const auto& [id, obj] : s.spu_groups.list(SpuThreadGroup::kIdBase)) {
+        n[6] += u64{static_cast<const SpuThreadGroup&>(*obj).max_num} * 0x40000;
+    }
+    if (!s.guest.valid(stat, 0x1C)) return err(CELL_EFAULT);
+    for (u32 i = 0; i < 7; i++) s.guest.w32(stat + i * 4, static_cast<u32>(n[i]));
+    return CELL_OK;
+}
+
 void register_memory_syscalls(SyscallTable& table)
 {
     PS_LV2_BIND(table, 324, sys_memory_container_create);
@@ -828,6 +909,9 @@ void register_memory_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 350, sys_memory_allocate_from_container);
     PS_LV2_BIND(table, 351, sys_memory_get_page_attribute);
     PS_LV2_BIND(table, 352, sys_memory_get_user_memory_size);
+    PS_LV2_BIND(table, 353, sys_memory_get_user_memory_stat);
+    PS_LV2_BIND(table, 356, sys_memory_allocate_colored);
+    PS_LV2_BIND(table, 361, sys_memory_allocate_from_container_colored);
     PS_LV2_BIND(table, 362, sys_mmapper_allocate_shared_memory_from_container);
     PS_LV2_BIND(table, 327, sys_mmapper_enable_page_fault_notification);
 }

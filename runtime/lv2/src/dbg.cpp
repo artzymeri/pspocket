@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 
 #include "internal.hpp"
@@ -39,6 +40,11 @@ constexpr CellError kDeHandlerAlreadyRegistered = static_cast<CellError>(0x80010
 constexpr CellError kDeInvalidHandler = static_cast<CellError>(0x8001042A);
 constexpr CellError kDeHandleNotRegistered = static_cast<CellError>(0x8001042B);
 constexpr CellError kDeInvalidThreadType = static_cast<CellError>(0x80010415);
+constexpr CellError kDeIllegalRegisterType = static_cast<CellError>(0x80010403);
+constexpr CellError kDeIllegalRegisterNumber = static_cast<CellError>(0x80010404);
+constexpr CellError kDeInvalidThreadStatus = static_cast<CellError>(0x8001040D);
+constexpr CellError kDeThreadStateIsNotStopped = static_cast<CellError>(0x80010414);
+constexpr CellError kDeInvalidLsAddress = static_cast<CellError>(0x80010426);
 
 // The calling process's control flags reach the system software's level (0x4000... and above).
 bool system_level(PpuThread& t) { return t.kernel.config().root; }
@@ -165,6 +171,10 @@ u32 ppu_state(Kernel::Impl& s, const PpuThread& caller, PpuThread& th)
         std::lock_guard lk(th.lock);
         if (!th.started) return 0;
     }
+    {
+        std::lock_guard lk(s.dbg_mutex);
+        if (th.dbg_stopped) return 6;
+    }
     if (&th == &caller) return 2;
     if (th.waiter.waiting_on().kind != WaitKind::None) return 3;
     return 1;
@@ -188,7 +198,60 @@ u32 group_state(SpuGroupState state)
     return 7;
 }
 
+// The SPU thread an ID names (the group's ID in its low 24 bits, the thread's index in the group above), with its
+// group; none when either is not there.
+std::pair<std::shared_ptr<SpuThreadGroup>, std::shared_ptr<SpuThread>> spu_thread(Kernel::Impl& s, u32 id)
+{
+    auto grp = s.spu_groups.get<SpuThreadGroup>((id & 0xFFFFFF) | 0x04000000);
+    if (!grp) return {};
+    std::lock_guard lk(grp->lock);
+    if ((id >> 24) >= grp->threads.size() || !grp->threads[id >> 24]) return {};
+    return {grp, grp->threads[id >> 24]};
+}
+
+// A PPU thread's stop (the kernel's 0x80000000000231AC): not the caller (CELL_EDEADLK), not one that ended
+// (CELL_ESTAT); the thread stops at its next stop point.
+Result stop_ppu(PpuThread& caller, PpuThread& th)
+{
+    if (&th == &caller) return err(CELL_EDEADLK);
+    std::lock_guard lk(caller.kernel.impl().join_mutex);
+    if (th.finished) return err(CELL_ESTAT);
+    th.dbg_stop.store(true, std::memory_order_release);
+    return CELL_OK;
+}
+
+// An SPU thread group's stop (0x800000000004018C): a group that runs or waits stops; one not started yet is left.
+void stop_group(SpuThreadGroup& g)
+{
+    std::lock_guard lk(g.lock);
+    if (g.state == SpuGroupState::NotInitialized || g.state == SpuGroupState::Initialized || g.dbg_stopped) return;
+    g.dbg_stopped = true;
+    for (const auto& th : g.threads)
+        if (th) ps_spu_request_stop(&th->ctx);
+}
+
+// A guest 128-bit register's bytes (D-004: host lanes in reverse).
+template <class V>
+void put_v128(const Guest& g, u32 at, const V& v)
+{
+    for (u32 i = 0; i < 16; i++) g.w8(at + i, v.u8[15 - i]);
+}
+
 } // namespace
+
+void dbg_park(PpuThread& t)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const auto over = [&] { return wait_aborted(t.waiter) || s.exiting.load(std::memory_order_relaxed); };
+    {
+        std::unique_lock lk(s.dbg_mutex);
+        if (!t.dbg_stop.load(std::memory_order_acquire)) return;
+        t.dbg_stopped = true;
+        s.dbg_cv.wait(lk, [&] { return !t.dbg_stop.load(std::memory_order_acquire) || over(); });
+        t.dbg_stopped = false;
+    }
+    if (over()) throw ThreadExit{};
+}
 
 // sys_dbg_get_console_type(u64* type), the kernel's 0x8000000000089AE0: a null pointer is CELL_EFAULT; a process below
 // the system software's level gets CELL_ENOSYS; else 1 on a retail console (2 a development one, 3 a debug one).
@@ -611,7 +674,7 @@ Result sys_dbg_get_thread_info(PpuThread& t, u32 thread, u32 info)
     std::vector<u32> members;
     {
         std::lock_guard lk(grp->lock);
-        state = group_state(grp->state);
+        state = grp->dbg_stopped ? 7 : group_state(grp->state);
         prio = grp->prio;
         slots = grp->max_num;
         for (u32 i = 0; i < grp->max_num; i++) {
@@ -692,8 +755,260 @@ Result sys_dbg_get_process_memory_container_information(PpuThread& t, u32 pid, u
     return CELL_OK;
 }
 
+// sys_dbg_stop_threads(threads, count), 0x8000000000090B28: each entry (24 bytes: the type, then the ID at +8, the
+// result written at +0x10) asks a PPU thread (type 0) or an SPU thread group (type 2) to stop; another type makes the
+// call's answer CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS, the rest are done all the same. No entries:
+// CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS. A PPU thread stops at its next call into lv2 or a library, or as one returns
+// (pspocket's threads run on host threads of their own: one that makes no call does not stop); the caller cannot stop
+// itself (CELL_EDEADLK), nor a thread that ended (CELL_ESTAT). An SPU thread group's threads park as a suspended
+// group's do; one not started yet is left.
+Result sys_dbg_stop_threads(PpuThread& t, u32 threads, u64 count)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!threads || !count) return err(kDeInvalidArguments);
+    if (const Result r = list_room("sys_dbg_stop_threads", static_cast<u32>(std::min<u64>(count, 0xFFFFFFFF)), 0x18);
+        r != CELL_OK) {
+        return r;
+    }
+    if (!g.valid(threads, count * 0x18)) return err(CELL_EFAULT);
+    Result answer = CELL_OK;
+    for (u32 i = 0; i < count; i++) {
+        const u32 at = threads + i * 0x18;
+        const u32 type = g.r32(at);
+        Result r = CELL_OK;
+        if (type == 0) {
+            const auto th = s.threads.get<PpuThread>(static_cast<u32>(g.r64(at + 8)));
+            r = th ? stop_ppu(t, *th) : err(kDeInvalidThreadId);
+        } else if (type == 2) {
+            const auto grp = s.spu_groups.get<SpuThreadGroup>(g.r32(at + 8));
+            if (grp) stop_group(*grp);
+            else r = err(kDeInvalidThreadId);
+        } else {
+            answer = err(kDeInvalidArguments);
+        }
+        g.w32(at + 0x10, static_cast<u32>(r));
+    }
+    return answer;
+}
+
+// sys_dbg_continue_threads(threads, count), 0x800000000009146C: the entries as sys_dbg_stop_threads's; a PPU thread's
+// stop request ends and, stopped, it goes on; an SPU thread group a debugger stopped goes on (one that is not stopped
+// is left).
+Result sys_dbg_continue_threads(PpuThread& t, u32 threads, u64 count)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!threads || !count) return err(kDeInvalidArguments);
+    if (const Result r = list_room("sys_dbg_continue_threads", static_cast<u32>(std::min<u64>(count, 0xFFFFFFFF)), 0x18);
+        r != CELL_OK) {
+        return r;
+    }
+    if (!g.valid(threads, count * 0x18)) return err(CELL_EFAULT);
+    Result answer = CELL_OK;
+    for (u32 i = 0; i < count; i++) {
+        const u32 at = threads + i * 0x18;
+        const u32 type = g.r32(at);
+        Result r = CELL_OK;
+        if (type == 0) {
+            const auto th = s.threads.get<PpuThread>(static_cast<u32>(g.r64(at + 8)));
+            if (th) {
+                std::lock_guard lk(s.dbg_mutex);
+                th->dbg_stop.store(false, std::memory_order_release);
+            } else {
+                r = err(kDeInvalidThreadId);
+            }
+        } else if (type == 2) {
+            const auto grp = s.spu_groups.get<SpuThreadGroup>(g.r32(at + 8));
+            if (grp) {
+                std::lock_guard lk(grp->lock);
+                if (grp->dbg_stopped) {
+                    grp->dbg_stopped = false;
+                    grp->state_cv.notify_all();
+                }
+            } else {
+                r = err(kDeInvalidThreadId);
+            }
+        } else {
+            answer = err(kDeInvalidArguments);
+        }
+        g.w32(at + 0x10, static_cast<u32>(r));
+    }
+    s.dbg_cv.notify_all();
+    return answer;
+}
+
+// sys_dbg_stop_processes(processes, count), 0x80000000000906B0: each entry (8 bytes: the process ID, then the result
+// written at +4) stops a process's PPU threads but the caller, and its SPU thread groups. A process other than the
+// caller's: CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS in its entry.
+Result sys_dbg_stop_processes(PpuThread& t, u32 processes, u64 count)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!processes || !count) return err(kDeInvalidArguments);
+    if (const Result r = list_room("sys_dbg_stop_processes", static_cast<u32>(std::min<u64>(count, 0xFFFFFFFF)), 8);
+        r != CELL_OK) {
+        return r;
+    }
+    if (!g.valid(processes, count * 8)) return err(CELL_EFAULT);
+    for (u32 i = 0; i < count; i++) {
+        const u32 at = processes + i * 8;
+        Result r = inspect(g.r32(at));
+        if (r == CELL_OK) {
+            for (const auto& th : ppu_threads(s)) {
+                if (th.get() != &t) (void)stop_ppu(t, *th);
+            }
+            for (const auto& [id, obj] : s.spu_groups.list(SpuThreadGroup::kIdBase)) {
+                stop_group(static_cast<SpuThreadGroup&>(*obj));
+            }
+        }
+        g.w32(at + 4, static_cast<u32>(r));
+    }
+    return CELL_OK;
+}
+
+// sys_dbg_read_thread_register(thread, register, value), 0x800000000008FB60: one register of a stopped thread into
+// the 16 bytes at `value` (a 32-bit or 64-bit one at the start, the rest zero). `register` is 64 bits: the register's
+// kind above, its number below.
+// - A PPU thread (entry type 0): stopped, or asked to stop and waiting in a call (else
+//   CELL_LV2DBG_ERROR_DEINVALIDTHREADSTATUS). Kinds: 0 CR, 1 LR, 2 CTR, 3 GPR, 4 XER, 5 FPR, 6 FPSCR, 7 VR, 8 VSCR, 9
+//   the instruction address, 10 the MSR (another: CELL_LV2DBG_ERROR_DEILLEGALREGISTERTYPE; a number past 31:
+//   CELL_LV2DBG_ERROR_DEILLEGALREGISTERNUMBER). pspocket's threads stop between calls, where every register is known
+//   (the kernel gives a thread stopped inside a call its non-volatile registers only); the MSR is a game thread's.
+// - An SPU thread (entry type 1): its group stopped by a debugger (else CELL_LV2DBG_ERROR_DETHREADSTATEISNOTSTOPPED).
+//   Kinds 11 GPR (0-127), 12 NPC, 13 FPSCR, 14 SRR0, 15 decrementer, 16 SPU inbound mailbox (0-3), 17 PPU outbound
+//   mailbox, 18 mailbox status, 19 SPU status, 20 SPU configuration, 21 MFC queue save area (0-95).
+Result sys_dbg_read_thread_register(PpuThread& t, u32 thread, u32 reg, u32 value)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!g.valid(thread, 16) || !g.valid(reg, 8)) return err(CELL_EFAULT);
+    const u32 type = g.r32(thread);
+    const u32 kind = g.r32(reg), index = g.r32(reg + 4);
+    std::array<u8, 16> out{};
+    const auto put32 = [&](u32 v) { ps_write32(out.data(), 0, v); };
+    const auto put64 = [&](u64 v) { ps_write64(out.data(), 0, v); };
+    const auto put128 = [&](const auto& v) {
+        for (u32 i = 0; i < 16; i++) out[i] = v.u8[15 - i];
+    };
+    if (type == 0) {
+        const auto th = s.threads.get<PpuThread>(static_cast<u32>(g.r64(thread + 8)));
+        if (!th) return err(kDeInvalidThreadId);
+        bool stopped = false;
+        {
+            std::lock_guard lk(s.dbg_mutex);
+            stopped = th->dbg_stopped;
+        }
+        const bool asked = th->dbg_stop.load(std::memory_order_acquire);
+        if (!stopped && !(asked && th.get() != &t && th->waiter.waiting_on().kind != WaitKind::None)) {
+            return err(kDeInvalidThreadStatus);
+        }
+        if (kind > 10) return err(kDeIllegalRegisterType);
+        if ((kind == 3 || kind == 5 || kind == 7) && index > 31) return err(kDeIllegalRegisterNumber);
+        const PPUContext& c = *th->ctx;
+        switch (kind) {
+        case 0: {
+            u32 cr = 0;
+            for (u32 i = 0; i < 32; i++) cr |= u32{c.cr[i]} << (31 - i);
+            put32(cr);
+            break;
+        }
+        case 1: put64(c.lr); break;
+        case 2: put64(c.ctr); break;
+        case 3: put64(c.gpr[index]); break;
+        case 4: put64(u64{c.xer_so} << 31 | u64{c.xer_ov} << 30 | u64{c.xer_ca} << 29 | c.xer_bc); break;
+        case 5: put64(std::bit_cast<u64>(c.fpr[index])); break;
+        case 6: put32(c.fpscr); break;
+        case 7: put128(c.vr[index]); break;
+        case 8: ps_write32(out.data(), 12, (c.vscr_nj ? 0x10000u : 0) | (c.vscr_sat ? 1u : 0)); break;
+        case 9: put64(c.cia); break;
+        case 10: put64(0x800000000200F032ull); break; // SF, VEC, EE, PR, FP, ME, IR, DR, RI: a game thread's MSR
+        }
+    } else if (type == 1) {
+        const auto [grp, th] = spu_thread(s, g.r32(thread + 8));
+        if (!th) return err(kDeInvalidThreadId);
+        {
+            std::lock_guard lk(grp->lock);
+            if (!grp->dbg_stopped) return err(kDeThreadStateIsNotStopped);
+        }
+        if (kind < 11 || kind > 21) return err(kDeIllegalRegisterType);
+        if ((kind == 11 && index > 127) || (kind == 16 && index > 3) || (kind == 21 && index > 95)) {
+            return err(kDeIllegalRegisterNumber);
+        }
+        const SPUContext& c = th->ctx;
+        switch (kind) {
+        case 11: put128(c.gpr[index]); break;
+        case 12: put32(c.pc); break;
+        case 13: put128(c.fpscr); break;
+        case 14: put32(c.srr0); break;
+        case 15: put32(c.ch.dec_value); break;
+        case 16: put32(index < c.ch.in_mbox_count ? c.ch.in_mbox[index] : 0); break;
+        case 17: put32(c.ch.out_mbox); break;
+        case 18: put32((4 - c.ch.in_mbox_count) << 8 | c.ch.out_intr_mbox_count << 16 | c.ch.out_mbox_count); break;
+        case 19: put32(PS_SPU_STATUS_STOPPED); break;
+        case 20: put64(th->snr_config); break;
+        case 21: put64(0); break; // pspocket's MFC runs each transfer as it is issued: nothing waits in its queue
+        }
+    } else {
+        return err(kDeInvalidArguments);
+    }
+    if (!g.valid(value, 16)) return err(CELL_EFAULT);
+    std::memcpy(g.ptr(value), out.data(), 16);
+    return CELL_OK;
+}
+
+// sys_dbg_spu_thread_read_from_ls(thread, address, size, out), 0x80000000000916B0: `size` bytes (1 to 256 KB) of an SPU
+// thread's local store, wherever its group is; outside the local store: CELL_LV2DBG_ERROR_DEINVALIDLSADDRESS.
+Result sys_dbg_spu_thread_read_from_ls(PpuThread& t, u32 thread, u32 address, u32 size, u32 out)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    if (address > 0x40000 || size > 0x40000 || u64{address} + size > 0x40000 || !size) return err(kDeInvalidLsAddress);
+    const auto [grp, th] = spu_thread(s, thread);
+    if (!th) return err(kDeInvalidThreadId);
+    if (!th->ls) return err(kDeInvalidLsAddress);
+    if (!s.guest.valid(out, size)) return err(CELL_EFAULT);
+    std::memcpy(s.guest.ptr(out), th->ls + address, size);
+    return CELL_OK;
+}
+
+// sys_dbg_read_spu_thread_context2(thread, context), 0x800000000009017C: a stopped SPU thread's context (0xB48
+// bytes: GPRs, NPC, FPSCR, SRR0, status, configuration, mailboxes, decrementer, the MFC queue's save area); its group
+// not stopped by a debugger: CELL_LV2DBG_ERROR_DETHREADSTATEISNOTSTOPPED.
+Result sys_dbg_read_spu_thread_context2(PpuThread& t, u32 thread, u32 context)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!context) return err(kDeInvalidArguments);
+    const auto [grp, th] = spu_thread(s, thread);
+    if (!th) return err(kDeInvalidThreadId);
+    {
+        std::lock_guard lk(grp->lock);
+        if (!grp->dbg_stopped) return err(kDeThreadStateIsNotStopped);
+    }
+    if (!g.valid(context, 0xB48)) return err(CELL_EFAULT);
+    std::memset(g.ptr(context), 0, 0xB48);
+    const SPUContext& c = th->ctx;
+    for (u32 i = 0; i < 128; i++) put_v128(g, context + i * 16, c.gpr[i]);
+    g.w32(context + 0x800, c.pc);
+    put_v128(g, context + 0x808, c.fpscr);
+    g.w32(context + 0x818, c.srr0);
+    g.w32(context + 0x81C, PS_SPU_STATUS_STOPPED);
+    g.w64(context + 0x820, th->snr_config);
+    g.w32(context + 0x828, (4 - c.ch.in_mbox_count) << 8 | c.ch.out_intr_mbox_count << 16 | c.ch.out_mbox_count);
+    g.w32(context + 0x82C, c.ch.out_mbox);
+    for (u32 i = 0; i < 4; i++) g.w32(context + 0x830 + i * 4, i < c.ch.in_mbox_count ? c.ch.in_mbox[i] : 0);
+    g.w32(context + 0x840, c.ch.dec_value);
+    return CELL_OK; // the MFC queue's save area (0x848, 96 doublewords) stays empty, as pspocket's queue does
+}
+
 void register_dbg_syscalls(SyscallTable& table)
 {
+    PS_LV2_BIND(table, 900, sys_dbg_stop_processes);
+    PS_LV2_BIND(table, 902, sys_dbg_stop_threads);
+    PS_LV2_BIND(table, 903, sys_dbg_continue_threads);
+    PS_LV2_BIND(table, 906, sys_dbg_read_thread_register);
+    PS_LV2_BIND(table, 911, sys_dbg_spu_thread_read_from_ls);
+    PS_LV2_BIND(table, 975, sys_dbg_read_spu_thread_context2);
     PS_LV2_BIND(table, 909, sys_dbg_get_thread_list);
     PS_LV2_BIND(table, 910, sys_dbg_get_thread_info);
     PS_LV2_BIND(table, 914, sys_dbg_get_process_info);

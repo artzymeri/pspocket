@@ -161,6 +161,12 @@ public:
     // lv2 directly, so a thread inside an HLE function is not in a syscall.
     std::atomic<u32> current_syscall{kNoSyscall};
 
+    // A debugger's stop (sys_dbg_stop_threads, D-937): once asked, the thread stops at its next call into lv2 or a
+    // library, or as such a call returns (dbg_stop_point), and waits there until sys_dbg_continue_threads.
+    // `dbg_stopped` while it waits; guarded by the kernel's debugging lock.
+    std::atomic<bool> dbg_stop{false};
+    bool dbg_stopped = false;
+
     // Yields back to back (usleep(0), sys_ppu_thread_yield) are a wait loop: after a run of them the thread sleeps a
     // little, longer each time (yield_wait, D-104). The owning host thread only.
     u64 last_yield_ns = 0;
@@ -175,6 +181,13 @@ private:
 
 // The lv2 thread running on the calling host thread, or nullptr.
 PpuThread* current_thread();
+// Where a thread a debugger asked to stop stops (D-937): lv2's calls and pspocket's library functions call it as they
+// begin and as they return to guest code. Throws ThreadExit when the process ends while the thread is stopped.
+void dbg_park(PpuThread& t);
+inline void dbg_stop_point(PpuThread& t)
+{
+    if (t.dbg_stop.load(std::memory_order_acquire)) [[unlikely]] dbg_park(t);
+}
 // Makes `t` the lv2 thread of the calling host thread (nullptr: none): a PPU thread's host thread at its start, and the
 // host thread of one of its fibers while that runs as the PPU thread (cellFiber, D-568).
 void set_current_thread(PpuThread* t);

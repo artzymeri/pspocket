@@ -169,6 +169,7 @@ public:
     u32 running = 0; // threads not yet stopped in this run
     u32 stop_count = 0;
     bool set_terminate = false;
+    bool dbg_stopped = false; // a debugger's stop (sys_dbg_stop_threads, D-937): its threads park as when suspended
     Waiter* joiner = nullptr; // a PPU thread in sys_spu_thread_group_join
     std::array<std::shared_ptr<SpuThread>, 8> threads;
     std::array<s8, 256> threads_map{}; // spu_num -> index, -1: none

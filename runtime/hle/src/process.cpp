@@ -51,7 +51,10 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
     if (f->impl) {
         PS_LOG_TRACE(kChan, "{}::{} (LR {:#010x}, r3 {:#x}, r4 {:#x}, r5 {:#x}) on thread {:#x}", f->module, f->name, ctx->lr,
             ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], lv2::current_thread() ? lv2::current_thread()->id : 0);
+        auto* t = static_cast<lv2::PpuThread*>(ctx->runtime);
+        if (t) lv2::dbg_stop_point(*t); // a debugger's stop (D-937)
         f->impl->fn(*ctx, base);
+        if (t) lv2::dbg_stop_point(*t);
         return;
     }
     const std::string_view name = f->name.empty() ? std::string_view("?") : std::string_view(f->name);

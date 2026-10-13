@@ -584,6 +584,10 @@ Kernel::Impl::~Impl() = default;
 void Kernel::Impl::abort_all_waits()
 {
     for (const auto& [id, obj] : threads.list(PpuThread::kIdBase)) abort_wait(static_cast<PpuThread&>(*obj).waiter);
+    {
+        std::lock_guard lock(dbg_mutex); // threads stopped for a debugger (dbg_park) see the abort
+    }
+    dbg_cv.notify_all();
     abort_spu_threads(*this);
     abort_raw_spus(*this);
 }
@@ -840,6 +844,7 @@ void Kernel::syscall(PPUContext& ctx)
         if (t_nonlocal) _longjmp(t_nonlocal->buf, 1); // D-213: nothing between here and run_guest to destroy
         throw NonLocalJump{};
     }
+    dbg_stop_point(*t); // a debugger's stop (D-937)
     const u64 number = ctx.gpr[11];
     if (const auto observer = impl_->syscall_observer.load(std::memory_order_relaxed)) [[unlikely]] {
         observer(impl_->syscall_observer_user, static_cast<u32>(number), &ctx.gpr[3]);
@@ -858,6 +863,7 @@ void Kernel::syscall(PPUContext& ctx)
             } in_syscall(*t, static_cast<u32>(number));
             entry.fn(*t, ctx);
             PS_LOG_TRACE(kChan, "{} -> r3={:#x}", entry.name, ctx.gpr[3]);
+            dbg_stop_point(*t);
             return;
         }
     }

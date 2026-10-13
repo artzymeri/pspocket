@@ -250,6 +250,7 @@ public:
     const u64 flags;
     const std::shared_ptr<MemoryContainer> container; // null: the default container
     u32 mappings = 0;           // guarded by the memory manager's mutex
+    bool ext = false;           // made by an _ext call (counted apart); guarded by the memory manager's mutex
     u64 handle = 0;             // host memory object (created on first map), guarded by the memory manager's mutex
     // The system software's (Kernel::create_system_shared_memory; RPCS3 lv2_memory::system_handle): kept by the kernel
     // under its key, charged to none of the process's containers. A process opens it by its key, one handle at a
@@ -547,6 +548,7 @@ struct Kernel::Impl {
     // The event queue sys_dbg_initialize_ppu_exception_handler registered for the process's PPU exceptions (dbg.cpp).
     std::mutex dbg_mutex;
     std::shared_ptr<EventQueue> dbg_exception_queue; // under dbg_mutex
+    std::condition_variable dbg_cv; // a thread stopped for a debugger waits on it (dbg_park), with dbg_mutex
 
     SyscallTable table;
     std::atomic<Kernel::SyscallObserver> syscall_observer{nullptr}; // Kernel::set_syscall_observer (tests)
