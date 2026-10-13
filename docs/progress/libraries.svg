@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="440" fill="#ffffff"/>
-<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6539 of 6625 pspocket&#x27;s own (98.7%), 0 answered as RPCS3</text>
+<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">System libraries: 6561 of 6625 pspocket&#x27;s own (99.0%), 0 answered as RPCS3</text>
 <g><title>sys_libc: 1119 own, 0 answered as RPCS3, 0 not yet, of 1119</title>
 <rect x="0.0" y="30.0" width="298.9" height="208.5" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="1.0" y="31.0" width="6.8" height="6.8" fill="#2da44e"/>
@@ -6209,29 +6209,29 @@
 <rect x="678.2" y="433.2" width="6.5" height="5.2" fill="#2da44e"/>
 <text x="680.2" y="420.9" font-size="10.5" fill="#ffffff" stroke="#24292f" stroke-width="2.4" paint-order="stroke">cell…</text>
 </g>
-<g><title>libsmvd2: 1 own, 0 answered as RPCS3, 20 not yet, of 21</title>
+<g><title>libsmvd2: 21 own, 0 answered as RPCS3, 0 not yet, of 21</title>
 <rect x="714.8" y="248.8" width="32.4" height="36.1" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
 <rect x="715.8" y="249.8" width="7.0" height="5.1" fill="#2da44e"/>
-<rect x="723.4" y="249.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="731.0" y="249.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="738.6" y="249.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="715.8" y="255.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="723.4" y="255.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="731.0" y="255.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="738.6" y="255.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="715.8" y="261.1" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="723.4" y="261.1" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="731.0" y="261.1" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="738.6" y="261.1" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="715.8" y="266.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="723.4" y="266.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="731.0" y="266.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="738.6" y="266.8" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="715.8" y="272.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="723.4" y="272.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="731.0" y="272.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="738.6" y="272.5" width="7.0" height="5.1" fill="#8c959f"/>
-<rect x="715.8" y="278.2" width="7.0" height="5.1" fill="#8c959f"/>
+<rect x="723.4" y="249.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="731.0" y="249.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="738.6" y="249.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="715.8" y="255.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="723.4" y="255.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="731.0" y="255.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="738.6" y="255.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="715.8" y="261.1" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="723.4" y="261.1" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="731.0" y="261.1" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="738.6" y="261.1" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="715.8" y="266.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="723.4" y="266.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="731.0" y="266.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="738.6" y="266.8" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="715.8" y="272.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="723.4" y="272.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="731.0" y="272.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="738.6" y="272.5" width="7.0" height="5.1" fill="#2da44e"/>
+<rect x="715.8" y="278.2" width="7.0" height="5.1" fill="#2da44e"/>
 </g>
 <g><title>libvdec: 21 own, 0 answered as RPCS3, 0 not yet, of 21</title>
 <rect x="747.2" y="248.8" width="32.4" height="36.1" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
@@ -6962,10 +6962,10 @@
 <rect x="833.8" y="420.4" width="8.6" height="3.7" fill="#2da44e"/>
 <rect x="833.8" y="424.7" width="8.6" height="3.7" fill="#2da44e"/>
 </g>
-<g><title>cellCelp8Dec: 0 own, 0 answered as RPCS3, 2 not yet, of 2</title>
+<g><title>cellCelp8Dec: 2 own, 0 answered as RPCS3, 0 not yet, of 2</title>
 <rect x="832.8" y="430.0" width="11.2" height="10.0" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
-<rect x="833.8" y="431.0" width="4.0" height="7.4" fill="#8c959f"/>
-<rect x="838.4" y="431.0" width="4.0" height="7.4" fill="#8c959f"/>
+<rect x="833.8" y="431.0" width="4.0" height="7.4" fill="#2da44e"/>
+<rect x="838.4" y="431.0" width="4.0" height="7.4" fill="#2da44e"/>
 </g>
 <g><title>cellCelpDec: 2 own, 0 answered as RPCS3, 0 not yet, of 2</title>
 <rect x="844.0" y="385.3" width="10.2" height="10.9" fill="#e6e8eb" stroke="#ffffff" stroke-width="1.5"/>
