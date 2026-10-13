@@ -153,6 +153,7 @@ add_library(pspocket_hle STATIC
     src/spu2.cpp
     src/libmixer.cpp
     src/codec_cores.cpp
+    src/vdec_avc.cpp
     src/cellCelpEnc.cpp
     src/cellCelp8Enc.cpp
     src/adec_celp.cpp
