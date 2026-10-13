@@ -85,7 +85,7 @@ TEST_CASE("The codec cores' comparison calls Sony's exports by their names; pspo
     check_names("libsjvtd", {"sjvtdGetVersionNumber"});
     check_names("libsmvd2", {"smvd2GetVersionNumber"}, false); // all of libsmvd2 is pspocket's own (D-920)
     check_names("libsmvd4", {"smvd4GetVersionNumber"}, false); // all of libsmvd4 is pspocket's own (D-920)
-    check_names("libsvc1d", {"svc1dGetVersionNumber"});
+    check_names("libsvc1d", {"svc1dGetVersionNumber"}, false); // all of libsvc1d is pspocket's own (D-920)
 }
 
 TEST_CASE("The video codec cores' version queries against Sony's modules", "[.][hle][lle][compare][codec-cores]")

@@ -143,6 +143,7 @@ add_library(pspocket_hle STATIC
     src/vdec_smvd4.cpp
     src/vdec_smvd2.cpp
     src/vdec_mpeg2.cpp
+    src/vdec_svc1d.cpp
     src/cellVpost.cpp
     src/cellAtrac.cpp
     src/cellJpgEnc.cpp

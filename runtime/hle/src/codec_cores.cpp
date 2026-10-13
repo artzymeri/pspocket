@@ -83,7 +83,7 @@ void register_codec_cores(Registry& r)
     r.add("libsmvd2", {PS_HLE_FUNC(0x52BB9416, smvd2GetVersionNumber)});
     r.add("libsmvd4", {PS_HLE_FUNC(0xC1D6771B, smvd4GetVersionNumber)});
     r.add("libsvc1d", {PS_HLE_FUNC(0x6C366C43, svc1dGetVersionNumber)});
-    for (const std::string_view library : {"libmvcdec", "libsjvtd", "libsvc1d"})
+    for (const std::string_view library : {"libmvcdec", "libsjvtd"})
         r.firmware_first(library);
 }
 

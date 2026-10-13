@@ -2058,4 +2058,216 @@ TEST_CASE("The tests' MPEG-2 streams decode with FFmpeg", "[hle][vdec-cores]")
     }
 }
 
+
+// The VC-1 writer's streams (vc1_writer.hpp) as FFmpeg's decoder reads them (the sequence header and entry point its
+// configuration, as cellVdec opens it): every picture, in display order, without errors, at the samples each kind
+// stands for. Pan-scan windows FFmpeg does not read: not here.
+std::vector<std::vector<u8>> ffmpeg_vc1(const std::vector<u8>& config, const std::vector<std::vector<u8>>& aus, int w,
+    int h, std::vector<int>* types, AVCodecID id = AV_CODEC_ID_VC1)
+{
+    const AVCodec* dec = avcodec_find_decoder(id);
+    REQUIRE(dec);
+    AVCodecContext* av = avcodec_alloc_context3(dec);
+    if (id == AV_CODEC_ID_WMV3) { // the simple and main profiles: the picture size from outside the stream
+        av->width = av->coded_width = w;
+        av->height = av->coded_height = h;
+    }
+    av->extradata = static_cast<u8*>(av_mallocz(config.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    std::memcpy(av->extradata, config.data(), config.size());
+    av->extradata_size = static_cast<int>(config.size());
+    av->err_recognition = AV_EF_EXPLODE;
+    REQUIRE(avcodec_open2(av, dec, nullptr) == 0);
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* f = av_frame_alloc();
+    std::vector<std::vector<u8>> pictures;
+    const auto drain = [&] {
+        while (avcodec_receive_frame(av, f) == 0) {
+            CHECK(f->decode_error_flags == 0);
+            CHECK(f->width == w);
+            CHECK(f->height == h);
+            std::vector<u8> yuv(static_cast<usize>(w * h * 3 / 2));
+            for (int r = 0; r < h; r++)
+                std::memcpy(yuv.data() + r * w, f->data[0] + r * f->linesize[0], static_cast<usize>(w));
+            for (int c = 0; c < 2; c++)
+                for (int r = 0; r < h / 2; r++)
+                    std::memcpy(yuv.data() + w * h + c * (w * h / 4) + r * (w / 2), f->data[1 + c] + r * f->linesize[1 + c],
+                        static_cast<usize>(w / 2));
+            pictures.push_back(std::move(yuv));
+            if (types) types->push_back(f->pict_type);
+            av_frame_unref(f);
+        }
+    };
+    for (const auto& au : aus) {
+        std::vector<u8> padded(au);
+        padded.resize(au.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+        pkt->data = padded.data();
+        pkt->size = static_cast<int>(au.size());
+        CHECK(avcodec_send_packet(av, pkt) == 0);
+        drain();
+    }
+    avcodec_send_packet(av, nullptr);
+    drain();
+    av_frame_free(&f);
+    av_packet_free(&pkt);
+    avcodec_free_context(&av);
+    return pictures;
+}
+
+TEST_CASE("The tests' VC-1 streams decode with FFmpeg", "[hle][vdec-cores]")
+{
+    namespace v1 = pspocket::hle::test::vc1;
+    if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP("this FFmpeg has no VC-1 decoder");
+    const auto join = [](std::initializer_list<std::vector<u8>> parts) {
+        std::vector<u8> out;
+        for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+        return out;
+    };
+    v1::Sequence seq;
+    v1::Entry entry;
+    const std::vector<u8> config = join({v1::sequence_header(seq), v1::entry_point(entry)});
+    const v1::DcPicture a = dc_levels(64, 48, 0), c = dc_levels(64, 48, 1), d = dc_levels(64, 48, 2);
+    v1::Header plain, ic;
+    ic.intensity = true;
+    ic.lumscale = 16;
+    ic.lumshift = 10;
+    // Coded order: I a, P (every macroblock skipped), I c, B (direct) between them, BI d, P with intensity
+    // compensation, a skipped P.
+    const std::vector<std::vector<u8>> aus = {join({config, v1::intra_frame(a, seq)}),
+        v1::skipped_mbs_p_frame(seq, entry, plain, 4, 3), v1::intra_frame(c, seq, entry, plain),
+        v1::direct_b_frame(seq, entry, plain, 4, 3), v1::intra_frame(d, seq, entry, plain, true),
+        v1::skipped_mbs_p_frame(seq, entry, ic, 4, 3), v1::skipped_frame(seq)};
+    std::vector<int> types;
+    const std::vector<std::vector<u8>> out = ffmpeg_vc1(config, aus, 64, 48, &types);
+    // Display order: I a, P (a), B, BI d (a B picture too: before the anchor coded before it), I c, P (c, mapped),
+    // skipped (that again).
+    REQUIRE(out.size() == 7);
+    const std::vector<u8> sa = v1::samples(a), sc = v1::samples(c), sd = v1::samples(d);
+    CHECK(out[0] == sa);
+    CHECK(out[1] == sa);
+    CHECK(out[3] == sd);
+    CHECK(out[4] == sc);
+    // The B picture: its anchors' average (the P picture, which is a's samples, and c), rounded up.
+    for (usize i = 0; i < sa.size(); i++)
+        if (out[2][i] != ((sa[i] + sc[i] + 1) >> 1)) {
+            FAIL(std::format("B picture sample {}: {} for ({} + {} + 1) / 2", i, out[2][i], sa[i], sc[i]));
+            break;
+        }
+    // Intensity compensation: the reference's samples (c's: the last anchor) through the standard's tables.
+    const int scale = ic.lumscale + 32, shift = ic.lumshift * 64;
+    for (usize i = 0; i < sc.size(); i++) {
+        const bool luma = i < 64 * 48;
+        const int v = luma ? std::clamp((scale * sc[i] + shift + 32) >> 6, 0, 255)
+                           : std::clamp((scale * (sc[i] - 128) + 128 * 64 + 32) >> 6, 0, 255);
+        if (out[5][i] != v) {
+            FAIL(std::format("intensity compensated sample {}: {} for {}", i, out[5][i], v));
+            break;
+        }
+    }
+    CHECK(out[6] == out[5]);
+    CHECK(types[2] == AV_PICTURE_TYPE_B);
+    // The other DC differential table (TRANSDCTAB 1), and the AC tables' choice with no AC coefficient.
+    v1::Header other;
+    other.transdctab = true;
+    other.transacfrm = 2;
+    other.transacfrm2 = 1;
+    other.rndctrl = true;
+    other.halfqp = true;
+    const std::vector<std::vector<u8>> second = ffmpeg_vc1(config, {join({config, v1::intra_frame(c, seq, entry, other)})},
+        64, 48, nullptr);
+    REQUIRE(second.size() == 1);
+    CHECK(second[0] == sc);
+    // Interlaced pictures (64x32): an interlaced frame's I picture (frame transforms) and a P picture of skipped
+    // macroblocks after it; a field picture of two I fields (each of its own DC levels, its lines interleaved).
+    v1::Sequence il;
+    il.width = 64;
+    il.height = 32;
+    il.interlace = true;
+    const std::vector<u8> il_config = join({v1::sequence_header(il), v1::entry_point(entry)});
+    const v1::DcPicture fa = dc_levels(64, 32, 3), top = dc_levels(64, 16, 4), bottom = dc_levels(64, 16, 5);
+    const std::vector<std::vector<u8>> frames = ffmpeg_vc1(il_config, {join({il_config, v1::interlaced_intra_frame(fa,
+        il, entry, plain)}), v1::interlaced_skipped_p_frame(il, entry, plain, 4, 2)}, 64, 32, nullptr);
+    REQUIRE(frames.size() == 2);
+    CHECK(frames[0] == v1::samples(fa));
+    CHECK(frames[1] == v1::samples(fa));
+    // An interlaced frame's P picture with intensity compensation (its INTCOMP), and with the 4MV switch.
+    for (const bool intcomp : {true, false}) {
+        v1::Header hp;
+        hp.intcomp = intcomp;
+        hp.lumscale = 20;
+        hp.lumshift = 7;
+        hp.fourmvswitch = !intcomp;
+        hp.fourmvbptab = 2;
+        const std::vector<std::vector<u8>> ps = ffmpeg_vc1(il_config, {join({il_config, v1::interlaced_intra_frame(fa,
+            il, entry, plain)}), v1::interlaced_skipped_p_frame(il, entry, hp, 4, 2)}, 64, 32, nullptr);
+        REQUIRE(ps.size() == 2);
+        for (usize i = 0; i < 64 * 32; i++) {
+            const int want = intcomp ? std::clamp((52 * ps[0][i] + 7 * 64 + 32) >> 6, 0, 255) : ps[0][i];
+            if (ps[1][i] != want) {
+                FAIL(std::format("interlaced P sample {} ({}): {} for {}", i, intcomp ? "intensity compensated" : "4MV",
+                    ps[1][i], want));
+                break;
+            }
+        }
+    }
+    // The simple and main profiles (WMV3 to FFmpeg): an I picture, a P picture of skipped macroblocks, a B picture
+    // (direct) after another I picture.
+    {
+        v1::SimpleSequence mp;
+        mp.maxbframes = 1;
+        v1::DcPicture ma = dc_levels(64, 48, 6), mc = dc_levels(64, 48, 7);
+        for (auto* pic : {&ma, &mc})
+            for (auto* plane : {&pic->y, &pic->cb, &pic->cr})
+                for (int& v : *plane) v += 100;
+        const v1::SimpleHeader sh;
+        std::vector<int> mtypes;
+        // (This FFmpeg's VC-1 decoder, given STRUCT_C behind a sequence header's start code and an entry point of
+        // the same coding tools with the coded size, and the frames escaped as BDUs' payloads, as the core does.)
+        std::vector<u8> mconfig = {0x00, 0x00, 0x01, 0x0F};
+        const std::vector<u8> mstruct = v1::struct_c(mp);
+        mconfig.insert(mconfig.end(), mstruct.begin(), mstruct.end());
+        v1::Entry me;
+        me.coded_width = 64;
+        me.coded_height = 48;
+        me.fastuvmc = mp.fastuvmc;
+        const std::vector<u8> mentry = v1::entry_point(me);
+        mconfig.insert(mconfig.end(), mentry.begin(), mentry.end());
+        const auto escaped = [](const std::vector<u8>& raw) {
+            std::vector<u8> out;
+            int zeros = 0;
+            for (const u8 c : raw) {
+                if (zeros >= 2 && c <= 3) {
+                    out.push_back(3);
+                    zeros = 0;
+                }
+                out.push_back(c);
+                zeros = c == 0 ? zeros + 1 : 0;
+            }
+            return out;
+        };
+        const std::vector<std::vector<u8>> mo = ffmpeg_vc1(mconfig, {escaped(v1::simple_intra_frame(ma, mp, sh)),
+            escaped(v1::simple_skipped_mbs_p_frame(mp, sh, 4, 3)), escaped(v1::simple_intra_frame(mc, mp, sh)),
+            escaped(v1::simple_direct_b_frame(mp, sh, 4, 3))}, 64, 48, &mtypes, AV_CODEC_ID_VC1);
+        REQUIRE(mo.size() == 4);
+        CHECK(mo[0] == v1::simple_samples(ma));
+        CHECK(mo[1] == v1::simple_samples(ma));
+        const std::vector<u8> mb = v1::simple_samples(mc);
+        CHECK(mo[3] == mb);
+        CHECK(mtypes[2] == AV_PICTURE_TYPE_B);
+    }
+    const std::vector<std::vector<u8>> fields = ffmpeg_vc1(il_config, {join({il_config, v1::field_picture(0, top,
+        bottom, il, entry, plain)})}, 64, 32, nullptr);
+    REQUIRE(fields.size() == 1);
+    const std::vector<u8> st = v1::samples(top), sb = v1::samples(bottom);
+    for (int r = 0; r < 32; r++)
+        for (int x = 0; x < 64; x++) {
+            const u8 want = (r & 1 ? sb : st)[static_cast<usize>((r / 2) * 64 + x)];
+            if (fields[0][static_cast<usize>(r * 64 + x)] != want) {
+                FAIL(std::format("field picture sample {}, {}: {} for {}", x, r, fields[0][static_cast<usize>(r * 64 + x)],
+                    want));
+                r = 32;
+                break;
+            }
+        }
+}
+
 #endif

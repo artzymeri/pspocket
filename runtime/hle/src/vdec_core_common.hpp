@@ -38,5 +38,6 @@ inline u64 call_import(PPUContext& ctx, std::string_view module, u32 nid, std::i
 // The cores registered in files of their own.
 void register_smvd4(Registry& r);
 void register_smvd2(Registry& r);
+void register_svc1d(Registry& r);
 
 } // namespace pspocket::hle::vdec_core

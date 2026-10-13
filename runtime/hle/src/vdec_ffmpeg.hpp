@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <deque>
+#include <map>
 #include <vector>
 
 #include "pspocket/core/types.hpp"
@@ -87,6 +88,7 @@ public:
 #if PSPOCKET_HAVE_FFMPEG
         avcodec_free_context(&av_);
         av_frame_free(&last_);
+        forget_all_but(0, 0);
 #endif
     }
 
@@ -132,6 +134,7 @@ public:
 #if PSPOCKET_HAVE_FFMPEG
         if (av_) avcodec_flush_buffers(av_);
         if (last_) av_frame_unref(last_);
+        forget_all_but(0, 0);
 #endif
     }
 
@@ -171,12 +174,7 @@ public:
         if (!last_ || !last_->data[0] || last_->width != static_cast<int>(w) || last_->height != static_cast<int>(h))
             return false;
         if (last_->format != AV_PIX_FMT_YUV420P && last_->format != AV_PIX_FMT_YUVJ420P) return false;
-        for (u32 r = 0; r < h; r++)
-            std::memcpy(last_->data[0] + r * static_cast<u32>(last_->linesize[0]), y + r * w, w);
-        for (u32 r = 0; r < h / 2; r++) {
-            std::memcpy(last_->data[1] + r * static_cast<u32>(last_->linesize[1]), u + r * (w / 2), w / 2);
-            std::memcpy(last_->data[2] + r * static_cast<u32>(last_->linesize[2]), v + r * (w / 2), w / 2);
-        }
+        write_planes(last_, w, h, y, u, v);
         return true;
 #else
         (void)w, (void)h, (void)y, (void)u, (void)v;
@@ -184,8 +182,78 @@ public:
 #endif
     }
 
+    // Keeps a reference to each picture FFmpeg gives, by its access unit's index, until forget_all_but(): for a core
+    // whose SPU program predicts from its frame buffers as they are, whatever they hold (D-920), the caller rewrites the
+    // pictures FFmpeg predicts from (rewrite()). Only for decoders whose references are the pictures they gave (each
+    // given as soon as it is decoded: VC-1's with AV_CODEC_FLAG_LOW_DELAY); like rewrite_last(), outside the API's
+    // contract.
+    void keep_pictures(bool on) { keep_pictures_ = on; }
+
+    // Drops the pictures kept but those of access units `a` and `b` (0: none).
+    void forget_all_but([[maybe_unused]] u64 a, [[maybe_unused]] u64 b)
+    {
+#if PSPOCKET_HAVE_FFMPEG
+        for (auto it = kept_.begin(); it != kept_.end();) {
+            if (it->first == a || it->first == b) {
+                ++it;
+                continue;
+            }
+            av_frame_free(&it->second);
+            it = kept_.erase(it);
+        }
+#endif
+    }
+
+    // Whether the picture of access unit `au` is kept and holds these planes (planar 4:2:0, no padding, w x h).
+    bool holds([[maybe_unused]] u64 au, [[maybe_unused]] u32 w, [[maybe_unused]] u32 h,
+        [[maybe_unused]] const u8* y, [[maybe_unused]] const u8* u, [[maybe_unused]] const u8* v) const
+    {
+#if PSPOCKET_HAVE_FFMPEG
+        const auto it = kept_.find(au);
+        if (it == kept_.end() || !fits(it->second, w, h)) return false;
+        const AVFrame* f = it->second;
+        for (u32 r = 0; r < h; r++)
+            if (std::memcmp(f->data[0] + r * static_cast<u32>(f->linesize[0]), y + r * w, w)) return false;
+        for (u32 r = 0; r < h / 2; r++)
+            if (std::memcmp(f->data[1] + r * static_cast<u32>(f->linesize[1]), u + r * (w / 2), w / 2) ||
+                std::memcmp(f->data[2] + r * static_cast<u32>(f->linesize[2]), v + r * (w / 2), w / 2))
+                return false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // The kept picture of access unit `au` rewritten as these planes. False when it is not kept (or of another size).
+    bool rewrite([[maybe_unused]] u64 au, [[maybe_unused]] u32 w, [[maybe_unused]] u32 h,
+        [[maybe_unused]] const u8* y, [[maybe_unused]] const u8* u, [[maybe_unused]] const u8* v)
+    {
+#if PSPOCKET_HAVE_FFMPEG
+        const auto it = kept_.find(au);
+        if (it == kept_.end() || !fits(it->second, w, h)) return false;
+        write_planes(it->second, w, h, y, u, v);
+        return true;
+#else
+        return false;
+#endif
+    }
+
 private:
 #if PSPOCKET_HAVE_FFMPEG
+    static bool fits(const AVFrame* f, u32 w, u32 h)
+    {
+        return f && f->data[0] && f->width == static_cast<int>(w) && f->height == static_cast<int>(h) &&
+               (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P);
+    }
+    static void write_planes(AVFrame* f, u32 w, u32 h, const u8* y, const u8* u, const u8* v)
+    {
+        for (u32 r = 0; r < h; r++) std::memcpy(f->data[0] + r * static_cast<u32>(f->linesize[0]), y + r * w, w);
+        for (u32 r = 0; r < h / 2; r++) {
+            std::memcpy(f->data[1] + r * static_cast<u32>(f->linesize[1]), u + r * (w / 2), w / 2);
+            std::memcpy(f->data[2] + r * static_cast<u32>(f->linesize[2]), v + r * (w / 2), w / 2);
+        }
+    }
+
     // FFmpeg's buffers, the next one filled as prefill() asked.
     static int get_buffer(AVCodecContext* av, AVFrame* f, int flags)
     {
@@ -224,6 +292,11 @@ private:
                 av_frame_unref(last_);
                 if (av_frame_ref(last_, f) < 0) av_frame_unref(last_);
             }
+            if (keep_pictures_) {
+                AVFrame*& k = kept_[static_cast<u64>(reinterpret_cast<uintptr_t>(f->opaque))];
+                av_frame_free(&k);
+                k = av_frame_clone(f);
+            }
             av_frame_unref(f);
         }
         av_frame_free(&f);
@@ -231,8 +304,9 @@ private:
 
     AVCodecContext* av_ = nullptr;
     AVFrame* last_ = nullptr;
+    std::map<u64, AVFrame*> kept_;
 #endif
-    bool keep_last_ = false;
+    bool keep_last_ = false, keep_pictures_ = false;
     u32 prefill_w_ = 0, prefill_h_ = 0;
     std::vector<u8> prefill_y_, prefill_u_, prefill_v_;
 };
