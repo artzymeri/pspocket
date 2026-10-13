@@ -290,7 +290,7 @@ Result sys_console_write(PpuThread& t, u32 buf, u32 len)
     if (!is_root(t)) return system_only(t, "sys_console_write");
     return console_print(t, buf, len);
 }
-Result sys_console_write2(PpuThread& t, u32 buf, u32 len) { return console_print(t, buf, len); }
+Result sys_console_write2(PpuThread&) { return retail_absent("sys_console_write2"); } // D-938
 
 Result sys_trace_create(PpuThread&) { return debug_kernel("sys_trace_create"); }
 Result sys_trace_start(PpuThread&) { return debug_kernel("sys_trace_start"); }
@@ -464,16 +464,13 @@ Result sys_mmapper_get_shared_memory_attribute(PpuThread&)
 {
     return quiet_ok("sys_mmapper_get_shared_memory_attribute", "nothing to report: CELL_OK");
 }
-Result sys_memory_budget_set(PpuThread&) { return quiet_ok("sys_memory_budget_set", "no budgets kept: CELL_OK"); }
+Result sys_memory_budget_set(PpuThread&) { return retail_absent("sys_memory_budget_set"); } // D-938
 Result sys_ss_sec_hw_framework(PpuThread&) { return quiet_ok("sys_ss_sec_hw_framework", "nothing to do: CELL_OK"); }
 Result sys_ss_disc_access_control(PpuThread&) { return quiet_ok("sys_ss_disc_access_control", "nothing to do: CELL_OK"); }
 Result sys_ss_ad_sign(PpuThread&) { return quiet_ok("sys_ss_ad_sign", "nothing to do: CELL_OK"); }
 Result sys_ss_media_id(PpuThread&) { return quiet_ok("sys_ss_media_id", "nothing to report: CELL_OK"); }
-Result sys_fsw_connect_event(PpuThread&) { return quiet_ok("sys_fsw_connect_event", "no file-system events: CELL_OK"); }
-Result sys_fsw_disconnect_event(PpuThread&)
-{
-    return quiet_ok("sys_fsw_disconnect_event", "no file-system events: CELL_OK");
-}
+Result sys_fsw_connect_event(PpuThread&) { return retail_absent("sys_fsw_connect_event"); }       // D-938
+Result sys_fsw_disconnect_event(PpuThread&) { return retail_absent("sys_fsw_disconnect_event"); } // D-938
 Result sys_gamepad_ycon_if(PpuThread&, u32 packet, u32, u32)
 {
     if ((packet & 0xFF) > 9) PS_LOG_ERROR(kMiscChan, "sys_gamepad_ycon_if: unknown packet {}", packet & 0xFF);

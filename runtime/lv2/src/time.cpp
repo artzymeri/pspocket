@@ -310,7 +310,8 @@ Result sys_time_set_current_time(PpuThread& t, s64, s64)
 
 u64 sys_time_get_timebase_frequency(PpuThread&) { return PS_TIMEBASE_HZ; }
 
-u64 sys_time_get_system_time(PpuThread&) { return guest_system_time_us(); }
+// Not in a retail console's lv2 (D-938): sysPrxForUser's sys_time_get_system_time reads the timebase itself.
+Result sys_time_get_system_time(PpuThread&) { return retail_absent("sys_time_get_system_time"); }
 
 void register_time_syscalls(SyscallTable& table)
 {

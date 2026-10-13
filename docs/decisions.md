@@ -14275,3 +14275,64 @@ debugging code) showed one race that was there before: a raw SPU's interrupt ser
 and outbound interrupt mailbox counts without the SPU's channel lock (atomic loads), while the SPU wrote them plainly
 under it. The SPU side now stores them atomically, with release order after the value it publishes
 (runtime/spu/src/channels.cpp). tsan.sh lv2 spu: no reports.
+
+## D-938 · 2026-10-13 · Retail conformance: every lv2 slot answers as the retail kernel's table does (part 1)
+
+With D-937 every syscall the kernel chart counts is pspocket's own. The retail 4.93 kernel's table (D-936) also says
+what a retail console answers in the slots RPCS3 does not name, and in named ones pspocket answers that a retail
+console does not have. A sweep of all 1,024 slots (inventory/firmware/tools/retail_sweep.py, its output in
+inventory/firmware/kernel493, never committed) against what pspocket binds found:
+- 547 slots with a retail handler that pspocket answers with its own; 41 named and absent on retail, answering
+  CELL_ENOSYS (D-936); 274 absent and unbound.
+- **31 slots RPCS3 answers with null_func (a log, then CELL_OK) or marks unused that a retail kernel points at its
+  not-implemented slot**: 0, 78, 200 to 212, 214, 220 to 229, 364, 468, 678, 889, 969. They now answer CELL_ENOSYS
+  (SyscallTable::bind_absent, logged at the first call).
+- **Named calls pspocket answered that a retail kernel does not have**: sys_time_get_system_time (149; sysPrxForUser's
+  reads the timebase itself, and pspocket's HLE now calls guest_system_time_us directly), sys_console_write2 (213),
+  sys_memory_budget_set (344), _sys_game_get_rtc_status (412), sys_prx_dbg_get_module_id_list (460),
+  sys_fsw_connect_event and sys_fsw_disconnect_event (633, 634), sys_dbg_read_process_memory and
+  sys_dbg_write_process_memory (904, 905): CELL_ENOSYS now (retail_absent). The debug kernels' calls (60 to 69, 77,
+  699, 880 to 899, 960 to 968) and 623 already answered so.
+- **85 unnamed slots have a retail handler that pspocket answers RPCS3's way** (CELL_OK): 24, 54, 55, 248, 249, 314,
+  315, 340, 346, 354, 355, 357 to 360, 363, 400, 401, 404 to 407, 413 to 415, 472 to 476, 552 to 555, 557, 560 to 569,
+  577, 578, 580 to 582, 598, 599, 620, 636 to 639, 648, 649, 679 to 696, 877, 959, 972, 974, 986 to 989. They are the
+  next parts: each ported from its handler, liblv2coredump's first (974, a stopped PPU thread's whole context; 972 and
+  959, events to the exception handler's queue; 988, which GTA V's C runtime calls: it ends liblv2coredump's handler,
+  the queue named "_l2cDBG").
+Tests: tests/lv2 (the calls answer CELL_ENOSYS; the timer tests read guest_system_time_us).
+
+### D-938, part 2: the unnamed calls under liblv2coredump, and 988
+
+Ported from the retail kernel (runtime/lv2/src/dbg.cpp; RPCS3 names none of these, so the names are pspocket's and
+SyscallTable::bind_unnamed refuses a slot the name table names):
+- **974, sys_dbg_read_ppu_thread_context(thread, context):** a PPU thread's registers at once (0x440 bytes, RPCS3's
+  sys_dbg_ppu_thread_context_t), under sys_dbg_read_thread_register's conditions.
+- **959, sys_dbg_signal_to_coredump_handler(pid, data1, data2, data3)** and **972, sys_dbg_send_coredump_event(params)**
+  (the event's data at +8, +0x10, +0x18 of 72 bytes): an event for the PPU exception handler's queue, from a port of the
+  kernel's own (0x8000666600000001; 0x8000111100000004), only when that queue is liblv2coredump's (the kernel compares
+  its name with "_l2cDBG"; else CELL_LV2DBG_ERROR_DEHANDLENOTREGISTERED).
+- **988, sys_dbg_end_coredump_handler(kind, zero):** kind 1, 2, 4, 8 or 16 and zero 0 (else CELL_EINVAL; a system
+  process CELL_EINVAL too); for a game it ends liblv2coredump's registration as 945 does (the queue's last event) and
+  leaves any other queue. GTA V's C runtime calls it as it starts, so a game's own crash handler takes over.
+Tests: tests/lv2/test_dbg.cpp, test_dispatch.cpp (the null-slot example is 24 now). 81 unnamed slots left.
+
+### D-938, part 3: the unnamed slots whose retail handlers refuse a game
+
+64 of the unnamed slots with retail handlers start with a check a game does not pass, so a game on a retail console
+gets the same answer every time (runtime/lv2/src/retail.cpp, a table of slot, handler address, check and answer):
+- the process's control flags at the system software's level (24, 54, 55, 248, 249, 314, 315, 354, 355, 401, 404,
+  413 to 415, 476, 560 to 562, 577, 877; CELL_ENOSYS; module loading's 472, 473, 475 answer CELL_EPERM);
+- the hypervisor repository's product mode (ss.param.product.mode), off on a retail console (400, 405 to 407;
+  CELL_ENOSYS);
+- the kernel's Bluetooth, USB Bluetooth audio and media control key subsystems, kept for the system software (580 to
+  582, 598, 599, 620, 636 to 638, 680 to 693, 696: "permission denied" on the kernel's console, CELL_ENOSYS), and the
+  deprecated USB Bluetooth audio calls (639, 648, 649, 694, 695: CELL_ENOSYS for everyone);
+- no check, one answer: 346 (CELL_OK), 474 (CELL_EINVAL), 553 to 555 (CELL_ENOSYS), 987 (a debug console's crash
+  tests; CELL_ENOSYS on a retail one);
+- an argument first: 679 (1 to 3, else CELL_EINVAL; then CELL_EPERM), 986 (a null pointer CELL_EFAULT; then
+  CELL_ENOSYS).
+pspocket runs no system software: a root process (tests) meets a game's answer, and the log says the system path past
+the check is not here. Also ported: 989, sys_dbg_get_spu_thread_arguments (an SPU thread's four arguments).
+Left (D-938's next parts): the colored memory calls a game may make (357, 358, 359, 360, 363), 340 (an _ext shared
+memory's address; the retail kernel gives _ext shared memory IDs of type 0x20, pspocket's are type 0x08), and the
+USB driver's unnamed calls on a usbd handle (552, 557, 563 to 569, 578).

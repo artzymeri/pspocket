@@ -22,6 +22,7 @@ add_library(pspocket_lv2 STATIC
     src/misc.cpp
     src/dbg.cpp
     src/crypto_engine.cpp
+    src/retail.cpp
     src/prx.cpp
     src/rsxaudio.cpp
     src/raw_spu.cpp

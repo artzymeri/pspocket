@@ -143,6 +143,12 @@ public:
     void bind_stub(u32 number, const char* name, u64 r3);
     // Binds `fn` to `number`; `name` must match the generated name table (catches a wrong number at startup).
     void bind(u32 number, const char* name, SyscallFn fn);
+    // A slot a retail console's lv2 points at its not-implemented slot (D-936, D-938): it logs the first call and
+    // answers CELL_ENOSYS.
+    void bind_absent(u32 number);
+    // Binds `fn` to a slot the name table leaves unnamed (RPCS3 names none) where the retail kernel has a handler
+    // (D-938); `name` is pspocket's, for the logs.
+    void bind_unnamed(u32 number, const char* name, SyscallFn fn);
     const SyscallEntry& operator[](u32 number) const { return entries_[number]; }
 
 private:
@@ -150,6 +156,8 @@ private:
 };
 
 #define PS_LV2_BIND(table, number, fn) (table).bind(number, #fn, &::pspocket::lv2::syscall_thunk<&::pspocket::lv2::fn>)
+#define PS_LV2_BIND_UNNAMED(table, number, fn) \
+    (table).bind_unnamed(number, #fn, &::pspocket::lv2::syscall_thunk<&::pspocket::lv2::fn>)
 
 void register_process_syscalls(SyscallTable& table);
 void register_thread_syscalls(SyscallTable& table);
@@ -170,6 +178,7 @@ void register_service_syscalls(SyscallTable& table);
 void register_misc_syscalls(SyscallTable& table);
 void register_dbg_syscalls(SyscallTable& table);
 void register_crypto_engine_syscalls(SyscallTable& table);
+void register_retail_syscalls(SyscallTable& table);
 void register_prx_syscalls(SyscallTable& table);
 void register_rsxaudio_syscalls(SyscallTable& table);
 void register_raw_spu_syscalls(SyscallTable& table);
@@ -561,6 +570,9 @@ struct Kernel::Impl {
     // Records the process exit once and notifies the host.
     void process_exit(s32 status);
 };
+
+// A call a retail console's lv2 does not have (D-936, D-938; misc.cpp): logs the first call, answers CELL_ENOSYS.
+Result retail_absent(std::string_view name);
 
 // Thread internals (thread.cpp).
 void thread_finish(PpuThread& t, u64 status);

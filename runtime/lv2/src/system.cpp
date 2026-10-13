@@ -135,12 +135,8 @@ Result _sys_game_board_storage_write(PpuThread& t, u32 buffer, u32 status)
     return CELL_OK;
 }
 
-Result _sys_game_get_rtc_status(PpuThread& t, u32 status)
-{
-    if (!status) return err(CELL_EFAULT);
-    if (!t.kernel.impl().guest.put32(status, 0)) return err(CELL_EFAULT);
-    return CELL_OK;
-}
+// Not in a retail console's lv2 (D-938).
+Result _sys_game_get_rtc_status(PpuThread&) { return retail_absent("_sys_game_get_rtc_status"); }
 
 // ------------------------------------------------------------------------------------------------- sys_ss
 

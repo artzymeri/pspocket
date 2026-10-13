@@ -61,7 +61,7 @@ Result sys_time_get_timezone(PpuThread& t, u32 timezone, u32 summertime);
 Result sys_time_get_current_time(PpuThread& t, u32 sec, u32 nsec);
 Result sys_time_set_current_time(PpuThread& t, s64 sec, s64 nsec);
 u64 sys_time_get_timebase_frequency(PpuThread& t);
-u64 sys_time_get_system_time(PpuThread& t);
+Result sys_time_get_system_time(PpuThread& t); // not in a retail lv2: CELL_ENOSYS (D-938)
 
 // Guest system time: microseconds since the timebase origin (ps_timebase_now at 79.8 MHz), the clock timers and
 // sys_time_get_system_time use.

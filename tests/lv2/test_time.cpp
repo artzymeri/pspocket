@@ -23,9 +23,11 @@ TEST_CASE("lv2 time: current time, timebase frequency, system time", "[lv2][time
 
     CHECK(c.call64(kTimebaseFrequency) == 79800000ull);
 
-    const u64 t0 = c.call64(kSystemTime);
+    // sys_time_get_system_time is sysPrxForUser's (it reads the timebase); a retail lv2 has no such call (D-938).
+    CHECK(c.call(kSystemTime) == rc(CELL_ENOSYS));
+    const u64 t0 = guest_system_time_us();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const u64 t1 = c.call64(kSystemTime);
+    const u64 t1 = guest_system_time_us();
     CHECK(t1 > t0);
     CHECK(t1 - t0 >= 45000);
     CHECK(t1 - t0 < 2000000);
@@ -124,12 +126,12 @@ TEST_CASE("lv2 timer: periodic and one-shot timers send to their event queue", "
     CHECK(f.r32(number) == 0); // stopped
 
     // One-shot: absolute guest system time.
-    const u64 now = c.call64(kSystemTime);
+    const u64 now = guest_system_time_us();
     CHECK(c.call(kTimerStart, timer, now - 1, 0) == rc(CELL_ETIMEDOUT)); // in the past
     REQUIRE(c.call(kTimerStart, timer, now + 20000, 0) == CELL_OK);
     REQUIRE(c.call(kQueueReceive, q, 0, 2000000) == CELL_OK);
     CHECK(c.ctx.gpr[7] == now + 20000);
-    CHECK(c.call64(kSystemTime) >= now + 20000);
+    CHECK(guest_system_time_us() >= now + 20000);
     REQUIRE(c.call(kTimerGetInfo, timer, info) == CELL_OK);
     CHECK(f.r32(info + 16) == 0); // one-shot timers stop after firing
 

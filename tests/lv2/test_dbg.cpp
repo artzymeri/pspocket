@@ -760,6 +760,13 @@ TEST_CASE("lv2 sys_dbg: threads stopped and continued, their registers, an SPU t
     CHECK(f.r64(val) == 0x5151);
     REQUIRE(read(worker, 0, 0) == CELL_OK); // CR: 32 bits
     CHECK(f.r32(val + 4) == 0);
+    // All of them at once (the unnamed 974, D-938).
+    const u32 whole = f.alloc(0x440, 16);
+    REQUIRE(c.call(974, worker, whole) == CELL_OK);
+    CHECK(f.r64(whole + 20 * 8) == 0x2020);
+    CHECK(f.r64(whole + 11 * 8) == kYield);
+    CHECK(c.call(974, c.id(), whole) == static_cast<s32>(0x8001040D));
+    CHECK(c.call(974, worker, 0) == kDeInvalidArguments);
     CHECK(read(c.id(), 3, 20) == static_cast<s32>(0x8001040D));
     CHECK(read(worker, 11, 0) == static_cast<s32>(0x80010403));
     CHECK(read(worker, 3, 32) == static_cast<s32>(0x80010404));
@@ -822,6 +829,10 @@ TEST_CASE("lv2 sys_dbg: threads stopped and continued, their registers, an SPU t
     f.w32(reg + 4, 3);
     REQUIRE(c.call(kReadRegister, tid, reg, val) == CELL_OK);
     CHECK(f.r64(val) == 0xA1A1A1A1);
+    const u32 sargs = f.alloc(32, 8); // its arguments (the unnamed 989, D-938)
+    REQUIRE(c.call(989, spu, sargs) == CELL_OK);
+    CHECK(f.r64(sargs) == 0xA1A1A1A1);
+    CHECK(c.call(989, 0x01FFFFFF, sargs) == static_cast<s32>(0x80010402));
     const u32 ls = f.alloc(16, 16);
     REQUIRE(c.call(kReadLs, spu, 0, 4, ls) == CELL_OK);
     CHECK(f.r32(ls) == pspocket::recomp::spu::as::br(0));
@@ -838,4 +849,60 @@ TEST_CASE("lv2 sys_dbg: threads stopped and continued, their registers, an SPU t
     REQUIRE(c.call(kSemPost, sem, 1) == CELL_OK);
     tw.join();
     ts.join();
+}
+
+TEST_CASE("lv2 retail unnamed calls: liblv2coredump's handler queue hears events and is ended (D-938)", "[lv2][dbg]")
+{
+    Fixture f;
+    Caller c(*f.kernel, "main");
+    const u32 out = f.alloc(4), ev = f.alloc(32, 8), n = f.alloc(4);
+    const auto queue = [&](u64 name) {
+        const u32 attr = queue_attr(f, SYS_SYNC_FIFO);
+        f.w64(attr + 8, name);
+        REQUIRE(c.call(kQueueCreate, out, attr, 0, 8) == CELL_OK);
+        return f.r32(out);
+    };
+    const auto next = [&](u32 q) {
+        f.w32(n, 0);
+        REQUIRE(c.call(kQueueTryReceive, q, ev, 1, n) == CELL_OK);
+        return f.r32(n);
+    };
+    // No handler, then another library's queue: not liblv2coredump's.
+    CHECK(c.call(959, 1, 1, 2, 3) == kDeHandleNotRegistered);
+    const u32 other = queue(0x6F74686572000000ull); // "other"
+    REQUIRE(c.call(kDbgInitExceptionHandler, other) == CELL_OK);
+    CHECK(c.call(959, 1, 1, 2, 3) == kDeHandleNotRegistered);
+    REQUIRE(c.call(988, 1, 0) == CELL_OK); // not liblv2coredump's: left registered
+    CHECK(next(other) == 0);
+    REQUIRE(c.call(kDbgFinalizeExceptionHandler, other) == CELL_OK);
+    CHECK(next(other) == 1);
+
+    // liblv2coredump's queue ("_l2cDBG"): events from the kernel's ports.
+    const u32 q = queue(0x5F6C326344424700ull);
+    REQUIRE(c.call(kDbgInitExceptionHandler, q) == CELL_OK);
+    CHECK(c.call(959, 2, 1, 2, 3) == kDeInvalidArguments); // another process
+    REQUIRE(c.call(959, 1, 0x11, 0x22, 0x33) == CELL_OK);
+    REQUIRE(next(q) == 1);
+    CHECK(f.r64(ev) == 0x8000666600000001ull);
+    CHECK(f.r64(ev + 8) == 0x11);
+    CHECK(f.r64(ev + 24) == 0x33);
+    const u32 params = f.alloc(0x48, 8);
+    f.w64(params + 8, 0xA);
+    f.w64(params + 0x10, 0xB);
+    f.w64(params + 0x18, 0xC);
+    REQUIRE(c.call(972, params) == CELL_OK);
+    REQUIRE(next(q) == 1);
+    CHECK(f.r64(ev) == 0x8000111100000004ull);
+    CHECK(f.r64(ev + 16) == 0xB);
+    CHECK(c.call(972, 0) == kDeInvalidArguments);
+
+    // 988 ends it: its arguments checked first.
+    CHECK(c.call(988, 3, 0) == rc(CELL_EINVAL));
+    CHECK(c.call(988, 1, 1) == rc(CELL_EINVAL));
+    REQUIRE(c.call(988, 16, 0) == CELL_OK);
+    REQUIRE(next(q) == 1);
+    CHECK(f.r64(ev) == 0x8000111100000001ull);
+    CHECK(f.r64(ev + 8) == ~0ull);
+    CHECK(c.call(kDbgFinalizeExceptionHandler, q) == kDeHandleNotRegistered);
+    CHECK(c.call(959, 1, 1, 2, 3) == kDeHandleNotRegistered);
 }

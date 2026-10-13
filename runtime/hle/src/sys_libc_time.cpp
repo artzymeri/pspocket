@@ -161,10 +161,10 @@ struct ClockState {
     u64 start = 0;
 };
 
-u64 clock_(PPUContext& ctx)
+u64 clock_(PPUContext&)
 {
     ClockState& s = HleProcess::current()->state<ClockState>();
-    const u64 us = lv2::sys_time_get_system_time(thread_of(ctx));
+    const u64 us = lv2::guest_system_time_us();
     std::lock_guard l(s.mutex);
     if (!s.started) {
         s.started = true;

@@ -18,7 +18,6 @@ namespace pspocket::lv2 {
 namespace {
 
 constexpr std::string_view kDevChan = "lv2";
-constexpr u32 CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS = 0x80010409; // RPCS3 Modules/sys_lv2dbg.h
 
 // sys_gpio device IDs (RPCS3 sys_gpio.h).
 constexpr u64 SYS_GPIO_LED_DEVICE_ID = 1, SYS_GPIO_DIP_SWITCH_DEVICE_ID = 2;
@@ -258,33 +257,10 @@ Result sys_sm_get_fan_policy(PpuThread& t) { return sm_service(t, "sys_sm_get_fa
 
 // ------------------------------------------------------------------------------------------------- sys_dbg
 
-// sys_dbg_read_process_memory(pid, address, size, data): the process's own memory (pid 1, the only process).
-Result sys_dbg_read_process_memory(PpuThread& t, s32 pid, u32 address, u32 size, u32 data)
-{
-    const Guest& g = t.kernel.impl().guest;
-    if (pid != 1 || !size || !data) return err(static_cast<CellError>(CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS));
-    if (!g.valid(data, size) || !g.valid(address, size)) return err(CELL_EFAULT);
-    std::memmove(g.ptr(data), g.ptr(address), size);
-    return CELL_OK;
-}
-
-// sys_dbg_write_process_memory(pid, address, size, data). Code pages take the bytes, but code pspocket translated
-// ahead of time does not change with them (RPCS3 recompiles the function there): logged.
-Result sys_dbg_write_process_memory(PpuThread& t, s32 pid, u32 address, u32 size, u32 data)
-{
-    Kernel::Impl& s = t.kernel.impl();
-    const Guest& g = s.guest;
-    if (pid != 1 || !size || !data) return err(static_cast<CellError>(CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS));
-    if (!g.valid(data, size) || !g.valid(address, size)) return err(CELL_EFAULT);
-    if (address < t.kernel.config().main_area_end && (address >> 28) != 0xD) {
-        PS_LOG_WARN(kDevChan,
-            "sys_dbg_write_process_memory({:#x}, {:#x}): bytes in the executable's area; translated code there is "
-            "not rebuilt",
-            address, size);
-    }
-    std::memmove(g.ptr(address), g.ptr(data), size);
-    return CELL_OK;
-}
+// sys_dbg_read_process_memory and sys_dbg_write_process_memory are not in a retail console's lv2 (its table points
+// them at the not-implemented slot, D-938): CELL_ENOSYS.
+Result sys_dbg_read_process_memory(PpuThread&) { return retail_absent("sys_dbg_read_process_memory"); }
+Result sys_dbg_write_process_memory(PpuThread&) { return retail_absent("sys_dbg_write_process_memory"); }
 
 void register_device_syscalls(SyscallTable& table)
 {

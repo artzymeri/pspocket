@@ -519,7 +519,7 @@ void rand_regenerate(u8* b, u32 st)
 void rand_seed(PPUContext& ctx, u32 st)
 {
     u8* b = gb(ctx);
-    const u64 now = lv2::sys_time_get_system_time(thread_of(ctx));
+    const u64 now = lv2::guest_system_time_us();
     const u32 sec = static_cast<u32>(now / 1000000), usec = static_cast<u32>(now % 1000000);
     u32 x = sec ^ usec, word = 0;
     for (u32 i = 0; i < 17; i++) {
@@ -927,7 +927,7 @@ s32 _sys_net_lib_usleep(PPUContext& ctx, u64 us) { return static_cast<s32>(lv2_s
 s32 _sys_net_lib_get_system_time(PPUContext& ctx, u32 out)
 {
     if (out && !usable(ctx, out, 8, "_sys_net_lib_get_system_time: out")) return 0;
-    if (out) ps_write64(gb(ctx), out, lv2::sys_time_get_system_time(thread_of(ctx)));
+    if (out) ps_write64(gb(ctx), out, lv2::guest_system_time_us());
     return 0;
 }
 

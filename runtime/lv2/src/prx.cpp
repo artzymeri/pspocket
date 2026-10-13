@@ -328,7 +328,7 @@ Result _sys_prx_stop(PpuThread&) { return CELL_OK; }
 Result sys_prx_get_ppu_guid(PpuThread&) { return CELL_OK; }
 
 // The debugger's module lists: root's (see the top).
-Result sys_prx_dbg_get_module_id_list(PpuThread& t) { return debugger_only(t, "sys_prx_dbg_get_module_id_list"); }
+Result sys_prx_dbg_get_module_id_list(PpuThread&) { return retail_absent("sys_prx_dbg_get_module_id_list"); } // D-938
 Result sys_prx_dbg_get_module_list(PpuThread& t) { return debugger_only(t, "sys_prx_dbg_get_module_list"); }
 Result sys_prx_dbg_get_module_info(PpuThread& t) { return debugger_only(t, "sys_prx_dbg_get_module_info"); }
 

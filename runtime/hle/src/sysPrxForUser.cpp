@@ -365,7 +365,7 @@ void sys_process_exit(PPUContext& ctx, s32 status)
 }
 
 // RPCS3 sysPrxForUser.cpp: the library's copy of the syscall.
-u64 sys_time_get_system_time(PPUContext& ctx) { return lv2::sys_time_get_system_time(thread_of(ctx)); }
+u64 sys_time_get_system_time(PPUContext&) { return lv2::guest_system_time_us(); }
 
 // RPCS3 sys_prx_.cpp: a TODO that returns CELL_OK.
 s32 sys_prx_exitspawn_with_level(PPUContext&)
@@ -553,12 +553,12 @@ s32 sys_lwmutex_lock(PPUContext& ctx, u32 lwmutex, u64 timeout)
                 atomic_add_be64(base, lwmutex + kAllInfo, ~u64{0});
                 return lv2::CELL_OK;
             }
-            const u64 time0 = timeout ? lv2::sys_time_get_system_time(t) : 0;
+            const u64 time0 = timeout ? lv2::guest_system_time_us() : 0;
             const s32 res2 = lv2::_sys_lwmutex_lock(t, queue, timeout);
             if (res2 == lv2::CELL_OK) {
                 atomic_store_be32(base, lwmutex + kOwner, tid);
             } else if (timeout && res2 != err(lv2::CELL_ETIMEDOUT)) {
-                const u64 elapsed = lv2::sys_time_get_system_time(t) - time0;
+                const u64 elapsed = lv2::guest_system_time_us() - time0;
                 if (timeout <= elapsed) {
                     atomic_add_be64(base, lwmutex + kAllInfo, ~u64{0});
                     return err(lv2::CELL_ETIMEDOUT);

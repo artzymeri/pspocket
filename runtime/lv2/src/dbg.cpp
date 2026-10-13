@@ -237,6 +237,54 @@ void put_v128(const Guest& g, u32 at, const V& v)
     for (u32 i = 0; i < 16; i++) g.w8(at + i, v.u8[15 - i]);
 }
 
+// A PPU thread's CR and XER as the architecture packs them.
+u32 packed_cr(const PPUContext& c)
+{
+    u32 cr = 0;
+    for (u32 i = 0; i < 32; i++) cr |= u32{c.cr[i]} << (31 - i);
+    return cr;
+}
+u64 packed_xer(const PPUContext& c) { return u64{c.xer_so} << 31 | u64{c.xer_ov} << 30 | u64{c.xer_ca} << 29 | c.xer_bc; }
+
+// A game thread's MSR: SF, VEC, EE, PR, FP, ME, IR, DR, RI.
+constexpr u64 kGameMsr = 0x800000000200F032ull;
+
+// A PPU thread stopped for a debugger, or asked to stop and waiting in a call (the kernel's check in
+// 0x800000000008F378 and the unnamed 974's): its registers can be read.
+bool readable(Kernel::Impl& s, const PpuThread& caller, PpuThread& th)
+{
+    {
+        std::lock_guard lk(s.dbg_mutex);
+        if (th.dbg_stopped) return true;
+    }
+    return th.dbg_stop.load(std::memory_order_acquire) && &th != &caller &&
+           th.waiter.waiting_on().kind != WaitKind::None;
+}
+
+// The queue liblv2coredump registers for its exception handler: the kernel compares the name's 8 bytes with
+// "_l2cDBG" and its NUL.
+constexpr u64 kCoredumpQueueName = 0x5F6C326344424700ull;
+
+std::shared_ptr<EventQueue> coredump_queue(Kernel::Impl& s)
+{
+    std::shared_ptr<EventQueue> q;
+    {
+        std::lock_guard lk(s.dbg_mutex);
+        q = s.dbg_exception_queue;
+    }
+    return q && kept_name(q->name) == kCoredumpQueueName ? q : nullptr;
+}
+
+// An event for liblv2coredump's handler from a port of the kernel's own named `port` (0x8000000000091E04): no queue
+// registered, or one not liblv2coredump's, is CELL_LV2DBG_ERROR_DEHANDLENOTREGISTERED.
+Result coredump_event(PpuThread& t, u32 pid, u64 port, u64 d1, u64 d2, u64 d3)
+{
+    if (const Result r = inspect(pid); r != CELL_OK) return r;
+    const auto q = coredump_queue(t.kernel.impl());
+    if (!q) return err(kDeHandleNotRegistered);
+    return q->send(Event{port, d1, d2, d3});
+}
+
 } // namespace
 
 void dbg_park(PpuThread& t)
@@ -894,35 +942,22 @@ Result sys_dbg_read_thread_register(PpuThread& t, u32 thread, u32 reg, u32 value
     if (type == 0) {
         const auto th = s.threads.get<PpuThread>(static_cast<u32>(g.r64(thread + 8)));
         if (!th) return err(kDeInvalidThreadId);
-        bool stopped = false;
-        {
-            std::lock_guard lk(s.dbg_mutex);
-            stopped = th->dbg_stopped;
-        }
-        const bool asked = th->dbg_stop.load(std::memory_order_acquire);
-        if (!stopped && !(asked && th.get() != &t && th->waiter.waiting_on().kind != WaitKind::None)) {
-            return err(kDeInvalidThreadStatus);
-        }
+        if (!readable(s, t, *th)) return err(kDeInvalidThreadStatus);
         if (kind > 10) return err(kDeIllegalRegisterType);
         if ((kind == 3 || kind == 5 || kind == 7) && index > 31) return err(kDeIllegalRegisterNumber);
         const PPUContext& c = *th->ctx;
         switch (kind) {
-        case 0: {
-            u32 cr = 0;
-            for (u32 i = 0; i < 32; i++) cr |= u32{c.cr[i]} << (31 - i);
-            put32(cr);
-            break;
-        }
+        case 0: put32(packed_cr(c)); break;
         case 1: put64(c.lr); break;
         case 2: put64(c.ctr); break;
         case 3: put64(c.gpr[index]); break;
-        case 4: put64(u64{c.xer_so} << 31 | u64{c.xer_ov} << 30 | u64{c.xer_ca} << 29 | c.xer_bc); break;
+        case 4: put64(packed_xer(c)); break;
         case 5: put64(std::bit_cast<u64>(c.fpr[index])); break;
         case 6: put32(c.fpscr); break;
         case 7: put128(c.vr[index]); break;
         case 8: ps_write32(out.data(), 12, (c.vscr_nj ? 0x10000u : 0) | (c.vscr_sat ? 1u : 0)); break;
         case 9: put64(c.cia); break;
-        case 10: put64(0x800000000200F032ull); break; // SF, VEC, EE, PR, FP, ME, IR, DR, RI: a game thread's MSR
+        case 10: put64(kGameMsr); break;
         }
     } else if (type == 1) {
         const auto [grp, th] = spu_thread(s, g.r32(thread + 8));
@@ -1001,8 +1036,98 @@ Result sys_dbg_read_spu_thread_context2(PpuThread& t, u32 thread, u32 context)
     return CELL_OK; // the MFC queue's save area (0x848, 96 doublewords) stays empty, as pspocket's queue does
 }
 
+// The retail kernel's unnamed debugging calls (D-938; RPCS3 names none of them, so the names are pspocket's).
+
+// 974 (the kernel's 0x8000000000090530), sys_dbg_read_ppu_thread_context(thread, context): a PPU thread's registers
+// all at once (0x440 bytes, RPCS3's sys_dbg_ppu_thread_context_t: GPRs, CR, XER, LR, CTR, the instruction address,
+// FPRs, FPSCR, VRs, VSCR), under sys_dbg_read_thread_register's conditions. No context:
+// CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS.
+Result sys_dbg_read_ppu_thread_context(PpuThread& t, u64 thread, u32 context)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!context) return err(kDeInvalidArguments);
+    const auto th = s.threads.get<PpuThread>(static_cast<u32>(thread));
+    if (!th) return err(kDeInvalidThreadId);
+    if (!readable(s, t, *th)) return err(kDeInvalidThreadStatus);
+    if (!g.valid(context, 0x440)) return err(CELL_EFAULT);
+    const PPUContext& c = *th->ctx;
+    std::memset(g.ptr(context), 0, 0x440);
+    for (u32 i = 0; i < 32; i++) g.w64(context + i * 8, c.gpr[i]);
+    g.w32(context + 0x100, packed_cr(c));
+    g.w64(context + 0x108, packed_xer(c));
+    g.w64(context + 0x110, c.lr);
+    g.w64(context + 0x118, c.ctr);
+    g.w64(context + 0x120, c.cia);
+    for (u32 i = 0; i < 32; i++) g.w64(context + 0x128 + i * 8, std::bit_cast<u64>(c.fpr[i]));
+    g.w32(context + 0x228, c.fpscr);
+    for (u32 i = 0; i < 32; i++) put_v128(g, context + 0x230 + i * 16, c.vr[i]);
+    g.w32(context + 0x43C, (c.vscr_nj ? 0x10000u : 0) | (c.vscr_sat ? 1u : 0));
+    return CELL_OK;
+}
+
+// 959 (0x8000000000092050), sys_dbg_signal_to_coredump_handler(pid, data1, data2, data3): an event for liblv2coredump's
+// handler from the kernel's port 0x8000666600000001.
+Result sys_dbg_signal_to_coredump_handler(PpuThread& t, u32 pid, u64 d1, u64 d2, u64 d3)
+{
+    return coredump_event(t, pid, 0x8000666600000001ull, d1, d2, d3);
+}
+
+// 972 (0x8000000000091F7C), sys_dbg_send_coredump_event(params): the 72 bytes at `params` give the event's data (the
+// doublewords at +8, +0x10, +0x18) for liblv2coredump's handler, from the kernel's port 0x8000111100000004.
+Result sys_dbg_send_coredump_event(PpuThread& t, u32 params)
+{
+    const Guest& g = t.kernel.impl().guest;
+    if (!params) return err(kDeInvalidArguments);
+    if (!g.valid(params, 0x48)) return err(CELL_EFAULT);
+    return coredump_event(t, kProcessId, 0x8000111100000004ull, g.r64(params + 8), g.r64(params + 0x10),
+        g.r64(params + 0x18));
+}
+
+// 988 (0x8000000000277688), sys_dbg_end_coredump_handler(kind, zero): `kind` 1, 2, 4, 8 or 16 and `zero` 0 (else
+// CELL_EINVAL); a process at the system software's level gets CELL_EINVAL too. For a game: when liblv2coredump's queue
+// is registered for its PPU exceptions, the registration ends as sys_dbg_finalize_ppu_exception_handler ends it (the
+// queue's last event, data1 all ones). GTA V's C runtime calls it as it starts.
+Result sys_dbg_end_coredump_handler(PpuThread& t, u64 kind, u32 zero)
+{
+    const u32 k = static_cast<u32>(kind); // its low word, as the kernel reads it
+    if (k > 16 || !((1u << k) & 0x10116u) || zero) return err(CELL_EINVAL);
+    if (system_level(t)) return err(CELL_EINVAL);
+    Kernel::Impl& s = t.kernel.impl();
+    std::shared_ptr<EventQueue> q;
+    {
+        std::lock_guard lk(s.dbg_mutex);
+        if (!s.dbg_exception_queue || kept_name(s.dbg_exception_queue->name) != kCoredumpQueueName) return CELL_OK;
+        q = std::move(s.dbg_exception_queue);
+    }
+    q->send(Event{0x8000111100000001ull, ~u64{0}, 0, 0});
+    return CELL_OK;
+}
+
+// 989 (0x80000000000921C4), sys_dbg_get_spu_thread_arguments(thread, args): an SPU thread's four arguments as
+// sys_spu_thread_initialize gave them (32 bytes), any state of its group.
+Result sys_dbg_get_spu_thread_arguments(PpuThread& t, u32 thread, u32 args)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const auto [grp, th] = spu_thread(s, thread);
+    if (!th) return err(kDeInvalidThreadId);
+    std::array<u64, 4> a{};
+    {
+        std::lock_guard lk(grp->lock);
+        a = grp->args[thread >> 24];
+    }
+    if (!s.guest.valid(args, 32)) return err(CELL_EFAULT);
+    for (u32 i = 0; i < 4; i++) s.guest.w64(args + i * 8, a[i]);
+    return CELL_OK;
+}
+
 void register_dbg_syscalls(SyscallTable& table)
 {
+    PS_LV2_BIND_UNNAMED(table, 989, sys_dbg_get_spu_thread_arguments);
+    PS_LV2_BIND_UNNAMED(table, 959, sys_dbg_signal_to_coredump_handler);
+    PS_LV2_BIND_UNNAMED(table, 972, sys_dbg_send_coredump_event);
+    PS_LV2_BIND_UNNAMED(table, 974, sys_dbg_read_ppu_thread_context);
+    PS_LV2_BIND_UNNAMED(table, 988, sys_dbg_end_coredump_handler);
     PS_LV2_BIND(table, 900, sys_dbg_stop_processes);
     PS_LV2_BIND(table, 902, sys_dbg_stop_threads);
     PS_LV2_BIND(table, 903, sys_dbg_continue_threads);

@@ -14,7 +14,6 @@ namespace {
 constexpr u32 kGpioSet = 630, kGpioGet = 631, kIoCreate = 624, kIoDestroy = 625, kIoAllocate = 626, kIoFree = 627;
 constexpr u32 kSmShopMode = 377, kSmExtEvent2 = 378, kSmShutdown = 379, kSmParams = 380, kSmLed = 386,
               kSmBuzzer = 392, kSmFanPolicy = 409, kDbgRead = 904, kDbgWrite = 905;
-constexpr s32 kDeInvalidArguments = static_cast<s32>(0x80010409);
 
 Config root_config()
 {
@@ -117,22 +116,11 @@ TEST_CASE("lv2 system manager: a game is refused, a root process answered", "[lv
     }
 }
 
-TEST_CASE("lv2 debugger: the process's own memory", "[lv2][devices]")
+TEST_CASE("lv2 debugger: a retail console has no process memory calls (D-938)", "[lv2][devices]")
 {
     Fixture f;
     Caller c(*f.kernel, "dbg");
     const u32 src = f.alloc(64), dst = f.alloc(64);
-    for (u32 i = 0; i < 64; i++) f.base()[src + i] = static_cast<u8>(i * 3);
-    CHECK(c.call(kDbgRead, 2, src, 16, dst) == kDeInvalidArguments);
-    CHECK(c.call(kDbgRead, 1, src, 0, dst) == kDeInvalidArguments);
-    CHECK(c.call(kDbgRead, 1, src, 16, 0) == kDeInvalidArguments);
-    CHECK(c.call(kDbgRead, 1, 0x7FF00000, 16, dst) == rc(CELL_EFAULT));
-    REQUIRE(c.call(kDbgRead, 1, src, 64, dst) == CELL_OK);
-    CHECK(std::memcmp(f.base() + src, f.base() + dst, 64) == 0);
-    for (u32 i = 0; i < 64; i++) f.base()[dst + i] = static_cast<u8>(0xF0 ^ i);
-    REQUIRE(c.call(kDbgWrite, 1, src, 32, dst) == CELL_OK);
-    CHECK(std::memcmp(f.base() + src, f.base() + dst, 32) == 0);
-    CHECK(f.base()[src + 32] == 32 * 3);
-    CHECK(c.call(kDbgWrite, 1, src, 32, 0x7FF00000) == rc(CELL_EFAULT));
-    CHECK(c.call(kDbgWrite, 3, src, 32, dst) == kDeInvalidArguments);
+    CHECK(c.call(kDbgRead, 1, src, 64, dst) == rc(CELL_ENOSYS));
+    CHECK(c.call(kDbgWrite, 1, src, 32, dst) == rc(CELL_ENOSYS));
 }

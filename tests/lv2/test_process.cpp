@@ -173,8 +173,7 @@ TEST_CASE("lv2 sys_game and sys_ss: watchdog, versions, board storage, random nu
     REQUIRE(c.call(410, board, status) == CELL_OK);
     CHECK(f.base()[board + 15] == 15);
     CHECK(c.call(410, 0, status) == rc(CELL_EFAULT));
-    REQUIRE(c.call(412, status) == CELL_OK);
-    CHECK(f.r32(status) == 0);
+    CHECK(c.call(412, status) == rc(CELL_ENOSYS)); // _sys_game_get_rtc_status: not in a retail lv2 (D-938)
 
     // Random numbers: package 2 only for a game; at most 256 MB.
     const u32 rnd = f.alloc(64);
@@ -219,6 +218,6 @@ TEST_CASE("lv2 process: RPCS3's stub syscalls answer its constant (D-184)", "[lv
     CHECK(c.call(976, 0) == rc(CELL_EFAULT));                 // sys_crypto_engine_create: the ID unwritable (D-937)
     CHECK(c.call(119, 0) == rc(CELL_ENOSYS));                 // sys_time_get_rtc: root's (D-527)
     CHECK(c.call(810, f.cstr("/a"), f.cstr("/b")) == rc(CELL_ENOTMOUNTED)); // sys_fs_link: pspocket's own (D-518)
-    CHECK(c.call(213, f.cstr("text"), 4) == CELL_OK);         // sys_console_write2 (an alias of sys_console_write)
+    CHECK(c.call(213, f.cstr("text"), 4) == rc(CELL_ENOSYS)); // sys_console_write2: not in a retail lv2 (D-938)
     CHECK(c.call(510) == 1);                                  // sys_hid_manager_check_focus
 }

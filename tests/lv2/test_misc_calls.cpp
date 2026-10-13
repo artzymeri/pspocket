@@ -45,6 +45,29 @@ TEST_CASE("lv2 retail console: what the retail kernel's table lacks, and its con
             INFO(n);
             CHECK(c.call(n, 0, 0, 0) == rc(CELL_ENOSYS));
         }
+        // Slots RPCS3 answers with null_func, or names and answers, that the retail table points at its
+        // not-implemented slot (D-938).
+        for (const u32 n : {0u, 78u, 200u, 201u, 202u, 203u, 204u, 205u, 206u, 207u, 208u, 209u, 210u, 211u, 212u, 214u,
+                 220u, 221u, 222u, 223u, 224u, 225u, 226u, 227u, 228u, 229u, 364u, 468u, 678u, 889u, 969u, 149u, 213u, 344u,
+                 412u, 460u, 633u, 634u, 904u, 905u}) {
+            INFO(n);
+            CHECK(c.call(n, 0, 0, 0) == rc(CELL_ENOSYS));
+        }
+        // Unnamed slots whose retail handlers refuse a game (D-938, part 3): the system software's level, the product
+        // mode, the Bluetooth and USB Bluetooth audio guards, or no check at all.
+        for (const u32 n : {24u, 54u, 55u, 248u, 249u, 314u, 315u, 354u, 355u, 400u, 401u, 404u, 405u, 406u, 407u, 413u,
+                 414u, 415u, 476u, 553u, 554u, 555u, 560u, 561u, 562u, 577u, 580u, 581u, 582u, 598u, 599u, 620u, 636u,
+                 637u, 638u, 639u, 648u, 649u, 680u, 693u, 694u, 695u, 696u, 877u, 987u}) {
+            INFO(n);
+            CHECK(c.call(n, 1, f.alloc(64), 0) == rc(CELL_ENOSYS));
+        }
+        CHECK(c.call(346) == CELL_OK);
+        CHECK(c.call(474) == rc(CELL_EINVAL));
+        for (const u32 n : {472u, 473u, 475u}) CHECK(c.call(n, 0, f.alloc(0x60), 0) == rc(CELL_EPERM));
+        CHECK(c.call(679, 0) == rc(CELL_EINVAL));
+        CHECK(c.call(679, 2) == rc(CELL_EPERM));
+        CHECK(c.call(986, 0) == rc(CELL_EFAULT));
+        CHECK(c.call(986, f.alloc(16)) == rc(CELL_ENOSYS));
         // sys_dbg_get_console_type: a null pointer first; then a game's control flags are below the system level.
         CHECK(c.call(985, 0) == rc(CELL_EFAULT));
         CHECK(c.call(985, f.alloc(8)) == rc(CELL_ENOSYS));
@@ -134,17 +157,15 @@ TEST_CASE("lv2 retail console: the console, Bluetooth audio events, module-made 
     Caller c(*f.kernel, "misc");
     const u32 text = f.alloc(16);
     std::memcpy(f.base() + text, "hello\n", 7);
-    CHECK(c.call(213, text, 6) == CELL_OK);
-    CHECK(c.call(213, 0x7FF00000, 6) == rc(CELL_EFAULT));
-    CHECK(c.call(213, text, 0) == CELL_OK);
+    CHECK(c.call(213, text, 6) == rc(CELL_ENOSYS)); // sys_console_write2: not in a retail lv2 (D-938)
 
     const u32 outs = f.alloc(16);
     CHECK(c.call(579, 0, outs, outs + 4, outs + 8, 0) == rc(CELL_EINVAL));
     CHECK(c.call(579, 2, outs, outs + 4, outs + 8, outs + 12) == static_cast<s32>(0x80111003));
     CHECK(c.call(579, 1, outs, outs + 4, outs + 8, outs + 12) == CELL_OK);
 
-    for (const u32 n : {167u, 244u, 245u, 246u, 247u, 333u, 336u, 338u, 344u, 864u, 876u, 878u, 879u, 633u, 634u, 621u,
-             570u, 571u, 572u, 573u, 574u, 575u, 839u, 843u, 844u, 31u}) {
+    for (const u32 n : {167u, 244u, 245u, 246u, 247u, 333u, 336u, 338u, 864u, 876u, 878u, 879u, 621u, 570u, 571u, 572u,
+             573u, 574u, 575u, 839u, 843u, 844u, 31u}) {
         INFO(n);
         CHECK(c.call(n, 0, 0, 0) == CELL_OK);
     }

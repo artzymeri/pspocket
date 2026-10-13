@@ -504,6 +504,39 @@ void SyscallTable::bind_stub(u32 number, const char* name, u64 r3)
     if (!entries_[number].name) entries_[number].name = name;
 }
 
+namespace {
+
+void absent_syscall(PpuThread& t, PPUContext& ctx)
+{
+    const u32 number = static_cast<u32>(ctx.gpr[11]);
+    if (!g_null_logged[number].exchange(true)) {
+        PS_LOG_WARN(kChan, "syscall {} ({}) is not in a retail console's lv2 (its table's not-implemented slot): "
+                           "CELL_ENOSYS (first call at {:#010x}, thread {:#x})",
+            number, syscall_name(number) ? syscall_name(number) : "unnamed", ctx.cia, t.id);
+    }
+    ctx.gpr[3] = to_r3(err(CELL_ENOSYS));
+}
+
+} // namespace
+
+void SyscallTable::bind_unnamed(u32 number, const char* name, SyscallFn fn)
+{
+    if (number >= kSyscallCount) PS_FATAL(kChan, "syscall {} ({}) out of range", number, name);
+    if (const char* named = syscall_name(number)) {
+        PS_FATAL(kChan, "syscall {} is '{}' in the name table: bind it by that name, not as '{}'", number, named, name);
+    }
+    if (entries_[number].fn) PS_FATAL(kChan, "syscall {} is already bound", number);
+    entries_[number].fn = fn;
+    entries_[number].name = name;
+}
+
+void SyscallTable::bind_absent(u32 number)
+{
+    if (number >= kSyscallCount) PS_FATAL(kChan, "syscall {} out of range", number);
+    if (entries_[number].fn) PS_FATAL(kChan, "syscall {} is already bound", number);
+    entries_[number].fn = absent_syscall;
+}
+
 void SyscallTable::bind_null(u32 number, const char* what)
 {
     if (number >= kSyscallCount) PS_FATAL(kChan, "syscall {} ({}) out of range", number, what);
@@ -554,9 +587,15 @@ Kernel::Impl::Impl(Kernel& k)
     register_misc_syscalls(table);
     register_dbg_syscalls(table);
     register_crypto_engine_syscalls(table);
+    register_retail_syscalls(table);
     register_prx_syscalls(table);
     register_rsxaudio_syscalls(table);
     register_raw_spu_syscalls(table);
+    // The slots RPCS3 answers with null_func (or marks unused) that a retail console's lv2 points at its
+    // not-implemented slot (the 4.93 kernel's table, inventory/firmware/kernel493, D-938): CELL_ENOSYS there.
+    static constexpr u32 kRetailAbsent[] = {0, 78, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 214,
+        220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 364, 468, 678, 889, 969};
+    for (const u32 n : kRetailAbsent) table.bind_absent(n);
     // Every other slot RPCS3 answers with null_func (a log, then CELL_OK) is answered so too (D-166): a game calling
     // one goes on instead of meeting ENOSYS. GTA V's CRT, for one, registers a debug exception handler (988).
     static constexpr struct {
