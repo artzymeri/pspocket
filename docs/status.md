@@ -26,10 +26,13 @@ run).
   each thread's information, the process's and its memory containers', the PPU exception handler's queue, the memory
   colors and counts, and a debugger's stop and continue with register, local store and SPU context reads (pspocket
   stops a thread at its next lv2 or library call, where its registers are all known).
-- **Next for the kernel: the retail conformance pass** (inventory/firmware/tools/retail_sweep.py): 85 unnamed slots
-  have retail handlers that pspocket answers RPCS3's way (a log, then CELL_OK; 988, which GTA V's C runtime calls,
-  among them: it ends liblv2coredump's exception handler); 31 slots answered CELL_OK are CELL_ENOSYS on a retail
-  console; a few named calls pspocket answers are not in a retail kernel (904 and 905, sys_dbg's memory calls).
+- **The retail conformance pass (D-938)**, every slot against the retail table (inventory/firmware/tools/
+  retail_sweep.py): done for the 31 RPCS3 null slots and 9 named calls a retail kernel lacks (CELL_ENOSYS now), the
+  unnamed calls under liblv2coredump (974, 959, 972, 988, which GTA V's C runtime calls, 989), the 64 unnamed slots
+  whose handlers refuse a game (retail.cpp: the system software's level, product mode, the Bluetooth and USB
+  Bluetooth audio guards), and the colored memory calls (357 to 360, 363). Left: 340 (an _ext shared memory's
+  creator; the retail kernel numbers _ext shared memory as type 0x20) and sys_usbd as the retail kernel has it (its
+  unnamed 552, 557, 563 to 569, 578, and the named calls' error codes and memory rules, which follow RPCS3 today).
 - The script comparison harness (tests/hle/sysutil_sub_compare.hpp) now compares the TTY's text too (a script asks)
   and the file system calls' paths by their text; PSPOCKET_TEST_DUMP=2 prints both runs.
 
