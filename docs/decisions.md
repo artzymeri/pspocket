@@ -14739,3 +14739,39 @@ and the reserved version, MPEG-2.5 without PTS, units of 0 bytes, of part of the
 first output and the information), MPEG-4 AAC (the PCM at 63.5 dB, a frame counter in the information), AC-3 (its
 first frame).
 
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 2: MPEG audio layers I and II, ATRAC3, MPEG-4 AAC)
+
+Part 1's comparison (tests/hle/test_adec_cores.cpp, [.compare-adec]) over the other cores. What each does as Sony's
+does now:
+
+- MPEG audio layers I and II (adec_mpeg.cpp, libmpl1dec and libm2bcdec): the output is the stream's own channels
+  whatever channelNumber says up to 2; past 2 every frame is refused (libmpl1dec 0x80613112, libm2bcdec's
+  OPENBS_EX 0x80612B21), as a multichannel extension is asked for. libmpl1dec has its own error range, libm2bcdec's
+  numbers from 0x80613100 (RPCS3 lists none). Refusals: no 12-bit sync (MPEG-2.5 and the reserved version too) SYNCF,
+  free format and bit rate 15 BITRATE, the reserved rate SAMPLEFREQ, the other layer's header, a unit shorter than its
+  frame and a frame the decoder refuses SYNCF_EX (0x22); emphasis 2 decodes. A refused unit gives an item of 1152
+  samples of silence in the information block's channels (libmpl1dec copies only a layer I frame's 384 of them out:
+  Decoded::copied) and leaves the block as the last frame decoded left it; before any frame the block reads stereo,
+  48 kHz, bit rate index 14, 1152 stereo samples, L_R. channelNumber in the block is the output's channel count, and
+  outputFrameSize 1152 samples of the channels in bytes (layer I's too). Floats are not held below 1. StartSeq refuses
+  a downmix flag past 1 only.
+- ATRAC3 (adec_atrac3.cpp, libat3dec): the sound is FFmpeg's with its sign turned over (FFmpeg's ATRAC3 decoder has the
+  opposite polarity: -6.0 dB against Sony's until turned, 116 dB after); a sequence's first frame, and the first after
+  a refused unit, comes out empty (decoded all the same: the frames after overlap it); the information's nbytes is a
+  channel's (nbytes / nch). Floats held below 1 and integers floored, as before (round to nearest made 16-bit worse).
+- MPEG-4 AAC (adec_aac.cpp, libm4aacdec and its 2-channel forms): the block lives from frame to frame (a refused unit
+  leaves the last frame's) and its word at +0x74, past RPCS3's structure, counts the frames decoded since the start or
+  the last refusal. A refused unit gives a frame of silence in the last frame's channels and starts the decoder
+  afresh (FFmpeg's opened again: its overlap and window shapes as at a sequence's start, which a flush alone does not
+  reset); a frame FFmpeg refuses is INVALID_SECTION_DATA (0x8061241C, libm4aacdec's for raw data that are not AAC's).
+  An ADTS frame its unit cuts short waits for the next unit, whose bytes complete it (libm4aacdec reads the two as one
+  frame, whatever the second holds).
+
+Not reproduced (documented tolerance): perceptual noise substitution's noise in AAC (each decoder's own random
+numbers: the comparison's AAC streams are encoded without it); an AAC unit without its sync whose bytes hold a false
+one (libm4aacdec reads on from it into the next unit); ATRAC3's frame after next when a sequence's first frame is
+refused (up to 12 16-bit steps: libat3dec's state after its partial decode of the bad frame).
+
+Compared: 45 cases of MP3, layers I and II, ATRAC3 and AAC agree, each in every answer, callback, item, information
+byte and PCM sample (floats within their last bits, 16-bit within one step). Still differing (part 3): AC-3.
+

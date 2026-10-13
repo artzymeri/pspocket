@@ -370,13 +370,15 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   except a set start bit (Sony's codes per syntax error are not known). MP3, MPEG audio layers I and II, MPEG-4 AAC,
   AC-3 and ATRAC3 have pspocket's own cores on FFmpeg too (adec_ffmpeg.cpp and a file each), which serve only where no
   firmware module gives Sony's core (firmware first, as D-563 for libraries). D-944 compares them with Sony's
-  (test_adec_cores.cpp, [.compare-adec], PSPOCKET_TEST_DEV_FLASH set): the sizes, versions and PCM handles are Sony's,
-  and MP3 agrees with libmp3dec in all 11 cases. **Next:** layers I and II (the information's first word is the
-  channel count, 2, not CELL_ADEC_CH's code; layer I's frame size field is 0x2400 in Sony's), ATRAC3 (Sony's first
-  output is empty: a frame of delay; its information 0xC0 against 0x180), MPEG-4 AAC (the PCM differs at 63.5 dB: check
-  whether FFmpeg's encoder put PNS in the test stream, whose noise no two decoders share; a frame counter in the
-  information's last words), AC-3 (Sony's first frame is an ERROR 0x80612503 with a frame of delay; its information is
-  0x50 bytes); then drop the firmware-first rule codec by codec. A game's stream can be
+  (test_adec_cores.cpp, [.compare-adec], PSPOCKET_TEST_DEV_FLASH set; PSPOCKET_TEST_DUMP, _SHIFT and _LAG print more):
+  the sizes, versions and PCM handles are Sony's, and MP3, layers I and II, ATRAC3 and AAC agree in all 45 cases.
+  **Next:** AC-3 (D-944 part 3): Sony's first frame is an ERROR 0x80612503 with no PCM; its StartSeq refuses only
+  enums out of range, more than 6 channels and channel pointers outside 0 to 5 (libadec's ARG), not the output mode,
+  scale factors or two pointers alike; its pointers put each channel in a slot (the later overwriting), slots past
+  numberOfChannels dropped; its downmixes take A/52's levels without normalising and auto means Lt/Rt; a scale past 1
+  gives silence; its information is 0x50 bytes (a codec word 0x1001, version 0x0499, the bit rate in bit/s, the rate
+  as MPEG-4's index, 0xFF or 3 for float or 16-bit, the BSI's bits in 24-bit words). Then drop the firmware-first rule
+  codec by codec. A game's stream can be
   given to a probe locally (as SND0.AT3 in run 105). Still Sony's only: MPEG-2 AAC, E-AC-3, MP3 surround, ATRAC3
   multichannel, TrueHD, DTS and WMA (RPCS3's cellAdec.h has no structures for them), and CELP (FFmpeg has no decoder).
 - **cellPngDec (D-199):** decodes the whole image into a host buffer, then copies rows (and converts colour to gray)

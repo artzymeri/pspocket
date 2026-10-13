@@ -185,6 +185,7 @@ void decode_au(PPUContext& ctx, u32 h, const Spec& spec, Codec& codec, const Cmd
     ps_write32(base, h + fx::output_locked, 1);
     unlock(ctx, h, fx::output_mutex);
     ps_write32(base, h + fx::pcm_size, d.size);
+    ps_write32(base, h + fx::copy_size, std::min(d.copied, d.size));
     ps_write32(base, h + fx::duration, d.duration);
     notify.pcm_out(cmd.pcm_handle, output, d.size, bsi.addr(), d.pts_type, d.error);
 }
@@ -359,7 +360,7 @@ public:
     {
         if (!out_buffer) return lv2::CELL_OK;
         u8* base = guest_base(ctx);
-        const u32 size = ps_read32(base, h + fx::pcm_size);
+        const u32 size = ps_read32(base, h + fx::copy_size);
         if (!pcm_start || !guest_readable(thread(ctx), out_buffer, size)) {
             log_call_site(ctx, base, std::format("cellAdecGetPcm: the buffer ({:#x}, {} bytes) or the PCM ({:#x}) is not "
                 "guest memory", out_buffer, size, pcm_start));

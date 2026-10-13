@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <functional>
@@ -27,6 +28,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
 }
 #endif
 
@@ -687,7 +689,7 @@ constexpr u32 kTypeMpegL1 = 22, kTypeMpegL2 = 6;
 // sinusoid at a quarter of the subband rate (0.9, 0, -0.9, 0 over the frame's 12 samples, 15-bit samples, scale factor
 // 6: 0.5), every other subband silent. Its sound is a tone at (band + 0.5) * 750 Hz (in an odd band too: the filter
 // bank turns odd bands over, and a quarter is their middle).
-std::vector<u8> layer1_tone(u32 channels, std::array<u32, 2> bands)
+std::vector<u8> layer1_tone(u32 channels, std::array<u32, 2> bands, u32 scale_factor = 6)
 {
     BitWriter w;
     w.put(0x7FF, 11);                // sync
@@ -705,7 +707,7 @@ std::vector<u8> layer1_tone(u32 channels, std::array<u32, 2> bands)
         for (u32 ch = 0; ch < channels; ch++) w.put(alloc(sb, ch), 4);
     for (u32 sb = 0; sb < 32; sb++)
         for (u32 ch = 0; ch < channels; ch++)
-            if (alloc(sb, ch)) w.put(6, 6);
+            if (alloc(sb, ch)) w.put(scale_factor, 6);
     for (u32 j = 0; j < 12; j++) {
         const s32 x = j % 4 == 0 ? 14745 : j % 4 == 2 ? -14745 : 0; // 0.9 of 16383
         for (u32 sb = 0; sb < 32; sb++)
@@ -866,46 +868,65 @@ TEST_CASE("cellAdec: MPEG layer I on FFmpeg, frames built here: tones, informati
         INFO("access unit " << k);
         const Out& o = run.outs[k];
         CHECK(o.size == 384 * 2 * 4);
-        CHECK(o.pcm == expected_pcm(ref[k], false));
+        CHECK(o.pcm == expected_pcm(ref[k], false, true));
         // The first has no PTS and none before it: none; the fourth follows the third by 720.
         CHECK(o.pts_upper == (k == 0 ? kTsInvalid : 0));
         CHECK(o.pts_lower == (k == 0 ? kTsInvalid : 0x1000 + 720 * k));
-        CHECK(be32(o.bsi, 0x00) == 3);   // channelNumber: CELL_ADEC_CH_STEREO
-        CHECK(be32(o.bsi, 0x04) == 1);   // sampleFreq: 48 kHz
-        CHECK(be32(o.bsi, 0x08) == 0);   // no CRC
-        CHECK(be32(o.bsi, 0x0C) == 12);  // bit rate index
-        CHECK(be32(o.bsi, 0x10) == 0);   // stereo
-        CHECK(be32(o.bsi, 0x30) == 384); // outputFrameSize
-        CHECK(be32(o.bsi, 0x3C) == 2);   // L_R
+        CHECK(be32(o.bsi, 0x00) == 2);        // channelNumber: the output's channels (D-944)
+        CHECK(be32(o.bsi, 0x04) == 1);        // sampleFreq: 48 kHz
+        CHECK(be32(o.bsi, 0x08) == 0);        // no CRC
+        CHECK(be32(o.bsi, 0x0C) == 12);       // bit rate index
+        CHECK(be32(o.bsi, 0x10) == 0);        // stereo
+        CHECK(be32(o.bsi, 0x30) == 1152 * 8); // outputFrameSize: 1152 samples of the channels in bytes, as Sony's
+        CHECK(be32(o.bsi, 0x3C) == 2);        // L_R
     }
     std::vector<u8> pcm;
     for (u32 k = 2; k < 6; k++) pcm.insert(pcm.end(), run.outs[k].pcm.begin(), run.outs[k].pcm.end());
     CHECK(energy_near(channel_of(pcm, 2, 0, false), 48000, 3375, 200) > 0.9);
     CHECK(energy_near(channel_of(pcm, 2, 1, false), 48000, 7125, 200) > 0.9);
-    // channelNumber MONO: the two averaged; STEREO from a mono stream: the one in both.
-    Feed mono;
-    mono.bsi_size = 0x40;
-    for (u32 k = 0; k < 3; k++) mono.aus.push_back(layer1_tone(2, {4, 9}));
-    const CoreRun down = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(1), mono);
-    REQUIRE(down.outs.size() == 3);
-    const auto ref3 = ffmpeg_decode("mp1float", mono.aus);
+    // channelNumber leaves the stream's channels as they are, as Sony's cores do (D-944): 1 on a stereo stream gives
+    // stereo, 2 on a mono stream mono. Past 2 every frame is refused (libmpl1dec's 0x80613112) with an item of 1152
+    // samples of silence in the information block's channels (stereo before any frame), 384 of them given out, and the
+    // block as before any frame.
+    Feed two;
+    two.bsi_size = 0x40;
+    for (u32 k = 0; k < 3; k++) two.aus.push_back(layer1_tone(2, {4, 9}));
+    const auto ref3 = ffmpeg_decode("mp1float", two.aus);
+    const CoreRun kept = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(1), two);
+    REQUIRE(kept.outs.size() == 3);
     for (u32 k = 0; k < 3; k++) {
-        CHECK(down.outs[k].size == 384 * 4);
-        CHECK(be32(down.outs[k].bsi, 0) == 1);
-        std::vector<std::vector<float>> avg(1);
-        for (usize i = 0; i < ref3[k][0].size(); i++) avg[0].push_back((ref3[k][0][i] + ref3[k][1][i]) * 0.5f);
-        CHECK(down.outs[k].pcm == expected_pcm(avg, false));
+        CHECK(kept.outs[k].size == 384 * 2 * 4);
+        CHECK(be32(kept.outs[k].bsi, 0) == 2);
+        CHECK(kept.outs[k].pcm == expected_pcm(ref3[k], false, true));
     }
     Feed one;
     one.bsi_size = 0x40;
     for (u32 k = 0; k < 3; k++) one.aus.push_back(layer1_tone(1, {6, 0}));
-    const CoreRun up = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(3), one);
-    REQUIRE(up.outs.size() == 3);
+    const CoreRun single = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(2), one);
+    REQUIRE(single.outs.size() == 3);
     const auto ref1 = ffmpeg_decode("mp1float", one.aus);
     for (u32 k = 0; k < 3; k++) {
-        CHECK(up.outs[k].size == 384 * 2 * 4);
-        CHECK(be32(up.outs[k].bsi, 0x3C) == 0); // MONO
-        CHECK(up.outs[k].pcm == expected_pcm({ref1[k][0], ref1[k][0]}, false));
+        CHECK(single.outs[k].size == 384 * 4);
+        CHECK(be32(single.outs[k].bsi, 0x00) == 1);
+        CHECK(be32(single.outs[k].bsi, 0x30) == 1152 * 4);
+        CHECK(be32(single.outs[k].bsi, 0x3C) == 0); // MONO
+        CHECK(single.outs[k].pcm == expected_pcm(ref1[k], false, true));
+    }
+    const CoreRun multi = run_core(f.base(), hle_calls(f, t), kTypeMpegL1, mpmc_param(3), two);
+    INFO(all(multi));
+    REQUIRE(multi.outs.size() == 3);
+    CHECK(flow_ok(multi, 3, {{0, 0x80613112}, {1, 0x80613112}, {2, 0x80613112}}));
+    for (u32 k = 0; k < 3; k++) {
+        const Out& o = multi.outs[k];
+        CHECK(o.size == 1152 * 2 * 4);
+        REQUIRE(o.pcm.size() == 1152 * 2 * 4);
+        CHECK(std::all_of(o.pcm.begin(), o.pcm.begin() + 384 * 2 * 4, [](u8 b) { return b == 0; }));
+        CHECK(std::all_of(o.pcm.begin() + 384 * 2 * 4, o.pcm.end(), [](u8 b) { return b == 0xCC; })); // not copied
+        CHECK(be32(o.bsi, 0x00) == 2);
+        CHECK(be32(o.bsi, 0x04) == 1);
+        CHECK(be32(o.bsi, 0x0C) == 14);
+        CHECK(be32(o.bsi, 0x30) == 1152 * 8);
+        CHECK(be32(o.bsi, 0x3C) == 2);
     }
 }
 
@@ -938,7 +959,7 @@ TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: t
         CHECK(be32(o.bsi, 0x08) == h.crc);
         CHECK(be32(o.bsi, 0x0C) == h.bitrate_index);
         CHECK(be32(o.bsi, 0x10) == h.mode);
-        CHECK(be32(o.bsi, 0x30) == 1152);
+        CHECK(be32(o.bsi, 0x30) == 1152 * 8);
     }
     u32 delay = 0;
     const double left = snr_db(floats_of(input, 2, 0), joined(run, 2, 0), 2000, &delay);
@@ -946,8 +967,8 @@ TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: t
     INFO(std::format("SNR {:.1f} and {:.1f} dB, delay {} samples", left, right, delay));
     CHECK(left > 30);
     CHECK(right > 30);
-    // Frames refused: a layer III frame (LAYER), one cut short (OPENBS), free format (UNSUPPORT), MPEG-2.5's sync
-    // (SYNCF); the frame after them decodes.
+    // Frames refused, as libm2bcdec refuses them (D-944): a layer III frame and one cut short (SYNCF_EX), free format
+    // (BITRATE), MPEG-2.5's sync (SYNCF), each an item of 1152 stereo samples of silence; the frame after them decodes.
     Feed bad;
     bad.bsi_size = 0x40;
     bad.aus.push_back(mp3_frame({}));
@@ -962,11 +983,13 @@ TEST_CASE("cellAdec: MPEG layer II on FFmpeg, a stream FFmpeg's encoder wrote: t
     const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeMpegL2, mpmc_param(0), bad);
     INFO(all(refused));
     REQUIRE(refused.outs.size() == 5);
-    CHECK(flow_ok(refused, 5, {{0, 0x80612B12}, {1, 0x80612B36}, {2, 0x80612B17}, {3, 0x80612B11}}));
-    CHECK(refused.outs[4].size == 1152 * 2 * 4);
-    // StartSeq refuses a layout past the CellAdecChannel values.
-    const CoreRun arg = run_core(f.base(), hle_calls(f, t), kTypeMpegL2, mpmc_param(12), Feed{});
-    CHECK(arg.lines[2] == "cellAdecStartSeq -> 0x80612b03");
+    CHECK(flow_ok(refused, 5, {{0, 0x80612B22}, {1, 0x80612B22}, {2, 0x80612B13}, {3, 0x80612B11}}));
+    for (u32 k = 0; k < 5; k++) CHECK(refused.outs[k].size == 1152 * 2 * 4);
+    for (u32 k = 0; k < 4; k++) CHECK(std::all_of(refused.outs[k].pcm.begin(), refused.outs[k].pcm.end(), [](u8 b) { return b == 0; }));
+    // StartSeq refuses a downmix flag past 1, nothing else (D-944).
+    CHECK(run_core(f.base(), hle_calls(f, t), kTypeMpegL2, be32s({0, 2, 0}), Feed{}).lines[2] ==
+        "cellAdecStartSeq -> 0x80612b03");
+    CHECK(run_core(f.base(), hle_calls(f, t), kTypeMpegL2, be32s({12, 0, 2}), Feed{}).lines[2] == "cellAdecStartSeq -> 0x0");
 }
 
 #endif
@@ -1190,13 +1213,16 @@ TEST_CASE("cellAdec: MPEG-4 AAC on FFmpeg, 5.1 out, downmixed by the two-channel
     };
     Feed bad;
     bad.bsi_size = 0x80;
+    // As libm4aacdec (D-944): no output for a refused unit before any frame decoded (the block's channels: none); a
+    // unit cut short waits for the next, whose bytes complete it (here as garbage: SECTION_DATA).
     bad.aus = {with(1, 0xF0, 0x70), with(1, 0x06, 0x02), with(2, 0x3C, 0x34), with(2, 0xC0, 0x80),
-        std::vector<u8>(good.begin(), good.begin() + 100), good};
+        std::vector<u8>(good.begin(), good.begin() + 100), good, good};
     const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeM4Aac, m4aac_param(1), bad);
     INFO(all(refused));
-    REQUIRE(refused.outs.size() == 6);
-    CHECK(flow_ok(refused, 6, {{0, 0x80612415}, {1, 0x80612414}, {2, 0x80612428}, {3, 0x80612426}, {4, 0x80612407}}));
-    CHECK(refused.outs[5].size == 1024 * 6 * 4);
+    REQUIRE(refused.outs.size() == 7);
+    CHECK(flow_ok(refused, 7, {{0, 0x80612415}, {1, 0x80612414}, {2, 0x80612428}, {3, 0x80612426}, {5, 0x8061241C}}));
+    for (u32 k = 0; k < 6; k++) CHECK(refused.outs[k].size == 0);
+    CHECK(refused.outs[6].size == 1024 * 6 * 4);
     // ADIF: a header that is not one, and a program the header has not.
     Feed no_adif;
     no_adif.bsi_size = 0x80;
@@ -1562,6 +1588,12 @@ TEST_CASE("cellAdec: ATRAC3 on FFmpeg, frames built here: the four PCM formats, 
     feed.step = 4180;
     for (u32 k = 0; k < 6; k++) feed.aus.push_back(atrac3_frame(2, {100, 60}));
     feed.missing = {2};
+    // libat3dec's sound (D-944): FFmpeg's with its sign turned over, the first frame out empty.
+    const auto negated = [](std::vector<std::vector<float>> unit) {
+        for (auto& ch : unit)
+            for (float& x : ch) x = -x;
+        return unit;
+    };
     const auto ref = ffmpeg_decode("atrac3", feed.aus, atrac3_setup(2, 384));
     for (const u32 bw : {0x84u, 2u, 3u, 4u}) {
         INFO("bw_pcm " << bw);
@@ -1571,13 +1603,14 @@ TEST_CASE("cellAdec: ATRAC3 on FFmpeg, frames built here: the four PCM formats, 
         CHECK(flow_ok(run, 6, {}));
         for (u32 k = 0; k < 6; k++) {
             const Out& o = run.outs[k];
-            CHECK(o.size == 1024 * 2 * (bw == 2 ? 2 : 4));
+            CHECK(o.size == (k == 0 ? 0 : 1024 * 2 * (bw == 2 ? 2 : 4)));
             CHECK(o.pts_lower == 0x1000 + 4180 * k);
             CHECK(be32(o.bsi, 0) == 2);   // nch
             CHECK(be32(o.bsi, 4) == 0);   // isJoint
-            CHECK(be32(o.bsi, 8) == 384); // nbytes
-            if (bw == 0x84 || bw == 2) CHECK(o.pcm == expected_pcm(ref[k], bw == 2));
-            else CHECK(o.pcm == expected_words(ref[k], bw == 3 ? 24 : 32));
+            CHECK(be32(o.bsi, 8) == 192); // a channel's bytes
+            if (k == 0) continue;
+            if (bw == 0x84 || bw == 2) CHECK(o.pcm == expected_pcm(negated(ref[k]), bw == 2));
+            else CHECK(o.pcm == expected_words(negated(ref[k]), bw == 3 ? 24 : 32));
         }
         if (bw == 0x84) {
             std::vector<u8> pcm;
@@ -1597,21 +1630,25 @@ TEST_CASE("cellAdec: ATRAC3 on FFmpeg, frames built here: the four PCM formats, 
     const CoreRun one = run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(1, 0, 152, 0x84), mono);
     REQUIRE(one.outs.size() == 3);
     const auto ref1 = ffmpeg_decode("atrac3", mono.aus, atrac3_setup(1, 152));
-    for (u32 k = 0; k < 3; k++) {
+    for (u32 k = 1; k < 3; k++) {
         CHECK(one.outs[k].size == 1024 * 4);
-        CHECK(one.outs[k].pcm == expected_pcm(ref1[k], false));
+        CHECK(be32(one.outs[k].bsi, 8) == 152);
+        CHECK(one.outs[k].pcm == expected_pcm(negated(ref1[k]), false));
     }
-    // Refused units: a sound unit whose ID is wrong (FFmpeg's error), one cut short; the frame after them decodes.
+    // Refused units: a sound unit whose ID is wrong (FFmpeg's error), one cut short; the frame after them comes out
+    // empty, as a sequence's first, and the one after that decodes.
     Feed bad;
     bad.bsi_size = 0xC;
     std::vector<u8> wrong_id = atrac3_frame(2, {100, 60});
     wrong_id[0] = 0;
-    bad.aus = {atrac3_frame(2, {100, 60}), wrong_id, std::vector<u8>(300, 0xA0), atrac3_frame(2, {100, 60})};
+    bad.aus = {atrac3_frame(2, {100, 60}), wrong_id, std::vector<u8>(300, 0xA0), atrac3_frame(2, {100, 60}),
+        atrac3_frame(2, {100, 60})};
     const CoreRun refused = run_core(f.base(), hle_calls(f, t), kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), bad);
     INFO(all(refused));
-    REQUIRE(refused.outs.size() == 4);
-    CHECK(flow_ok(refused, 4, {{1, 0x80612180}, {2, 0x80612180}}));
-    CHECK(refused.outs[3].size == 1024 * 2 * 4);
+    REQUIRE(refused.outs.size() == 5);
+    CHECK(flow_ok(refused, 5, {{1, 0x80612180}, {2, 0x80612180}}));
+    CHECK(refused.outs[3].size == 0);
+    CHECK(refused.outs[4].size == 1024 * 2 * 4);
     // StartSeq's checks: three channels, joint stereo of one, a frame size FFmpeg has not, a word size; joint stereo of
     // two is taken.
     for (const auto& p : {atrac3_param(3, 0, 576, 0x84), atrac3_param(1, 1, 192, 0x84), atrac3_param(2, 0, 400, 0x84),
@@ -1901,7 +1938,9 @@ TEST_CASE("cellAdec: the cores' own PTS functions (D-591)", "[hle][adec]")
 // and on Sony's core module linked for it as the loader links it for a game, D-197). The answers, memory size,
 // version, callbacks, items, information blocks are compared exactly (the PCM handles and AU addresses as offsets: the
 // cores' memory is their own); the PCM by its largest difference and its signal to difference ratio, per codec.
-// PSPOCKET_TEST_DEV_FLASH (the gate sets it on the Mac) or the test passes without comparing. No game data.
+// PSPOCKET_TEST_DEV_FLASH (the gate sets it on the Mac) or the test passes without comparing. No game data. For a
+// look: PSPOCKET_TEST_DUMP=1 prints the first items' information blocks whole and some PCM, PSPOCKET_TEST_SHIFT=1 each
+// item's PCM against pspocket's one before, PSPOCKET_TEST_LAG=<channels> the lag that best lines the two up.
 TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][adec][firmware][.compare-adec]")
 {
 #if !PSPOCKET_HAVE_FFMPEG
@@ -1914,7 +1953,7 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
     }
     InterpretMisses interpret;
     struct Case {
-        const char* name;
+        std::string name;
         u32 type;
         std::vector<u8> param;
         Feed feed;
@@ -2004,6 +2043,32 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
         for (u32 k = 0; k < 5; k++) feed.aus.push_back(layer1_tone(2, {4, 9}));
         feed.missing = {0, 3};
         cases.push_back({"MPEG layer I", kTypeMpegL1, mpmc_param(0), feed, true});
+        for (const u32 n : {1u, 2u, 3u, 4u, 9u})
+            cases.push_back({std::format("MPEG layer I, channelNumber {}", n), kTypeMpegL1, mpmc_param(n), feed, true});
+        Feed mono = feed;
+        mono.aus.assign(5, layer1_tone(1, {4, 9}));
+        cases.push_back({"MPEG layer I, mono", kTypeMpegL1, mpmc_param(0), mono, true});
+        cases.push_back({"MPEG layer I, mono, channelNumber 2", kTypeMpegL1, mpmc_param(2), mono, true});
+        // Each refused header between good frames: no sync, layer II, bit rate 15, the reserved rate, the reserved
+        // version, MPEG-2.5, free format, emphasis 2; then a unit shorter than its frame.
+        Feed errors = feed;
+        errors.missing = {};
+        errors.aus.clear();
+        const std::vector<u8> good = layer1_tone(2, {4, 9});
+        for (const auto& [at, v] : {std::pair<u32, u8>{0, 0x00}, {1, 0xFD}, {2, 0xF4}, {2, 0xCC}, {1, 0xEF}, {1, 0xE7},
+                 {2, 0x04}, {3, 0x02}}) {
+            std::vector<u8> au = good;
+            au[at] = v;
+            errors.aus.push_back(good);
+            errors.aus.push_back(au);
+        }
+        errors.aus.push_back(good);
+        errors.aus.push_back(std::vector<u8>(good.begin(), good.begin() + 100));
+        errors.aus.push_back(good);
+        cases.push_back({"MPEG layer I, errors", kTypeMpegL1, mpmc_param(0), errors, true});
+        Feed loud = feed;
+        loud.aus.assign(4, layer1_tone(2, {4, 9}, 0)); // scale factor 2.0: the tone at 1.8
+        cases.push_back({"MPEG layer I, loud", kTypeMpegL1, mpmc_param(0), loud, true});
     }
     {
         Feed feed;
@@ -2012,6 +2077,30 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
         for (u32 k = 0; k < 4; k++) feed.aus.push_back(atrac3_frame(2, {100, 60}));
         feed.missing = {2};
         cases.push_back({"ATRAC3", kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), feed, true});
+        Feed varied = feed;
+        varied.aus.clear();
+        for (u32 k = 0; k < 5; k++) varied.aus.push_back(atrac3_frame(2, {100 + 37 * k, 60 + 11 * k}));
+        cases.push_back({"ATRAC3, frames that differ", kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), varied, true});
+        Feed mono = feed;
+        mono.aus.assign(4, atrac3_frame(1, {100, 0}));
+        cases.push_back({"ATRAC3, mono", kTypeAtrac3, atrac3_param(1, 0, 192, 0x84), mono, true});
+        Feed small = feed;
+        small.aus.assign(4, atrac3_frame(2, {100, 60}, 96));
+        cases.push_back({"ATRAC3, 96 bytes a channel, 16-bit", kTypeAtrac3, atrac3_param(2, 0, 192, 2), small, false});
+        Feed loud = feed;
+        loud.aus.assign(4, atrac3_frame(2, {100, 60}, 192, 62));
+        cases.push_back({"ATRAC3, loud", kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), loud, true});
+        cases.push_back({"ATRAC3, loud, 16-bit", kTypeAtrac3, atrac3_param(2, 0, 384, 2), loud, false});
+        Feed errors = feed;
+        errors.missing = {};
+        std::vector<u8> wrong_id = atrac3_frame(2, {100, 60});
+        wrong_id[0] = 0;
+        errors.aus = {atrac3_frame(2, {100, 60}), atrac3_frame(2, {110, 70}), wrong_id, atrac3_frame(2, {120, 80}),
+            std::vector<u8>(300, 0xA0), atrac3_frame(2, {130, 90}), atrac3_frame(2, {140, 100})};
+        cases.push_back({"ATRAC3, errors", kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), errors, true});
+        Feed first = errors;
+        first.aus = {wrong_id, atrac3_frame(2, {110, 70}), atrac3_frame(2, {120, 80})};
+        cases.push_back({"ATRAC3, an error first", kTypeAtrac3, atrac3_param(2, 0, 384, 0x84), first, true});
     }
     const std::vector<s16> input = sines(48000, 24000, {1000, 2500}, {0.5, 0.3});
     if (avcodec_find_encoder_by_name("mp2")) {
@@ -2022,28 +2111,142 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
         feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 6);
         feed.missing = {2};
         cases.push_back({"MPEG layer II", kTypeMpegL2, mpmc_param(0), feed, true});
+        std::vector<s16> left;
+        for (usize k = 0; k < input.size(); k += 2) left.push_back(input[k]);
+        const Encoded mono = ffmpeg_encode("mp2", 48000, 1, 192000, left);
+        REQUIRE(mono.packets.size() >= 6);
+        feed.aus.assign(mono.packets.begin(), mono.packets.begin() + 6);
+        cases.push_back({"MPEG layer II, mono", kTypeMpegL2, mpmc_param(0), feed, true});
+        for (const u32 n : {1u, 3u})
+            cases.push_back({std::format("MPEG layer II, channelNumber {}", n), kTypeMpegL2, mpmc_param(n), feed, true});
+        // The same refusals as layer I's (a layer I header the other layer).
+        Feed errors = feed;
+        errors.missing = {};
+        errors.aus.clear();
+        const std::vector<u8> good = enc.packets[3];
+        for (const auto& [at, v] : {std::pair<u32, u8>{0, 0x00}, {1, 0xFF}, {2, static_cast<u8>(good[2] | 0xF0)},
+                 {2, static_cast<u8>(good[2] | 0x0C)}, {1, static_cast<u8>((good[1] & ~0x10) | 0x08)},
+                 {1, static_cast<u8>(good[1] & ~0x18)}, {2, static_cast<u8>(good[2] & 0x0F)}, {3, static_cast<u8>((good[3] & ~3) | 2)}}) {
+            std::vector<u8> au = good;
+            au[at] = v;
+            errors.aus.push_back(good);
+            errors.aus.push_back(au);
+        }
+        errors.aus.push_back(good);
+        errors.aus.push_back(std::vector<u8>(good.begin(), good.begin() + 100));
+        errors.aus.push_back(good);
+        cases.push_back({"MPEG layer II, errors", kTypeMpegL2, mpmc_param(0), errors, true});
     }
     if (avcodec_find_encoder_by_name("aac")) {
-        const Encoded enc = aac_encode(input, 2, 48000, 128000);
-        REQUIRE(enc.packets.size() >= 6);
+        // FFmpeg's encoder without perceptual noise substitution: PNS's noise is each decoder's own (its random
+        // numbers), so no two decoders give the same samples for it.
+        const Encoded plain = ffmpeg_encode("aac", 48000, 2, 128000, input, [](AVCodecContext* av) {
+            av_opt_set(av->priv_data, "aac_pns", "0", 0);
+            av_opt_set(av->priv_data, "aac_is", "0", 0);
+        });
+        REQUIRE(plain.packets.size() >= 6);
         Feed feed;
         feed.bsi_size = 0x80;
         feed.step = 1920;
-        for (u32 k = 0; k < 6; k++) feed.aus.push_back(adts(enc.extradata, enc.packets[k]));
+        for (u32 k = 0; k < 6; k++) feed.aus.push_back(adts(plain.extradata, plain.packets[k]));
         feed.missing = {3};
         cases.push_back({"MPEG-4 AAC", kTypeM4Aac, m4aac_param(1), feed, true});
         cases.push_back({"MPEG-4 AAC 2ch", kTypeM4Aac2ch, m4aac_param(1), feed, true});
         cases.push_back({"MPEG-4 AAC 2ch mod", kTypeM4Aac2chMod, m4aac_param(1), feed, true});
+        const Encoded is = ffmpeg_encode("aac", 48000, 2, 128000, input, [](AVCodecContext* av) {
+            av_opt_set(av->priv_data, "aac_pns", "0", 0);
+        });
+        REQUIRE(is.packets.size() >= 6);
+        feed.aus.clear();
+        for (u32 k = 0; k < 6; k++) feed.aus.push_back(adts(is.extradata, is.packets[k]));
+        cases.push_back({"MPEG-4 AAC, intensity stereo, no PNS", kTypeM4Aac, m4aac_param(1), feed, true});
+        // A unit refused between good frames, each kind alone (a unit of zeros, layer 1, the rate index 13, profile 2,
+        // a unit cut to 20 bytes, raw data of noise, a frame without its sync).
+        Feed zeros = feed;
+        zeros.missing = {};
+        zeros.aus = {adts(plain.extradata, plain.packets[0]), adts(plain.extradata, plain.packets[1]),
+            std::vector<u8>(300, 0), adts(plain.extradata, plain.packets[2]), adts(plain.extradata, plain.packets[3])};
+        cases.push_back({"MPEG-4 AAC, a unit of zeros", kTypeM4Aac, m4aac_param(1), zeros, true});
+        Feed layer = zeros;
+        layer.aus[2] = adts(plain.extradata, plain.packets[2]);
+        layer.aus[2][1] = 0xF3;
+        cases.push_back({"MPEG-4 AAC, a layer error", kTypeM4Aac, m4aac_param(1), layer, true});
+        Feed rate = zeros;
+        rate.aus[2] = adts(plain.extradata, plain.packets[2]);
+        rate.aus[2][2] = static_cast<u8>((rate.aus[2][2] & 0xC3) | (13 << 2));
+        cases.push_back({"MPEG-4 AAC, a rate error", kTypeM4Aac, m4aac_param(1), rate, true});
+        Feed profile = zeros;
+        profile.aus[2] = adts(plain.extradata, plain.packets[2]);
+        profile.aus[2][2] = static_cast<u8>((profile.aus[2][2] & 0x3F) | 0x80);
+        cases.push_back({"MPEG-4 AAC, a profile error", kTypeM4Aac, m4aac_param(1), profile, true});
+        Feed cut = zeros;
+        cut.aus[2] = adts(plain.extradata, plain.packets[2]);
+        cut.aus[2].resize(20);
+        cases.push_back({"MPEG-4 AAC, a unit cut short", kTypeM4Aac, m4aac_param(1), cut, true});
+        Feed noise = zeros;
+        noise.aus[2] = adts(plain.extradata, plain.packets[2]);
+        for (usize i = 7; i < noise.aus[2].size(); i++) noise.aus[2][i] = static_cast<u8>(i * 151 + 7);
+        cases.push_back({"MPEG-4 AAC, raw data of noise", kTypeM4Aac, m4aac_param(1), noise, true});
+        Feed sync = zeros;
+        sync.aus[2] = adts(plain.extradata, plain.packets[2]);
+        sync.aus[2][0] = 0;
+        cases.push_back({"MPEG-4 AAC, a frame without its sync", kTypeM4Aac, m4aac_param(1), sync, true});
     }
     if (avcodec_find_encoder_by_name("ac3")) {
         const Encoded enc = ffmpeg_encode("ac3", 48000, 2, 192000, input);
         REQUIRE(enc.packets.size() >= 5);
         Feed feed;
-        feed.bsi_size = 0x44;
+        feed.bsi_size = 0x50;
         feed.step = 2880;
         feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 5);
         feed.missing = {2};
         cases.push_back({"AC-3", kTypeAc3, ac3_param({}), feed, true});
+        Ac3Param sixteen;
+        sixteen.word = 0;
+        cases.push_back({"AC-3, 16-bit", kTypeAc3, ac3_param(sixteen), feed, false});
+        for (const u8 k : {0, 1, 2}) {
+            Ac3Param karaoke;
+            karaoke.karaoke = k;
+            cases.push_back({std::format("AC-3, karaoke mode {}", k), kTypeAc3, ac3_param(karaoke), feed, true});
+        }
+        const auto params = [&](const char* name, auto change) {
+            Ac3Param a;
+            change(a);
+            cases.push_back({std::format("AC-3, {}", name), kTypeAc3, ac3_param(a), feed, true});
+        };
+        params("stereo out", [](Ac3Param& a) { a.mode = 2; a.channels = 2; a.lfe = 0; a.pointers = {0, 2, 1, 3, 4, 5}; });
+        params("stereo out, the pointers swapped", [](Ac3Param& a) { a.mode = 2; a.channels = 2; a.lfe = 0; a.pointers = {1, 2, 0, 3, 4, 5}; });
+        params("2/0 in six slots", [](Ac3Param& a) { a.mode = 2; a.lfe = 0; });
+        params("3/2 in two slots", [](Ac3Param& a) { a.channels = 2; });
+        params("one slot", [](Ac3Param& a) { a.channels = 1; });
+        params("no slots", [](Ac3Param& a) { a.channels = 0; });
+        params("mode 0", [](Ac3Param& a) { a.mode = 0; });
+        params("mode 1", [](Ac3Param& a) { a.mode = 1; });
+        params("mode 8", [](Ac3Param& a) { a.mode = 8; });
+        params("the same pointer twice", [](Ac3Param& a) { a.pointers = {0, 0, 1, 4, 5, 3}; });
+        params("scale 2", [](Ac3Param& a) { a.scale = 2; });
+        params("scale -1", [](Ac3Param& a) { a.scale = -1; });
+        params("no LFE out", [](Ac3Param& a) { a.lfe = 0; });
+        const Encoded e44 = ffmpeg_encode("ac3", 44100, 2, 128000, input);
+        Feed f44 = feed;
+        f44.aus.assign(e44.packets.begin(), e44.packets.begin() + 5);
+        f44.step = 3135;
+        cases.push_back({"AC-3, 44.1 kHz", kTypeAc3, ac3_param({}), f44, true});
+        std::vector<s16> mono;
+        for (usize k = 0; k < input.size(); k += 2) mono.push_back(input[k]);
+        const Encoded e32 = ffmpeg_encode("ac3", 32000, 1, 96000, mono);
+        Feed f32 = feed;
+        f32.aus.assign(e32.packets.begin(), e32.packets.begin() + 5);
+        f32.step = 4320;
+        cases.push_back({"AC-3, mono at 32 kHz", kTypeAc3, ac3_param({}), f32, true});
+        const std::vector<s16> six = sines(48000, 24000, {300, 500, 700, 900, 1100, 60}, {0.3, 0.3, 0.3, 0.3, 0.3, 0.3});
+        const Encoded e51 = ffmpeg_encode("ac3", 48000, 6, 384000, six, [](AVCodecContext* av) {
+            av_channel_layout_uninit(&av->ch_layout);
+            av_channel_layout_from_mask(&av->ch_layout, AV_CH_LAYOUT_5POINT1_BACK);
+        });
+        Feed f51 = feed;
+        f51.aus.assign(e51.packets.begin(), e51.packets.begin() + 5);
+        cases.push_back({"AC-3, 5.1", kTypeAc3, ac3_param({}), f51, true});
     }
     for (const Case& c : cases) {
         DYNAMIC_SECTION(c.name)
@@ -2092,8 +2295,42 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
                 // libmp3dec leaves a byte of its own in CellAdecMP3Info's padding (0x17) after an error.
                 if (c.type == kTypeMp3 && sony_bsi.size() >= 0x1C && be32(sony_bsi, 0x18) != 0 && x.bsi.size() >= 0x1C)
                     sony_bsi[0x17] = x.bsi[0x17];
-                same(std::format("out {} information", i), hex(x.bsi.data(), static_cast<u32>(x.bsi.size())),
-                    hex(sony_bsi.data(), static_cast<u32>(sony_bsi.size())));
+                if (std::getenv("PSPOCKET_TEST_DUMP") && i < 3) { // both blocks whole, and some PCM, for a look
+                    differ.push_back(std::format("out {} information whole: pspocket {}, Sony {}", i,
+                        hex(x.bsi.data(), static_cast<u32>(x.bsi.size())),
+                        hex(sony_bsi.data(), static_cast<u32>(sony_bsi.size()))));
+                    std::string a, b;
+                    for (usize k = 200; k < 212; k++) {
+                        if (c.floats && 4 * k + 4 <= x.pcm.size()) a += std::format(" {:.5f}", be_float(x.pcm, k));
+                        if (c.floats && 4 * k + 4 <= y.pcm.size()) b += std::format(" {:.5f}", be_float(y.pcm, k));
+                    }
+                    differ.push_back(std::format("out {} PCM from 200: pspocket{}; Sony{}", i, a, b));
+                }
+                if (std::getenv("PSPOCKET_TEST_SHIFT") && i > 0) { // pspocket's PCM a unit behind Sony's
+                    const Out& p = ours.outs[i - 1];
+                    const usize m = std::min(p.pcm.size(), y.pcm.size()) / 4;
+                    double sig = 0, err = 0;
+                    for (usize k = 0; k < m; k++) {
+                        const double a = static_cast<double>(be_float(p.pcm, k)), b = static_cast<double>(be_float(y.pcm, k));
+                        sig += b * b;
+                        err += (a - b) * (a - b);
+                    }
+                    differ.push_back(std::format("out {}: Sony's against pspocket's out {}: {:.1f} dB over {} samples", i,
+                        i - 1, err > 0 ? 10 * std::log10(sig / err) : 999.0, m));
+                }
+                if (x.bsi != sony_bsi) { // the words that differ, at their offsets
+                    std::string words;
+                    for (usize o = 0; o < std::max(x.bsi.size(), sony_bsi.size()); o += 4) {
+                        const auto word = [&](const std::vector<u8>& v) {
+                            u32 w = 0;
+                            for (usize k = 0; k < 4; k++) w = w << 8 | (o + k < v.size() ? v[o + k] : 0u);
+                            return w;
+                        };
+                        if (word(x.bsi) != word(sony_bsi))
+                            words += std::format(" +{:#x} {:08x}/{:08x}", o, word(x.bsi), word(sony_bsi));
+                    }
+                    differ.push_back(std::format("out {} information (pspocket/Sony):{}", i, words));
+                }
                 const usize n = std::min(x.pcm.size(), y.pcm.size()) / (c.floats ? 4 : 2);
                 double out_worst = 0, worst_ours = 0, worst_theirs = 0, peak_ours = 0, peak_theirs = 0;
                 usize worst_at = 0;
@@ -2123,10 +2360,47 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
                                                  "Sony {:.6g}; peaks {:.6g} and {:.6g})",
                         i, out_worst, worst_at, worst_ours, worst_theirs, peak_ours, peak_theirs));
             }
+            if (std::getenv("PSPOCKET_TEST_LAG") && c.floats) {
+                // The lag that best lines pspocket's first channel up with Sony's (both runs' items joined).
+                const auto joined_first = [](const CoreRun& r, u32 nch) {
+                    std::vector<double> v;
+                    for (const Out& o : r.outs)
+                        for (usize k = 0; 4 * (k + 1) <= o.pcm.size(); k += nch) v.push_back(static_cast<double>(be_float(o.pcm, k)));
+                    return v;
+                };
+                const u32 nch = static_cast<u32>(std::max<s64>(1, std::atoi(std::getenv("PSPOCKET_TEST_LAG"))));
+                const auto a = joined_first(ours, nch), b = joined_first(theirs, nch);
+                double best = -1e300, best_snr = 0;
+                long best_lag = 0;
+                for (long lag = -3000; lag <= 3000; lag++) {
+                    double dot = 0, sig = 0, err = 0;
+                    usize n = 0;
+                    for (usize k = 0; k < b.size(); k++) {
+                        const long j = static_cast<long>(k) - lag;
+                        if (j < 0 || static_cast<usize>(j) >= a.size()) continue;
+                        dot += a[static_cast<usize>(j)] * b[k];
+                        sig += b[k] * b[k];
+                        err += (a[static_cast<usize>(j)] - b[k]) * (a[static_cast<usize>(j)] - b[k]);
+                        n++;
+                    }
+                    if (n > 1000 && dot > best) {
+                        best = dot;
+                        best_lag = lag;
+                        best_snr = err > 0 ? 10 * std::log10(sig / err) : 999.0;
+                    }
+                }
+                differ.push_back(std::format("Sony's first channel is pspocket's {} samples later: {:.1f} dB there",
+                    best_lag, best_snr));
+            }
             const double snr = noise > 0 ? 10.0 * std::log10(signal / noise) : 999.0;
+            double peak = 0;
+            for (const Out& o : theirs.outs)
+                for (usize k = 0; (c.floats ? 4 : 2) * (k + 1) <= o.pcm.size(); k++)
+                    peak = std::max(peak, std::abs(c.floats ? static_cast<double>(be_float(o.pcm, k)) :
+                                                              static_cast<s16>(o.pcm[2 * k] << 8 | o.pcm[2 * k + 1]) / 32768.0));
             std::string report = std::format("{}: {} differences besides the PCM; PCM largest difference {:.3g} ({:.1f} "
-                                             "16-bit steps), signal to difference {:.1f} dB",
-                c.name, differ.size(), worst, worst * 32768.0, snr);
+                                             "16-bit steps), signal to difference {:.1f} dB, Sony's peak {:.4g}",
+                c.name, differ.size(), worst, worst * 32768.0, snr, peak);
             for (usize i = 0; i < differ.size() && i < 30; i++) report += "\n  " + differ[i];
             WARN(report);
             CHECK(differ.empty());

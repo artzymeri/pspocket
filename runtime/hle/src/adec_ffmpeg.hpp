@@ -46,7 +46,7 @@ constexpr u32 cmd_front = 0x100, cmd_back = 0x104, cmd_size = 0x108, queue_mutex
               output_mutex = 0x114, output_consumed = 0x118, output_locked = 0x11C, run_thread_mutex = 0x120,
               run_thread = 0x124, notify = 0x128, thread_id = 0x148, tls = 0x150, type = 0x154, output = 0x158,
               pcm_size = 0x15C, prev_pts = 0x160, prev_duration = 0x168, duration = 0x16C, param = 0x170,
-              notify_guest = 0x1A0, size = 0x200;
+              notify_guest = 0x1A0, copy_size = 0x1A4, size = 0x200;
 } // namespace fx
 
 // What a codec made of one access unit.
@@ -55,6 +55,9 @@ struct Decoded {
     s32 error = 0;    // CELL_OK, or the codec's error: notified first, then given with the PCM (none, or what came)
     s8 pts_type = -1; // the correctPtsValueType the front end gets (adec.hpp)
     u32 duration = 0; // the frame's length in 90 kHz ticks, for the cores' own PTS correction (AdecCore::correct_pts)
+    // The bytes cellAdecGetPcm copies out (realign): `size`, unless the codec copies fewer (libmpl1dec's refused units:
+    // an item of 1152 samples, 384 of them copied, D-944).
+    u32 copied = ~0u;
 };
 
 // One codec's decoding, on the decoder's thread: a sequence's start, then its access units.
