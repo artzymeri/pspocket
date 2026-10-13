@@ -566,7 +566,7 @@ TEST_CASE("fuzz: the audio cores' frame parsing in front of FFmpeg over damaged 
     std::vector<std::vector<u8>> l2 = {mpeg_silence(0xFFFD8404, 384)};
     for (auto& p : encoded("mp2", 48000, 2, 192000)) l2.push_back(std::move(p));
     l2.resize(std::min<usize>(l2.size(), 3));
-    targets.push_back({6, "adec mpeg layer 2", be_words({3, 0, 0}), l2});
+    targets.push_back({6, "adec mpeg layer 2", be_words({0, 0, 0}), l2}); // channelNumber 0: the stream's (D-944)
     // AAC LC from FFmpeg's encoder: ADTS frames, and its raw blocks (configuration 2: rate index 3, LC).
     std::vector<std::vector<u8>> aac = encoded("aac", 48000, 2, 128000);
     if (aac.size() > 3) {
