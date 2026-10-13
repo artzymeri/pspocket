@@ -1,11 +1,42 @@
 # Where pspocket stands
 
-2026-10-07, after runs 192-207 and D-226 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac). **A new
-session: read `docs/handoff.md` first** (what was in flight, the user's rules, commands), then this file, `CLAUDE.md`,
+2026-10-07, after runs 192-207 and D-226 (route B: D-147; its stages 1 to 5 done, stage 6 reached on the Mac; "Now"
+below is 2026-10-13). **A new session: read `docs/handoff.md` first** (what was in flight, the user's rules,
+commands), then this file, `CLAUDE.md`,
 `docs/decisions.md` (D-076 onwards matter most now; D-147 sets the current goal) and the latest `docs/runs/` entries.
 Keep this file current when the picture changes. Where each part can improve, with the numbers behind it, is
 `docs/improve.md`; how each game stands against the "Flawless" bar is `docs/compatibility.md` (both updated after every
 run).
+
+## Now (2026-10-13)
+
+- **System libraries: 6,537 of 6,625 pspocket's own** (README chart). The rest is with three agents working in clones
+  (inventory/agents/c, d, e; the main session merges, gates and pushes): the CELP codecs (D-932: cellCelpEnc and
+  cellCelpDec done, cellCelp8Enc/Dec next), libavcdec and libmvcdec (D-933), and the video cores libsmvd2, libsvc1d and
+  libsjvtd (D-920). The main session's last one is sys_lv2coredump_D725F320 (liblv2coredump's crash-dump writer),
+  which stood on lv2's debug calls (below). fs_utility_init is done (D-935).
+- **Kernel: 601 of 634 after D-936.** The retail kernel itself is now read: lv2_kernel.self from the official 4.93
+  update, decrypted with RPCS3's keys (inventory/firmware/tools/kernel_unself.py; the kernel, its flat image and Ghidra
+  output in inventory/firmware/kernel493, never committed). Its syscall table (0x8000000000363BE0) says which calls a
+  retail console has: the 41 of the chart's 74 it lacks answer CELL_ENOSYS (D-936). The 33 left have retail handlers
+  (353, 356, 361, sys_dbg's 900, 902, 903, 906, 909-911, 914, 933, 935, 937, 941, 943-945, 947, 951, 957, 971, 975,
+  the crypto engine's 976-984, 985). What the kernel shows about them (inventory/firmware/kernel493/ghidra/decomp.c):
+  - A process has an authority ID and two 256-bit vectors: its SELF's capability flags (in the encrypted metadata's
+    optional header 1; GTA V: ...0000003b 00000001 00040000) and its control flags (supplemental header 1; GTA V: 0).
+    Checks either want bits of the first or compare the second as a number (system modules have 0x4000..., the kernel
+    0x8000...). sys_dbg_get_console_type (985) wants the second at 0x4000... at least: a game gets CELL_ENOSYS.
+  - sys_dbg's object calls go through one access check (0x8008CB4C): on a retail console a process may inspect only
+    itself (any other process: 0x80010409), whatever its flags. So a game can list and read its own threads, objects,
+    registers and SPU contexts (liblv2coredump's crash reports): 900, 902, 903, 906, 909-911, 914, 933, 935, 937, 941,
+    943-945, 947, 951, 957, 971, 975 are real for a game, each a kernel structure copied out (layouts in the code).
+  - The crypto engine (976-984): objects any process may create; HMAC-SHA1 and ciphers keyed by the system's keys,
+    loaded at boot from a validated blob outside the kernel image (not reproducible); hash index 1 is open to games,
+    the rest want system-level control flags.
+  Next: port those, sys_dbg first (liblv2coredump's crash-dump writer, the libraries' last function, stands on them).
+  The same table can check every call pspocket answers against retail (988, which GTA V's C runtime calls, has a
+  retail handler: arguments checked, then CELL_OK for a game).
+- The script comparison harness (tests/hle/sysutil_sub_compare.hpp) now compares the TTY's text too (a script asks)
+  and the file system calls' paths by their text; PSPOCKET_TEST_DUMP=2 prints both runs.
 
 ## The project
 

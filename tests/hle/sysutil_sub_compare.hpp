@@ -7,7 +7,8 @@
 // documents, FixedMemory, the packets) go to pspocket's own libsysutil, which D-534 compared with Sony's, so both runs
 // share one libsysutil and its channels. After every call the answer, the script's memory, libsysutil's globals and
 // FixedMemory, the channels' shared memory, the lv2 calls the script's thread made (with their arguments; addresses on
-// either run's stack as "stack") and the requests the system side read must be the same.
+// either run's stack as "stack", paths and names by their text) and the requests the system side read must be the
+// same; a script may ask for the TTY's text (what the functions print) to be the same too.
 //
 // The system side: pspocket's console has none (its channels are closed, D-534), and both runs first get that. A
 // script may then open a channel: the test lays out its ring as the system software does and answers the requests on
@@ -40,6 +41,7 @@
 #include <vector>
 
 #include "firmware_compare.hpp"
+#include "pspocket/core/log.hpp"
 #include "pspocket/recomp/nid.hpp"
 #include "sysutil.hpp"
 #include "sysutil_cxml.hpp" // runtime/hle/src
@@ -198,12 +200,29 @@ struct Trace {
     std::mutex m;
     std::thread::id script;
     u8* base = nullptr;
+    const GuestMemory* mem = nullptr;
     SystemSide* system = nullptr;
     std::vector<std::string> calls;
     // Memory each run has at its own address, named alike in the lv2 calls' arguments (a module's data: Sony's in its
     // image, pspocket's in a block of its own laid out the same). Set before the calls that use it.
     std::vector<std::tuple<u32, u32, std::string>> regions;
+    // The TTY's lines since the last step (sys_tty_write logs them on the "tty" channel; liblv2's printf writes there).
+    std::vector<std::string> tty;
 };
+
+// The log's sink while a script runs: the TTY's lines kept for the step, every line on stderr as the default sink
+// writes it. It runs under the log's lock: it must not log.
+inline void tty_sink(void* user, log::Level level, std::string_view channel, std::string_view message)
+{
+    if (channel == "tty") {
+        auto& tr = *static_cast<Trace*>(user);
+        std::lock_guard lock(tr.m);
+        tr.tty.emplace_back(message);
+    }
+    const std::string_view l = log::level_name(level);
+    std::fprintf(stderr, "[%.*s] %.*s: %.*s\n", static_cast<int>(l.size()), l.data(), static_cast<int>(channel.size()),
+        channel.data(), static_cast<int>(message.size()), message.data());
+}
 
 void observe(void* user, u32 n, const u64* a);
 
@@ -372,23 +391,39 @@ inline u32 lv2_args(u32 n)
 {
     switch (n) {
     case 41: case 96: case 98: case 99: case 101: case 103: case 104: case 106: case 108: case 109: case 135: case 137:
-    case 141: case 329: case 331: case 342: case 349: case 804: case 807: case 813: case 814: case 30:
+    case 141: case 329: case 331: case 342: case 349: case 601: case 804: case 807: case 813: case 814: case 30:
         return 1;
     case 44: case 97: case 100: case 102: case 107: case 110: case 129: case 136: case 324: case 335: case 341: case 343:
-    case 805: case 808: case 809: case 811: case 812:
+    case 609: case 805: case 808: case 809: case 811: case 812:
         return 2;
-    case 105: case 130: case 134: case 348: case 806:
+    case 105: case 130: case 134: case 348: case 806: case 838:
         return 3;
-    case 128: case 138: case 330: case 332: case 337: case 350: case 403: case 802: case 803: case 818:
+    case 128: case 138: case 330: case 332: case 337: case 350: case 403: case 600: case 802: case 803: case 818:
         return 4;
     case 95: case 362:
         return 5;
     case 801:
         return 6;
-    case 328:
+    case 328: case 616:
         return 7;
     default:
         return 8;
+    }
+}
+
+// The arguments of an lv2 call that are paths or names (bit i: argument i): compared by their text, wherever each run
+// keeps it.
+inline u32 lv2_string_args(u32 n)
+{
+    switch (n) {
+    case 801: case 805: case 808: case 811: case 813: case 814: case 838:
+        return 1;
+    case 810: case 812:
+        return 3;
+    case 837: // sys_fs_mount(device, file system, path, ...)
+        return 7;
+    default:
+        return 0;
     }
 }
 
@@ -402,8 +437,23 @@ inline void observe(void* user, u32 n, const u64* a)
             if (v >= at && v < u64{at} + size) return std::format("{}+{:#x}", name, v - at);
         return std::format("{:#x}", v);
     };
+    const auto text = [&tr](u64 v) -> std::optional<std::string> {
+        if (v == 0 || v >= 0xFFFFF000 || !tr.mem) return std::nullopt;
+        std::string out;
+        for (u32 i = 0; i < 0x400; i++) {
+            const u32 at = static_cast<u32>(v) + i;
+            if ((i == 0 || at % 0x1000 == 0) && !tr.mem->is_committed(at)) return std::nullopt;
+            const char c = static_cast<char>(tr.base[at]);
+            if (c == 0) return std::format("\"{}\"", out);
+            out += c;
+        }
+        return std::nullopt;
+    };
     std::string s = std::format("sc {}(", n);
-    for (u32 i = 0; i < lv2_args(n); i++) s += std::format("{}{}", i ? ", " : "", arg(a[i]));
+    for (u32 i = 0; i < lv2_args(n); i++) {
+        std::optional<std::string> t = (lv2_string_args(n) >> i & 1) ? text(a[i]) : std::nullopt;
+        s += std::format("{}{}", i ? ", " : "", t ? *t : arg(a[i]));
+    }
     s += ")";
     if (n == 403) s += std::format(" \"{}\"", std::string(reinterpret_cast<const char*>(tr.base + static_cast<u32>(a[1])), static_cast<u32>(a[2])));
     {
@@ -422,6 +472,8 @@ struct Step {
     std::vector<u8> sysutil; // libsysutil's globals and FixedMemory
     u64 shm = 0;
     std::vector<std::string> lv2, requests;
+    std::vector<std::string> tty; // compared when the script asked for it (Script::compare_tty)
+    bool tty_compared = false;
 };
 
 inline constexpr u32 kSmall = 0x4000;   // [kData, kData + kSmall): byte for byte
@@ -442,17 +494,23 @@ public:
         lib_.emplace(f_, t_, flash, libraries_.front(), start);
         std::memset(b_ + kData, 0, kRegion);
         tr_.base = b_;
+        tr_.mem = &f_.mem;
         tr_.script = std::this_thread::get_id();
         system_.emplace(f_, globals_);
         tr_.system = &*system_;
         f_.kernel->set_syscall_observer(&observe, &tr_);
+        log::set_sink(&tty_sink, &tr_);
         step("start");
     }
     ~Script()
     {
         f_.kernel->set_syscall_observer(nullptr, nullptr);
+        log::set_sink(nullptr, nullptr);
         system_.reset();
     }
+
+    // From the next step on, the TTY's text (what the functions print) is compared too.
+    void compare_tty() { tty_ = true; }
 
     bool sony() const { return sony_; }
     u8* base() const { return b_; }
@@ -527,7 +585,10 @@ public:
             std::lock_guard lock(tr_.m);
             s.lv2 = std::move(tr_.calls);
             tr_.calls.clear();
+            s.tty = std::move(tr_.tty);
+            tr_.tty.clear();
         }
+        s.tty_compared = tty_;
         s.requests = system_->take_requests();
         steps_.push_back(std::move(s));
     }
@@ -574,6 +635,7 @@ private:
     u32 globals_ = 0;
     Trace tr_;
     std::vector<Step> steps_;
+    bool tty_ = false;
 };
 
 using Body = std::function<void(Script&)>;
@@ -617,6 +679,16 @@ inline void compare(const std::vector<Step>& mine, const std::vector<Step>& sony
             why += std::format(" requests: pspocket {} | Sony {};", o.requests.empty() ? "(none)" : o.requests.front(),
                 s.requests.empty() ? "(none)" : s.requests.front());
         }
+        if ((o.tty_compared || s.tty_compared) && o.tty != s.tty) {
+            const usize m = std::max(o.tty.size(), s.tty.size());
+            for (usize k = 0; k < m; k++) {
+                const std::string a = k < o.tty.size() ? o.tty[k] : "(none)", c = k < s.tty.size() ? s.tty[k] : "(none)";
+                if (a != c) {
+                    why += std::format(" TTY line {}: pspocket \"{}\" | Sony \"{}\";", k, a, c);
+                    break;
+                }
+            }
+        }
         if (o.lv2 != s.lv2) {
             const usize m = std::max(o.lv2.size(), s.lv2.size());
             for (usize k = 0; k < m; k++) {
@@ -652,6 +724,7 @@ inline void compare_script(const char* what, std::vector<std::string> libraries,
         for (const Step& st : sony) {
             std::fprintf(stderr, "%s\n", st.call.c_str());
             for (const std::string& c : st.lv2) std::fprintf(stderr, "    %s\n", c.c_str());
+            for (const std::string& c : st.tty) std::fprintf(stderr, "    tty %s\n", c.c_str());
             for (const std::string& r : st.requests) std::fprintf(stderr, "    request %s\n", r.substr(0, 160).c_str());
         }
     }
@@ -659,6 +732,13 @@ inline void compare_script(const char* what, std::vector<std::string> libraries,
         Script s(*flash, false, libraries, start);
         body(s);
         mine = std::move(s.steps());
+    }
+    if (const char* d = std::getenv("PSPOCKET_TEST_DUMP"); d && std::string_view(d) == "2") { // pspocket's run too
+        for (const Step& st : mine) {
+            std::fprintf(stderr, "mine %s\n", st.call.c_str());
+            for (const std::string& c : st.lv2) std::fprintf(stderr, "    %s\n", c.c_str());
+            for (const std::string& c : st.tty) std::fprintf(stderr, "    tty %s\n", c.c_str());
+        }
     }
     for (const Step& s : sony) requests += s.requests.size();
     INFO(std::format("{}: {} calls, {} lv2 calls, {} requests answered", what, sony.size(), lv2_calls(sony), requests));

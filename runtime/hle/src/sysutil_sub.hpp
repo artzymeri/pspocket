@@ -143,6 +143,7 @@ struct PrintArg {
     PrintArg(s32 v) : value(static_cast<u64>(static_cast<s64>(v))) {}
     PrintArg(const char* s) : text(s), is_text(true) {}
     PrintArg(std::string_view s) : text(s), is_text(true) {}
+    PrintArg(const std::string& s) : text(s), is_text(true) {} // a temporary lives to the end of the call
 };
 
 // liblv2's printf (vprintf) of `fmt` with `args` (at most seven).

@@ -540,6 +540,8 @@ Kernel::Impl::Impl(Kernel& k)
     register_device_syscalls(table);
     register_service_syscalls(table);
     register_misc_syscalls(table);
+    register_dbg_syscalls(table);
+    register_crypto_engine_syscalls(table);
     register_prx_syscalls(table);
     register_rsxaudio_syscalls(table);
     register_raw_spu_syscalls(table);

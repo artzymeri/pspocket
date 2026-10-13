@@ -154,6 +154,13 @@ add_library(pspocket_hle STATIC
     src/libmixer.cpp
     src/codec_cores.cpp
     src/cellCelpEnc.cpp
+    src/adec_celp.cpp
+    src/celp_math.cpp
+    src/celp_mpe.cpp
+    src/celp_rpe.cpp
+    src/celp_rpe_enc.cpp
+    src/celp_tables.cpp
+    src/celp_tables_nb.cpp
     src/cellRudp.cpp
     src/cellNetAoi.cpp
     src/libad.cpp
@@ -168,6 +175,7 @@ add_library(pspocket_hle STATIC
     src/cellGamePs1Emu.cpp
     src/cellDtcpIpUtility.cpp
     src/sys_fs.cpp
+    src/fs_utility_init.cpp
     src/sys_io.cpp
     src/sys_net.cpp
     src/sysutil_misc.cpp

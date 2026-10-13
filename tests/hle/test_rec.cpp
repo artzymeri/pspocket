@@ -1,5 +1,5 @@
-// cellRec, cellSubDisplay and libfs_utility_init's partition count (synthetic: no game data): RPCS3's checks and
-// answers; a recording cannot start (no video encoder), the sub display has no device registered (D-189).
+// cellRec and cellSubDisplay (synthetic: no game data): RPCS3's checks and answers; a recording cannot start (no video
+// encoder), the sub display has no device registered (D-189). libfs_utility_init: test_fs_utility_init.cpp (D-935).
 
 #include <catch_amalgamated.hpp>
 
@@ -293,15 +293,4 @@ TEST_CASE("cellSubDisplay: no device registered; parameters and memory as RPCS3 
     CHECK(ps_read32(base, kNum) == 6);
     for (u32 i = 0; i < 36; i++) CHECK(base[kInfo + i] == 0);
     CHECK(base[kInfo + 36] == 0xAA);
-}
-
-TEST_CASE("fs_utility_init_6B5896B0: two partitions, as RPCS3", "[hle][rec]")
-{
-    Fixture f;
-    GuestThread a(f, 0, "a");
-    u8* base = f.base();
-    ps_write64(base, kData, 0);
-    REQUIRE(a.call("fs_utility_init_6B5896B0", kData) == 0);
-    CHECK(ps_read64(base, kData) == 2);
-    CHECK(a.call("fs_utility_init_6B5896B0", 0) == rec_code(0x8001000D)); // CELL_EFAULT
 }

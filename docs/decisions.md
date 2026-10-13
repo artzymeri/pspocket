@@ -13878,3 +13878,273 @@ in forked children of the test process; they inherit the directory and its remov
 it while the other half (or the parent) still used it: the gate after merging the agents' cellSail and cellSailRec
 parts aborted cellPngEnc's comparison (SIGABRT in its file output, std::filesystem throwing on the missing directory).
 tests/own_temp_dir.cpp now records the process that made the directory and removes it only from that process.
+Withdrawn by D-934: no test forks (a comparison's halves run one after the other in the test's own process), and the
+abort was a guest race in the comparison itself; tests/own_temp_dir.cpp is D-924's again.
+
+## D-934 · 2026-10-12 · cellPngEnc's comparison reopens an encoder only once its thread sleeps
+
+The gate aborted cellPngEnc's comparison one run in a few (also one in three alone), with
+`[fatal] sysPrxForUser: sys_lwmutex_lock(0x015002f8): owner 0xfffffffe, expected reserved` (or 0xfffffffc) in the 16:07,
+19:02 and 19:23 gates of 2026-10-12; D-931 put it down to the temporary directory, which was wrong (no filesystem error
+in those logs, and nothing forks). 0x015002f8 is the lwmutex of the encoder in work memory slot 5, which only the
+comparison's last step uses: an encoder opened again over its own work memory. Sony's Open builds the new encoder over
+the first without looking at it, while the first one's thread still runs, and its sys_lwmutex_create writes the new
+lwmutex where the thread's is: owner free, waiter count 0. When that thread is still in the middle of a
+sys_lwmutex_lock (just back from the first Open's handshake, before it sleeps on its lwcond for work), the waiter it
+counted on the old lwmutex is taken off the new one: the count was 0, so the 64-bit decrement borrows from the owner
+word, free (0xffffffff) becoming 0xfffffffe or reserved (0xfffffffd) 0xfffffffc, and the lock that the kernel granted
+finds no reserved owner. pspocket's lwmutex is right (its counts balance on every path, as RPCS3's, whose lock throws
+on the same owner); the step is a race in the guest, the comparison's own doing, and only Sony's half has the thread.
+- The step now waits (two seconds at most, then fails) until Sony's first encoder's thread (its ID at the handle's
+  +0x10) sleeps on the encoder's lwcond. Asleep there, nothing wakes it again: the second Open makes a new lwcond and
+  every later signal goes to that one; the thread ends with the process.
+- tests/own_temp_dir.cpp is D-924's again (D-931's check of the creating process answered a fork that does not happen).
+
+## D-935 · 2026-10-12 · fs_utility_init from libfs_utility_init: the disk's identity, its partitions, fsck and growfs
+
+The system menu's disk utilities (libfs_utility_init.sprx in /dev_flash/sys/internal), RPCS3's placeholders until now
+(and its "2 partitions" for 6B5896B0, D-189), are pspocket's own (runtime/hle/src/fs_utility_init.cpp), read from the
+module (decompiled into inventory/, with FreeBSD 7.2's fsck_ffs and growfs, which Sony built for lv2, in
+external/freebsd-7.2) and compared with it call for call. A game has no use for them; each does what the module does
+on pspocket's lv2 in a game's process:
+- **665DF255 / E7563CE6**: the disk's serial number and model from an ATA IDENTIFY DEVICE through sys_storage, whose
+  open is a root process's call: a game gets CELL_ENOSYS and its buffer untouched (null: CELL_EFAULT).
+- **6B5896B0**: the partitions from the module's disk object, whose information (sys_storage_get_device_info, also a
+  root process's) is asked for three times: none, so 0 partitions and CELL_ENODEV, where RPCS3 answered 2.
+- **4E949DA4**: the raw device's mount at /dev_simple_hdd0 is refused (CELL_EPERM), the mount point unmounted all the
+  same, the mount's error the answer.
+- **fsck (A9B04535, 263172B8, 1F3CD9F1)**: Sony's own getopt (an index that each run starts again; an unknown option
+  ends the options; -b, -c and -m go through a strtol stub that prints "my_strtol: to avoid link error for prx" and
+  answers 0), exit() as the answer (exit(0) and exit(1) told apart by the module's flag), the heaps (liblv2's: 2 MB
+  with -F and 32 MB without from lv2, or in the caller's memory, which must be that large: "wrong size" and
+  CELL_ENOMEM), 1F3CD9F1's callback and notification ID with their messages, and the disk through a mount of its raw
+  device for hdd0, /dev_hdd0 and CELL_FS_UTILITY:HDD0 (refused: each stat and open is one refused mount). Then
+  getmntpt, blockcheck (/dev_ before a name without a '/'), the superblock's pre-read, -F's answer 3, setup's "Can't
+  stat", -B's "dummy_entry(setitimer)" and NOT MOUNTED, preening's pfatal with ckfini (whose close of descriptor -1
+  tries to unmount /dev_hdd0), 8 at the end; every message through liblv2's printf, as the module prints it.
+- **growfs (F691D443)**: the raw device's mount at /dev_hdd0 is refused: "Error Status: 1", "Mount failed 0x…", a blank
+  line, CELL_EIO.
+Not ported, logged loudly where reached: checking or growing a file system (the disk is never a game's, and pspocket's
+lv2 runs no root process), a root process's continuations (the disk's sector size and partition table), and fsck of a
+file or directory that exists, which the module reads block by block as a disk (1,040 lseeks for six paths in the
+probe) to answer 8 nearly always: here it logs and exits 8 at the first stat or open that succeeds. The module reads
+an end pointer its strtol stub never sets (it faults under the comparison with -b, -c or -m): here the 0 is taken.
+The module keeps its state in globals and takes no lock; pspocket's calls run one at a time.
+Compared (tests/hle/test_fs_utility_init.cpp, the comparison in the gate with the firmware): 44 calls and 112 lv2 calls
+in a game's process, the TTY's text included: 0 differ. sysutil_sub_compare.hpp now records each step's TTY lines (a
+script asks for them to be compared), compares the path arguments of the file system's calls by their text, knows the
+storage and mount calls' arguments, and PSPOCKET_TEST_DUMP=2 prints pspocket's run beside Sony's.
+
+## D-932 · 2026-10-12 · The CELP libraries pspocket's own (part 1: cellCelpEnc, the 16 kHz encoder)
+
+libcelpenc (cellCelpEnc, ten functions) is MPEG-4 CELP's wideband coder (ISO/IEC 14496-3 subpart 3: 16 kHz, regular
+pulse excitation, configurations 0 to 3 at 14400, 16000, 18667 and 22533 bit/s): a PPU library driving an SPU program.
+pspocket's (runtime/hle/src/cellCelpEnc.cpp) answers as the library does and does the SPU program's work on the host,
+bit for bit (celp_rpe_enc.cpp, with celp_math.cpp, celp_tables.cpp and celp_spu_fp.hpp shared with the other CELP
+libraries).
+
+What Sony's library does, and pspocket's with it:
+- QueryAttr: workMemSize 0xA600, versions 0x04000000 and 0x100. NULL: ARG.
+- Open: the resource copied (the game's is left alone); start not 0, PPU priority at most 0xBFF, SPU priority at most
+  0xFF, the handle (the start's next 128-byte boundary) and its 0x7D80 bytes within the memory; then the handle's state,
+  frame size and access unit size words zeroed, and only then 0x2800 bytes more wanted (ARG, the words zeroed already);
+  a SPURS instance of one SPU, a task set, two SPURS queues and the task made. OpenEx and OpenExt (one function in
+  libcelpenc): the game's SPURS (not 0) and maxContention 1 to 8, and they change the game's resource: its size less
+  the handle's memory and alignment, its start past the handle's memory (before the last check).
+- The state word (+0): open 1, started 2, a frame sent 3, its answer taken 4. Start (from 1 or 2; 2 ends first): RPE 1,
+  16 kHz 2, configuration up to 3, word size up to 1 (16-bit little-endian 0, float 1), else ARG, then the state
+  (SEQ); a frame is 160 samples in configuration 1 and 240 in the others (its bytes at +0x28, written before the end);
+  the SPU program sets its encoder up and answers with the header, 28 bytes, copied to outBuff (outSize 0 without
+  one). EncodeFrame: the state (2) first, then its pointer, the frame's address and its size, exactly a frame; the
+  frame copied into the handle and sent. WaitForOutput (only in 3) takes the answer; GetAu (auItem first, then state 4)
+  writes auItem {outBuffer, size} and copies the access unit (size 0 without a buffer); End (from 2 to 4) takes an
+  answer still waiting; Close from any open state, SEQ when closed.
+- The header: ".mp4", 0, 0x4003, 1, the sampling rate, the bit rate, a frame's bits twice (216, 160, 280, 338), 32 bits
+  of 0, 2, 6, then 14496-3's CelpHeader (RPE, 16 kHz, no fine rate control, the configuration), padded to a byte.
+- The first two access units are empty (the encoder looks two frames ahead); the others 27, 20, 35 or 43 bytes. Float
+  samples are scaled by 32767 on the SPU, in its single precision.
+
+The SPU program is the reference encoder (ISO/IEC 14496-5: Philips's phi_*.c, Matsushita's pan_*.c; DIN-DKE's copy of
+the reference software in external/usac-refsoft, never in the repository) compiled for the SPU, its loops vectorised.
+pspocket's encoder does its arithmetic: the SPU's single precision (truncation, denormals zero; pspocket's SPU model),
+every sum in the program's order and grouping (four lanes, vectors of four summed three at a time), its divisions
+(frest, fi and a Newton step), the SDK's cosf4 and acosf4, double precision where the program uses it. Where the SPU
+program differs from the reference software:
+- The input is not high-pass filtered.
+- The LSP root search starts its next interval differently; the LSP quantiser keeps four first-stage candidates and
+  compares in its own order; the LPC analysis accumulates in blocks of 16 samples.
+- The adaptive codebook's energy table gets only its newest row each subframe (the reference recomputes every row in a
+  frame's middle subframe); it has a row for each subframe's length of the codebook (6, 6, 8, 10).
+- The lag preselection compares each row's 16 values as a tournament for 40-sample subframes, in order for shorter.
+- For 30-sample subframes a candidate's filtered vector has two values more (the codebook's next samples after a full
+  convolution, the previous candidate's after the end correction), whose squares count in its energy, and the end
+  correction leaves values 24 to 27 the previous candidate's.
+- The fixed codebook fixes its Np-4 largest pulses only when more than Np-3 pulses are not zero (the reference: at
+  least Np-4).
+- The first-order fit's parameter is the previous frame's first reflection coefficient times 0.8, in double precision.
+
+Not reproduced: no SPURS instance, task set or queue is made (their errors cannot happen); the SPU program's own state
+(+0x2100 in the handle) is kept on the host; float samples of exponent 255 (on the SPU, numbers past FLT_MAX) are
+outside pspocket's SPU model.
+
+Compared (tests/hle/test_celp_compare.cpp, the user's firmware 4.92): QueryAttr; Open's, OpenEx's and OpenExt's checks,
+the handles and the resources they change; every call in every state; Start's eight headers; 332 frames of ten kinds
+of synthetic audio (speech-like, sines, a chirp, noise, a square wave, impulses, noise in a sample's last bits, a
+constant, gated speech, silence) in each configuration and word size, every access unit byte for byte: 0 of 1925
+observations differ. Before that, in a scratch harness running Sony's SPU program's functions under pspocket's SPU
+interpreter (inventory/, never in the repository), every intermediate of the encoder (the LPC analysis and its LSPs,
+the quantiser, each subframe's targets, energies, lag candidates, searches and states) for every subframe of 30 to 60
+frames in each configuration: 0 differences. Without the firmware, test_celp_compare.cpp encodes speech through the
+library and decodes it with pspocket's CELP decoder (part 2): about 6 dB SNR in each configuration.
+
+### D-932, part 2: cellCelpDec, libcelpdec's cellAdec core, pspocket's own
+
+libcelpdec exports two things: the operation table of its cellAdec core (g_cell_adec_core_ops_Celp, NID 0xFFE42C22)
+and _SceAdecCorrectPtsValue_Celp. pspocket's (runtime/hle/src/adec_celp.cpp) is libcelpdec's PPU side with the SPU
+program's decoding on the host (celp_rpe.cpp, part 1: bit for bit with the SPU program on 7,200 frames).
+
+What Sony's core does, and pspocket's with it:
+- Memory 0x3CC00 bytes, four PCM handles, 16 bytes of information, version 0x02500000.
+- openExt (open: no SPURS resource) checks the AUDONE, PCMOUT and ERROR functions and the resource (SEQDONE may be
+  missing), PPU priority at most 0xBFF, SPU priority at most 0xFF: the core's ARG, 0x80612E03. Then a SPURS instance
+  of its own or a task set on the game's, two SPURS queues and the SPU task; mutexes "_cedm01" and conditions
+  "_cedc01"; the input thread "_CelpDecInputThrFunc" at the resource's priority and stack.
+- StartSeq (CellAdecParamCelp: excitationMode 1, sampleRate 2, configuration up to 3, wordSize up to 1, else ARG) and
+  EndSeq are queued (BUSY, 0x80612E01, with four commands waiting); the parameters are kept for DecodeAu's check.
+  DecodeAu: the unit's size must be the frame's of the last StartSeq's configuration (27, 20, 35 or 43 bytes) and its
+  user data's low seven bits at most 63 (ARG); then queued. Those bits choose one of the SPU program's 64 decoders,
+  bit 7 makes that decoder again (and clears its PTS slot), bits 8 to 15 mute the frame.
+- The thread runs one command at a time on the SPU program. Start: the 64 PTS slots cleared, the parameters in force,
+  64 decoders made; the core started. End: the decoders dropped, then SEQDONE. A unit: decoded by its decoder into the
+  next of four PCM slots (960 bytes of samples, then the parameters in force as its information), then AUDONE and
+  PCMOUT (PTS correction type 24). A unit the core is not started for (cellAdec takes one after EndSeq) fails: ERROR
+  (SEQ, 0x80612E04), then AUDONE and PCMOUT without samples.
+- The samples: 16-bit little-endian, or big-endian floats (each clamped to 16 bits' range, times 0x38000107, about
+  1/32767.75, clamped to [-1, 1]). Muting zeroes the three quarters of the excitation largest in magnitude: the first
+  frame of a new decoder is then silent.
+- _SceAdecCorrectPtsValue_Celp uses the last unit's decoder's slot: a PTS given is kept there a frame on (1350 ticks
+  of 90 kHz, 900 in configuration 1); one not given takes the slot's (and steps it on).
+- realign copies the PCM slot's bytes by its information's configuration and word size; releasePcm does nothing.
+
+pspocket's cellAdec now serves CELP with this core before any firmware module's (no longer importing libcelpdec's
+exports), and its PTS correction asks any core of pspocket's own for its own correction (before, only those of codecs
+the firmware serves first). The core's exports are pspocket's too: Sony's libadec, given them, drives pspocket's core.
+Not reproduced: no SPURS instance, task set, queues or SPU task (their errors cannot happen); the 64 decoders' states
+are on the host.
+
+Compared (tests/hle/test_celp_dec_compare.cpp, firmware 4.92): a decoder for each configuration and word size, units on
+decoders 0, 5 and 63, resets, muting, missing PTS, StartSeq again in the middle, refusals (decoders 64 and 127, a unit
+a byte short and a byte long, one before StartSeq), a unit after EndSeq. pspocket's cellAdec and core against Sony's
+libadec and libcelpdec, and Sony's libadec on pspocket's core against the same: 0 differences in 1108 lines and 105
+PCM outputs (70,400 bytes) each. Found on the way: Sony's libadec keeps the frame of a unit its core refuses (BUSY
+after four), as pspocket's cellAdec does. test_adec_more.cpp's D-623 test now expects CELP's core.
+
+### D-932, part 3: cellCelp8Dec, libcelp8dec's cellAdec core, pspocket's own
+
+libcelp8dec exports its cellAdec core's operation table (g_cell_adec_core_ops_Celp8, NID 0xF0190C6C) and
+_SceAdecCorrectPtsValue_Celp8 (0x881583C3). Its PPU side is libcelpdec's program (part 2) with other numbers; its SPU
+program decodes MPEG-4 CELP's narrowband coder (8 kHz, multi-pulse excitation: NEC's, with Matsushita's 22-bit LSP
+quantiser). pspocket's: adec_celp.cpp now holds both cores, one program with each library's numbers (a Spec), and
+celp_mpe.cpp the 8 kHz decoder (with the reference software's narrowband tables, celp_tables_nb.cpp: inc_lsp22.tbl,
+nec_gain_4m6b2d.tbl, fix_acb_int.tbl, which Sony's program holds unchanged).
+
+What libcelp8dec's core does that libcelpdec's does not:
+- Memory 0x42F00 bytes, version 0x04000000; its own codes: ARG 0x80612EA3, SEQ 0x80612EA4, BUSY 0x80612EA1, the SPU
+  program's failure 0x80612EB1 and SEQ 0x80612EB3; "_c8dm01", "_c8dc01", "_Celp8DecInputThrFunc". getMemSize checks
+  the SPU task's context save area (more than 0x36C00: 0x80612EB1); pspocket's has no task and always answers.
+- StartSeq (CellAdecParamCelp8): excitationMode 0 (MPE), sampleRate 5 (8 kHz), wordSize 0, and a configuration below
+  27 the library's table marks: 0, 2, 6, 9, 12, 15, 18, 21, 24 and 26 (3850, 4650, 5700, 6600, 7300, 8700, 9900,
+  10700, 11800 and 12200 bit/s), else ARG.
+- 16 decoders: the user data's low seven bits at most 15. A unit is the configuration's frame's bits in bytes (20, 24,
+  15, 17, 19, 22, 25, 27, 15 and 16 bytes). The output is always float: four PCM slots of 0x580 bytes (the frame, 80
+  to 320 samples, times 4; the information at +0x500); PCMOUT's PTS correction type 34, the frame 3600, 2700, 1800 or
+  900 ticks.
+
+The SPU program, as celp_mpe.cpp does it bit for bit (each operation in its order, the SPU's single precision): the
+frame's LSP indices, signal mode, RMS index, each subframe's lag, pulse positions and signs and gain index; the LSPs
+decoded and stabilised, interpolated per subframe, into LPC coefficients; each subframe's RMS; the adaptive codebook,
+the pulses, the comb filter and the gains; the synthesis filter. Where it differs from the reference software
+(nec_*.c, pan_*.c, att_lsf2pc.c):
+- Only those ten configurations: no fine rate control, no bandwidth scalability or enhancement layers, no silence
+  compression (the decoder's creation fails). No postfilter and no pitch enhancement.
+- The adaptive codebook's interpolation at a fractional lag takes 10 of the filter's 11 taps (k = -5 to 4).
+- The comb filter's gains are 0.6 and 0.8 (the reference: 19661/32768 and 26214/32768).
+- The RMS: 10^x as 2^(x log2 10) by the SDK's exp2 and log2 (log2 10 computed each frame), nwk / aa as
+  nwk * log10(1 + mu), the logarithms the SDK's log10f4.
+- The gains: gcb * sqrt(power / energy) (frsqest and one step), the power qxnorm^2 * samples * prod(1 - k^2) with the
+  reflection coefficients' product taken innermost first, 1 / (1 - k^2) the SDK's reciprocal times, not a division.
+- The predicted LSPs: (first stage + previous) * 0.5 plus or minus the second stage in one multiply-add (the fifth
+  dimension rounded twice); the stabilisation compares lsp + gap > next.
+- The LSP-to-LPC conversion (order 10) runs both halves' filters side by side in double precision, the last sum
+  ((w1 + x1) + x2) - w2.
+- The access unit's size is not checked (the PPU side does). Muting zeroes, in each subframe, the largest excitation
+  samples: a subframe's eighth in the first muted frame, one more eighth each muted frame in a row, at most three
+  quarters.
+
+Compared: in the scratch harness (Sony's SPU program under pspocket's SPU interpreter, inventory/, never in the
+repository), 6,000 random frames (300 in each configuration, with and without muting): every frame's LSPs, LPC
+coefficients, RMS, excitation, past excitation, synthesis memory and samples: 0 differences. Under cellAdec
+(tests/hle/test_celp_dec_compare.cpp, firmware 4.92), a decoder for each configuration, random units on decoders 0, 5
+and 15, resets, muting, missing PTS, StartSeq again in the middle, refusals (decoders 16 and 127, a unit a byte short
+and long, one before StartSeq, StartSeq's six checks), a unit after EndSeq: pspocket's cellAdec and core against Sony's
+libadec and libcelp8dec, and Sony's libadec on pspocket's core against the same: 0 differences in 1506 lines and 145
+PCM outputs (100,480 bytes) each. pspocket's cellAdec now serves CELP 8 kHz with this core before any firmware module's
+(no longer importing libcelp8dec's exports); test_adec_more.cpp's D-623 test expects it (memory 0x4368F, version 4.0).
+
+## D-936 · 2026-10-12 · The calls a retail console's lv2 does not have answer its CELL_ENOSYS
+
+What a retail console's lv2 answers is now read from its kernel: lv2_kernel.self of the 4.93 system software (the
+official update's CORE_OS package, decrypted with RPCS3's key table as the other SELFs are, kept in
+inventory/firmware/kernel493 and never committed; inventory/firmware/tools/kernel_unself.py). Its syscall table, at
+0x8000000000363BE0 (1,024 function descriptors; the address the PS3 scene documents for 4.xx retail kernels, and the
+one where getpid, the thread, lwmutex, timer, memory and file calls all have handlers), points 392 slots at one
+not-implemented function (lis r3,0x8001; ori r3,r3,3; blr: CELL_ENOSYS). Of the 74 calls the kernel chart counted as
+RPCS3's (null slots answering CELL_OK with nothing written, or stubs), 41 are that slot on retail: the memory access
+trap conditions (215, 216); sys_dbg_continue_processes (901), write_thread_register (907), get_process_list (908),
+spu_thread_write_to_ls (912), kill_process (913); 915 to 932 (the SPU run control and exception cause, the kernel
+event queues, the event control flags, the module and raw SPU lists, the scratch areas, the memory statistics and
+attribute lists, the mutex list); the cond, rwlock, lwmutex, event queue, semaphore, kernel thread and lwcond lists
+(934, 936, 938, 942, 946, 948, 950), the DABR calls (939, 940), the kernel thread information (949), the scratch data
+area extension, page and VM information (952 to 954), the floating-point exception switches (955, 956) and the event
+flag list (970). They are a debug or development kernel's: pspocket answers CELL_ENOSYS as the retail kernel does
+(logged once each), where it answered CELL_OK before. No game pspocket has booted calls one (the boot logs record each
+first call). Sony's liblv2coredump calls sys_dbg_vm_get_info (954) when it writes a crash dump: it now meets what it
+meets on a retail console.
+The other 33 have handlers of their own on retail and stay as they were until each is ported from the kernel's code:
+353, 356 and 361 (the memory statistics and colored allocations), sys_dbg's stop_processes, stop/continue_threads,
+read_thread_register, get_thread_list and get_thread_info, spu_thread_read_from_ls, get_process_info, the mutex,
+cond, rwlock, lwmutex, event queue, semaphore, lwcond and event flag information calls, the PPU exception handler's
+initialize and finalize, get_process_memory_container_information and read_spu_thread_context2 (900, 902, 903, 906,
+909 to 911, 914, 933, 935, 937, 941, 943 to 945, 947, 951, 957, 971, 975), the crypto engine's nine (976 to 984) and
+sys_dbg_get_console_type (985).
+A first reading took the table 26 entries early (into a list of exception names) and drew the wrong set; the
+comparison of every well-known call with its handler is the check that the table now starts where it does.
+Tests: tests/lv2/test_dispatch.cpp (the null-slot example is now 988; 215 answers CELL_ENOSYS).
+
+## D-937 · 2026-10-13 · lv2's debugging and crypto calls a retail console has, ported from its kernel (part 1)
+
+The 33 calls D-936 left are real on a retail console; each is ported from the retail kernel's own handler (the 4.93
+lv2_kernel.self, decompiled into inventory/firmware/kernel493/ghidra; addresses in the code). What their checks rest
+on, read from the kernel:
+- **A process's privileges.** The kernel keeps, per process, its authority ID and two 256-bit vectors: its SELF's
+  capability flags (the encrypted metadata's optional header 1) and its control flags (supplemental header 1). A check
+  either wants bits of the first or compares the second as a number: the kernel's own is 0x8000..., the system
+  software's modules 0x4000...; a game's is 0 (GTA V's EBOOT: control flags zero, capability flags
+  ...0000003b 00000001 00040000). pspocket's root process (tests) stands for the system software's level, a game's
+  process for a game's.
+- **sys_dbg's access check** (0x800000000008CB4C): on a retail console a process may inspect only itself, whatever its
+  flags (another process: 0x80010409). So a game reads its own threads, objects, registers and SPU contexts with them,
+  which is how liblv2coredump writes a game's crash report on a retail console.
+Ported in this part (runtime/lv2/src/dbg.cpp, crypto_engine.cpp):
+- **sys_dbg_get_console_type (985):** a null pointer is CELL_EFAULT; below the system software's level CELL_ENOSYS (a
+  game's answer); else 1, a retail console.
+- **The crypto engine (976 to 984):** engines (object type 0x78) any process may create and destroy; HMAC-SHA1 hashing
+  and ciphers keyed by the system's key tables, which the kernel takes at boot from a validated blob outside its image.
+  pspocket has no such keys: its engines meet what a console meets when that blob does not validate (preparing a hasher
+  or cipher CELL_ENOENT, running one or reading its hash CELL_EINVAL for an unprepared engine). Every other check is the
+  kernel's, in its order: hasher index 1 and cipher table 1 / index 1 / mode 0 or 1 only below the system level (else
+  CELL_EPERM), the key copied in before the engine is looked up (CELL_EFAULT, then CELL_ESRCH), the hash output 20
+  bytes at least (else CELL_EFAULT), the data 1 KB at a time. random_generate writes 16 random bytes whatever larger
+  size is asked (less than 16: CELL_EINVAL).
+Tests: tests/lv2/test_misc_calls.cpp. Left: 353, 356, 361 and sys_dbg's 900, 902, 903, 906, 909 to 911, 914, 933, 935,
+937, 941, 943 to 945, 947, 951, 957, 971 and 975 (the next parts).

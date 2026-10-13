@@ -75,10 +75,9 @@ constexpr bool kFfmpeg = false;
 } // namespace
 
 // What needs no FFmpeg: the exports are there exactly when the cores are, firmware-first (D-563), under RPCS3's NIDs;
-// libadec's types for CELP and CELP 8 kHz (FFmpeg decodes no MPEG-4 CELP) and the reserved 28 and 29 get no core of
-// pspocket's.
-TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and markers; none for CELP or types 28 and 29 "
-          "(D-623)",
+// the reserved types 28 and 29 get no core of pspocket's. CELP's and CELP 8 kHz's are pspocket's own (D-932), not
+// firmware-first.
+TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and markers; none for types 28 and 29 (D-623)",
     "[hle][adec]")
 {
     const hle::Registry& reg = hle::registry();
@@ -97,8 +96,10 @@ TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and ma
             CHECK((reg.find("cellAdec", recomp::nid_of(name)) != nullptr) == ffmpeg);
         }
     }
-    CHECK(reg.find_variable("cellCelpDec", 0xFFE42C22) == nullptr);
-    CHECK(reg.find_variable("cellCelp8Dec", 0xF0190C6C) == nullptr);
+    CHECK(reg.find_variable("cellCelpDec", 0xFFE42C22) != nullptr);
+    CHECK_FALSE(reg.is_firmware_first("cellCelpDec"));
+    CHECK(reg.find_variable("cellCelp8Dec", 0xF0190C6C) != nullptr);
+    CHECK_FALSE(reg.is_firmware_first("cellCelp8Dec"));
     CHECK_FALSE(reg.is_firmware_first("cellAdec"));
 
     BigFixture f;
@@ -109,11 +110,18 @@ TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and ma
         ps_write32(b, kType, type);
         return call("cellAdecQueryAttr", 0x7E4A4A49, {kType, kAttr});
     };
-    // No firmware here: CELP, CELP 8 kHz and the reserved types have no core (FATAL); 26 and 27 are invalid (ARG).
-    for (const u32 type : {11u, 25u, 28u, 29u}) {
+    // No firmware here: the reserved types have no core (FATAL); 26 and 27 are invalid (ARG). CELP's (D-932):
+    // libcelpdec's memory, version 2.5; CELP 8 kHz's libcelp8dec's, version 4.0.
+    for (const u32 type : {28u, 29u}) {
         INFO("type " << type);
         CHECK(query(type) == 0x80610001);
     }
+    CHECK(query(11) == 0);
+    CHECK(ps_read32(b, kAttr) == 0x3D38F);
+    CHECK(ps_read32(b, kAttr + 8) == 0x02500000);
+    CHECK(query(25) == 0);
+    CHECK(ps_read32(b, kAttr) == 0x4368F);
+    CHECK(ps_read32(b, kAttr + 8) == 0x04000000);
     CHECK(query(26) == 0x80610003);
     CHECK(query(27) == 0x80610003);
     for (const u32 type : {7u, 8u, 9u, 10u, 18u, 19u, 21u, 23u, 30u, 31u}) {
