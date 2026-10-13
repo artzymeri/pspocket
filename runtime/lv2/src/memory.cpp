@@ -852,6 +852,54 @@ Result sys_memory_allocate_from_container_colored(PpuThread& t, u64 size, u32 ci
     return allocate(t, size, flags, alloc_addr, ct); // the page size, then the alignment
 }
 
+// The unnamed colored forms of the memory and shared memory calls (D-938, part 4; RPCS3 names none of them, the names
+// are pspocket's): each checks the color where its plain form would go on, then is that form.
+
+// 357 (0x8000000000079FD0), sys_memory_free_colored(addr, color).
+Result sys_memory_free_colored(PpuThread& t, u32 addr, u32 color)
+{
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_memory_free(t, addr);
+}
+
+// 358 (0x800000000007C54C), sys_mmapper_allocate_shared_memory_colored(key, size, flags, color, mem_id): the size and
+// page size first.
+Result sys_mmapper_allocate_shared_memory_colored(PpuThread& t, u64 ipc_key, u64 size, u64 flags, u32 color, u32 mem_id)
+{
+    if (const Result r = check_granularity(size, flags); r != CELL_OK) return r;
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_mmapper_allocate_shared_memory(t, ipc_key, size, flags, mem_id);
+}
+
+// 359 (0x800000000007AE38), sys_mmapper_free_shared_memory_colored(mem_id, color).
+Result sys_mmapper_free_shared_memory_colored(PpuThread& t, u32 mem_id, u32 color)
+{
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_mmapper_free_shared_memory(t, mem_id);
+}
+
+// 360 (0x800000000007B844), sys_mmapper_allocate_shared_memory_ext_colored(key, size, flags, entries, count, color,
+// mem_id): the size, the page size, 1 to 16 entries and flags of the page size only, then the color.
+Result sys_mmapper_allocate_shared_memory_ext_colored(PpuThread& t, u64 ipc_key, u64 size, u32 flags, u32 entries,
+    s32 entry_count, u32 color, u32 mem_id)
+{
+    if (const Result r = check_granularity(size, flags); r != CELL_OK) return r;
+    if (entry_count <= 0 || entry_count > 0x10 || (flags & ~SYS_MEMORY_GRANULARITY_MASK)) return err(CELL_EINVAL);
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_mmapper_allocate_shared_memory_ext(t, ipc_key, size, flags, entries, entry_count, mem_id);
+}
+
+// 363 (0x800000000007C170), sys_mmapper_allocate_shared_memory_from_container_colored(key, size, cid, flags, color,
+// mem_id): the size, the page size and no creation-mode flag (0xC000), then the color.
+Result sys_mmapper_allocate_shared_memory_from_container_colored(PpuThread& t, u64 ipc_key, u64 size, u32 cid,
+    u64 flags, u32 color, u32 mem_id)
+{
+    if (const Result r = check_granularity(size, flags); r != CELL_OK) return r;
+    if (flags & 0xC000) return err(CELL_EINVAL);
+    if (const Result r = check_color(color); r != CELL_OK) return r;
+    return sys_mmapper_allocate_shared_memory_from_container(t, ipc_key, size, cid, flags, mem_id);
+}
+
 // sys_memory_get_user_memory_stat(stat) (353), the retail kernel's 0x8000000000079D14: seven 32-bit counts of the
 // process's memory in bytes, which the kernel keeps as memory comes and goes: [0] shared memory it made with the _ext
 // calls (sys_mmapper_allocate_shared_memory_ext, ..._from_container_ext), [1] such memory another process made (none:
@@ -912,6 +960,11 @@ void register_memory_syscalls(SyscallTable& table)
     PS_LV2_BIND(table, 353, sys_memory_get_user_memory_stat);
     PS_LV2_BIND(table, 356, sys_memory_allocate_colored);
     PS_LV2_BIND(table, 361, sys_memory_allocate_from_container_colored);
+    PS_LV2_BIND_UNNAMED(table, 357, sys_memory_free_colored);
+    PS_LV2_BIND_UNNAMED(table, 358, sys_mmapper_allocate_shared_memory_colored);
+    PS_LV2_BIND_UNNAMED(table, 359, sys_mmapper_free_shared_memory_colored);
+    PS_LV2_BIND_UNNAMED(table, 360, sys_mmapper_allocate_shared_memory_ext_colored);
+    PS_LV2_BIND_UNNAMED(table, 363, sys_mmapper_allocate_shared_memory_from_container_colored);
     PS_LV2_BIND(table, 362, sys_mmapper_allocate_shared_memory_from_container);
     PS_LV2_BIND(table, 327, sys_mmapper_enable_page_fault_notification);
 }

@@ -14336,3 +14336,15 @@ the check is not here. Also ported: 989, sys_dbg_get_spu_thread_arguments (an SP
 Left (D-938's next parts): the colored memory calls a game may make (357, 358, 359, 360, 363), 340 (an _ext shared
 memory's address; the retail kernel gives _ext shared memory IDs of type 0x20, pspocket's are type 0x08), and the
 USB driver's unnamed calls on a usbd handle (552, 557, 563 to 569, 578).
+
+### D-938, part 4: the colored memory and shared memory calls a game may make
+
+Five unnamed slots are colored forms of calls a game makes; their retail handlers check no privilege, so a game gets
+them (runtime/lv2/src/memory.cpp; the names are pspocket's): **357 sys_memory_free_colored(addr, color)**, **358
+sys_mmapper_allocate_shared_memory_colored(key, size, flags, color, id)**, **359
+sys_mmapper_free_shared_memory_colored(id, color)**, **360 sys_mmapper_allocate_shared_memory_ext_colored(key, size,
+flags, entries, count, color, id)** and **363 sys_mmapper_allocate_shared_memory_from_container_colored(key, size,
+container, flags, color, id)**. Each checks the color (0 and 1 are the system's: CELL_EINVAL) where its handler does,
+after the size and page size and, for 360, the entry count (1 to 16) and flags of the page size only, and for 363 no
+creation-mode flag; then it is its plain form. Tests: tests/lv2/test_dbg.cpp. Left: 340 and the USB driver's unnamed
+calls (552, 557, 563 to 569, 578).

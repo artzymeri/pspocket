@@ -661,6 +661,26 @@ TEST_CASE("lv2 retail memory calls: colored allocations and the process's memory
     CHECK(count(0) == 0x10000);
     CHECK(count(2) == 0x10000 + 0x100000);
 
+    // The unnamed colored forms (D-938, part 4): the color where the plain form goes on.
+    REQUIRE(c.call(kColored, 0x100000, k1M, 3, out) == CELL_OK);
+    const u32 b = f.r32(out);
+    CHECK(c.call(357, b, 1) == rc(CELL_EINVAL));
+    REQUIRE(c.call(357, b, 3) == CELL_OK);
+    CHECK(c.call(357, b, 3) == rc(CELL_EINVAL)); // freed
+    constexpr u64 kNoKey = 0xFFFF000000000000ull;
+    CHECK(c.call(358, kNoKey, 0, k1M, 0, out) == rc(CELL_EALIGN));     // the size before the color
+    CHECK(c.call(358, kNoKey, 0x100000, k1M, 0, out) == rc(CELL_EINVAL));
+    REQUIRE(c.call(358, kNoKey, 0x100000, k1M, 2, out) == CELL_OK);
+    const u32 shm = f.r32(out);
+    CHECK(c.call(359, shm, 0) == rc(CELL_EINVAL));
+    REQUIRE(c.call(359, shm, 2) == CELL_OK);
+    CHECK(c.call(360, 0x5678, 0x10000, k64K, entries, 0, 2, out) == rc(CELL_EINVAL)); // no entries
+    CHECK(c.call(360, 0x5678, 0x10000, k64K, entries, 1, 1, out) == rc(CELL_EINVAL)); // the color
+    REQUIRE(c.call(360, 0x5678, 0x10000, k64K, entries, 1, 2, out) == CELL_OK);
+    CHECK(c.call(363, kNoKey, 0x10000, ct, k64K | 0x4000, 2, out) == rc(CELL_EINVAL));
+    CHECK(c.call(363, kNoKey, 0x10000, ct, k64K, 0, out) == rc(CELL_EINVAL));
+    REQUIRE(c.call(363, kNoKey, 0x10000, ct, k64K, 2, out) == CELL_OK);
+
     // An SPU thread group's local stores, 256 KB a thread.
     const u32 gattr = f.alloc(16);
     REQUIRE(c.call(kGroupCreate, out, 3, 100, gattr) == CELL_OK);
