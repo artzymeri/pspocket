@@ -1410,6 +1410,89 @@ TEST_CASE("cellGame: disc boot check and permit, game data created then found; s
     fsys::remove_all(root);
 }
 
+TEST_CASE("cellGame: the boot check of an installed game and of a disc game started from its update (D-939)",
+    "[hle][game]")
+{
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / ("pspocket-hle-hddgame-" + std::to_string(::getpid()));
+    fsys::remove_all(root);
+    fsys::create_directories(root / "hdd0" / "game");
+    fsys::create_directories(root / "bdvd" / "PS3_GAME");
+    constexpr u32 kType = kData + 0x100, kAttributes = kData + 0x104, kSize = kData + 0x110, kDirName = kData + 0x120,
+                  kContent = kData + 0x200, kUsrdir = kData + 0x300, kBuf = kData + 0x400, kInfo = kData + 0x500;
+    constexpr u64 kNotPatch = 0xFFFFFFFF8002CB27ull, kNotDiscBoot = 0xFFFFFFFF8002BD02ull;
+
+    {
+        // An installed PSN game: HDD, its folder's name (here not its title ID's); its content is its folder.
+        hle::ProcessConfig config;
+        config.game.boot = hle::GameInfo::Boot::Hdd;
+        config.game.title_id = "NPXX00000";
+        config.game.dir = "NPXX00001";
+        config.game.param_sfo = make_param_sfo({{"APP_VER", "01.00", 8}, {"CATEGORY", "HG", 4},
+            {"TITLE", "Test PSN Game", 128}, {"TITLE_ID", "NPXX00000", 16}});
+        Fixture f(config);
+        u8* base = f.base();
+        REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+        GuestThread a(f, 0, "a");
+        const auto str = [&](u32 addr) { return std::string(reinterpret_cast<const char*>(base + addr)); };
+        REQUIRE(a.call("cellGameBootCheck", kType, kAttributes, kSize, kDirName) == 0);
+        CHECK(ps_read32(base, kType) == 2); // CELL_GAME_GAMETYPE_HDD
+        CHECK(ps_read32(base, kAttributes) == 0);
+        CHECK(str(kDirName) == "NPXX00001");
+        REQUIRE(a.call("cellGameGetParamString", 100, kBuf, 16) == 0);
+        CHECK(str(kBuf) == "NPXX00000");
+        REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+        CHECK(str(kContent) == "/dev_hdd0/game/NPXX00001");
+        CHECK(str(kUsrdir) == "/dev_hdd0/game/NPXX00001/USRDIR");
+        CHECK(a.call("cellGamePatchCheck", kSize, 0) == kNotPatch);
+        // No disc in the drive: the disc calls find none.
+        CHECK(a.call("cellDiscGameGetBootDiscInfo", kInfo) == kNotDiscBoot);
+        CHECK(a.call("cellGameDataCheck", 1, 0, kSize) == 2); // CELL_GAME_RET_NONE
+        REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+    }
+    {
+        // A disc game started from its update: the disc's type with the patch attribute and the update's PARAM.SFO;
+        // its content stays the disc's, and the calls about the disc read the disc's PARAM.SFO.
+        const std::vector<u8> disc_sfo = make_param_sfo({{"APP_VER", "01.00", 8}, {"CATEGORY", "DG", 4},
+            {"TITLE", "Test Game", 128}, {"TITLE_ID", "BLES01807", 16}});
+        std::ofstream(root / "bdvd" / "PS3_GAME" / "PARAM.SFO", std::ios::binary)
+            .write(reinterpret_cast<const char*>(disc_sfo.data()), static_cast<std::streamsize>(disc_sfo.size()));
+        hle::ProcessConfig config;
+        config.game.boot = hle::GameInfo::Boot::Hdd;
+        config.game.title_id = "BLES01807";
+        config.game.param_sfo = make_param_sfo({{"APP_VER", "01.27", 8}, {"CATEGORY", "GD", 4},
+            {"TITLE", "Test Game", 128}, {"TITLE_ID", "BLES01807", 16}, {"VERSION", "01.27", 8}});
+        Fixture f(config);
+        u8* base = f.base();
+        REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+        REQUIRE(f.kernel->vfs_mount("/dev_bdvd", (root / "bdvd").string(), true));
+        GuestThread a(f, 0, "a");
+        const auto str = [&](u32 addr) { return std::string(reinterpret_cast<const char*>(base + addr)); };
+        std::memset(base + kDirName, 0xAA, 4);
+        REQUIRE(a.call("cellGameBootCheck", kType, kAttributes, kSize, kDirName) == 0);
+        CHECK(ps_read32(base, kType) == 1);       // CELL_GAME_GAMETYPE_DISC
+        CHECK(ps_read32(base, kAttributes) == 1); // CELL_GAME_ATTRIBUTE_PATCH
+        CHECK(ps_read32(base, kDirName) == 0xAAAAAAAAu); // a disc's: not written
+        REQUIRE(a.call("cellGameGetParamString", 106, kBuf, 8) == 0); // APP_VER: the update's
+        CHECK(str(kBuf) == "01.27");
+        REQUIRE(a.call("cellGameGetParamString", 101, kBuf, 8) == 0); // VERSION: the patch session's, as game data's
+        CHECK(str(kBuf) == "01.27");
+        REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+        CHECK(str(kContent) == "/dev_bdvd/PS3_GAME");
+        CHECK(str(kUsrdir) == "/dev_bdvd/PS3_GAME/USRDIR");
+        REQUIRE(a.call("cellGamePatchCheck", kSize, 0) == 0);
+        REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+        CHECK(str(kContent) == "/dev_hdd0/game/BLES01807");
+        REQUIRE(a.call("cellGameDataCheck", 1, 0, kSize) == 0); // DISC: found, the disc's
+        REQUIRE(a.call("cellGameGetParamString", 106, kBuf, 8) == 0);
+        CHECK(str(kBuf) == "01.00");
+        REQUIRE(a.call("cellGameContentPermit", kContent, kUsrdir) == 0);
+        REQUIRE(a.call("cellDiscGameGetBootDiscInfo", kInfo) == 0);
+        CHECK(str(kInfo) == "BLES01807");
+    }
+    fsys::remove_all(root);
+}
+
 TEST_CASE("cellGame: param ints and strings, sizes, patch check, delete, themes; cellSysutil's game rest (D-183)",
     "[hle][game]")
 {

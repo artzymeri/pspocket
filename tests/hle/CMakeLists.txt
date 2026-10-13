@@ -116,6 +116,23 @@ if(TARGET pspocket-boot)
     set_tests_properties(pspocket_boot_thread_report PROPERTIES PASS_REGULAR_EXPRESSION "${thread_report_block}")
 endif()
 
+# pspocket-boot with an installed game (D-939): an executable in --hdd0's game folder starts with its own guest path
+# as argv[0] and its USRDIR as /app_home; the program exits 0 only if both are there.
+set(boot_hdd_programs ${CMAKE_CURRENT_BINARY_DIR}/boot_programs_hdd)
+set(boot_hdd_eboot ${boot_hdd_programs}/hdd0/game/NPXX00000/USRDIR/EBOOT.BIN)
+add_custom_command(
+    OUTPUT ${boot_hdd_eboot}
+    COMMAND make_boot_programs ${boot_hdd_programs}
+    DEPENDS make_boot_programs
+    COMMENT "Writing the synthetic pspocket-boot installed game"
+    VERBATIM)
+add_custom_target(boot_hdd_programs ALL DEPENDS ${boot_hdd_eboot})
+if(TARGET pspocket-boot)
+    add_test(NAME pspocket_boot_hdd_game
+        COMMAND pspocket-boot ${boot_hdd_eboot} --hdd0 ${boot_hdd_programs}/hdd0 --timeout 20)
+    set_tests_properties(pspocket_boot_hdd_game PROPERTIES PASS_REGULAR_EXPRESSION "process exit, status 0[^0-9]")
+endif()
+
 # The parser fuzzing of the HLE libraries (D-603, tests/common/mutation_fuzz.hpp): a game's files, its images, its
 # movies and sound. "[fuzz]" runs them alone; PSPOCKET_FUZZ_ITERS=<n> longer.
 target_sources(test_hle PRIVATE test_fuzz_files.cpp test_fuzz_images.cpp test_fuzz_media.cpp)

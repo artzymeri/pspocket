@@ -57,13 +57,17 @@ struct LinkedFunction {
     std::atomic<u64> calls{0};
 };
 
-// The running game, for cellGame: how it was started and its PARAM.SFO. A disc game has it in
-// /dev_bdvd/PS3_GAME, an HDD game in /dev_hdd0/game/<title_id>.
+// The running game, for cellGame: how it was started and its PARAM.SFO. A disc game has it in /dev_bdvd/PS3_GAME; a
+// game started from /dev_hdd0/game/<dir> (D-939) in that folder: an installed PSN game (category HG), or a disc game's
+// update (category GD), which runs with its disc in the drive.
 struct GameInfo {
     enum class Boot : u8 { Disc, Hdd };
     Boot boot = Boot::Disc;
     std::string title_id;      // "BLES01807"; empty if unknown
-    std::vector<u8> param_sfo; // PARAM.SFO as on the disc; empty if unknown
+    std::vector<u8> param_sfo; // the PARAM.SFO of what booted: the disc's, or the folder's; empty if unknown
+    std::string dir;           // an HDD boot's folder under /dev_hdd0/game; empty: the title ID's
+
+    std::string hdd_dir() const { return dir.empty() ? title_id : dir; }
 };
 
 // Modules the game loads while it runs (sys_prx_load_module and the rest, D-159): the loader's (runtime/loader

@@ -26,4 +26,10 @@ struct DiscModules {
 bool save_disc_modules(const std::string& image_path, const std::string& prx_dir, const std::string& spu_dir,
     DiscModules* out, std::string* error);
 
+// The same for a game installed in /dev_hdd0/game (D-939): its folder's USRDIR walked on the host, a PSN module
+// decrypted with its licence (free content, or the player's .rap under hdd0_dir, D-580), saved under its guest path
+// /dev_hdd0/game/<folder>/USRDIR/... False with *error when the folder has no USRDIR.
+bool save_installed_modules(const std::string& game_dir, const std::string& hdd0_dir, const std::string& prx_dir,
+    const std::string& spu_dir, DiscModules* out, std::string* error);
+
 } // namespace pspocket::disc

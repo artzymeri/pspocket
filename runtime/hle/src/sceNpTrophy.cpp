@@ -343,13 +343,13 @@ std::string game_category()
 }
 
 // The trophy pack of `name`: TROPDIR/<name>/TROPHY.TRP in the booted game's directory (RPCS3 Emu.GetDir():
-// /dev_bdvd/PS3_GAME/ for a disc game, /dev_hdd0/game/<title ID>/ for an HDD game), or, for a game booted from game
-// data (category GD: a patch), on the disc. `path` is set to the last path tried.
+// /dev_bdvd/PS3_GAME/ for a disc game, /dev_hdd0/game/<dir>/ for an HDD game), or, for a game booted from game
+// data (category GD: a disc game's update, D-939), on the disc. `path` is set to the last path tried.
 std::optional<std::vector<u8>> read_trophy_pack(PPUContext& ctx, const std::string& name, std::string& path)
 {
     const GameInfo& g = HleProcess::current()->config().game;
     const std::string dir =
-        g.boot == GameInfo::Boot::Disc ? std::string("/dev_bdvd/PS3_GAME/") : "/dev_hdd0/game/" + g.title_id + "/";
+        g.boot == GameInfo::Boot::Disc ? std::string("/dev_bdvd/PS3_GAME/") : "/dev_hdd0/game/" + g.hdd_dir() + "/";
     path = dir + "TROPDIR/" + name + "/TROPHY.TRP";
     std::optional<std::vector<u8>> pack = read_vfs_file(ctx, path);
     if (!pack && game_category() == "GD") {

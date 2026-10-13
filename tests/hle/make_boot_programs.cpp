@@ -3,6 +3,9 @@
 //                   address)
 //   wait_queue.elf  _start calls a function that creates an event queue named "bootwait" and waits on it forever (the
 //                   thread report at the timeout must name the thread, the syscall, the queue and the caller)
+//   hdd0/game/NPXX00000/   an installed game (D-939): PARAM.SFO (category HG), USRDIR/EBOOT.BIN, whose _start
+//                   stats its own argv[0] and /app_home/MARKER (USRDIR/MARKER) and exits with the two results or'ed:
+//                   0 when the boot host started it as the PS3 starts an HDD game
 //
 //   make_boot_programs <dir>
 
@@ -103,7 +106,33 @@ int main(int argc, char** argv)
         as::blr(),
     };
 
+    // The installed game's _start: sys_fs_stat(argv[0]) or'ed with sys_fs_stat("/app_home/MARKER"), its exit status.
+    const u32 hdd_start[] = {
+        as::stdu(1, -0x100, 1),
+        as::ld(3, 0, 4),       // argv[0]
+        as::addi(4, 1, 0x40),  // CellFsStat
+        as::li(11, 808),       // sys_fs_stat
+        as::sc(),
+        as::mr(30, 3),
+        as::lis(3, 0x0001),
+        as::ori(3, 3, 0x0380), // "/app_home/MARKER"
+        as::addi(4, 1, 0x40),
+        as::li(11, 808),
+        as::sc(),
+        as::or_(3, 3, 30),
+        as::li(11, 22), // _sys_process_exit(status)
+        as::sc(),
+    };
+    const u32 marker_path[] = {0x2F617070, 0x5F686F6D, 0x652F4D41, 0x524B4552, 0}; // "/app_home/MARKER"
+    const std::filesystem::path game = dir / "hdd0" / "game" / "NPXX00000";
+    std::filesystem::create_directories(game / "USRDIR");
+
     const bool ok = write_file(dir / "fault.elf", program({{0x10200, fault}})) &&
-        write_file(dir / "wait_queue.elf", program({{0x10200, start}, {0x10240, wait_forever}}));
+        write_file(dir / "wait_queue.elf", program({{0x10200, start}, {0x10240, wait_forever}})) &&
+        write_file(game / "PARAM.SFO",
+            test::build_param_sfo({{"APP_VER", "01.00"}, {"CATEGORY", "HG"}, {"TITLE", "Boot test"},
+                {"TITLE_ID", "NPXX00000"}})) &&
+        write_file(game / "USRDIR" / "EBOOT.BIN", program({{0x10200, hdd_start}, {0x10380, marker_path}})) &&
+        write_file(game / "USRDIR" / "MARKER", {'o', 'k'});
     return ok ? 0 : 1;
 }

@@ -55,6 +55,15 @@ int ps_psn_install_rap(const char* hdd0_dir, const char* rap_path, char* error, 
 int ps_psn_decrypt_executable(const char* self_path, const char* hdd0_dir, const char* elf_path, char* error,
     size_t error_size);
 
+/*
+ * Saves the own PRX modules and SPU ELFs of a game installed in /dev_hdd0/game (a PSN game, a disc game's update) for
+ * its preparation (D-239, D-939), as ps_disc_save_modules does a disc's: game_dir is its folder, hdd0_dir the folder
+ * that is /dev_hdd0 (the player's licences are under it). Returns how many files it saved (or found saved), or -1 with
+ * the reason in error.
+ */
+int ps_psn_save_modules(const char* game_dir, const char* hdd0_dir, const char* prx_dir, const char* spu_dir,
+    char* error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

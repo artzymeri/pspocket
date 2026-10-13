@@ -1383,7 +1383,7 @@ s32 cellGameGetBootGameInfo(PPUContext& ctx, u32 type, u32 dir_name, u32 execdat
         std::lock_guard lock(s.mutex);
         ps_write32(base, execdata, s.execdata);
     }
-    if (hdd) put_string(base, dir_name, 32, g.title_id);
+    if (hdd) put_string(base, dir_name, 32, g.hdd_dir());
     return logged("cellGameExec", lv2::CELL_OK, call);
 }
 

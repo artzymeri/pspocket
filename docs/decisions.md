@@ -14348,3 +14348,52 @@ container, flags, color, id)**. Each checks the color (0 and 1 are the system's:
 after the size and page size and, for 360, the entry count (1 to 16) and flags of the page size only, and for 363 no
 creation-mode flag; then it is its plain form. Tests: tests/lv2/test_dbg.cpp. Left: 340 and the USB driver's unnamed
 calls (552, 557, 563 to 569, 578).
+
+## D-939 · 2026-10-13 · Games that start from /dev_hdd0/game: installed PSN games and disc games' updates, on the iPhone
+
+The engine checklist's PSN item was partial: the Mac tools install a PSN game's package and the player's licence and
+decrypt its executable (D-580 to D-583), but nothing started a game the way a PS3 starts one from the hard disk, and
+the app could neither install a package nor list the game. Now, as RPCS3 starts them (rpcs3/Emu/System.cpp,
+Emulator::Load):
+
+- **An installed game** (a folder of /dev_hdd0/game whose PARAM.SFO has category HG, from its package) starts with its
+  executable's guest path as argv[0] (/dev_hdd0/game/<folder>/USRDIR/EBOOT.BIN), its USRDIR as /app_home (writable,
+  RPCS3 mounts the executable's folder), no disc, and cellGame sees an HDD game: cellGameBootCheck answers
+  CELL_GAME_GAMETYPE_HDD with the folder's name, cellGameContentPermit the folder.
+- **A disc game whose update is installed** (/dev_hdd0/game/<TITLE_ID> with a PARAM.SFO of the disc's title ID,
+  category GD, and an executable of its own) starts the update's executable with the disc in the drive, as a PS3 does:
+  cellGameBootCheck answers the disc's type with CELL_GAME_ATTRIBUTE_PATCH and the update's PARAM.SFO (its APP_VER),
+  the content stays the disc's (/dev_bdvd/PS3_GAME), cellGamePatchCheck opens the update, and the calls about the disc
+  (cellGameDataCheck of the disc, cellDiscGameGetBootDiscInfo) read the disc's PARAM.SFO through /dev_bdvd as RPCS3
+  does. Trophies come from the update's folder, else the disc's (sceNpTrophy already did that for category GD).
+- hle::GameInfo keeps the folder's name (`dir`): a PSN game installed under a name apart from its title ID is reported
+  by its folder, as RPCS3 takes the name from the path.
+
+Where (runtime/loader/hdd_game.hpp): read_hdd_game (a folder of hdd0/game, its PARAM.SFO), find_update (RPCS3's test:
+the title ID's folder, category GD, USRDIR/EBOOT.BIN), hdd_game_of (the folder an executable is in), mount_app_home.
+pspocket-boot: an executable in --hdd0's game folder starts that way (an update needs --bdvd, its disc); booting a
+disc's own executable while --hdd0 holds its update says so (a PS3 would start the update; pspocket-boot runs the
+executable it is given). Found on the way: start_main_thread took the boot options apart from the state that
+prepare_kernel_config had read, and both callers passed none, so argv[0] was always the disc's path; they pass the
+state's now.
+
+The game's own modules: save_installed_modules (runtime/disc/modules.hpp; C: ps_psn_save_modules) walks an installed
+game's or an update's USRDIR as save_disc_modules walks a disc's (D-239), a PSN module decrypted with its licence (free
+content, or the player's .rap), saved under its /dev_hdd0 guest path for the preparation.
+
+The app (app/ios, through ps_game_options.game_dir, ps_game_probe_installed, ps_game_find_update and the PSN C API):
+- a .pkg or .rap put in Games (or picked with +) is installed into Documents/hdd0 once per file (its size and date),
+  once it has not changed for 3 s (Files copies a big file in for a while), one package at a time in the background
+  with the screen kept on; the library shows how it goes, which licence a game still needs, and that the package may
+  be deleted. A package refused before (an update put in before its game) is tried again after the next install; a
+  split package installs from NAME_00.pkg. The file itself stays: the app never deletes the user's files.
+- installed PSN games (category HG with an executable) are games of the library, their covers from their ICON0.PNG;
+  their executable decrypts with the licence (a missing .rap is the game's problem line until one is installed, then
+  it is tried again).
+- a disc game with an update installed starts the update: its executable decrypted into
+  pspocket-games/<TITLE_ID>/update-<APP_VER>/, prepared like any (the library is made again for the new executable),
+  its modules scanned once per version, the disc mounted as ever.
+
+Tests: tests/disc/test_psn.cpp (an installed game from its package, an update found or not, its modules saved, its
+USRDIR as /app_home), tests/hle/test_sysPrxForUser.cpp (the boot check of each kind), ctest pspocket_boot_hdd_game (a
+synthetic installed game that exits 0 only when its argv[0] and /app_home are the HDD game's).

@@ -14,12 +14,16 @@
 #include <string>
 #include <vector>
 
+#include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/types.hpp"
 #include "pspocket/disc/psn.h"
+#include "pspocket/loader/hdd_game.hpp"
+#include "pspocket/lv2/kernel.hpp"
 #include "pspocket/recomp/crypto.hpp"
 #include "pspocket/recomp/elf.hpp"
 #include "pspocket/recomp/npdrm.hpp"
 #include "pspocket/recomp/pkg.hpp"
+#include "pspocket/recomp/prx_place.hpp"
 #include "pspocket/recomp/self_decrypt.hpp"
 #include "synthetic.hpp"
 
@@ -304,5 +308,101 @@ TEST_CASE("A PSN game from its package and the player's licence to its ELF (the 
     lines.clear();
     REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), collect, &lines, error, sizeof error) == 0);
     CHECK(has_line(lines, ", which is in place ("));
+    fs::remove_all(root);
+}
+
+TEST_CASE("Games that start from /dev_hdd0/game: an installed PSN game, a disc game's update (D-939)", "[disc][psn]")
+{
+    // An installed game, from its package (a debug one: a plain ELF as its executable).
+    const std::vector<u8> elf = test::build_ppu_exec().bytes;
+    test::PkgSpec spec = game_package(elf, "01.00");
+    spec.retail = false;
+    const fs::path root = fs::weakly_canonical(temp_dir("hddgame"));
+    const fs::path hdd0 = root / "dev_hdd0", game = hdd0 / "game" / "NPXX00000";
+    write_file(root / "game.pkg", test::build_pkg(spec));
+    char error[512] = {};
+    REQUIRE(ps_psn_install_pkg((root / "game.pkg").c_str(), hdd0.c_str(), nullptr, nullptr, error, sizeof error) == 0);
+    std::string why;
+    const auto installed = loader::read_hdd_game(hdd0.string(), game.string() + "/", &why);
+    INFO(why);
+    REQUIRE(installed);
+    CHECK(installed->dir == "NPXX00000");
+    CHECK(installed->title_id == "NPXX00000");
+    CHECK(installed->category == "HG");
+    CHECK(installed->app_ver == "01.00");
+    CHECK_FALSE(installed->update());
+    CHECK(installed->boot_path == "/dev_hdd0/game/NPXX00000/USRDIR/EBOOT.BIN");
+    const hle::GameInfo info = installed->game_info();
+    CHECK(info.boot == hle::GameInfo::Boot::Hdd);
+    CHECK(info.hdd_dir() == "NPXX00000");
+    CHECK(info.param_sfo == read_file(game / "PARAM.SFO"));
+    // By its executable (pspocket-boot), with the executable's own guest path; an executable elsewhere is no HDD
+    // game, and a folder outside hdd0/game is refused.
+    const auto by_exe = loader::hdd_game_of(hdd0.string(), (game / "USRDIR" / "EBOOT.BIN").string(), &why);
+    REQUIRE(by_exe);
+    CHECK(by_exe->boot_path == "/dev_hdd0/game/NPXX00000/USRDIR/EBOOT.BIN");
+    why.clear();
+    CHECK_FALSE(loader::hdd_game_of(hdd0.string(), (root / "game.pkg").string(), &why));
+    CHECK(why.empty());
+    CHECK_FALSE(loader::hdd_game_of(hdd0.string(), (hdd0 / "game" / "EBOOT.BIN").string(), &why));
+    CHECK_FALSE(loader::read_hdd_game(hdd0.string(), root.string(), &why));
+    CHECK(why.find("is not a folder of") != std::string::npos);
+    fs::create_directories(hdd0 / "game" / "EMPTY" / "USRDIR");
+    CHECK_FALSE(loader::hdd_game_of(hdd0.string(), (hdd0 / "game" / "EMPTY" / "USRDIR" / "EBOOT.BIN").string(), &why));
+    CHECK(why.find("has no PARAM.SFO") != std::string::npos);
+    // Its USRDIR is /app_home.
+    GuestMemory memory;
+    REQUIRE(memory.reserve());
+    lv2::Kernel kernel(memory);
+    REQUIRE(loader::mount_app_home(kernel, *installed, &why));
+    CHECK(kernel.vfs_host_path("/app_home/DATA.BIN") == (game / "USRDIR" / "DATA.BIN").string());
+
+    // A disc game's update: the folder of the disc's title ID, category GD, with its own executable. Game data of the
+    // same title (another folder, or no executable) and an installed game are not updates.
+    CHECK_FALSE(loader::find_update(hdd0.string(), "NPXX00000")); // category HG
+    const fs::path update = hdd0 / "game" / "BLES01807";
+    write_file(update / "PARAM.SFO",
+        test::build_param_sfo({{"APP_VER", "01.27"}, {"CATEGORY", "GD"}, {"TITLE", "Test"}, {"TITLE_ID", "BLES01807"}}));
+    CHECK_FALSE(loader::find_update(hdd0.string(), "BLES01807")); // no executable yet
+    write_file(update / "USRDIR" / "EBOOT.BIN", elf);
+    const auto found = loader::find_update(hdd0.string(), "BLES01807");
+    REQUIRE(found);
+    CHECK(found->update());
+    CHECK(found->app_ver == "01.27");
+    CHECK(found->host_dir == update.string());
+    CHECK(found->boot_path == "/dev_hdd0/game/BLES01807/USRDIR/EBOOT.BIN");
+    CHECK_FALSE(loader::find_update(hdd0.string(), "BLES01808"));
+    CHECK_FALSE(loader::find_update(hdd0.string(), ""));
+    CHECK_FALSE(loader::find_update(hdd0.string(), "../dev_hdd0/game/BLES01807"));
+    write_file(update / "PARAM.SFO",
+        test::build_param_sfo({{"APP_VER", "01.27"}, {"CATEGORY", "GD"}, {"TITLE_ID", "BLES01808"}}));
+    CHECK_FALSE(loader::find_update(hdd0.string(), "BLES01807")); // another title's
+
+    // The installed game's own modules, saved for its preparation as a disc's are (D-239): LIB/GAME.SPRX a module (a
+    // debug SELF), SPU/TASK.ELF an SPU program, LIB/NP.SPRX a SELF that does not decrypt, DATA/LEVEL.BIN data.
+    const auto prx = test::build_ppu_prx();
+    write_file(game / "USRDIR" / "LIB" / "GAME.SPRX",
+        test::wrap_in_self(prx.bytes, {.debug = true, .npdrm = false, .self_type = 4}));
+    std::vector<u8> spu(0x100, 0);
+    const u8 ident[16] = {0x7F, 'E', 'L', 'F', 1, 2, 1, 0};
+    std::memcpy(spu.data(), ident, 16);
+    spu[0x11] = 2;  // ET_EXEC
+    spu[0x13] = 23; // EM_SPU
+    write_file(game / "USRDIR" / "SPU" / "TASK.ELF", spu);
+    std::vector<u8> np(3000, 7);
+    std::memcpy(np.data(), "SCE\0", 4);
+    write_file(game / "USRDIR" / "LIB" / "NP.SPRX", np);
+    write_file(game / "USRDIR" / "DATA" / "LEVEL.BIN", std::vector<u8>(5000, 8));
+    const fs::path prx_dir = root / "prepared" / "disc-prx", spu_dir = root / "prepared" / "disc-spu";
+    REQUIRE(ps_psn_save_modules(game.c_str(), hdd0.c_str(), prx_dir.c_str(), spu_dir.c_str(), error, sizeof error) == 2);
+    auto module_elf = recomp::ElfFile::parse(prx.bytes);
+    REQUIRE(module_elf);
+    const std::string identity = recomp::prx_identity(*module_elf);
+    CHECK(read_file(prx_dir / (identity + ".elf")) == prx.bytes);
+    const std::vector<u8> where = read_file(prx_dir / (identity + ".txt"));
+    CHECK(std::string(where.begin(), where.end()).starts_with("path /dev_hdd0/game/NPXX00000/USRDIR/LIB/GAME.SPRX\n"));
+    CHECK(ps_psn_save_modules((root / "nowhere").c_str(), hdd0.c_str(), prx_dir.c_str(), spu_dir.c_str(), error,
+              sizeof error) == -1);
+    CHECK(std::string(error).find("has no USRDIR") != std::string::npos);
     fs::remove_all(root);
 }

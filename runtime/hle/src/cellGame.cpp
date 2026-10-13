@@ -65,6 +65,7 @@ enum : u32 {
     CELL_GAME_ERROR_NOSPACE = 0x8002CB20,
 };
 constexpr u32 CELL_GAME_GAMETYPE_DISC = 1, CELL_GAME_GAMETYPE_HDD = 2, CELL_GAME_GAMETYPE_GAMEDATA = 3;
+constexpr u32 CELL_GAME_ATTRIBUTE_PATCH = 0x1;
 constexpr s32 CELL_GAME_SIZEKB_NOTCALC = -1;
 constexpr u32 CELL_GAME_PATH_MAX = 128, CELL_GAME_DIRNAME_SIZE = 32;
 constexpr u32 CELL_GAME_SYSP_TITLE_SIZE = 128, CELL_GAME_SYSP_TITLEID_SIZE = 10, CELL_GAME_SYSP_VERSION_SIZE = 6;
@@ -171,7 +172,19 @@ const char* type_name(u32 type)
     return type == CELL_GAME_GAMETYPE_DISC ? "DISC" : type == CELL_GAME_GAMETYPE_HDD ? "HDD" : "GAMEDATA";
 }
 
-// RPCS3 cellGameBootCheck.
+// The disc's PARAM.SFO: the one the game booted with when it booted from the disc, else /dev_bdvd/PS3_GAME/PARAM.SFO
+// as RPCS3 reads it (a disc game booted from its update has its disc in the drive; an HDD game has none: empty).
+std::vector<u8> disc_param_sfo(lv2::Kernel& kernel)
+{
+    const GameInfo& g = game();
+    if (g.boot == GameInfo::Boot::Disc) return g.param_sfo;
+    std::vector<u8> bytes;
+    if (!kernel.vfs_read_file("/dev_bdvd/PS3_GAME/PARAM.SFO", bytes)) bytes.clear();
+    return bytes;
+}
+
+// RPCS3 cellGameBootCheck: a disc game, a disc game booted from its update (category GD, D-939: the disc's type with
+// the patch attribute and the update's PARAM.SFO; its content stays the disc's), or an HDD game (its folder's name).
 s32 cellGameBootCheck(PPUContext& ctx, u32 type, u32 attributes, u32 size, u32 dir_name)
 {
     if (!type || !attributes) return error(CELL_GAME_ERROR_PARAM);
@@ -183,23 +196,30 @@ s32 cellGameBootCheck(PPUContext& ctx, u32 type, u32 attributes, u32 size, u32 d
     psf::Registry sfo;
     if (auto parsed = psf::parse(g.param_sfo)) sfo = std::move(*parsed);
     std::string dir;
+    const char* kind = "disc";
+    u32 attrs = 0;
     if (g.boot == GameInfo::Boot::Disc) {
         perm.mode = Permission::Mode::DiscGame;
         ps_write32(base, type, CELL_GAME_GAMETYPE_DISC);
+    } else if (psf::get_string(sfo, "CATEGORY") == "GD") {
+        perm.mode = Permission::Mode::Patch;
+        ps_write32(base, type, CELL_GAME_GAMETYPE_DISC);
+        attrs = CELL_GAME_ATTRIBUTE_PATCH;
+        kind = "disc (its update)";
     } else {
         perm.mode = Permission::Mode::HddGame;
         ps_write32(base, type, CELL_GAME_GAMETYPE_HDD);
-        dir = g.title_id;
+        dir = g.hdd_dir();
         if (dir_name) put_string(base, dir_name, CELL_GAME_DIRNAME_SIZE, dir);
+        kind = "HDD";
     }
-    ps_write32(base, attributes, 0);
+    ps_write32(base, attributes, attrs);
     write_size(base, size, CELL_GAME_SIZEKB_NOTCALC, 4);
     perm.open = true;
     perm.dir = std::move(dir);
     perm.sfo = std::move(sfo);
     perm.exists = true;
-    PS_LOG_INFO(kChan, "cellGameBootCheck: {} game {}", g.boot == GameInfo::Boot::Disc ? "disc" : "HDD",
-        psf::get_string(perm.sfo, "TITLE_ID"));
+    PS_LOG_INFO(kChan, "cellGameBootCheck: {} game {}", kind, psf::get_string(perm.sfo, "TITLE_ID"));
     return lv2::CELL_OK;
 }
 
@@ -217,7 +237,7 @@ s32 cellGameDataCheck(PPUContext& ctx, u32 type, u32 dir_name, u32 size)
     psf::Registry sfo;
     SfoLoad load = SfoLoad::Missing;
     if (type == CELL_GAME_GAMETYPE_DISC) {
-        if (auto parsed = psf::parse(game().param_sfo)) {
+        if (auto parsed = psf::parse(disc_param_sfo(t.kernel))) {
             sfo = std::move(*parsed);
             load = SfoLoad::Ok;
         }
@@ -1084,7 +1104,8 @@ s32 cellDiscGameGetBootDiscInfo(PPUContext& ctx, u32 get_param)
     }
     // The disc's PARAM.SFO, as RPCS3's psf::load reads it (an unknown category makes it empty).
     psf::Registry sfo;
-    if (auto parsed = psf::parse(game().param_sfo); parsed && known_category(psf::get_string(*parsed, "CATEGORY"))) {
+    if (auto parsed = psf::parse(disc_param_sfo(thread_of(ctx).kernel));
+        parsed && known_category(psf::get_string(*parsed, "CATEGORY"))) {
         sfo = std::move(*parsed);
     }
     if (const auto it = sfo.find("PARENTAL_LEVEL"); it != sfo.end() && it->second.format == psf::Format::Integer) {
@@ -1159,11 +1180,12 @@ s32 cellGameDataCheckCreate(PPUContext& ctx, u32 version, u32 dir_name, u32 err_
     return cellGameDataCheckCreate2(ctx, version, dir_name, err_dialog, func_stat, container);
 }
 
-// The directory the game booted from: the disc's PS3_GAME, or an HDD game's /dev_hdd0/game/<title ID>.
+// The directory the game booted from: the disc's PS3_GAME, or its folder in /dev_hdd0/game (an HDD game's, a disc
+// game's update's).
 std::string boot_dir()
 {
     const GameInfo& g = game();
-    return g.boot == GameInfo::Boot::Disc ? "/dev_bdvd/PS3_GAME" : "/dev_hdd0/game/" + g.title_id;
+    return g.boot == GameInfo::Boot::Disc ? "/dev_bdvd/PS3_GAME" : "/dev_hdd0/game/" + g.hdd_dir();
 }
 
 // RPCS3 cellHddGameGetSizeKB: the booted directory's size in KB, each file rounded up to 1 KB.

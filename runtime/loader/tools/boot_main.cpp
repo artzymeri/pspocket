@@ -15,6 +15,10 @@
 // licence, NP_KLIC_FREE for free content or the player's <CONTENT_ID>.rap in --hdd0's home/00000001/exdata.
 // --bdvd takes the game's disc as a directory or as its disc image, read in place (/dev_bdvd from the image root,
 // /app_home from PS3_GAME/USRDIR unless --app-home says otherwise).
+// An executable in --hdd0's game folder (DIR/game/<folder>/USRDIR/EBOOT.BIN, D-939) starts as the PS3 starts it from
+// there: an installed PSN game (its folder's PARAM.SFO has category HG) with that USRDIR as /app_home, or a disc game's
+// update (category GD), which runs with its disc (--bdvd). A disc game booted from its disc's executable while --hdd0
+// holds its update is told so (a PS3 would start the update).
 // --flash mounts DIR read-only as /dev_flash: the system files a game reads itself (GTA V's MultiStream loads its MP3
 // codec, sys/external/flashMP3.pic), taken from the user's own firmware and kept out of the repository (D-067).
 // --system-library DIR runs the firmware's modules from their translation (pspocket-prepare --system, D-178); by
@@ -85,6 +89,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -112,6 +117,7 @@
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/disc.hpp"
+#include "pspocket/loader/hdd_game.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/loader/system.hpp"
 #include "pspocket/lv2/kernel.hpp"
@@ -1023,6 +1029,21 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "pspocket-boot: %s: %s\n", elf_path, exe.error().message.c_str());
         return 65;
     }
+    // An executable in --hdd0's game folder (D-939): an installed game, or a disc game's update (with its disc).
+    std::optional<loader::HddGame> hdd_game;
+    if (!hdd0.empty()) {
+        std::string why;
+        hdd_game = loader::hdd_game_of(hdd0, elf_path, &why);
+        if (!hdd_game && !why.empty()) {
+            std::fprintf(stderr, "pspocket-boot: %s\n", why.c_str());
+            return 66;
+        }
+        if (hdd_game && hdd_game->update() && bdvd.empty()) {
+            std::fprintf(stderr, "pspocket-boot: %s is an update of the disc game %s: it runs with its disc (--bdvd)\n",
+                elf_path, hdd_game->title_id.c_str());
+            return 64;
+        }
+    }
 
     GuestMemory memory;
     if (!memory.reserve()) return 71;
@@ -1043,6 +1064,7 @@ int main(int argc, char** argv)
         exited = true;
     };
     loader::BootState state;
+    if (hdd_game) state.options.argv[0] = hdd_game->boot_path;
     loader::prepare_kernel_config(cfg, state);
     cfg.rsx_log_failures = rsx_recover;
 
@@ -1134,6 +1156,27 @@ int main(int argc, char** argv)
     }
     if (!hdd0.empty() && !kernel.vfs_mount("/dev_hdd0", hdd0, false)) return 66;
     if (!flash.empty() && !kernel.vfs_mount("/dev_flash", flash, true)) return 66;
+    if (hdd_game) {
+        // Its folder's USRDIR is /app_home, its PARAM.SFO what cellGame reads (an update's: category GD).
+        std::string why;
+        if (!loader::mount_app_home(kernel, *hdd_game, &why)) {
+            std::fprintf(stderr, "pspocket-boot: %s\n", why.c_str());
+            return 66;
+        }
+        if (hdd_game->update() && !game.title_id.empty() && game.title_id != hdd_game->title_id) {
+            PS_LOG_WARN("boot", "the update is {}'s, the disc {}", hdd_game->title_id, game.title_id);
+        }
+        PS_LOG_INFO("boot", "{} {} \"{}\" version {} from /dev_hdd0/game/{}",
+            hdd_game->update() ? "the disc game's update:" : "an installed game:", hdd_game->title_id, hdd_game->title,
+            hdd_game->app_ver.empty() ? "?" : hdd_game->app_ver, hdd_game->dir);
+        game = hdd_game->game_info();
+    } else if (!hdd0.empty() && !game.title_id.empty()) {
+        if (const auto update = loader::find_update(hdd0, game.title_id)) {
+            PS_LOG_WARN("boot", "{} has an update installed (version {}): a PS3 starts it; to run it, boot {}/USRDIR/"
+                                "EBOOT.BIN with this disc",
+                game.title_id, update->app_ver.empty() ? "?" : update->app_ver, update->host_dir);
+        }
+    }
     if (!app_home.empty() && !kernel.vfs_mount("/app_home", app_home, false)) return 66;
 
     hle::ProcessConfig process_config;
@@ -1345,7 +1388,8 @@ int main(int argc, char** argv)
             start_watch(watch);
         }).detach();
     }
-    if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, {}, main_id); r != lv2::CELL_OK) {
+    const loader::BootOptions options = state.options; // argv[0]: the executable's guest path
+    if (const lv2::Result r = loader::start_main_thread(*exe, kernel, state, options, main_id); r != lv2::CELL_OK) {
         std::fprintf(stderr, "pspocket-boot: cannot start the main thread: %s\n", lv2::error_name(r));
         return 70;
     }
