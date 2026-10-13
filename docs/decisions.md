@@ -14267,3 +14267,11 @@ Tests: tests/lv2/test_dbg.cpp (a thread making calls stops and goes on, register
 thread, the process stopped but its caller, an SPU loop stopped and read). With this part every one of the 634
 syscalls the kernel chart counts is pspocket's own; the retail table's unnamed slots (958, 959, 972, 974, 988) are
 the next pass (D-936's conformance sweep).
+
+### D-937, part 6: a race ThreadSanitizer found in the SPU outbound mailboxes
+
+Running the kernel's tests under ThreadSanitizer for parts 1 to 5 (scripts/tsan.sh lv2: no report in the new
+debugging code) showed one race that was there before: a raw SPU's interrupt service and its MMIO read the outbound
+and outbound interrupt mailbox counts without the SPU's channel lock (atomic loads), while the SPU wrote them plainly
+under it. The SPU side now stores them atomically, with release order after the value it publishes
+(runtime/spu/src/channels.cpp). tsan.sh lv2 spu: no reports.

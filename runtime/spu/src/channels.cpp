@@ -495,7 +495,7 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
     case PS_SPU_WrOutMbox:
         if (wait_until(ctx, lock, pc, [&] { return ch.out_mbox_count == 0; })) return 1;
         ch.out_mbox = value;
-        ch.out_mbox_count = 1;
+        __atomic_store_n(&ch.out_mbox_count, 1u, __ATOMIC_RELEASE); // read without the lock by raw SPUs (D-571)
         notify(ctx);
         return 0;
     case PS_SPU_WrOutIntrMbox: {
@@ -509,7 +509,7 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
         }
         if (wait_until(ctx, lock, pc, [&] { return ch.out_intr_mbox_count == 0; })) return 1;
         ch.out_intr_mbox = value;
-        ch.out_intr_mbox_count = 1;
+        __atomic_store_n(&ch.out_intr_mbox_count, 1u, __ATOMIC_RELEASE); // read without the lock by raw SPUs (D-571)
         notify(ctx);
         if (ctx->hooks && ctx->hooks->intr_mbox_written) {
             lock.unlock();
@@ -595,7 +595,7 @@ int ps_spu_read_out_mbox(SPUContext* ctx, uint32_t* value)
     ChannelLock lock(ctx);
     if (!ctx->ch.out_mbox_count) return 0;
     *value = ctx->ch.out_mbox;
-    ctx->ch.out_mbox_count = 0;
+    __atomic_store_n(&ctx->ch.out_mbox_count, 0u, __ATOMIC_RELEASE);
     set_events(ctx, PS_SPU_EVENT_LE);
     notify(ctx);
     return 1;
@@ -606,7 +606,7 @@ int ps_spu_read_out_intr_mbox(SPUContext* ctx, uint32_t* value)
     ChannelLock lock(ctx);
     if (!ctx->ch.out_intr_mbox_count) return 0;
     *value = ctx->ch.out_intr_mbox;
-    ctx->ch.out_intr_mbox_count = 0;
+    __atomic_store_n(&ctx->ch.out_intr_mbox_count, 0u, __ATOMIC_RELEASE);
     set_events(ctx, PS_SPU_EVENT_ME);
     notify(ctx);
     return 1;
@@ -625,7 +625,7 @@ int ps_spu_wait_out_mbox(SPUContext* ctx, uint32_t* value, uint64_t timeout_ns)
     }
     if (!ch.out_mbox_count) return 0;
     *value = ch.out_mbox;
-    ch.out_mbox_count = 0;
+    __atomic_store_n(&ch.out_mbox_count, 0u, __ATOMIC_RELEASE);
     set_events(ctx, PS_SPU_EVENT_LE);
     notify(ctx);
     return 1;
