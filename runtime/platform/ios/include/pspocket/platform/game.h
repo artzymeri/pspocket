@@ -23,6 +23,10 @@ typedef struct ps_game_options {
     void* metal_layer;     /* the CAMetalLayer the frames go to (bridged), or NULL */
     const char* game_library; /* the game's translated code as a game library (route B, D-152), or NULL: the
                                  translation built into the app, if it is this game's, else the interpreters */
+    const char* game_dir;  /* a game started from /dev_hdd0/game (D-939), a folder of hdd0_dir/game, or NULL: an
+                              installed PSN game (iso_path NULL), or a disc game's update (category GD; iso_path is its
+                              disc). Its USRDIR is /app_home, its PARAM.SFO the one the game reads; elf_path is its
+                              USRDIR/EBOOT.BIN decrypted (ps_psn_decrypt_executable) */
 } ps_game_options;
 
 /*
@@ -34,6 +38,23 @@ int ps_game_boot(const ps_game_options* options, char* error, size_t error_size)
 /* The disc's title ID and title ("BLES01807", "Grand Theft Auto V"). Returns 0, or non-zero with `error` set. */
 int ps_game_probe_disc(const char* iso_path, char* title_id, size_t title_id_size, char* title, size_t title_size,
     char* error, size_t error_size);
+
+/*
+ * A game installed in /dev_hdd0/game (D-939): game_dir is its folder, which has to be in hdd0_dir/game. Its title ID,
+ * title, category ("HG" a PSN game; "GD" game data, a disc game's update when it has USRDIR/EBOOT.BIN) and version
+ * (APP_VER) go to the buffers. Returns 0, or non-zero with `error` set (a folder elsewhere, no PARAM.SFO).
+ */
+int ps_game_probe_installed(const char* hdd0_dir, const char* game_dir, char* title_id, size_t title_id_size,
+    char* title, size_t title_size, char* category, size_t category_size, char* version, size_t version_size,
+    char* error, size_t error_size);
+
+/*
+ * The update installed for the disc game title_id, as a PS3 (and RPCS3) finds it: hdd0_dir/game/<title_id> with a
+ * PARAM.SFO of that title ID and category GD and its own USRDIR/EBOOT.BIN (D-939). Its folder and version (APP_VER) go
+ * to the buffers. Returns 1 when there is one, else 0.
+ */
+int ps_game_find_update(const char* hdd0_dir, const char* title_id, char* game_dir, size_t game_dir_size,
+    char* version, size_t version_size);
 
 /*
  * A file of the disc image, by its path on the disc ("PS3_GAME/ICON0.PNG"): its size goes to *size, and as much of it

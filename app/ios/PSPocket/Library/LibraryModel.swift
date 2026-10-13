@@ -5,11 +5,14 @@ import Observation
 import os
 import UIKit
 
-/// One disc image in the library: an .iso in Documents/Games (Files > On My iPhone > PSPocket > Games), or one the
-/// user added from anywhere else with Add Game (kept as a security-scoped bookmark).
+/// One game in the library: a disc image (an .iso in Documents/Games, Files > On My iPhone > PSPocket > Games, or one
+/// the user added from anywhere else with Add Game, kept as a security-scoped bookmark), or a game installed from its
+/// package into Documents/hdd0/game (D-939: a PSN game).
 struct LibraryEntry: Identifiable, Equatable {
-    let id: String // "games:<path inside Games>" or "added:<uuid>"
-    let url: URL
+    enum Kind { case disc, installed }
+    let id: String // "games:<path inside Games>", "added:<uuid>" or "hdd0:<folder>"
+    let url: URL   // the disc image, or the installed game's folder
+    var kind: Kind = .disc
     var titleID: String?
     var title: String?
     /// Why the image can't be played (not a PS3 disc, still being copied, its executable failed to decrypt).
@@ -25,7 +28,9 @@ struct LibraryEntry: Identifiable, Equatable {
 ///   Documents/Games/                                 the user's disc images (made at launch so Files shows it)
 ///   Library/Application Support/pspocket-library/library.json   added images' bookmarks, play time per title ID
 ///   Library/Caches/pspocket-covers/<TITLE_ID>.jpg     covers from GameTDB; <TITLE_ID>-icon0.png the disc's ICON0.PNG
-///   Library/Application Support/pspocket-games/<TITLE_ID>/EBOOT.elf   the disc's executable decrypted here (D-121)
+///   Library/Application Support/pspocket-games/<TITLE_ID>/EBOOT.elf   the disc's executable decrypted here (D-121), or
+///                                                    an installed game's; update-<version>/EBOOT.elf an update's
+///   Documents/hdd0/game/<folder>/                     games and updates installed from packages put in Games (D-939)
 @Observable
 final class LibraryModel {
     enum InputMode { case pad, touch }
@@ -57,6 +62,8 @@ final class LibraryModel {
     @ObservationIgnored static let log = Logger(subsystem: "com.artzymeri.pspocket", category: "library")
     /// A boot that failed, for the library to show.
     private(set) var bootError: String?
+    /// How installing the packages and licences put in Games goes (D-939), for the library to show.
+    private(set) var notice: String?
 
     @ObservationIgnored private var store = Store()
     @ObservationIgnored private var added: [String: URL] = [:] // "added:<uuid>" -> URL (access started)
@@ -69,6 +76,13 @@ final class LibraryModel {
     @ObservationIgnored private var pendingSave: DispatchWorkItem?
     @ObservationIgnored private var armTimer: Timer?
     @ObservationIgnored private weak var game: GameModel?
+    /// Why an installed game cannot be played (its executable did not decrypt: no licence yet), by entry ID.
+    @ObservationIgnored private var installedProblems: [String: String] = [:]
+    @ObservationIgnored private var installing: String? // the package being installed (its path)
+    @ObservationIgnored private var installQueue: [(url: URL, scoped: Bool)] = []
+    @ObservationIgnored private var seenPackages: [String: (signature: String, since: Date)] = [:]
+    @ObservationIgnored private var packageCheckPending = false
+    @ObservationIgnored private let packageQueue = DispatchQueue(label: "pspocket.library.packages", qos: .utility)
 
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     static var gamesFolder: URL { documents.appendingPathComponent("Games", isDirectory: true) }
@@ -82,6 +96,9 @@ final class LibraryModel {
     /// Where executables decrypted on the phone go: a folder the app makes itself (Documents/game/ is the Mac's,
     /// `scripts/ios.sh push-game`, and the app may not write in it).
     static var decryptedGames: URL { support.appendingPathComponent("pspocket-games") }
+    /// The folder that is the games' /dev_hdd0 (GameModel mounts it): installed games and updates in game/<folder>,
+    /// the player's licences in home/00000001/exdata.
+    static var hdd0: URL { documents.appendingPathComponent("hdd0", isDirectory: true) }
 
     init() {
         try? FileManager.default.createDirectory(at: Self.gamesFolder, withIntermediateDirectories: true)
@@ -139,16 +156,25 @@ final class LibraryModel {
         return "Last played \(day) · \(minutes / 60) h \(String(format: "%02d", minutes % 60)) min"
     }
 
-    /// Images in Documents/Games and the ones added elsewhere, probed, newest played first.
+    /// Images in Documents/Games and the ones added elsewhere, probed, and the games installed in /dev_hdd0, newest
+    /// played first; packages and licences put in Games are installed.
     func rescan() {
         var found: [(id: String, url: URL)] = []
+        var dropped: [URL] = []
         let games = Self.gamesFolder.standardizedFileURL
         if let walker = FileManager.default.enumerator(at: games, includingPropertiesForKeys: [.isRegularFileKey],
                                                        options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-            for case let url as URL in walker where url.pathExtension.lowercased() == "iso" {
-                let path = url.standardizedFileURL.path
-                let relative = path.hasPrefix(games.path) ? String(path.dropFirst(games.path.count + 1)) : path
-                found.append(("games:" + relative, url))
+            for case let url as URL in walker {
+                switch url.pathExtension.lowercased() {
+                case "iso":
+                    let path = url.standardizedFileURL.path
+                    let relative = path.hasPrefix(games.path) ? String(path.dropFirst(games.path.count + 1)) : path
+                    found.append(("games:" + relative, url))
+                case "pkg", "rap":
+                    dropped.append(url)
+                default:
+                    break
+                }
             }
         }
         let inGames = Set(found.map { $0.url.standardizedFileURL.path })
@@ -168,7 +194,44 @@ final class LibraryModel {
             }
             next.append(entry)
         }
+        let installed = installedGames()
+        next += installed
         apply(next)
+        for entry in installed where entry.problem == nil { ensureExecutable(entry) }
+        installDropped(dropped)
+    }
+
+    /// Games installed from their packages (D-939): folders of /dev_hdd0/game whose PARAM.SFO says HG (a PSN game),
+    /// with an executable. Game data and disc games' updates (category GD) are not games of their own.
+    private func installedGames() -> [LibraryEntry] {
+        let folder = Self.hdd0.appendingPathComponent("game", isDirectory: true)
+        guard let folders = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
+                                                                          options: [.skipsHiddenFiles]) else { return [] }
+        var out: [LibraryEntry] = []
+        for game in folders where FileManager.default.fileExists(atPath: game.appendingPathComponent("USRDIR/EBOOT.BIN").path) {
+            guard let probe = Self.probeInstalled(game), probe.category == "HG" else { continue }
+            let id = "hdd0:" + game.lastPathComponent
+            var entry = LibraryEntry(id: id, url: game, kind: .installed)
+            entry.titleID = probe.titleID
+            entry.title = probe.title.replacingOccurrences(of: "\n", with: " ")
+            entry.problem = installedProblems[id]
+            out.append(entry)
+        }
+        return out
+    }
+
+    /// An installed game's folder: its PARAM.SFO's title ID, title, category and version.
+    static func probeInstalled(_ folder: URL) -> (titleID: String, title: String, category: String, version: String)? {
+        var tid = [CChar](repeating: 0, count: 32)
+        var name = [CChar](repeating: 0, count: 256)
+        var category = [CChar](repeating: 0, count: 8)
+        var version = [CChar](repeating: 0, count: 16)
+        var error = [CChar](repeating: 0, count: 256)
+        guard ps_game_probe_installed(hdd0.path, folder.path, &tid, tid.count, &name, name.count, &category,
+                                      category.count, &version, version.count, &error, error.count) == 0 else {
+            return nil
+        }
+        return (String(cString: tid), String(cString: name), String(cString: category), String(cString: version))
     }
 
     private func apply(_ next: [LibraryEntry]) {
@@ -184,7 +247,7 @@ final class LibraryModel {
         }
         if sorted != entries { entries = sorted }
         if focusID == nil || !entries.contains(where: { $0.id == focusID }) { focusID = entries.first?.id }
-        for entry in entries { if let id = entry.titleID { requestCover(titleID: id, iso: entry.url) } }
+        for entry in entries where entry.titleID != nil { requestCover(for: entry) }
     }
 
     private func probe(id: String, url: URL, size: Int64) {
@@ -204,7 +267,7 @@ final class LibraryModel {
                     e.title = title
                     e.problem = problem
                 }
-                if let titleID { self.ensureExecutable(titleID: titleID, iso: url) }
+                if titleID != nil, let entry = self.entries.first(where: { $0.id == id }) { self.ensureExecutable(entry) }
             }
         }
     }
@@ -242,11 +305,24 @@ final class LibraryModel {
     // MARK: Add Game
 
     /// An image the user picked in Files: kept where it is (a disc image is 20 GB) through a security-scoped bookmark.
+    /// A package or a licence is installed from where it is (D-939), and not kept.
     func add(_ url: URL) {
         let accessing = url.startAccessingSecurityScopedResource()
         guard accessing || FileManager.default.isReadableFile(atPath: url.path) else {
             bootError = "Can't open \(url.lastPathComponent)"
             return
+        }
+        switch url.pathExtension.lowercased() {
+        case "rap":
+            if let signature = Self.signature(of: url) { installLicence(url, key: url.standardizedFileURL.path, signature: signature) }
+            if accessing { url.stopAccessingSecurityScopedResource() }
+            return
+        case "pkg":
+            installQueue.append((url, accessing))
+            installNext()
+            return
+        default:
+            break
         }
         if url.standardizedFileURL.path.hasPrefix(Self.gamesFolder.standardizedFileURL.path) {
             rescan() // already in Games
@@ -305,45 +381,105 @@ final class LibraryModel {
         return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    /// The disc's executable decrypted on the phone with the keys the app carries (D-121), one disc at a time.
-    private func ensureExecutable(titleID: String, iso: URL) {
-        guard Self.executable(titleID: titleID) == nil, !decrypting.contains(titleID) else { return }
+    /// The update installed for a disc game (D-939): /dev_hdd0/game/<TITLE_ID> with category GD and an executable of
+    /// its own, which a PS3 starts in the disc's place, with the disc.
+    static func update(titleID: String) -> (folder: URL, version: String)? {
+        var dir = [CChar](repeating: 0, count: 1024)
+        var version = [CChar](repeating: 0, count: 16)
+        guard ps_game_find_update(hdd0.path, titleID, &dir, dir.count, &version, version.count) == 1 else { return nil }
+        return (URL(fileURLWithPath: String(cString: dir), isDirectory: true), String(cString: version))
+    }
+
+    /// What an entry starts (D-939): the disc's own executable; its update's, when one is installed (a PS3 starts that
+    /// with the disc); or an installed game's. `elf` is where it is decrypted to (it may not exist yet), `folder` the
+    /// game's folder in /dev_hdd0/game for the last two.
+    private func target(for entry: LibraryEntry, titleID: String) -> (elf: URL, folder: URL?) {
+        let dir = Self.decryptedGames.appendingPathComponent(titleID)
+        switch entry.kind {
+        case .installed:
+            return (dir.appendingPathComponent("EBOOT.elf"), entry.url)
+        case .disc:
+            if let update = Self.update(titleID: titleID) {
+                let name = update.version.isEmpty ? "update" : "update-\(update.version)"
+                return (dir.appendingPathComponent(name).appendingPathComponent("EBOOT.elf"), update.folder)
+            }
+            return (Self.executable(titleID: titleID) ?? dir.appendingPathComponent("EBOOT.elf"), nil)
+        }
+    }
+
+    /// The entry's executable decrypted on the phone, one at a time: a disc's with the keys the app carries (D-121),
+    /// an installed game's or an update's with its licence (D-582: free content, or the player's .rap).
+    private func ensureExecutable(_ entry: LibraryEntry) {
+        guard let titleID = entry.titleID, !decrypting.contains(titleID) else { return }
+        let target = self.target(for: entry, titleID: titleID)
+        guard !FileManager.default.fileExists(atPath: target.elf.path) else { return }
         decrypting.insert(titleID)
-        let folder = Self.decryptedGames.appendingPathComponent(titleID)
-        let elf = folder.appendingPathComponent("EBOOT.elf")
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: target.elf.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let iso = entry.url, hdd0 = Self.hdd0, kind = entry.kind, entryID = entry.id
         decryptQueue.async {
             var error = [CChar](repeating: 0, count: 512)
-            let status = ps_disc_decrypt_executable(iso.path, elf.path, &error, error.count)
+            let status: Int32
+            if let folder = target.folder {
+                status = ps_psn_decrypt_executable(folder.path, hdd0.path, target.elf.path, &error, error.count)
+            } else {
+                status = ps_disc_decrypt_executable(iso.path, target.elf.path, &error, error.count)
+            }
             let message = String(cString: error)
             DispatchQueue.main.async {
                 self.decrypting.remove(titleID)
                 if status != 0 {
-                    for e in self.entries where e.titleID == titleID {
-                        self.update(e.id) { $0.problem = "Could not decrypt the game's EBOOT.BIN: \(message)" }
-                    }
+                    let problem = "Could not decrypt the game's EBOOT.BIN: \(message)"
+                    if kind == .installed { self.installedProblems[entryID] = problem }
+                    for e in self.entries where e.titleID == titleID { self.update(e.id) { $0.problem = problem } }
                 }
                 if let boot = self.boot, boot.phase == .armed { self.armBoot() }
             }
         }
     }
 
-    /// The disc's own PRX modules and SPU ELFs saved into the game's folder for its preparation (D-239), once.
-    private func ensureDiscModules(titleID: String, iso: URL, gameDir: URL) {
+    /// Where a game's own PRX modules and SPU ELFs come from for its preparation (D-239): its disc, and an installed
+    /// game's or an update's folder in /dev_hdd0/game (D-939), each scanned once (per version for a folder).
+    private struct ModuleSource {
+        enum Kind { case disc(URL), folder(URL) }
+        let kind: Kind
+        let marker: String // the file that says it was scanned, in the game's folder
+    }
+
+    private func moduleSources(entry: LibraryEntry, folder: URL?, gameDir: URL) -> [ModuleSource] {
+        var sources: [ModuleSource] = []
+        if entry.kind == .disc { sources.append(ModuleSource(kind: .disc(entry.url), marker: "disc-scanned")) }
+        if let folder {
+            let version = Self.probeInstalled(folder)?.version ?? ""
+            sources.append(ModuleSource(kind: .folder(folder), marker: "\(folder.lastPathComponent)-\(version)-scanned"))
+        }
+        return sources.filter { !FileManager.default.fileExists(atPath: gameDir.appendingPathComponent($0.marker).path) }
+    }
+
+    /// The game's own PRX modules and SPU ELFs saved into the game's folder for its preparation (D-239), once.
+    private func ensureModules(titleID: String, sources: [ModuleSource], gameDir: URL) {
         guard !decrypting.contains(titleID) else { return }
         decrypting.insert(titleID)
         try? FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        let hdd0 = Self.hdd0
         decryptQueue.async {
-            var error = [CChar](repeating: 0, count: 512)
-            let saved = ps_disc_save_modules(iso.path, gameDir.appendingPathComponent("disc-prx").path,
-                                             gameDir.appendingPathComponent("disc-spu").path, &error, error.count)
-            if saved < 0 {
-                Self.log.error("pspocket: \(titleID, privacy: .public): the disc's modules: \(String(cString: error), privacy: .public)")
-            } else {
-                Self.log.notice("pspocket: \(titleID, privacy: .public): \(saved) executable files of its own on the disc")
+            let prx = gameDir.appendingPathComponent("disc-prx").path, spu = gameDir.appendingPathComponent("disc-spu").path
+            for source in sources {
+                var error = [CChar](repeating: 0, count: 512)
+                let saved: Int32
+                switch source.kind {
+                case .disc(let iso):
+                    saved = ps_disc_save_modules(iso.path, prx, spu, &error, error.count)
+                case .folder(let folder):
+                    saved = ps_psn_save_modules(folder.path, hdd0.path, prx, spu, &error, error.count)
+                }
+                if saved < 0 {
+                    Self.log.error("pspocket: \(titleID, privacy: .public): its own modules: \(String(cString: error), privacy: .public)")
+                } else {
+                    Self.log.notice("pspocket: \(titleID, privacy: .public): \(saved) executable files of its own (\(source.marker, privacy: .public))")
+                }
+                // Done, whatever it found (a disc that cannot be read now is not read again on every start).
+                FileManager.default.createFile(atPath: gameDir.appendingPathComponent(source.marker).path, contents: nil)
             }
-            // Done, whatever it found (a disc that cannot be read now is not read again on every start).
-            FileManager.default.createFile(atPath: gameDir.appendingPathComponent("disc-scanned").path, contents: nil)
             DispatchQueue.main.async {
                 self.decrypting.remove(titleID)
                 if let boot = self.boot, boot.phase == .armed { self.armBoot() }
@@ -351,11 +487,137 @@ final class LibraryModel {
         }
     }
 
+    // MARK: packages and licences (D-939)
+
+    /// The size and date of a file put in Games: a package or a licence is installed once per version of the file.
+    private static func signature(of url: URL) -> String? {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = values.fileSize else { return nil }
+        return "\(size):\(values.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+    }
+
+    /// A package split into parts is installed from its first, NAME_00.pkg (ps_psn_install_pkg).
+    private static func isLaterPart(_ url: URL) -> Bool {
+        let name = url.deletingPathExtension().lastPathComponent
+        guard name.count > 3, let part = Int(name.suffix(2)), name.dropLast(2).hasSuffix("_") else { return false }
+        return part != 0
+    }
+
+    /// Packages (.pkg: a PSN game, an update, add-ons) and licences (.rap) put in Games are installed into /dev_hdd0
+    /// as RPCS3 installs them (D-583), once per file; the files stay (the user deletes them in Files). A file is
+    /// taken once it has not changed for 3 s (Files copies a big one in for a while).
+    private func installDropped(_ urls: [URL]) {
+        var waiting = false
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let key = url.standardizedFileURL.path
+            guard let signature = Self.signature(of: url), store.packages?[key]?.signature != signature,
+                  installing != key, !installQueue.contains(where: { $0.url.standardizedFileURL.path == key }),
+                  !Self.isLaterPart(url) else { continue }
+            guard let seen = seenPackages[key], seen.signature == signature,
+                  Date().timeIntervalSince(seen.since) >= 3 else {
+                if seenPackages[key]?.signature != signature { seenPackages[key] = (signature, Date()) }
+                waiting = true
+                continue
+            }
+            if url.pathExtension.lowercased() == "rap" {
+                installLicence(url, key: key, signature: signature)
+            } else {
+                installQueue.append((url, false))
+            }
+        }
+        if waiting && !packageCheckPending {
+            packageCheckPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                self.packageCheckPending = false
+                self.rescan()
+            }
+        }
+        installNext()
+    }
+
+    private func record(_ key: String, signature: String, ok: Bool) {
+        var records = store.packages ?? [:]
+        records[key] = PackageRecord(signature: signature, ok: ok)
+        store.packages = records
+        saveSoon()
+    }
+
+    /// A licence (<CONTENT_ID>.rap) put where pspocket looks for it (D-580); the games it opens are tried again.
+    private func installLicence(_ url: URL, key: String, signature: String) {
+        var error = [CChar](repeating: 0, count: 512)
+        let ok = ps_psn_install_rap(Self.hdd0.path, url.path, &error, error.count) == 0
+        record(key, signature: signature, ok: ok)
+        guard ok else {
+            notice = "\(url.lastPathComponent) was not installed: \(String(cString: error))"
+            return
+        }
+        notice = "Licence \(url.deletingPathExtension().lastPathComponent) installed"
+        installedProblems.removeAll()
+        for entry in entries where entry.problem?.hasPrefix("Could not decrypt") == true {
+            update(entry.id) { $0.problem = nil }
+            if let fresh = entries.first(where: { $0.id == entry.id }) { ensureExecutable(fresh) }
+        }
+    }
+
+    /// The next package, in the background; the screen stays on meanwhile (a locked phone pauses the install).
+    private func installNext() {
+        guard installing == nil, !installQueue.isEmpty else { return }
+        let (url, scoped) = installQueue.removeFirst()
+        let key = url.standardizedFileURL.path
+        guard let signature = Self.signature(of: url) else {
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            installNext()
+            return
+        }
+        installing = key
+        notice = "Installing \(url.lastPathComponent)…"
+        UIApplication.shared.isIdleTimerDisabled = true
+        let hdd0 = Self.hdd0
+        try? FileManager.default.createDirectory(at: hdd0, withIntermediateDirectories: true)
+        let progress = InstallProgress()
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let files = progress.files
+            if files > 0 { self?.notice = "Installing \(url.lastPathComponent)… \(files) files" }
+        }
+        packageQueue.async {
+            var error = [CChar](repeating: 0, count: 1024)
+            let user = Unmanaged.passRetained(progress).toOpaque()
+            let status = ps_psn_install_pkg(url.path, hdd0.path, { user, line in
+                guard let user, let line else { return }
+                Unmanaged<InstallProgress>.fromOpaque(user).takeUnretainedValue().add(String(cString: line))
+            }, user, &error, error.count)
+            Unmanaged<InstallProgress>.fromOpaque(user).release()
+            let message = String(cString: error)
+            DispatchQueue.main.async {
+                timer.invalidate()
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                self.installing = nil
+                if self.boot == nil { UIApplication.shared.isIdleTimerDisabled = false }
+                self.record(key, signature: signature, ok: status == 0)
+                if status == 0 {
+                    // A package refused before (an update put in before its game) is tried again.
+                    if var records = self.store.packages {
+                        records = records.filter { $0.value.ok }
+                        self.store.packages = records
+                    }
+                    var text = "Installed \(url.lastPathComponent); you can delete it from Games now"
+                    if let licence = progress.licenceLine { text += ". \(licence)" }
+                    self.notice = text
+                    self.rescan()
+                } else {
+                    self.notice = "\(url.lastPathComponent) was not installed: \(message)"
+                }
+                self.installNext()
+            }
+        }
+    }
+
     // MARK: covers
 
-    /// GameTDB's cover (350x408), cached; else the disc's ICON0.PNG; else none (the title shows as text).
-    private func requestCover(titleID: String, iso: URL) {
-        guard !coverRequested.contains(titleID) else { return }
+    /// GameTDB's cover (350x408), cached; else the disc's (or the installed game's) ICON0.PNG; else none (the title
+    /// shows as text).
+    private func requestCover(for entry: LibraryEntry) {
+        guard let titleID = entry.titleID, !coverRequested.contains(titleID) else { return }
         coverRequested.insert(titleID)
         let cover = Self.coversFolder.appendingPathComponent("\(titleID).jpg")
         let icon0 = Self.coversFolder.appendingPathComponent("\(titleID)-icon0.png")
@@ -365,7 +627,9 @@ final class LibraryModel {
                 return
             }
             // ICON0.PNG first, while the download runs (and for good when there is no network).
-            if let image = UIImage(contentsOfFile: icon0.path) ?? Self.readIcon0(iso: iso, to: icon0) {
+            let own = entry.kind == .installed ? Self.copyIcon0(folder: entry.url, to: icon0)
+                : Self.readIcon0(iso: entry.url, to: icon0)
+            if let image = UIImage(contentsOfFile: icon0.path) ?? own {
                 self.setCover(image, for: titleID)
             }
             guard let url = URL(string: "https://art.gametdb.com/ps3/coverM/EN/\(titleID).jpg") else { return }
@@ -390,6 +654,13 @@ final class LibraryModel {
         else { return nil }
         let data = Data(bytes)
         guard let image = UIImage(data: data) else { return nil }
+        try? data.write(to: file, options: .atomic)
+        return image
+    }
+
+    private static func copyIcon0(folder: URL, to file: URL) -> UIImage? {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent("ICON0.PNG")), let image = UIImage(data: data)
+        else { return nil }
         try? data.write(to: file, options: .atomic)
         return image
     }
@@ -442,11 +713,17 @@ final class LibraryModel {
         guard let boot, boot.phase == .armed, armTimer == nil,
               let entry = entries.first(where: { $0.id == boot.entryID }), let titleID = entry.titleID else { return }
         if decrypting.contains(titleID) { return } // ensureExecutable comes back here when done
-        guard let elf = Self.executable(titleID: titleID), game != nil else {
+        let target = self.target(for: entry, titleID: titleID)
+        if !FileManager.default.fileExists(atPath: target.elf.path), entry.problem == nil {
+            ensureExecutable(entry) // an update installed since the disc was read: decrypted now, then back here
+            if decrypting.contains(titleID) { return }
+        }
+        guard FileManager.default.fileExists(atPath: target.elf.path), game != nil else {
             self.boot = nil
             bootError = entry.problem ?? "The game's executable is missing"
             return
         }
+        let elf = target.elf, folder = target.folder
         // The PS3 system software's own modules, translated once (D-178), before the first game after it is
         // installed (or after an update of pspocket that translates differently), and the SPU programs of the system
         // modules a game links, the first time a game links them (D-191). A game goes on without them if that fails:
@@ -476,17 +753,19 @@ final class LibraryModel {
                 Self.log.error("pspocket: cannot prepare the system software: \(message ?? "", privacy: .public)")
             }
         }
-        // The disc's own PRX modules and SPU programs (D-239), found once, so its first session runs them translated
-        // too (scanning reads only files named as executables: a few MB).
+        // The game's own PRX modules and SPU programs (D-239): its disc's, its update's or the installed game's, found
+        // once, so its first session runs them translated too (scanning reads only files named as executables).
         let gameDir = Self.decryptedGames.appendingPathComponent(titleID)
-        if !FileManager.default.fileExists(atPath: gameDir.appendingPathComponent("disc-scanned").path) {
-            ensureDiscModules(titleID: titleID, iso: entry.url, gameDir: gameDir)
+        let sources = moduleSources(entry: entry, folder: folder, gameDir: gameDir)
+        if !sources.isEmpty {
+            ensureModules(titleID: titleID, sources: sources, gameDir: gameDir)
             return // comes back here when done
         }
         // Route B (D-154): the game runs from the library this iPhone made of it; the first time, it is made now.
         let check = Preparer.check(gameDir: gameDir, executable: elf)
         if check.ready {
-            startGame(entry: entry, titleID: titleID, elf: elf, library: gameDir.appendingPathComponent("game.dylib"))
+            startGame(entry: entry, titleID: titleID, elf: elf, folder: folder,
+                      library: gameDir.appendingPathComponent("game.dylib"))
             return
         }
         Self.log.notice("pspocket: preparing \(titleID, privacy: .public): \(check.why, privacy: .public)")
@@ -498,27 +777,30 @@ final class LibraryModel {
                   let entry = self.entries.first(where: { $0.id == entryID }) else { return }
             switch result {
             case .success(let library):
-                self.startGame(entry: entry, titleID: titleID, elf: elf, library: library)
+                self.startGame(entry: entry, titleID: titleID, elf: elf, folder: folder, library: library)
             case .failure(let error):
                 // The game still starts, the way it did before route B: the translation built into the app when
                 // it is this game's, else the interpreters (slow).
                 Self.log.error("pspocket: preparing \(titleID, privacy: .public) failed: \(error.message, privacy: .public)")
                 self.preparationNotes[titleID] = "Preparing failed: \(error.message)"
-                self.startGame(entry: entry, titleID: titleID, elf: elf, library: nil)
+                self.startGame(entry: entry, titleID: titleID, elf: elf, folder: folder, library: nil)
             }
         }) {
             Self.log.error("pspocket: cannot prepare \(titleID, privacy: .public): \(message, privacy: .public)")
             preparationNotes[titleID] = "Not prepared: \(message)"
-            startGame(entry: entry, titleID: titleID, elf: elf, library: nil)
+            startGame(entry: entry, titleID: titleID, elf: elf, folder: folder, library: nil)
             return
         }
         UIApplication.shared.isIdleTimerDisabled = true // the screen stays on while the phone prepares the game
         self.boot?.phase = .preparing
     }
 
-    private func startGame(entry: LibraryEntry, titleID: String, elf: URL, library: URL?) {
+    /// `folder`: the game's folder in /dev_hdd0/game when it starts from there (D-939): an installed game's, or the
+    /// disc's update's (the disc goes in the drive all the same).
+    private func startGame(entry: LibraryEntry, titleID: String, elf: URL, folder: URL?, library: URL?) {
         guard let game else { return }
-        if let message = game.boot(iso: entry.url, elf: elf, library: library) {
+        if let message = game.boot(iso: entry.kind == .disc ? entry.url : nil, gameFolder: folder, elf: elf,
+                                   library: library) {
             self.boot = nil
             bootError = message
             return
@@ -556,6 +838,12 @@ final class LibraryModel {
         var seconds: Double = 0
     }
 
+    /// A package or licence installed (or refused) from a file: its size and date then (D-939).
+    struct PackageRecord: Codable {
+        var signature: String
+        var ok: Bool
+    }
+
     private struct Store: Codable {
         struct Added: Codable {
             var id: UUID
@@ -564,6 +852,7 @@ final class LibraryModel {
         var added: [Added] = []
         var stats: [String: Stats] = [:]
         var migratedOldBookmark = false
+        var packages: [String: PackageRecord]? // by the file's path; optional: stores written before it decode
     }
 
     private func loadStore() {
@@ -588,6 +877,27 @@ final class LibraryModel {
         try? FileManager.default.createDirectory(at: Self.storeURL.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(store) { try? data.write(to: Self.storeURL, options: .atomic) }
+    }
+}
+
+/// What ps_psn_install_pkg reports while it installs (its callback runs on the install's thread): the files written,
+/// and the line saying which licence the game needs when it is not in place yet.
+final class InstallProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var licence: String?
+
+    var files: Int { lock.withLock { count } }
+    var licenceLine: String? { lock.withLock { licence } }
+
+    func add(_ line: String) {
+        lock.withLock {
+            if line.contains("which is not there yet") {
+                licence = line.trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("file ") || line.hasPrefix("replaced ") {
+                count += 1
+            }
+        }
     }
 }
 
