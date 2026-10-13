@@ -22,14 +22,17 @@
 
 #include <catch_amalgamated.hpp>
 
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "compare_util.hpp"
+#include "h264_streams.hpp"
 #include "h264_writer.hpp"
 #include "mpeg2_writer.hpp"
 #include "vc1_writer.hpp"
@@ -43,6 +46,7 @@ using namespace pspocket::hle::test::vdec_test;
 namespace v1 = pspocket::hle::test::vc1;
 namespace h = pspocket::hle::test::h264;
 namespace m2 = pspocket::hle::test::mpeg2;
+namespace hs = pspocket::hle::test::h264s;
 
 TEST_CASE("cellVdec's comparison calls Sony's exports by their names; pspocket's library", "[hle][vdec]")
 {
@@ -59,8 +63,8 @@ using namespace pspocket::hle::test::vdec_streams;
 
 namespace {
 
-constexpr u32 CODEC_MPEG2 = 0, CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_DIVX3_11 = 9, CODEC_MVC = 11,
-              CODEC_MVC2 = 13;
+constexpr u32 CODEC_MPEG2 = 0, CODEC_MPEG4 = 2, CODEC_VC1 = 3, CODEC_DIVX = 5, CODEC_JVT = 7, CODEC_DIVX3_11 = 9,
+              CODEC_MVC = 11, CODEC_MVC2 = 13;
 
 // Sony's information block of each codec (RPCS3's VDEC_SCE_DECODER attributes).
 u32 info_size(u32 codec)
@@ -71,6 +75,7 @@ u32 info_size(u32 codec)
     case CODEC_DIVX: return 0x20;
     case CODEC_DIVX3_11: return 0x18;
     case CODEC_VC1: return 0x170;
+    case CODEC_JVT: return 0x160;
     case CODEC_MVC:
     case CODEC_MVC2: return 0x214;
     default: return 0x244;
@@ -171,6 +176,8 @@ Region frame_region(u32 codec, u32 width, u32 height, bool lines16 = false)
         const u32 hl = lines16 ? h16 : (height + 31) & ~31u;
         return {(hl + 128) * 16 + 64 * 16, (w16 + 32) * (hl + 128) * 3 / 2};
     }
+    case CODEC_JVT: // libsjvtd's: 32 lines of edge above and below the luma, 16 the chroma (D-920 part 8)
+        return {(h16 + 64) * 16 + 32 * 16, (w16 + 32) * (h16 + 64) * 3 / 2};
     default: { // libavcdec's (D-196): two strips of edge each side, no lines of edge; the start is the frame's
         const u32 strips = w16 / 16 + 4;
         return {0, strips * 16 * height + 0x400 + strips * 16 * (height / 2) + 0x400};
@@ -221,6 +228,18 @@ struct Life {
             const u32 info_bytes = info_size(codec);
             if (r.readable(info, info_bytes)) {
                 std::vector<u8> block(b + info, b + info + info_bytes);
+                // JVT's of a sequence without a VUI: libvdec copies the VUI's values from the words of libsjvtd's
+                // sequence structure the core leaves unwritten then, on libvdec's stack, where Sony's core's own
+                // calls left what they left and pspocket's (on the host) leave nothing (D-920 part 8): the video
+                // signal's, colour's and timing's bytes are notes.
+                if (codec == CODEC_JVT && block[0x12] == 0) {
+                    std::string bytes;
+                    for (const u32 at : {0x15u, 0x16u, 0x18u, 0x19u, 0x1Au, 0x1Bu, 0x1Du, 0x1Eu}) {
+                        bytes += std::format(" {:02x}", block[at]);
+                        block[at] = 0;
+                    }
+                    r.o.note(std::format("{}: the information's VUI bytes{}", key, bytes));
+                }
                 const u32 error_word = codec == CODEC_DIVX3_11 ? 0x14 : codec == CODEC_DIVX ? 0x1C : 0;
                 if (damaged && error_word) {
                     r.o.note(std::format("{}: the information's error word {:#x}", key, ps_read32(b, info + error_word)));
@@ -1048,6 +1067,114 @@ Observed mpeg2_family(const Setup& s, bool sony_half)
     return std::move(r.o);
 }
 
+// JVT (H.264 by libsjvtd, D-920 part 8): h264_streams.hpp's pictures (I_PCM, P_Skip, B_Skip: any decoder's samples are
+// the same), each sequence's first access unit with its parameter sets.
+std::vector<std::vector<u8>> jvt_stream(const std::string& tokens, const std::function<void(hs::Sps&)>& setup = {})
+{
+    hs::Sps sps;
+    sps.width_mbs = sps.height_map_units = 4;
+    sps.poc_type = 0;
+    sps.profile = 77;
+    sps.constraints = 0x40;
+    sps.max_num_ref_frames = 2;
+    if (setup) setup(sps);
+    const hs::Pps pps;
+    std::vector<std::vector<u8>> aus;
+    u32 fn = 0;
+    bool first = true;
+    for (usize pos = 0; pos < tokens.size();) {
+        while (pos < tokens.size() && tokens[pos] == ' ') pos++;
+        if (pos >= tokens.size()) break;
+        const char t = tokens[pos++];
+        int idx = 0;
+        while (pos < tokens.size() && std::isdigit(static_cast<unsigned char>(tokens[pos])))
+            idx = idx * 10 + (tokens[pos++] - '0');
+        hs::Slice sl;
+        hs::AuParts parts;
+        sl.kind = t == 'I' || t == 'i' ? hs::Kind::I : t == 'P' || t == 'p' ? hs::Kind::P : hs::Kind::B;
+        sl.nal_ref_idc = std::isupper(static_cast<unsigned char>(t)) || t == 'i' ? 3 : 0;
+        if (t == 'I') {
+            sl.idr = true;
+            fn = 0;
+            parts.sps = parts.pps = first;
+            first = false;
+        }
+        sl.frame_num = fn % 16;
+        if (sl.nal_ref_idc) fn++;
+        sl.poc_lsb = static_cast<u32>(2 * idx) % 64;
+        aus.push_back(hs::access_unit(sps, pps, sl, h::pattern(64, 64, idx), parts));
+    }
+    return aus;
+}
+
+Observed jvt(const Setup& s, bool sony_half)
+{
+    Run r(s, sony_half, "libvdec");
+    for (const u32 level : {9u, 10u, 11u, 12u, 13u, 20u, 21u, 22u, 30u, 31u, 32u, 40u, 41u, 42u, 50u}) {
+        query(r, std::format("JVT level {}", level), CODEC_JVT, level, {});
+        query(r, std::format("JVT level {} 64x64", level), CODEC_JVT, level, spec8(12, 64, 64));
+    }
+    query(r, "JVT level 21, the information 8 bytes", CODEC_JVT, 21, spec8(8, 64, 64));
+    for (const u32 less : {0u, 1u})
+        open_with_less(r, std::format("JVT with {} bytes less than its codec's part", less), CODEC_JVT, 21,
+            spec8(12, 64, 64), less);
+    const Rule exact = Rule::exact();
+    const std::vector<u8> spec = spec8(12, 64, 64);
+    decode(r, "JVT 64x64 I P P P", stream(CODEC_JVT, 21, jvt_stream("I0 P1 P2 P3"), spec), 64, 64, exact);
+    decode(r, "JVT 64x64 I P B", stream(CODEC_JVT, 21, jvt_stream("I0 P2 b1 P4 b3 P6 B5"), spec), 64, 64, exact);
+    decode(r, "JVT 64x64 I P B, without the information", stream(CODEC_JVT, 21, jvt_stream("I0 P2 b1 P4 b3")), 64, 64,
+        exact);
+    decode(r, "JVT 64x64, a VUI of every field",
+        stream(CODEC_JVT, 21, jvt_stream("I0 P2 b1 P4 b3", [](hs::Sps& q) {
+            hs::Vui& v = q.vui;
+            v.present = true;
+            v.aspect_ratio_idc = 255;
+            v.sar_width = 4;
+            v.sar_height = 3;
+            v.overscan = 1;
+            v.video_signal = true;
+            v.video_format = 2;
+            v.full_range = 1;
+            v.colour = true;
+            v.primaries = 5;
+            v.transfer = 6;
+            v.matrix = 7;
+            v.chroma_loc = true;
+            v.chroma_top = 1;
+            v.chroma_bottom = 2;
+            v.timing = true;
+            v.units_in_tick = 1001;
+            v.time_scale = 60000;
+            v.restriction = true;
+            v.num_reorder_frames = 1;
+            v.max_dec_frame_buffering = 2;
+            q.crop = true;
+            q.crop_right = 2;
+            q.crop_bottom = 1;
+        }), spec),
+        64, 64, exact);
+    // The information's deblocking flag and frame buffer count (the core's parameters from them).
+    const auto jvt_spec = [](u8 deblock, u8 buffers) {
+        std::vector<u8> v = spec8(12, 64, 64);
+        v[8] = deblock;
+        v[9] = buffers;
+        return v;
+    };
+    for (const auto& [deblock, buffers] : {std::pair<u8, u8>{1, 0}, {0, 2}, {0, 4}, {1, 16}, {2, 0}, {0, 17}}) {
+        const std::string what = std::format("JVT 64x64 I P B, deblocking {}, {} buffers", deblock, buffers);
+        query(r, what, CODEC_JVT, 21, jvt_spec(deblock, buffers));
+        decode(r, what, stream(CODEC_JVT, 21, jvt_stream("I0 P2 b1 P4 b3 P5 P6"), jvt_spec(deblock, buffers)), 64, 64,
+            exact);
+    }
+    // The decode modes (DecodeAu's): each access unit in turn in modes 0, 1 and 2.
+    decode(r, "JVT 64x64 I P B in modes 0, 1, 2", stream(CODEC_JVT, 21, jvt_stream("I0 P2 b1 P4 b3 p5 P6 b7"), spec),
+        64, 64, exact, false, {0, 1, 2, 0, 1, 2, 0, 1});
+    hold(r, "JVT 64x64, pictures not taken", stream(CODEC_JVT, 21, jvt_stream("I0 P1 P2 P3 P4 P5 P6 P7"), spec), 64, 64,
+        exact);
+    items_ahead(r, "JVT 64x64, items ahead of their pictures", stream(CODEC_JVT, 21, jvt_stream("I0 P1 P2"), spec));
+    return std::move(r.o);
+}
+
 // The comparison's setup: Sony's libvdec over Sony's codec cores, which pspocket now has its own of (D-920).
 Setup libvdec_setup()
 {
@@ -1169,6 +1296,12 @@ TEST_CASE("The VC-1 core under Sony's libvdec: pspocket's against Sony's", "[.][
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);
     const Setup s = cores_setup();
     run(s, "libsvc1d under Sony's libvdec", [&](bool sony) { return vc1_family(s, sony); }, [](const Observed&) {});
+}
+
+TEST_CASE("The JVT core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    const Setup s = cores_setup();
+    run(s, "libsjvtd under Sony's libvdec", [&](bool sony) { return jvt(s, sony); }, [](const Observed&) {});
 }
 
 TEST_CASE("cellVdec's new codecs against Sony's libvdec: MVC", "[.][hle][lle][compare][vdec]")

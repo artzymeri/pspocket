@@ -59,6 +59,7 @@ target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compar
 # The H.264 and MVC codec cores pspocket's own (D-933): test_hle "[vdec-cores]"; their comparisons with Sony's modules
 # "[compare][vdec-cores]".
 target_sources(test_hle PRIVATE test_vdec_avc_compare.cpp)
+target_sources(test_hle PRIVATE test_vdec_sjvtd_compare.cpp)
 
 # The CELP libraries (D-932): libcelpenc, libcelp8enc, libcelpdec and libcelp8dec, pspocket's own: test_hle "[celp]",
 # their comparisons with Sony's modules "[compare][celp]".
