@@ -168,6 +168,33 @@ static float4 rsx_shadow_depth(depth2d<float> t, sampler s, float2 uv, float ref
 
 constexpr const char* kXyzw = "xyzw";
 
+constexpr const char* kPackHelpers = R"MSL(// Metal's pack_float_to_unorm4x8 and its kin, by hand (D-942): the compiler gets them wrong next to another write to
+// the components of the register they are written to. round(x * n) of the exact product, as the intrinsics round it
+// (checked bit for bit against them): a float product that lands on k + 0.5 is decided by its rounding error.
+static float rsx_round_product(float x, float n)
+{
+    const float p = x * n, e = fma(x, n, -p), f = floor(p);
+    return p - f == 0.5 ? (e < 0.0 ? f : e > 0.0 ? f + 1.0 : rint(p)) : rint(p);
+}
+static uint rsx_pack_unorm4x8(float4 v)
+{
+    const float4 c = clamp(v, 0.0, 1.0);
+    return uint(rsx_round_product(c.x, 255.0)) | (uint(rsx_round_product(c.y, 255.0)) << 8) |
+           (uint(rsx_round_product(c.z, 255.0)) << 16) | (uint(rsx_round_product(c.w, 255.0)) << 24);
+}
+static uint rsx_pack_snorm8(float x) { return uint(int(sign(x) * rsx_round_product(abs(x), 127.0))) & 0xffu; }
+static uint rsx_pack_snorm4x8(float4 v)
+{
+    const float4 c = clamp(v, -1.0, 1.0);
+    return rsx_pack_snorm8(c.x) | (rsx_pack_snorm8(c.y) << 8) | (rsx_pack_snorm8(c.z) << 16) | (rsx_pack_snorm8(c.w) << 24);
+}
+static uint rsx_pack_unorm2x16(float2 v)
+{
+    const float2 c = clamp(v, 0.0, 1.0);
+    return uint(rsx_round_product(c.x, 65535.0)) | (uint(rsx_round_product(c.y, 65535.0)) << 16);
+}
+)MSL";
+
 std::string mask_suffix(u8 mask)
 {
     if (mask == 0xf) return "";
@@ -322,6 +349,12 @@ u64 translation_fingerprint()
 const std::string& msl_prologue()
 {
     static const std::string s = kPrologue;
+    return s;
+}
+
+const std::string& msl_pack_helpers()
+{
+    static const std::string s = kPackHelpers;
     return s;
 }
 
@@ -746,6 +779,8 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     FpContext c{fp, opt, {}, {}, {}, {}, 0, 0, 0, {}, false, false};
     bool uses_divsq = false, uses_lit = false, uses_refl = false, uses_to_srgb = false, uses_from_srgb = false;
     bool uses_texel = false;
+    bool discards = false; // the program can discard its fragment (D-941)
+    bool uses_pack = false; // PK4, PKB, PK16, PKG: packed by hand (D-942)
     std::string body;
     u32 const_slot = 0;
 
@@ -854,6 +889,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         if (op == FpOp::KIL) {
             body += conditional ? std::format("        if (any({})) discard_fragment();\n    }}\n", cond)
                                 : std::string("        discard_fragment();\n    }\n");
+            discards = true;
             continue;
         }
         if (op == FpOp::RET) {
@@ -892,21 +928,30 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
             e = std::format("rsx_divsq({}, ({}).x)", s0, s1());
             uses_divsq = true;
             break;
-        // RPCS3 packs and unpacks PK16/UP16 as two unorm16 (packUnorm2x16).
-        case FpOp::PK16: e = std::format("float4(as_type<float>(pack_float_to_unorm2x16(({}).xy)))", s0); break;
+        // RPCS3 packs and unpacks PK16/UP16 as two unorm16 (packUnorm2x16). Packs by hand (D-942).
+        case FpOp::PK16:
+            e = std::format("float4(as_type<float>(rsx_pack_unorm2x16(({}).xy)))", s0);
+            uses_pack = true;
+            break;
         case FpOp::UP16: e = std::format("unpack_unorm2x16_to_float(as_type<uint>(({}).x)).xyxy", s0); break;
         // RPCS3: PKB/UPB packUnorm4x8 and unpackUnorm4x8, PK4/UP4 the snorm forms, PK2/UP2 packHalf2x16.
-        case FpOp::PKB: e = std::format("float4(as_type<float>(pack_float_to_unorm4x8({})))", s0); break;
+        case FpOp::PKB:
+            e = std::format("float4(as_type<float>(rsx_pack_unorm4x8({})))", s0);
+            uses_pack = true;
+            break;
         case FpOp::UPB: e = std::format("unpack_unorm4x8_to_float(as_type<uint>(({}).x))", s0); break;
-        case FpOp::PK4: e = std::format("float4(as_type<float>(pack_float_to_snorm4x8({})))", s0); break;
+        case FpOp::PK4:
+            e = std::format("float4(as_type<float>(rsx_pack_snorm4x8({})))", s0);
+            uses_pack = true;
+            break;
         case FpOp::UP4: e = std::format("unpack_snorm4x8_to_float(as_type<uint>(({}).x))", s0); break;
         case FpOp::PK2: e = std::format("float4(as_type<float>(half2(({}).xy)))", s0); break;
         case FpOp::UP2: e = std::format("float2(as_type<half2>(as_type<uint>(({}).x))).xyxy", s0); break;
         // PKG and UPG: PKB and UPB with gamma (RPCS3 _builtin_pkg, _builtin_upg: linear_to_srgb before packing,
         // srgb_to_linear after unpacking, on all four components).
         case FpOp::PKG:
-            e = std::format("float4(as_type<float>(pack_float_to_unorm4x8(rsx_linear_to_srgb({}))))", s0);
-            uses_to_srgb = true;
+            e = std::format("float4(as_type<float>(rsx_pack_unorm4x8(rsx_linear_to_srgb({}))))", s0);
+            uses_to_srgb = uses_pack = true;
             break;
         case FpOp::UPG:
             e = std::format("rsx_srgb_to_linear(unpack_unorm4x8_to_float(as_type<uint>(({}).x)))", s0);
@@ -1069,7 +1114,10 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
                 const bool convert = ((opt.texture_convert_mask >> t) & 1) || in.tex_bx2;
                 if (kill || convert) {
                     pre += std::format("        float4 tex = {};\n", e);
-                    if (kill) pre += "        if (tex.w < 0.000001) discard_fragment(); // alpha kill\n";
+                    if (kill) {
+                        pre += "        if (tex.w < 0.000001) discard_fragment(); // alpha kill\n";
+                        discards = true;
+                    }
                     if (convert) {
                         pre += std::format("        tex = rsx_texel(tex, fp.tex_control[{}], {});\n", t, in.tex_bx2 ? "true" : "false");
                         uses_texel = true;
@@ -1130,6 +1178,10 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     // program only wrote the other file's aliasing register, that one is exported.
     const bool fp32_out = (opt.shader_control & 0x40) != 0;
     const bool depth_export = (opt.shader_control & 0xe) != 0;
+    // Under the depth clamp a program that can discard exports the depth it was rasterized at, for Metal to clamp
+    // (D-941).
+    discards = discards || opt.alpha_test || opt.alpha_to_coverage || opt.depth_bounds || opt.polygon_stipple;
+    const bool depth_out = depth_export || (opt.clamp_depth && discards);
     static constexpr u32 kR[4] = {0, 2, 3, 4};
     static constexpr u32 kH[4] = {0, 4, 6, 8};
     std::array<std::string, 4> outputs;
@@ -1156,8 +1208,8 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
     src += "};\n\nstruct rsx_fs_out {\n";
     const u32 mrt = std::min<u32>(opt.mrt_count, 4);
     for (u32 i = 0; i < mrt; i++) src += std::format("    float4 c{} [[color({})]];\n", i, i);
-    if (depth_export) src += "    float depth [[depth(any)]];\n";
-    if (mrt == 0 && !depth_export) src += "    float4 c0 [[color(0)]];\n";
+    if (depth_out) src += "    float depth [[depth(any)]];\n";
+    if (mrt == 0 && !depth_out) src += "    float4 c0 [[color(0)]];\n";
     src += "};\n\n";
     src += "static float4 rsx_nrm(float4 v) { const float l = length(v.xyz); return (l > 0.0 ? float4(v.xyz / l, 0.0) : v).xyzz; }\n";
     if (uses_divsq) {
@@ -1173,6 +1225,7 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         src += "static float4 rsx_lif(float4 v) { return float4(1.0, v.y, v.y > 0.0 ? exp2(v.w) : 0.0, 1.0); }\n";
     }
     if (uses_refl) src += "static float4 rsx_refl(float4 i, float4 n) { return i - 2.0 * dot(n, i) * n; }\n";
+    if (uses_pack) src += kPackHelpers;
     if (uses_to_srgb || (opt.srgb_output && mrt > 0)) {
         // RPCS3 RSXFragmentPrologue.glsl linear_to_srgb.
         src += "static float4 rsx_linear_to_srgb(float4 c)\n{\n"
@@ -1302,10 +1355,10 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
             src += std::format("    out.c{} = float4({}, {}, {}, {});\n", i, ch(sw[0]), ch(sw[1]), ch(sw[2]), ch(sw[3]));
         }
     }
-    if (mrt == 0 && !depth_export) src += "    out.c0 = float4(0.0);\n";
+    if (mrt == 0 && !depth_out) src += "    out.c0 = float4(0.0);\n";
     // Exported depth is clamped to [0, 1], float depth buffers too (RPCS3 VKFragmentProgram.cpp, from tests on the
     // hardware): Metal clamps it to the viewport's depth range itself (D-266, checked in tests/rsx).
-    if (depth_export) src += "    out.depth = r1.z;\n";
+    if (depth_out) src += depth_export ? "    out.depth = r1.z;\n" : "    out.depth = in.position.z;\n";
     src += "    return out;\n}\n";
 
     result.shader.source = std::move(src);
@@ -1315,6 +1368,10 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
     result.ok = true;
     return result;
 }
+
+bool vp_vec_op_supported(u32 op) { return vp_vec_supported(op); }
+bool vp_sca_op_supported(u32 op) { return vp_sca_supported(op); }
+bool fp_op_supported(u32 op) { return fp_supported(op); }
 
 void read_fragment_constants(const FragmentProgram& fp, const u8* program_data, std::vector<std::array<float, 4>>& out)
 {

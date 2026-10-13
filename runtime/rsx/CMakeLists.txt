@@ -8,6 +8,7 @@ add_library(pspocket_rsx STATIC
     src/null_backend.cpp
     src/rsx.cpp
     src/shader/fp.cpp
+    src/shader/interp.cpp
     src/shader/msl.cpp
     src/shader/vp.cpp
     src/state.cpp

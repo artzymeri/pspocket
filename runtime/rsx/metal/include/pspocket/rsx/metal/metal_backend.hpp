@@ -73,6 +73,7 @@ struct WindowStats {
     u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread or for it in the background
     double compile_ms = 0;                      // in the window: the RSX thread's compiling, or waiting for compiles
     double draws_compiling = 0;                 // draws skipped while their compile ran in the background (D-158)
+    double draws_interpreted = 0;               // draws the shader interpreter drew meanwhile (D-940)
     u64 textures = 0, surfaces = 0;             // cached at its end
     double texture_mb = 0, surface_mb = 0;
     double gpu_allocated_mb = 0;                // MTLDevice.currentAllocatedSize at its end
@@ -111,6 +112,12 @@ struct MetalBackendConfig {
     bool async_shaders = false;
     double compile_wait_ms = 4.0;
     u32 async_threads = 0; // 0: half the cores, 2 to 4
+    // With async_shaders, a draw whose programs or pipeline are still compiling is drawn by the shader interpreter
+    // (D-940: one vertex and one fragment function that run any program) once the interpreter's own pipeline for the
+    // draw's targets is made, instead of skipped. force_interpreter (or PSPOCKET_RSX_INTERPRETER=1) sends every draw
+    // through it: its results against the translation's (tests).
+    bool shader_interpreter = true;
+    bool force_interpreter = false;
     // Textures and surfaces unused for this many flips are freed (D-116; a minute at 30 fps).
     u32 evict_after_flips = 1800;
     // A texture of another format over a render target the GPU drew since guest memory last held it is decoded with
@@ -130,6 +137,7 @@ struct BackendStats {
     u64 vertex_constant_bytes_copied = 0; // transform constant bytes uploaded, those the programs read (D-278)
     u64 draws_skipped = 0;
     u64 draws_compiling = 0;  // of those, skipped while their program or pipeline compiled in the background (D-158)
+    u64 draws_interpreted = 0; // drawn by the shader interpreter while their own compile ran (D-940)
     u64 compile_wait_ns = 0;  // the RSX thread's waits for background compiles, within the frame's budget
     u64 async_programs = 0;   // programs compiled in the background
     u64 async_pipelines = 0;  // ... and pipelines

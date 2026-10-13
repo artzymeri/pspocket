@@ -56,10 +56,13 @@ target_sources(test_hle PRIVATE
 # libvdec's last functions (D-920) against Sony's libvdec: test_hle "[compare][vdec-ext]". The video codec cores
 # pspocket's own (D-920): test_hle "[vdec-cores]", their comparisons with Sony's "[compare][vdec-cores]".
 target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compare.cpp test_vdec_score_compare.cpp)
+# The H.264 and MVC codec cores pspocket's own (D-933): test_hle "[vdec-cores]"; their comparisons with Sony's modules
+# "[compare][vdec-cores]".
+target_sources(test_hle PRIVATE test_vdec_avc_compare.cpp)
 
 # The CELP libraries (D-932): libcelpenc, libcelp8enc, libcelpdec and libcelp8dec, pspocket's own: test_hle "[celp]",
 # their comparisons with Sony's modules "[compare][celp]".
-target_sources(test_hle PRIVATE test_celp_compare.cpp test_celp_dec_compare.cpp)
+target_sources(test_hle PRIVATE test_celp_compare.cpp test_celp8_compare.cpp test_celp_dec_compare.cpp)
 
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE

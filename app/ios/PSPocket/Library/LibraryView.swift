@@ -196,7 +196,7 @@ struct LibraryView: View {
                 .lineLimit(2)
                 .shadow(color: .black.opacity(0.35), radius: 7, y: 2)
             Text(entry.map { library.meta(for: $0) }
-                 ?? "Copy .iso files into Files › On My iPhone › PSPocket › Games, or add one with +.")
+                 ?? "Copy .iso files (or a PSN game's .pkg and .rap) into Files › On My iPhone › PSPocket › Games, or add one with +.")
                 .font(.system(size: 15))
                 .tracking(-0.23)
                 .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.75))
@@ -225,6 +225,13 @@ struct LibraryView: View {
                 Text(error)
                     .font(.system(size: 13))
                     .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .padding(.top, 6)
+            }
+            if let notice = library.notice {
+                Text(notice)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.6))
                     .lineLimit(3)
                     .padding(.top, 6)
             }

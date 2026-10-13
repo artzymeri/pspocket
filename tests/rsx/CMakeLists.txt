@@ -16,4 +16,8 @@ if(TARGET pspocket::rsx_metal)
     target_include_directories(test_rsx_metal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(test_rsx_metal PRIVATE -fobjc-arc)
     set_target_properties(test_rsx_metal PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF)
+    # Every end-to-end draw again through the shader interpreter (D-940): the same pixels as the translation's. The
+    # cases that count compiles are left out (the interpreter's functions are compiles of their own).
+    add_test(NAME test_rsx_metal_interpreted COMMAND test_rsx_metal "metal e2e:*" "~*(D-114)" "~*(D-158)" "~*(D-940)")
+    set_tests_properties(test_rsx_metal_interpreted PROPERTIES ENVIRONMENT PSPOCKET_RSX_INTERPRETER=1)
 endif()

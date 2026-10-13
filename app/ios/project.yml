@@ -130,6 +130,25 @@ targets:
         name: hle
         group: Runtime
         includes: *compiled
+        excludes: ["freetype/**"]
+      # FreeType 2.2.1 for the font libraries (D-500, D-525), as third_party/CMakeLists.txt builds it: pspocket's
+      # system layer and FreeType's modules from the source tree the host build uses (scripts/ios.sh sets
+      # PSPOCKET_FREETYPE_SRC). Not ours: no warnings.
+      - path: ../../runtime/hle/src/freetype
+        name: freetype-layer
+        group: Runtime
+        includes: [pspocket_ftsystem.c]
+        compilerFlags: [-w, -DFT2_BUILD_LIBRARY]
+      - path: ${PSPOCKET_FREETYPE_SRC}
+        name: freetype
+        group: ThirdParty
+        includes: [base/ftinit.c, base/ftdebug.c, base/ftbase.c, base/ftbbox.c, base/ftglyph.c, base/ftbitmap.c,
+                   base/ftstroke.c, base/ftsynth.c, base/ftmm.c, base/fttype1.c, base/ftwinfnt.c, base/ftgxval.c,
+                   base/ftotval.c, base/ftpfr.c, base/ftbdf.c, base/ftxf86.c, autofit/autofit.c, truetype/truetype.c,
+                   type1/type1.c, cff/cff.c, cid/type1cid.c, pfr/pfr.c, type42/type42.c, winfonts/winfnt.c,
+                   psaux/psaux.c, psnames/psnames.c, pshinter/pshinter.c, raster/raster.c, sfnt/sfnt.c, smooth/smooth.c,
+                   gzip/ftgzip.c, lzw/ftlzw.c, cache/ftcache.c]
+        compilerFlags: [-w, -DFT2_BUILD_LIBRARY]
       # libpng for cellPngDec (D-199), compiled from the source tree the host build uses (scripts/ios.sh sets
       # PSPOCKET_LIBPNG_SRC; pnglibconf.h is the host build's). Not ours: no warnings.
       - path: ${PSPOCKET_LIBPNG_SRC}
@@ -235,12 +254,20 @@ targets:
           # libpng (D-199) and the host build's pnglibconf.h.
           - ${PSPOCKET_LIBPNG_SRC}
           - $(PSPOCKET_HOST_BUILD_DIR)/third_party/libpng
+          # FreeType (D-500): pspocket's module list and options, then FreeType's headers.
+          - $(PSPOCKET_ROOT)/runtime/hle/src/freetype
+          - ${PSPOCKET_FREETYPE_INCLUDE}
         GCC_PREPROCESSOR_DEFINITIONS:
           - $(inherited)
           - PSPOCKET_HAVE_GAME_SPU=${PSPOCKET_HAVE_GAME_SPU}
           - PSPOCKET_HAVE_GAME_PPU=${PSPOCKET_HAVE_GAME_PPU}
           - PSPOCKET_HAVE_FFMPEG=${PSPOCKET_HAVE_FFMPEG}
           - PSPOCKET_HAVE_LIBPNG=${PSPOCKET_HAVE_LIBPNG}
+          # FreeType's build for every file that includes it (third_party/CMakeLists.txt's public definitions).
+          - PSPOCKET_HAVE_FREETYPE=1
+          - DARWIN_NO_CARBON
+          - FT_CONFIG_MODULES_H=<pspocket_ftmodule.h>
+          - FT_CONFIG_OPTIONS_H=<pspocket_ftoption.h>
         # cmake/PSPocketWarnings.cmake, without -Werror. Xcode's defaults that the host build doesn't use are off,
         # so warning-free on the host means warning-free here (bar iOS-only code paths).
         CLANG_WARN_COMMA: NO

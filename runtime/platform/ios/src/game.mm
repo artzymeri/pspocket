@@ -30,6 +30,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,6 +48,7 @@
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
 #include "pspocket/loader/game_modules.hpp"
+#include "pspocket/loader/hdd_game.hpp"
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/loader/system.hpp"
@@ -265,7 +267,9 @@ bool read_file(const char* path, std::vector<u8>& out)
 extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_size)
 {
     if (g_session) return fail(error, error_size, "a game is already running; quit the app to start another");
-    if (!o || !o->elf_path || !o->iso_path || !o->hdd0_dir) return fail(error, error_size, "missing paths");
+    if (!o || !o->elf_path || !o->hdd0_dir || (!o->iso_path && !o->game_dir)) {
+        return fail(error, error_size, "missing paths");
+    }
 
     if (o->log_path) {
         // The last boot's log stays beside it (game-prev.log): a game iOS stopped is looked at after the next launch.
@@ -285,6 +289,16 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     const std::string exe_sha256 = recomp::to_hex(recomp::Sha256::hash(std::span<const u8>(bytes)));
     auto exe = loader::Executable::parse(std::move(bytes));
     if (!exe) return fail(error, error_size, "the executable: " + exe.error().message);
+    // A game in /dev_hdd0/game (D-939): an installed PSN game, or a disc game's update, which runs with its disc.
+    std::optional<loader::HddGame> hdd_game;
+    if (o->game_dir) {
+        std::string why;
+        hdd_game = loader::read_hdd_game(o->hdd0_dir, o->game_dir, &why);
+        if (!hdd_game) return fail(error, error_size, "the installed game: " + why);
+        if (hdd_game->update() && !o->iso_path) {
+            return fail(error, error_size, hdd_game->title_id + "'s update runs with its disc, and there is none");
+        }
+    }
 
     auto s = std::make_unique<Session>();
     s->exe = *exe;
@@ -308,6 +322,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         PS_LOG_INFO(kChan, "the game exited, status {}", status);
         raw->running = false;
     };
+    if (hdd_game) s->state.options.argv[0] = hdd_game->boot_path;
     loader::prepare_kernel_config(cfg, s->state);
     // A FIFO the RSX cannot read (a desync) is logged and skipped to put, as RPCS3 recovers (CLAUDE.md rule 5: the
     // app falls back and logs; pspocket-boot on the Mac stops there).
@@ -402,14 +417,23 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     s->kernel->install();
 
     hle::GameInfo game;
-    loader::DiscInfo disc;
-    std::string disc_error;
-    if (!loader::mount_disc_image(*s->kernel, o->iso_path, &disc, &disc_error)) {
-        return fail(error, error_size, "the disc image: " + disc_error);
+    std::string title = hdd_game ? hdd_game->title : std::string();
+    if (o->iso_path && (!hdd_game || hdd_game->update())) {
+        loader::DiscInfo disc;
+        std::string disc_error;
+        if (!loader::mount_disc_image(*s->kernel, o->iso_path, &disc, &disc_error)) {
+            return fail(error, error_size, "the disc image: " + disc_error);
+        }
+        if (hdd_game && disc.title_id != hdd_game->title_id) {
+            return fail(error, error_size, "the update is " + hdd_game->title_id + "'s, the disc " + disc.title_id);
+        }
+        game.title_id = disc.title_id;
+        game.param_sfo = std::move(disc.param_sfo);
+        title = disc.title;
     }
-    game.title_id = disc.title_id;
-    game.param_sfo = std::move(disc.param_sfo);
-    for (const char c : disc.title_id) { // a path component: letters and digits only
+    // Its folder's PARAM.SFO is what cellGame reads (an update's: category GD), its USRDIR /app_home (below).
+    if (hdd_game) game = hdd_game->game_info();
+    for (const char c : game.title_id) { // a path component: letters and digits only
         if (std::isalnum(static_cast<unsigned char>(c))) s->title_id += c;
     }
     if (s->title_id.empty()) s->title_id = "unknown";
@@ -433,6 +457,13 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     std::filesystem::create_directories(std::filesystem::path(o->hdd0_dir) / "game", ec);
     if (!s->kernel->vfs_mount("/dev_hdd0", o->hdd0_dir, false)) {
         return fail(error, error_size, std::string("cannot mount ") + o->hdd0_dir + " as /dev_hdd0");
+    }
+    if (hdd_game) {
+        std::string why;
+        if (!loader::mount_app_home(*s->kernel, *hdd_game, &why)) return fail(error, error_size, why);
+        PS_LOG_INFO(kChan, "{} {} \"{}\" version {} from /dev_hdd0/game/{}",
+            hdd_game->update() ? "the disc game's update:" : "an installed game:", hdd_game->title_id, hdd_game->title,
+            hdd_game->app_ver.empty() ? "?" : hdd_game->app_ver, hdd_game->dir);
     }
     if (o->flash_dir && std::filesystem::is_directory(o->flash_dir, ec)) {
         // An install from before D-177 also holds the XMB, the Blu-ray player and the emulators: 150 MB no game reads.
@@ -557,15 +588,17 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                                                       if (rsx::metal::MetalBackend* b = g_session->backend.load())
                                                           b->trim_memory();
                                                   }];
-    if (const lv2::Result r = loader::start_main_thread(g_session->exe, *g_session->kernel, g_session->state, {},
-            main_id);
+    const loader::BootOptions boot_options = g_session->state.options; // argv[0]: the executable's guest path
+    if (const lv2::Result r = loader::start_main_thread(g_session->exe, *g_session->kernel, g_session->state,
+            boot_options, main_id);
         r != lv2::CELL_OK) {
         g_session->running = false;
         return fail(error, error_size, std::string("cannot start the main thread: ") + lv2::error_name(r));
     }
     PS_LOG_INFO(kChan, "{} \"{}\" booted from {}: {} imported functions ({} implemented, {} RPCS3 stubs)",
-        disc.title_id, disc.title, o->iso_path, report.functions_linked, report.functions_implemented,
-        report.functions_stubbed);
+        g_session->hle->config().game.title_id, title,
+        hdd_game ? g_session->state.options.argv[0] : std::string(o->iso_path), report.functions_linked,
+        report.functions_implemented, report.functions_stubbed);
     watch_for_freezes(g_session);
     return 0;
 }
@@ -582,6 +615,34 @@ extern "C" int ps_game_probe_disc(const char* iso_path, char* title_id, size_t t
     if (title_id && title_id_size) std::snprintf(title_id, title_id_size, "%s", info.title_id.c_str());
     if (title && title_size) std::snprintf(title, title_size, "%s", info.title.c_str());
     return 0;
+}
+
+extern "C" int ps_game_probe_installed(const char* hdd0_dir, const char* game_dir, char* title_id,
+    size_t title_id_size, char* title, size_t title_size, char* category, size_t category_size, char* version,
+    size_t version_size, char* error, size_t error_size)
+{
+    std::string why = "missing paths";
+    const auto game = hdd0_dir && game_dir ? loader::read_hdd_game(hdd0_dir, game_dir, &why) : std::nullopt;
+    if (!game) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", why.c_str());
+        return 1;
+    }
+    if (title_id && title_id_size) std::snprintf(title_id, title_id_size, "%s", game->game_info().title_id.c_str());
+    if (title && title_size) std::snprintf(title, title_size, "%s", game->title.c_str());
+    if (category && category_size) std::snprintf(category, category_size, "%s", game->category.c_str());
+    if (version && version_size) std::snprintf(version, version_size, "%s", game->app_ver.c_str());
+    return 0;
+}
+
+extern "C" int ps_game_find_update(const char* hdd0_dir, const char* title_id, char* game_dir, size_t game_dir_size,
+    char* version, size_t version_size)
+{
+    if (!hdd0_dir || !title_id) return 0;
+    const auto update = loader::find_update(hdd0_dir, title_id);
+    if (!update) return 0;
+    if (game_dir && game_dir_size) std::snprintf(game_dir, game_dir_size, "%s", update->host_dir.c_str());
+    if (version && version_size) std::snprintf(version, version_size, "%s", update->app_ver.c_str());
+    return 1;
 }
 
 extern "C" int ps_game_read_disc_file(const char* iso_path, const char* path, void* buffer, size_t buffer_size,

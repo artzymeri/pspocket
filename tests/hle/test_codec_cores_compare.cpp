@@ -80,7 +80,7 @@ Observed half(const Setup& s, bool sony_half, const Core& core)
 TEST_CASE("The codec cores' comparison calls Sony's exports by their names; pspocket's version queries, firmware first",
     "[hle][codec-cores]")
 {
-    check_names("libavcdec", {"avcDecGetVersion", "avcDecQueryCharacteristics"});
+    check_names("libavcdec", {"avcDecGetVersion", "avcDecQueryCharacteristics"}, false); // pspocket's own (D-933)
     check_names("libmvcdec", {"mvcDecGetVersion", "mvcDecQueryCharacteristics"});
     check_names("libsjvtd", {"sjvtdGetVersionNumber"});
     check_names("libsmvd2", {"smvd2GetVersionNumber"}, false); // all of libsmvd2 is pspocket's own (D-920)

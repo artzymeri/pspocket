@@ -22,6 +22,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
+#include "pspocket/rsx/shader/interp.hpp"
 #include "pspocket/rsx/texture.hpp"
 #include "rsx_test_util.hpp"
 #include "shader_asm.hpp"
@@ -713,7 +714,8 @@ struct E2E {
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
 
     explicit E2E(u32 capture_every = 0, std::string shader_cache = {}, u32 evict_after_flips = 1800,
-        bool overlay_targets = true, double async_wait_ms = -1)
+        bool overlay_targets = true, double async_wait_ms = -1, bool shader_interpreter = true,
+        bool force_interpreter = false)
     {
         PS_CHECK(mem.reserve());
         PS_CHECK(mem.commit(kCmdEa, 0x100000));
@@ -751,6 +753,8 @@ struct E2E {
         mc.overlay_targets = overlay_targets;
         mc.async_shaders = async_wait_ms >= 0;
         if (async_wait_ms >= 0) mc.compile_wait_ms = async_wait_ms;
+        mc.shader_interpreter = shader_interpreter;
+        mc.force_interpreter = force_interpreter;
         mc.capture = [this](const u8* bgra, u32 w, u32 h, u64 flip) {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
@@ -1188,8 +1192,9 @@ TEST_CASE("metal e2e: window z is clipped to NV4097_SET_CLIP_MIN/MAX and stored 
 {
     REQUIRE_METAL();
     // The triangle's window z is 0.75 (z 0.5, viewport scale and offset 0.5). Drawn into a Z16 depth buffer that
-    // takes every depth: (whether colour 0 was drawn, the depth stored at the centre).
-    const auto draw = [](float clip_min, float clip_max, u32 zmin_max_control) {
+    // takes every depth: (whether colour 0 was drawn, the depth stored at the centre). With alpha_test the fragment
+    // program can discard (D-941: Apple GPUs did not clamp such a fragment's depth).
+    const auto draw = [](float clip_min, float clip_max, u32 zmin_max_control, bool alpha_test = false) {
         E2E e;
         e.put_local_bytes(kFpOffset, fp_color(false));
         write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
@@ -1208,6 +1213,10 @@ TEST_CASE("metal e2e: window z is clipped to NV4097_SET_CLIP_MIN/MAX and stored 
         b.method(m::NV4097_SET_DEPTH_MASK, 1);
         b.method(m::NV4097_SET_CLIP_MIN, {f2u(clip_min), f2u(clip_max)});
         b.method(m::NV4097_SET_ZMIN_MAX_CONTROL, zmin_max_control);
+        if (alpha_test) {
+            b.method(m::NV4097_SET_ALPHA_TEST_ENABLE, 1);
+            b.method(m::NV4097_SET_ALPHA_FUNC, static_cast<u32>(CompareFunc::Always));
+        }
         upload_vertex_program(b);
         set_fragment_program(b, kFpOffset, 0x40);
         bind_vertex_arrays(b);
@@ -1242,6 +1251,15 @@ TEST_CASE("metal e2e: window z is clipped to NV4097_SET_CLIP_MIN/MAX and stored 
     std::tie(drawn, depth) = draw(0.f, 0.7f, 0); // not clipped: clamped too (RPCS3)
     CHECK(drawn);
     CHECK(near(depth, 0.7));
+    // A fragment program that can discard (an alpha test here) is clamped too, and clipped as before (D-941).
+    std::tie(drawn, depth) = draw(0.f, 0.7f, 0x11, true);
+    CHECK(drawn);
+    CHECK(near(depth, 0.7));
+    std::tie(drawn, depth) = draw(0.f, 0.7f, 1, true);
+    CHECK_FALSE(drawn);
+    std::tie(drawn, depth) = draw(0.f, 1.f, 1, true);
+    CHECK(drawn);
+    CHECK(near(depth, 0.75));
 }
 
 TEST_CASE("metal e2e: user clip planes keep what their distance has on the side they name (D-259)")
@@ -2885,7 +2903,7 @@ TEST_CASE("metal e2e: with background compiles, a draw goes without its programs
     };
     const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, cleared{0, 0, 0, 0};
     {
-        E2E e(0, {}, 1800, true, 0.0); // no wait at all
+        E2E e(0, {}, 1800, true, 0.0, false); // no wait at all, no shader interpreter (D-940)
         CHECK(draw(e, 0) == cleared);  // skipped: its vertex program is compiling
         CHECK(e.backend->stats().draws_compiling == 1);
         CHECK(e.backend->stats().draws == 0);
@@ -2902,13 +2920,56 @@ TEST_CASE("metal e2e: with background compiles, a draw goes without its programs
         CHECK(e.backend->stats().pipeline_ns == 0);
     }
     {
-        E2E e(0, {}, 1800, true, 10000.0); // a budget that covers the compiles: the draw waits and draws
+        E2E e(0, {}, 1800, true, 10000.0, false); // a budget that covers the compiles: the draw waits and draws
         CHECK(draw(e, 0) == red);
         CHECK(e.backend->stats().draws_compiling == 0);
         CHECK(e.backend->stats().draws == 1);
         CHECK(e.backend->stats().async_programs == 2);
         CHECK(e.backend->stats().compile_wait_ns > 0);
     }
+}
+
+TEST_CASE("metal e2e: with background compiles, a draw whose programs or pipeline are compiling is drawn by the shader "
+          "interpreter (D-940)")
+{
+    REQUIRE_METAL();
+    const auto draw = [](E2E& e, u32 offset, bool fp16) {
+        e.put_local_bytes(kFpOffset, fp_color(fp16));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(offset);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, fp16 ? 0 : 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        return guest_pixel(e, kSurfaceOffset, 32, 48);
+    };
+    const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, cleared{0, 0, 0, 0};
+    E2E e(0, {}, 1800, true, 0.0); // no wait at all
+    e.backend->wait_for_async_compiles(); // the interpreter's functions, queued when the backend starts
+    // Its programs compiling, and the interpreter's pipeline for these targets: left out.
+    CHECK(draw(e, 0, false) == cleared);
+    CHECK(e.backend->stats().draws_compiling == 1);
+    // Its own pipeline compiling: the interpreter draws it.
+    e.backend->wait_for_async_compiles();
+    CHECK(draw(e, 0x1000, false) == red);
+    CHECK(e.backend->stats().draws_interpreted == 1);
+    // Everything made: its own programs draw it.
+    e.backend->wait_for_async_compiles();
+    CHECK(draw(e, 0x2000, false) == red);
+    CHECK(e.backend->stats().draws == 2);
+    CHECK(e.backend->stats().draws_interpreted == 1);
+    // A program never seen: drawn at once, by the interpreter, while it compiles.
+    CHECK(draw(e, 0x3000, true) == red);
+    CHECK(e.backend->stats().draws == 3);
+    CHECK(e.backend->stats().draws_interpreted == 2);
+    CHECK(e.backend->stats().draws_compiling == 1);
 }
 
 TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red as blue, as its bytes say")
@@ -4969,4 +5030,463 @@ TEST_CASE("metal e2e: unsupported shader opcodes skip the draw loudly")
     REQUIRE_FALSE(e.failures.empty());
     CHECK(e.failures[0].kind == FailKind::Unsupported);
     CHECK(e.failures[0].message.find("POW") != std::string::npos);
+}
+
+TEST_CASE("metal: the shader interpreter compiles, its vertex function and every fragment variant, into pipelines (D-940)")
+{
+    REQUIRE_METAL();
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    const auto library = [&](u32 mrt, bool depth) -> id<MTLLibrary> {
+        MTLCompileOptions* o = [MTLCompileOptions new];
+        if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeSafe;
+        o.preprocessorMacros = @{@"RSX_MRT": @(mrt), @"RSX_DEPTH": @(depth ? 1 : 0)};
+        NSError* error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:shader::interpreter_source().c_str()]
+                                                  options:o
+                                                    error:&error];
+        if (!lib) FAIL(error.localizedDescription.UTF8String);
+        return lib;
+    };
+    id<MTLFunction> vs = [library(1, false) newFunctionWithName:@(shader::kInterpVsEntry)];
+    REQUIRE(vs != nil);
+    for (u32 mrt = 0; mrt <= 4; mrt++) {
+        for (bool depth : {false, true}) {
+            INFO("RSX_MRT " << mrt << ", RSX_DEPTH " << depth);
+            id<MTLFunction> fs = [library(mrt, depth) newFunctionWithName:@(shader::kInterpFsEntry)];
+            REQUIRE(fs != nil);
+            // A pipeline of the pair: the vertex function's outputs feed every fragment input.
+            MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+            d.vertexFunction = vs;
+            d.fragmentFunction = fs;
+            for (u32 i = 0; i < mrt; i++) d.colorAttachments[i].pixelFormat = i % 2 ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+            if (depth || mrt == 0) d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+            NSError* error = nil;
+            id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:d error:&error];
+            if (!pso) FAIL(error.localizedDescription.UTF8String);
+        }
+    }
+}
+
+// ---- the shader interpreter against the translation, on random programs (D-940) ----------------------------------
+//   PSPOCKET_FUZZ_SEED=<n>   the seed (default 0x5EED)
+//   PSPOCKET_FUZZ_ITERS=<n>  rounds (default 1: 64 fragment and 64 vertex programs)
+
+namespace {
+
+u64 fuzz_env(const char* name, u64 fallback)
+{
+    const char* v = std::getenv(name);
+    return v && *v ? std::strtoull(v, nullptr, 0) : fallback;
+}
+
+// One backend drawing the test triangle into a 32-bit float target, translated or through the interpreter; each draw
+// gets its own program and command offsets.
+struct FloatDraws {
+    E2E e;
+    u32 next = 0;
+    explicit FloatDraws(bool interpreted) : e(0, {}, 1800, true, -1, true, interpreted) {}
+
+    std::vector<float> draw(const std::vector<u32>& vp_words, u32 vp_inputs, const std::vector<std::array<float, 4>>& consts,
+        const std::vector<u8>& fp_bytes)
+    {
+        const u32 slot = next++;
+        const u32 fp_at = 0x200000 + (slot % 4096) * 0x800; // past the target at kSurfaceOffset
+        // Each draw's commands in a slot of their own, the FIFO started at them (it would run through the gap from the
+        // last draw's end, and it does not wrap).
+        const u32 at = (slot % 512) * 0x800;
+        e.rsx->set_fifo_pointers(at, at);
+        e.put_local_bytes(fp_at, fp_bytes);
+        write_triangle(e, {0xff4080c0, 0x20ff6010, 0x8010ff40});
+        auto b = e.at(at);
+        setup_surface_as(b, kSurfaceOffset, SurfaceColorFormat::F_W32Z32Y32X32, kW * 16);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_LOAD, 0);
+        for (usize i = 0; i < vp_words.size(); i += 32) { // the method takes 32 words at a time
+            b.method(m::NV4097_SET_TRANSFORM_PROGRAM,
+                std::vector<u32>(vp_words.begin() + static_cast<std::ptrdiff_t>(i),
+                    vp_words.begin() + static_cast<std::ptrdiff_t>(std::min(i + 32, vp_words.size()))));
+        }
+        b.method(m::NV4097_SET_TRANSFORM_PROGRAM_START, 0);
+        b.method(m::NV4097_SET_VERTEX_ATTRIB_INPUT_MASK, vp_inputs);
+        if (!consts.empty()) {
+            b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+            std::vector<u32> words;
+            for (const auto& v : consts)
+                for (float f : v) words.push_back(f2u(f));
+            b.method(m::NV4097_SET_TRANSFORM_CONSTANT, words);
+        }
+        set_fragment_program(b, fp_at, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        e.failures.clear();
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 16));
+        std::vector<float> out(kW * kH * 4);
+        for (usize i = 0; i < out.size(); i++) {
+            const u32 w = ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + static_cast<u32>(i) * 4);
+            std::memcpy(&out[i], &w, 4);
+        }
+        return out;
+    }
+};
+
+// The default vertex program: o0 = v0, o1 = v3 (COL0), o7 = v8 (TEX0).
+std::vector<u32> plain_vp()
+{
+    VpInst p0;
+    p0.vec_op = 1;
+    p0.src[0] = vp_in();
+    p0.out = 0;
+    p0.vec_mask = 0xf;
+    VpInst p1 = p0;
+    p1.input = 3;
+    p1.out = 1;
+    VpInst p2 = p0;
+    p2.input = 8;
+    p2.out = 7;
+    p2.end = true;
+    return assemble_vp({p0, p1, p2});
+}
+constexpr u32 kPlainInputs = (1u << 0) | (1u << 3) | (1u << 8);
+
+// Equal, or both NaN, or within a few units in the last place of the larger. A denormal counts as zero: the GPU may
+// flush one (a packed value's bits that read as a denormal: the translation's constant folding flushes them).
+bool same_float(float a, float b)
+{
+    if (std::isnan(a) || std::isnan(b)) return std::isnan(a) && std::isnan(b);
+    if (std::fpclassify(a) == FP_SUBNORMAL) a = 0.f;
+    if (std::fpclassify(b) == FP_SUBNORMAL) b = 0.f;
+    if (a == b) return true;
+    return std::abs(a - b) <= 4e-6f * std::max(std::abs(a), std::abs(b));
+}
+
+std::array<u8, 4> random_swizzle(std::mt19937& rng)
+{
+    std::uniform_int_distribution<int> c(0, 3);
+    if (rng() % 3 == 0) return {0, 1, 2, 3};
+    return {static_cast<u8>(c(rng)), static_cast<u8>(c(rng)), static_cast<u8>(c(rng)), static_cast<u8>(c(rng))};
+}
+
+// A random fragment program over R0-R3 and H0-H3, the inputs WPOS, COL0, TEX0, and embedded constants: every
+// arithmetic, pack and unpack operation, the modifiers, condition codes, and IFE and LOOP blocks. R0 is its output.
+std::vector<FpInst> random_fp_insts(std::mt19937& rng)
+{
+    static constexpr u32 kOps[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x38, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x1A, 0x1B, 0x1C, 0x1D, 0x1F, 0x22, 0x23, 0x3A, 0x39, 0x07, 0x2E, 0x1E, 0x3C, 0x36, 0x2B, 0x20, 0x21,
+        0x3B, 0x27, 0x28, 0x29, 0x2A, 0x13, 0x14, 0x24, 0x25, 0x2C, 0x2D};
+    std::uniform_real_distribution<float> value(-4.f, 4.f);
+    const auto source = [&]() {
+        FpSrc src;
+        switch (rng() % 4) {
+        case 0: src = fp_in(); break;
+        case 1: src = fp_const(); break;
+        default: src = rng() % 4 == 0 ? fp_h(rng() % 4) : fp_r(rng() % 4); break;
+        }
+        src.sw = random_swizzle(rng);
+        src.neg = rng() % 5 == 0;
+        src.abs = rng() % 6 == 0;
+        return src;
+    };
+    std::vector<FpInst> prog;
+    const u32 n = 2 + rng() % 9;
+    for (u32 i = 0; i < n; i++) {
+        FpInst in;
+        in.op = kOps[rng() % std::size(kOps)];
+        in.dst = rng() % 4;
+        in.fp16 = rng() % 5 == 0;
+        in.mask = static_cast<u8>(1 + rng() % 15);
+        static constexpr u32 kInputs[] = {0, 1, 4};
+        in.input = kInputs[rng() % 3];
+        for (FpSrc& s : in.src) s = source();
+        if (std::any_of(std::begin(in.src), std::end(in.src), [](const FpSrc& s) { return s.type == 2; }))
+            in.constant = std::array<float, 4>{value(rng), value(rng), value(rng), value(rng)};
+        in.saturate = rng() % 7 == 0;
+        if (rng() % 5 == 0) in.prec = 1 + rng() % 3;
+        if (rng() % 6 == 0) in.scale = rng() % 8;
+        if (rng() % 5 == 0) {
+            in.set_cond = true;
+            in.cond_mod_reg = rng() % 2;
+            in.no_dest = rng() % 3 == 0;
+        }
+        if (rng() % 4 == 0) {
+            do {
+                in.exec_lt = rng() % 2;
+                in.exec_eq = rng() % 2;
+                in.exec_gt = rng() % 2;
+            } while (!in.exec_lt && !in.exec_eq && !in.exec_gt);
+            in.cond_reg = rng() % 2;
+            in.cond_sw = random_swizzle(rng);
+        }
+        prog.push_back(in);
+    }
+    FpInst out;
+    out.op = 0x01; // MOV R0, R0..R3 or H0..H3
+    out.src[0] = rng() % 4 == 0 ? fp_h(rng() % 4) : fp_r(rng() % 4);
+    prog.push_back(out);
+    // A block around part of the body: an IFE (with or without an else part) or a LOOP run 1 to 3 times.
+    if (prog.size() > 3 && rng() % 2 == 0) {
+        const u32 first = rng() % (prog.size() - 2), last = first + 1 + rng() % (prog.size() - 1 - first - 1);
+        FpInst block;
+        block.op = rng() % 2 ? 0x42 : 0x43; // IFE, LOOP
+        do {
+            block.exec_lt = rng() % 2;
+            block.exec_eq = rng() % 2;
+            block.exec_gt = rng() % 2;
+        } while (!block.exec_lt && !block.exec_eq && !block.exec_gt);
+        block.cond_reg = rng() % 2;
+        block.cond_sw = random_swizzle(rng);
+        prog.insert(prog.begin() + first, block);
+        // Byte offsets: each instruction 16 bytes, and 16 for its constant.
+        const auto offset_of = [&](usize index) {
+            u32 at = 0;
+            for (usize k = 0; k < index; k++) at += prog[k].constant ? 32 : 16;
+            return at;
+        };
+        const u32 end = offset_of(last + 2);
+        if (block.op == 0x42) {
+            const u32 else_at = rng() % 2 ? offset_of(first + 1 + (last - first) / 2 + 1) : end;
+            fp_if(prog[first], else_at, end);
+        } else {
+            fp_loop(prog[first], 1 + rng() % 3, rng() % 4, 1, end);
+        }
+    }
+    prog.back().end = true;
+    return prog;
+}
+
+std::vector<u8> random_fp(std::mt19937& rng) { return assemble_fp(random_fp_insts(rng)); }
+
+// A random vertex program: o0 the position as given, then vector and scalar operations (dual issue) over R0-R3, the
+// inputs and c[0]-c[7], conditional writes, its result in o7 (TEX0, read unclamped by MOV R0, f[TEX0]).
+std::vector<u32> random_vp(std::mt19937& rng)
+{
+    static constexpr u32 kVec[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+    static constexpr u32 kSca[] = {1, 2, 3, 4, 5, 6, 7, 13, 14, 15, 16};
+    std::vector<VpInst> prog;
+    VpInst pos;
+    pos.vec_op = 1;
+    pos.src[0] = vp_in();
+    pos.out = 0;
+    pos.vec_mask = 0xf;
+    prog.push_back(pos);
+    const auto source = [&]() {
+        VpSrc src;
+        switch (rng() % 3) {
+        case 0: src = vp_in(); break;
+        case 1: src = vp_const(); break;
+        default: src = vp_temp(rng() % 4); break;
+        }
+        src.sw = random_swizzle(rng);
+        src.neg = rng() % 5 == 0;
+        src.abs = rng() % 6 == 0;
+        return src;
+    };
+    const u32 n = 2 + rng() % 9;
+    for (u32 i = 0; i < n; i++) {
+        VpInst in;
+        static constexpr u32 kInputs[] = {0, 3, 8};
+        in.input = kInputs[rng() % 3];
+        in.constant = rng() % 8;
+        for (VpSrc& s : in.src) s = source();
+        in.vec_result = false;
+        const bool vec = rng() % 5 != 0, sca = !vec || rng() % 3 == 0;
+        if (vec) {
+            in.vec_op = kVec[rng() % std::size(kVec)];
+            in.vec_temp = rng() % 4;
+            in.vec_mask = static_cast<u8>(1 + rng() % 15);
+        }
+        if (sca) {
+            in.sca_op = kSca[rng() % std::size(kSca)];
+            in.sca_temp = rng() % 4;
+            in.sca_mask = static_cast<u8>(1 + rng() % 15);
+        }
+        in.saturate = rng() % 7 == 0;
+        if (rng() % 5 == 0) in.cond_update = true;
+        if (rng() % 4 == 0) {
+            in.cond_test = true;
+            in.cond = 1 + rng() % 6;
+            in.cond_sw = random_swizzle(rng);
+        }
+        prog.push_back(in);
+    }
+    VpInst out;
+    out.vec_op = 1;
+    out.src[0] = vp_temp(rng() % 4);
+    out.out = 7;
+    out.vec_mask = 0xf;
+    out.end = true;
+    prog.push_back(out);
+    return assemble_vp(prog);
+}
+
+} // namespace
+
+TEST_CASE("metal: the shader interpreter draws random programs as their translation does (D-940)")
+{
+    REQUIRE_METAL();
+    const u64 seed = fuzz_env("PSPOCKET_FUZZ_SEED", 0x5EED), rounds = std::max<u64>(1, fuzz_env("PSPOCKET_FUZZ_ITERS", 1));
+    std::mt19937 rng(static_cast<u32>(seed));
+    FloatDraws translated(false), interpreted(true);
+    std::uniform_real_distribution<float> value(-4.f, 4.f);
+    // MOV R0, f[TEX0]: the vertex programs' results.
+    FpInst mov;
+    mov.op = 0x01;
+    mov.input = 4;
+    mov.src[0] = fp_in();
+    mov.end = true;
+    const std::vector<u8> tex0 = assemble_fp({mov});
+    const auto compare = [](const std::vector<float>& a, const std::vector<float>& b, u64 round, u32 index, bool vertex,
+                             const std::string& program) {
+        usize differ = 0, first = a.size();
+        for (usize i = 0; i < a.size(); i++) {
+            if (same_float(a[i], b[i])) continue;
+            if (!differ++) first = i;
+        }
+        INFO(program);
+        const usize px = first / 4 * 4;
+        const auto pixel = [&](const std::vector<float>& v) {
+            return px + 3 < v.size() ? std::format("({}, {}, {}, {})", v[px], v[px + 1], v[px + 2], v[px + 3]) : std::string();
+        };
+        INFO((vertex ? "vertex" : "fragment") << " program " << index << " of round " << round << ": " << differ
+             << " floats differ, the first at " << first << ": pixel " << px / 4 << " translated " << pixel(a)
+             << ", interpreted " << pixel(b));
+        CHECK(differ == 0);
+    };
+    for (u64 round = 0; round < rounds; round++) {
+        for (u32 i = 0; i < 64; i++) {
+            const std::vector<u8> fp = random_fp(rng);
+            const auto decoded = shader::decode_fragment_program(fp.data(), static_cast<u32>(fp.size()));
+            std::string text = decoded ? shader::disassemble(*decoded) : std::string("(no program)");
+            if (decoded && std::getenv("PSPOCKET_TEST_DUMP")) { // the translation too
+                shader::FpOptions fo;
+                fo.shader_control = 0x40;
+                text += "\n" + shader::translate_fragment_program(*decoded, fo).shader.source;
+            }
+            if (const char* only = std::getenv("PSPOCKET_TEST_ONLY")) {
+                if (std::strtoul(only, nullptr, 0) != i) continue;
+                FloatDraws fresh(false), fresh_i(true);
+                compare(fresh.draw(plain_vp(), kPlainInputs, {}, fp), fresh_i.draw(plain_vp(), kPlainInputs, {}, fp), round, i, false, text);
+                // Each instruction a NOP in turn (its constant kept, so offsets stay): does the difference stay?
+                std::mt19937 again(static_cast<u32>(seed));
+                std::vector<FpInst> insts;
+                for (u32 k = 0; k <= i; k++) insts = random_fp_insts(again);
+                REQUIRE(assemble_fp(insts) == fp);
+                for (usize k = 0; k + 1 < insts.size(); k++) {
+                    if (insts[k].flow_src1) continue;
+                    std::vector<FpInst> cut = insts;
+                    cut[k].op = 0;
+                    cut[k].set_cond = false;
+                    const std::vector<u8> bytes = assemble_fp(cut);
+                    const auto a = fresh.draw(plain_vp(), kPlainInputs, {}, bytes);
+                    const auto b = fresh_i.draw(plain_vp(), kPlainInputs, {}, bytes);
+                    usize differ = 0;
+                    for (usize q = 0; q < a.size(); q++) differ += same_float(a[q], b[q]) ? 0 : 1;
+                    std::printf("without instruction %zu: %zu floats differ\n", k, differ);
+                }
+                continue;
+            }
+            compare(translated.draw(plain_vp(), kPlainInputs, {}, fp), interpreted.draw(plain_vp(), kPlainInputs, {}, fp),
+                round, i, false, text);
+        }
+        for (u32 i = 0; i < 64; i++) {
+            const std::vector<u32> vp = random_vp(rng);
+            std::vector<std::array<float, 4>> consts(8);
+            for (auto& c : consts) c = {value(rng), value(rng), value(rng), value(rng)};
+            const auto decoded = shader::decode_vertex_program(vp.data(), static_cast<u32>(vp.size() / 4), 0);
+            compare(translated.draw(vp, kPlainInputs, consts, tex0), interpreted.draw(vp, kPlainInputs, consts, tex0), round,
+                i, true, decoded ? shader::disassemble(*decoded) : std::string("(no program)"));
+        }
+    }
+    CHECK(translated.e.backend->stats().draws_interpreted == 0);
+    CHECK(interpreted.e.backend->stats().draws_interpreted == interpreted.e.backend->stats().draws);
+}
+
+TEST_CASE("metal: pspocket's packs are Metal's pack_float_to_* bit for bit (D-942)")
+{
+    REQUIRE_METAL();
+    // Metal's intrinsics in a kernel with nothing else written next to them (where the compiler gets them right),
+    // against the hand-written ones the translation and the interpreter use: every code's value and half-step, and
+    // random values in and past the range.
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    const std::string src = std::string("#include <metal_stdlib>\nusing namespace metal;\n") + shader::msl_pack_helpers() + R"(
+kernel void k(device const float4* in [[buffer(0)]], device atomic_uint* bad [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    const float4 v = in[i];
+    if (rsx_pack_unorm4x8(v) != pack_float_to_unorm4x8(v)) atomic_fetch_add_explicit(&bad[0], 1u, memory_order_relaxed);
+    if (rsx_pack_snorm4x8(v) != pack_float_to_snorm4x8(v)) atomic_fetch_add_explicit(&bad[1], 1u, memory_order_relaxed);
+    if (rsx_pack_unorm2x16(v.xy) != pack_float_to_unorm2x16(v.xy)) atomic_fetch_add_explicit(&bad[2], 1u, memory_order_relaxed);
+}
+)";
+    MTLCompileOptions* o = [MTLCompileOptions new];
+    if (@available(macOS 15.0, *)) o.mathMode = MTLMathModeSafe;
+    NSError* error = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:o error:&error];
+    if (!lib) FAIL(error.localizedDescription.UTF8String);
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k"] error:&error];
+    REQUIRE(pso != nil);
+    std::vector<std::array<float, 4>> in;
+    for (u32 c = 0; c <= 65535; c++) {
+        const float u = static_cast<float>(c) / 65535.f, h = (static_cast<float>(c) + 0.5f) / 65535.f;
+        const float b = static_cast<float>(c & 255) / 255.f, bh = (static_cast<float>(c & 255) + 0.5f) / 255.f;
+        in.push_back({u, h, b, bh});
+        in.push_back({-u, -h, -b, -bh});
+        in.push_back({(static_cast<float>(c & 127) + 0.5f) / 127.f, -(static_cast<float>(c & 127) + 0.5f) / 127.f,
+            static_cast<float>(c & 127) / 127.f, bh * 2.f - 1.f});
+    }
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> any(-2.f, 2.f);
+    for (u32 i = 0; i < 100000; i++) in.push_back({any(rng), any(rng), any(rng), any(rng)});
+    in.push_back({std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), 0.f, -0.f});
+    id<MTLBuffer> ib = [device newBufferWithBytes:in.data() length:in.size() * 16 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bad = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    std::memset(bad.contents, 0, 16);
+    id<MTLCommandQueue> q = [device newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:ib offset:0 atIndex:0];
+    [enc setBuffer:bad offset:0 atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(in.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const u32* b = static_cast<const u32*>(bad.contents);
+    CHECK(b[0] == 0);
+    CHECK(b[1] == 0);
+    CHECK(b[2] == 0);
+}
+
+TEST_CASE("metal e2e: a pack next to another write to its register's components draws as written (D-942)")
+{
+    REQUIRE_METAL();
+    // PK16R R0.zw, H3; DP2AR R0.xw, f[TEX0], c.xyyz, c.zzyw; MOVR R0, R0: with Metal's pack_float_to_unorm2x16 the
+    // compiled program lost the DP2A's w (and the pack's z), translated or interpreted.
+    FpInst pk;
+    pk.op = 0x29;
+    pk.mask = mask("zw");
+    pk.src[0] = fp_h(3);
+    FpInst dp;
+    dp.op = 0x2E;
+    dp.mask = mask("xw");
+    dp.input = 4;
+    dp.src[0] = fp_in();
+    dp.src[1] = fp_const("xyyz");
+    dp.src[2] = fp_const("zzyw");
+    dp.constant = std::array<float, 4>{-2.7386088f, 2.415514f, 2.1589785f, -0.497972f};
+    FpInst mov;
+    mov.op = 0x01;
+    mov.src[0] = fp_r(0);
+    mov.end = true;
+    const std::vector<u8> fp = assemble_fp({pk, dp, mov});
+    for (bool interpreted : {false, true}) {
+        INFO("interpreted " << interpreted);
+        FloatDraws d(interpreted);
+        const auto px = d.draw(plain_vp(), kPlainInputs, {}, fp);
+        const usize at = (32 + 40 * kW) * 4; // inside the triangle
+        CHECK(px[at] != 0.f);
+        CHECK(px[at + 3] == px[at]); // DP2A's w
+        CHECK(px[at + 2] == 0.f);    // the pack of H3's (0, 0)
+    }
 }

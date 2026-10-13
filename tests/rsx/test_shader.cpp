@@ -545,7 +545,9 @@ TEST_CASE("fragment program DIVSQ, PK16, UP16 and RET")
     INFO(s);
     CHECK(s.find("rsx_divsq(") != std::string::npos);
     CHECK(s.find("select(a, a / sqrt(abs(b)), abs(a) > 0.0)") != std::string::npos); // a zero numerator stays zero
-    CHECK(s.find("pack_float_to_unorm2x16(") != std::string::npos);
+    CHECK(s.find("rsx_pack_unorm2x16(") != std::string::npos); // packed by hand (D-942)
+    CHECK(s.find("= pack_float_to_") == std::string::npos);
+    CHECK(s.find("(pack_float_to_") == std::string::npos);
     CHECK(s.find("unpack_unorm2x16_to_float(as_type<uint>(") != std::string::npos);
     CHECK(s.find("do {") != std::string::npos);
     CHECK(s.find("if (any((cc0 > float4(0.0)))) { fp_ret = true; break; }") != std::string::npos);
@@ -671,7 +673,7 @@ TEST_CASE("fragment programs: LIT, LIF, DST, REFL, DP2A, PKG, UPG, BEM, TEXBEM a
              Row{FpOp::DST, "float4(1.0, (r1).y * (r2).y, (r1).z, (r2).w)"},
              Row{FpOp::REFL, "const float4 res = rsx_refl(r1, r2);"},
              Row{FpOp::DP2A, "float4(dot((r1).xy, (r2).xy) + (r3).x)"},
-             Row{FpOp::PKG, "float4(as_type<float>(pack_float_to_unorm4x8(rsx_linear_to_srgb(r1))))"},
+             Row{FpOp::PKG, "float4(as_type<float>(rsx_pack_unorm4x8(rsx_linear_to_srgb(r1))))"},
              Row{FpOp::UPG, "rsx_srgb_to_linear(unpack_unorm4x8_to_float(as_type<uint>((r1).x)))"},
              Row{FpOp::BEM, "((r1).xyxy + (r2).xxxx * (r3).xzxz + (r2).yyyy * (r3).ywyw)"},
              Row{FpOp::TEXBEM, "const float4 x2d = ((r1).xyxy + (r2).xxxx * (r3).xzxz + (r2).yyyy * (r3).ywyw);"},

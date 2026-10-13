@@ -33,6 +33,17 @@ run).
   Bluetooth audio guards), and the colored memory calls (357 to 360, 363). Left: 340 (an _ext shared memory's
   creator; the retail kernel numbers _ext shared memory as type 0x20) and sys_usbd as the retail kernel has it (its
   unnamed 552, 557, 563 to 569, 578, and the named calls' error codes and memory rules, which follow RPCS3 today).
+- **PSN games and disc games' updates on the iPhone (D-939):** a .pkg or .rap put in the app's Games folder is
+  installed into its /dev_hdd0; installed PSN games are games of the library; a disc game whose update is installed
+  starts the update's executable with its disc, as a PS3 does (cellGame's patch boot), and pspocket-boot does both on
+  the Mac (an executable in --hdd0's game folder). The engine checklist's PSN item is done. The app's build had broken
+  when the font libraries brought FreeType (D-500): the iOS project builds it now as the host build does.
+- **The shader interpreter (D-940):** a draw whose programs or pipeline are still compiling is drawn by two MSL functions
+  that run any RSX program, instead of left out (a game's first session no longer pops objects in); checked against
+  the translation on every end-to-end test and on random programs. On the way, D-941: under the RSX's depth clamp an
+  alpha-tested (discarding) draw was stored unclamped on Apple GPUs; such programs now export their depth. D-942:
+  Metal's pack intrinsics are miscompiled next to another write to the same register (programs with PK4, PKB, PK16 or
+  PKG drew wrong components); pspocket packs by hand, bit for bit as the intrinsics.
 - The script comparison harness (tests/hle/sysutil_sub_compare.hpp) now compares the TTY's text too (a script asks)
   and the file system calls' paths by their text; PSPOCKET_TEST_DUMP=2 prints both runs.
 

@@ -14481,3 +14481,209 @@ The app (app/ios, through ps_game_options.game_dir, ps_game_probe_installed, ps_
 Tests: tests/disc/test_psn.cpp (an installed game from its package, an update found or not, its modules saved, its
 USRDIR as /app_home), tests/hle/test_sysPrxForUser.cpp (the boot check of each kind), ctest pspocket_boot_hdd_game (a
 synthetic installed game that exits 0 only when its argv[0] and /app_home are the HDD game's).
+
+### D-932, part 4: cellCelp8Enc, the 8 kHz encoder, pspocket's own
+
+libcelp8enc (cellCelp8Enc: QueryAttr, Open, OpenEx, Close, Start, End, EncodeFrame, WaitForOutput and GetAu; the
+module exports nothing else but its two module functions) is libcelpenc's design (part 1) for MPEG-4 CELP's
+narrowband coder (8 kHz, multi-pulse excitation). pspocket's (runtime/hle/src/cellCelp8Enc.cpp) answers as the library
+does and does the SPU program's work on the host, bit for bit (celp_mpe_enc.cpp, with the LSP decoding, adaptive
+codebook and pulse positions of part 3's decoder, celp_mpe.cpp). With it every function of the four CELP libraries is
+pspocket's own (23).
+
+What differs from libcelpenc:
+- QueryAttr: workMemSize 0xBB00 (0x4000 and the handle's 0x7B00), versions 0x04000000 and 0x200. Codes from
+  0x806140A1: SEQ 0x806140A2, ARG 0x806140A3; the SPU program's answers 0x4000 and 0x5000 become 0x806140B2 and
+  0x806140B3, any other but 0x1000 0x806140B1 (none can happen on the host).
+- The handle's memory is 0x7A80 bytes (the frame's copy at +0x1c80, the header or access unit at +0x2180, the SPU
+  program's state at +0x2200) and 0x4000 more are wanted after it. One OpenEx (no OpenExt).
+- Start: excitationMode 0 (multi-pulse), sampleRate 1 (8 kHz), a configuration of at most 26 that the library's table
+  marks (0, 2, 6, 9, 12, 15, 18, 21, 24 and 26), wordSize 0 (floats: there is no 16-bit input), else ARG; a frame is
+  320 samples (configurations 0 and 2), 160 (6 to 21) or 80 (24 and 26), its bytes four times that.
+- The header, 29 bytes: ".mp4", 0, 0x4003, 1, 8000, the bit rate (3850, 4650, 5700, 6600, 7300, 8700, 9900, 10700,
+  11800, 12200), a frame's bits twice (154, 186, 114, 132, 146, 174, 198, 214, 118, 122: the SPU program's fixed point,
+  as libcelpenc's), 32 bits of 0, 2, 11 (the CelpHeader's bits), then 14496-3's CelpHeader (multi-pulse, 8 kHz, no fine
+  rate control, the configuration, no enhancement layers, no bandwidth scalability), padded to a byte (232 bits; the
+  SPU program answers with the bits / 8).
+- Only the first access unit is empty (an access unit codes the frame before; the LPC analysis looks 40 samples
+  further); the others are a frame's bits in bytes (20, 24, 15, 17, 19, 22, 25, 27, 15 and 16). The SPU program
+  scales the frame by 32767 in its single precision.
+
+The SPU program is the reference encoder (ISO/IEC 14496-5: NEC's nec_mode_decision.c, nec_qrms_enc.c,
+nec_abs_exc_analysis.c, nec_exc_acb_enc.c, nec_exc_mp_enc.c and nec_exc_gain_enc.c, Matsushita's pan_lspqtz2_dd.c,
+Philips's phi_lpc.c, with the decoder's tables; external/usac-refsoft, never in the repository) compiled for the SPU
+and vectorised. pspocket's encoder does its arithmetic as part 3's decoder does (the SPU's single precision, the
+program's order and grouping of every sum, the SDK's division, reciprocal, square root, logarithms and 2^x). Where the
+SPU program differs from the reference software:
+- The input is not high-pass filtered (the reference's preprocessing is in the program, switched off).
+- The LPC analysis (every 80 samples, a 200-sample window: a 240-point Hamming window's first half, then a quarter
+  cosine over 80; the 10th-order lag window) is in single precision; Levinson-Durbin also stops when the residual
+  energy falls to a millionth of the first, and a window's energy of at most 1 gives all zeros. LSP roots not found
+  keep the previous frame's LSPs divided by pi once more.
+- The open-loop pitch search updates each lag's energy recursively; the voiced/unvoiced test of a quiet or unpitched
+  frame compares the pitch gain times the mean square (not the RMS) with 93750 (250 x 375): the reference's
+  gain x RMS > 375 only at an RMS of 250.
+- The adaptive codebook search tries the open-loop lag's index and one index either side (the reference 8 either side,
+  NEC_LAG_IDX_RNG 16).
+- The multi-pulse tree search keeps as many candidates as the next pulse has positions (the reference 32), each best
+  found as a tournament over vectors of four whose pairings the later side wins only when strictly greater (on ties
+  not always the reference's first largest); each pulse's sign is its position's correlation's (the reference searches
+  the sign combinations of its four best position sets below 8 pulses), and only the best candidate goes to the gain
+  search (the reference's four).
+- The comb filter's gains are 0.6 and 0.8 (as in the decoder).
+
+Not reproduced: no SPURS instance, task set or queue is made (their errors cannot happen); the SPU program's state
+(+0x2200) is kept on the host; float samples of exponent 255 are outside pspocket's SPU model.
+
+Compared: in the scratch harness (Sony's SPU program under pspocket's SPU interpreter, inventory/, never in the
+repository), every frame's LPC coefficients and LSPs, quantiser indices and quantised LSPs, each subframe's LPC
+coefficients, weighting filters and their memories, weighted speech, signal mode and open-loop lags, RMS index and
+values, each subframe's lag, pulse, sign and gain indices, the excitation's memories and the access unit, for 11
+kinds of synthetic audio with 10 seeds in each of the 10 configurations (56,100 frames: 30 a run with seeds 1 to 3, 60
+with seeds 4 to 10; every signal mode, 0 to 3, reached): 0 differences; the 10 headers: 0 differences. Under the library
+(tests/hle/test_celp8_compare.cpp, firmware 4.92): QueryAttr; Open's and OpenEx's checks, the handles and the
+resource OpenEx changes; every call in every state; Start's eleven parameter checks and ten headers; 446 frames
+(speech-like, sines, a chirp, noise, a square wave, impulses, noise in a sample's last bits, a constant, gated speech,
+speech past full scale, silence) and every access unit byte for byte: 0 of 2514 observations differ. Without the
+firmware, the test encodes speech through the library and decodes it with part 3's decoder: 6.9 to 8.8 dB SNR.
+
+## D-940 · 2026-10-13 · The shader interpreter: a draw whose programs are still compiling is drawn, not left out
+
+The engine checklist's "Draws while a shader compiles". Since D-158 a draw whose vertex or fragment program, or
+pipeline, is still compiling in the background is left out once the frame's 4 ms wait is spent: a game's first
+session on the phone shows objects popping in as their shaders land. RPCS3's answer is its "async with shader
+interpreter" mode; pspocket's is the same in spirit:
+
+- **Two functions run any program** (runtime/rsx/shader/interp.hpp, interp.cpp): the vertex function rsx_vs_interp and
+  the fragment function rsx_fs_interp. The programs are decoded on the CPU as for the translation (ir.hpp) and encoded
+  into fixed-width words (8 a vertex instruction, 12 a fragment one, the fragment program's flow-control ends and elses
+  as instruction indices), once per program, in a buffer of their own. The MSL runs each operation as msl.cpp
+  translates it (same helpers, same order of modifiers, the same RPCS3 citations), and reads at run time what the
+  translator fixes at compile time from VpOptions and FpOptions (texture kinds, 2D coordinates, flat and two-sided
+  colours, point sprites, stipple, depth bounds, the texel conversions and alpha kill, sRGB, the alpha test and alpha
+  to coverage, output swizzles). Vertex flow control: a pc and a call stack of 8, the translation's 65536-jump guard;
+  fragment flow control: a stack of open IFE/LOOP/REP blocks, BRK, RET and the loop index of indexed inputs as the
+  translation's lexical blocks have them. What the translation refuses (its unsupported opcodes, an indexed input past
+  SSA outside a loop) the interpreter refuses too: the two draw the same.
+- **What cannot be read at run time is a variant**: the fragment function's colour outputs (0 to 4) and depth export are
+  preprocessor variants of one source (RSX_MRT, RSX_DEPTH), as the translation writes them. The vertex function puts
+  out every varying (flat copies of the colours beside the smooth ones, all six clip distances, the point size).
+- **Textures by kind**: a unit's texture goes to its kind's slot (fragment: 2D, 1D and shadow at 0-15, cube at 16-31, 3D
+  at 32-47, depth at 48-63, the depth bounds copy at 64; vertex: 0-3, 4-7, 8-11), every other slot a 1x1 stand-in of
+  its type, every sampler bound (the interpreter indexes them). 65 fragment textures need Apple GPU family 6 (A13) or
+  later, and the Macs; where a pipeline cannot be made the draw is left out as before.
+- **In the backend** (metal_backend.mm): at the three places a draw was left out for a compile (its fragment program,
+  vertex program, pipeline), it goes to the interpreter instead, when the interpreter's functions and its pipeline for
+  the draw's targets and blending are made; else it is left out as before. The interpreter's functions are programs like
+  any other (made in the background, the vertex function and the commonest fragment variant as soon as the backend
+  starts, the others when first needed), its pipelines are pipeline_for's like any pair: the shader cache records both
+  and makes them ahead at the next launch (D-114). The report line counts "drawn by the interpreter".
+  MetalBackendConfig::shader_interpreter (on) and force_interpreter, PSPOCKET_RSX_INTERPRETER=1: every draw through it.
+
+Cost: an interpreted draw is slower on the GPU (a loop over the instructions, registers in thread memory) and binds 77
+textures; it lasts only the frames until the draw's own compile lands. Tests (tests/rsx/test_metal.mm): the interpreter
+compiles in every variant into pipelines; every end-to-end draw of the suite again through it
+(test_rsx_metal_interpreted: the same pixels as the translation's); random programs drawn both ways into a 32-bit float
+target (64 fragment programs with every arithmetic, pack and unpack operation, modifiers, condition codes and IFE and
+LOOP blocks, and 64 vertex programs with dual issue and conditional writes a round; PSPOCKET_FUZZ_SEED,
+PSPOCKET_FUZZ_ITERS; PSPOCKET_TEST_ONLY=<n> draws that program alone and then each of its instructions as a NOP in
+turn): every float the same within 4e-6, a denormal counting as zero (the translation's constant folding flushes a packed
+value's denormal bits); the two disagreements it found were the translation's (D-941, D-942); and a game's view of it: a
+draw whose pipeline compiles, and one whose program was never seen, drawn at once by the interpreter. The phone's numbers (how many draws a first session
+interprets, and what they cost) come with the next phone session.
+
+## D-941 · 2026-10-13 · Under the depth clamp, a fragment program that can discard exports its depth
+
+Found while checking D-940 against the D-258 test: on Apple GPUs (the M4 here) a fragment function that can discard its
+fragment gets no depth clamp from MTLDepthClipModeClamp, the RSX's NV4097_SET_ZMIN_MAX_CONTROL clamp (D-258): with an
+alpha test on, the depth stored was the unclamped 0.75 where the clip range ends at 0.7. Metal does clamp an exported
+depth to the viewport's range (D-266). So FpOptions::clamp_depth, set where the backend sets the clamp mode: a program
+that can discard (KIL, a texture's alpha kill, the alpha test, alpha to coverage, depth bounds, polygon stipple) exports
+the depth it was rasterized at (in.position.z; r1.z when it exports its own). The backend clears the option for
+programs that cannot discard, so their keys and compiles, and the shader cache recorded on the Mac, stay as they were;
+the translation's version and fingerprint are unchanged (no existing key's MSL changed). The interpreter (which can
+always discard) takes its depth variant under the clamp. Regression: the D-258 test's alpha-tested draws, clamped to
+0.7 and clipped as before, translated and interpreted.
+
+## D-942 · 2026-10-13 · Metal's pack intrinsics miscompile next to another write to their register: pspocket packs by hand
+
+Found by D-940's random programs, where the translated program and the interpreter disagreed and the translated one
+contradicted its own MSL: `PK16R R0.zw, H3` then `DP2AR R0.xw, ...` drew R0.w as the pack's value (or 1.0), not the
+DP2A's, and the pack's own lanes came out wrong too. Reduced to plain MSL on the Mac's compiler (M4, safe and fast
+math alike): any of Metal's pack_float_to_unorm4x8, _snorm4x8, _unorm2x16 or _snorm2x16, bitcast to a float and written
+to some components of a vector that another write overlaps, is compiled wrongly. A plain bitcast, the half2 bitcast
+(PK2), the unpack functions and a pack written to a register of its own are not affected. So the translation (and the
+interpreter) pack by hand (msl.cpp kPackHelpers, emitted into the programs that pack): round(x * n) of the exact
+product, a float product that lands on k + 0.5 decided by its rounding error from an fma, which matches Metal's
+intrinsics bit for bit on every code's value and half-step and 100,000 random values (tests/rsx: "pspocket's packs are
+Metal's ... bit for bit"); the plain float product rounds a quarter of the half-steps the other way. A program that
+packs (PK4, PKB, PK16, PKG) gets a key of its own (":pk"), so a shader cache recorded before holds none of its old
+translation, and every other program keeps its cache. Regression: the reduced program, translated and interpreted.
+
+## D-933 · 2026-10-13 · The H.264 and MVC codec cores pspocket's own (part 1: libavcdec)
+
+libavcdec is the H.264 core Sony's libvdec loads (eight decoding calls; GetVersion and QueryCharacteristics were already
+pspocket's, D-575): a PPU library whose helper thread hands an SPU program on SPURS each access unit and gives the
+caller's callback what the program answers. pspocket's (runtime/hle/src/vdec_avc.cpp, with the H.264 syntax readers in
+vdec_h264.hpp) answers as the module does and does the SPU program's work on the host: it reads the stream itself
+(parameter sets, slice headers, SEI, picture order counts), keeps the decoded picture buffer as Sony's does (a model
+measured from Sony's outputs, below) and has FFmpeg decode the samples, written into Sony's frame buffer layout (D-196).
+libavcdec is no longer firmware-first (codec_cores.cpp).
+
+What Sony's core does, and pspocket's with it:
+- QueryMemory: the level's (10 to 42) or the caller's frame size (4 to 120 by 4 to 68 macroblocks, within the level's
+  largest frame), deblocking up to 2, buffers up to the level's; the memory is fourteen blocks (the frame buffers the
+  fifth, as many as the buffer and two) and 0x299500 bytes, to 128. Open: the arguments' checks (the SDK version picks
+  the access unit size limit), the memory zeroed up to +0x294300, the context in its last 0x1380 bytes (magic
+  0xBE264DEC), a SPURS instance of its own when given none ("_libvdec_avc"), a task set "_libvdec_avc_<handle>".
+- The states: open, flushing (Flush; AccessUnit is SEQ until the flush is done), resetting (Reset; Reset's flags 0
+  to 3, keep the parameter sets or not), closed. After Close, the calls that take the context's lock answer 0x80010005
+  (the lock is gone); Close again is SEQ.
+- AccessUnit: up to five access units queued (BUSY when fewer than two places are left), side data up to 0x40 bytes
+  copied into a table of 46 entries, freed when the access unit's pictures are released.
+- Messages: AU done (the access unit, its side data, discarded, in error, whether a sequence it decodes is active, the
+  error code), a picture (0x178 bytes of information), flush done, reset done, a severe error.
+- The decoded picture buffer: max_dec_frame_buffering when the stream gives it (num_reorder_frames is not used), else
+  the level's MaxDpbMbs, at most what the frame buffers the decoder was opened with hold (a 64 x 80 stream in a decoder
+  opened for 5 x 4 macroblocks gets 16 frame buffers and a buffer of 14). At each access unit: the caller's releases are
+  taken; the picture decoded last joins the buffer; an IDR picture outputs everything (or nothing, with
+  no_output_of_prior_pics_flag); a reference picture's marking (the sliding window or its memory management
+  operations) comes before pictures are output while the buffer holds more than its size; then the pictures whose PTS
+  this access unit's DTS reached are output (a picture whose PTS is before its DTS, or that has no DTS or PTS, leaves
+  only when the buffer outputs it). The outputs follow the access unit's AU done.
+- Frame buffers in turn from the second; a buffer is free once its picture left the buffer and the caller released it,
+  counting only those free before the access unit's buffer step. Frame IDs are the lowest free; skipped pictures (decode
+  modes 1 to 3 leave non-reference pictures out) are given 256 and up and need no release.
+- The GOP flag (+0xC of the information) is set on the first I picture after an SPS, in its access unit or an earlier
+  one; an IDR picture without one has none.
+- Errors: a sequence it refuses (0x10 a profile or level it does not know; 0x12 Extended, High 10, High 4:2:2, chroma
+  other than 4:2:0, more than 8 bits, a frame under 64 x 64, or any sequence after Reset with flags 0; 0x13 a frame
+  larger than the decoder was opened for) gives each access unit an AU done in error and a picture skipped and in error
+  at once, the code with the first only. An access unit with no slice to decode gives 0x11 (0x10 with a slice) before a
+  sequence, 0x51 (0x50) within one, with the last picture's type and order count. Before any frame buffers are laid out
+  the error picture is in the first, made blank (luma 0, chroma 0x80, its gaps too).
+
+Not reproduced (documented tolerance):
+- Within a sequence, an access unit with no slice makes Sony's core vary with its SPU side's timing (two runs differ):
+  the frame buffer of its error picture (blank, a copy of a picture a line down, or left as it was) and the NAL unit
+  flags of the pictures after it (their own, or another access unit's). pspocket leaves the buffer as it was and gives
+  each picture its own flags.
+- Before any sequence, access units with no slice and no SPS are taken by Sony's core as field pairs (an error picture
+  for every second one, one access unit late), as are High 4:4:4 and CAVLC 4:4:4 sequences, whose SPS its parser reads
+  as another profile's; pspocket gives each its error picture at once.
+- A damaged slice (cut short) is 0x50 in Sony's core, the next picture 0x66 (the frame number gap); pspocket decodes
+  what FFmpeg decodes.
+- The information's padding (+0xD to +0xF, +0xCA, +0xCB) is the helper thread's stack in Sony's module (0 in a new
+  thread, what its Reset left after one); pspocket writes 0. The SPU side's working memory, queues and task contexts
+  are not written.
+
+Compared (tests/hle/test_vdec_avc_compare.cpp, the user's firmware 4.92): QueryMemory over levels and sizes, Open's
+refusals, IDR, I/P, B, buffers of 1, 2 and the level's, non-reference pictures, IDR pictures between, decode modes 1 to
+3, the clock (PTS against DTS, missing stamps, 33 bits), held pictures and the queue, side data, every call in every
+state, Reset's flags, refused sequences, access units with no slice, GOP flags, a decoder opened smaller than its
+stream, its own SPURS, other sizes and levels; every answer, message, information byte and frame buffer: 0 of 2215
+observations differ. Sony's libvdec over pspocket's core against Sony's libvdec over Sony's (test_vdec_ext_compare.cpp,
+libvdec's H.264 lives: as a game that imports libvdec's unverified functions gets it): 0 of 1145 differ. Without the
+firmware, some of the lives run through pspocket's core against Sony's recorded answers. Shared files changed:
+codec_cores.cpp (libavcdec no longer firmware-first), modules.cpp, test_codec_cores.cpp and
+test_codec_cores_compare.cpp (that mark), test_vdec_ext_compare.cpp (Sony's libvdec over pspocket's core).

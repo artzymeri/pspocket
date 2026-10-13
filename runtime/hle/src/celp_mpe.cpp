@@ -132,6 +132,8 @@ constexpr float kGapNb = 2.0f / 256; // the narrowband LSPs' minimum distance (P
 
 float neg(float x) { return from_bits(bits(x) ^ 0x80000000u); }
 
+} // namespace
+
 // 1 / x: the SDK's reciprocal (frest, fi, one step towards 1.0000001).
 float recip_sdk(float x)
 {
@@ -200,6 +202,8 @@ float exp2_sdk(float x)
     return r;
 }
 
+namespace {
+
 // The lag and its fraction (sixths) of an adaptive codebook index (nec_acb_generation's idx2lag tables).
 void lag_of(u32 idx, s32* ip, s32* fp)
 {
@@ -220,6 +224,43 @@ void lag_of(u32 idx, s32* ip, s32* fp)
 }
 
 } // namespace
+
+void mpe_lag(u32 idx, s32* ip, s32* fp) { lag_of(idx, ip, fp); }
+
+// The adaptive codebook (nec_acb_generation): the past excitation at the lag, repeated each lag's samples, interpolated
+// (10 taps of 11: Sony's programs leave out the last) at a fraction; all zero for index 255.
+void mpe_acb(float* mem, u32 idx, u32 sb, float* acb)
+{
+    const float fil0 = from_bits(0x3F7FFE00u); // 32767/32768: the interpolation filter's middle tap
+    std::memset(acb, 0, sb * sizeof(float));
+    s32 ip, fp;
+    lag_of(idx, &ip, &fp);
+    if (ip <= 0) return;
+    if (fp == 0) {
+        for (u32 smp = 0; smp < sb;)
+            for (s32 i = 0; i < ip && smp < sb; i++, smp++) {
+                const float v = fm(mem[150 - ip + i], fil0);
+                acb[smp] = v;
+                mem[150 + smp] = v;
+            }
+        return;
+    }
+    s32 f0 = 0;
+    for (u32 smp = 0; smp < sb;) {
+        f0 += fp;
+        const s32 i0 = ip + f0 / 6;
+        f0 %= 6;
+        for (s32 i = 0; i < i0 && smp < sb; i++, smp++) {
+            float acc = 0.0f;
+            for (s32 k = -5; k <= 4; k++) {
+                const s32 kk = (k + 1) * 6 - f0;
+                acc = fma(static_cast<float>(kNbFil[kk < 0 ? -kk : kk]) / 32768.0f, mem[149 - i0 + i - k], acc);
+            }
+            acb[smp] = acc;
+            mem[150 + smp] = acc;
+        }
+    }
+}
 
 // The LPC coefficients of 10 line spectral frequencies (radians): the narrowband programs' lsffir, its two halves'
 // filters run side by side, the last sum ((w1 + x1) + x2) - w2; a_k = -x_k / 2.
@@ -437,40 +478,12 @@ void MpeDecoder::decode(const u8* au, u32 size, u32* consumed, float* y, u32 mut
     }
 
     const float comb_gain = vu == 2 ? 0.6f : 0.8f;
-    const float fil0 = from_bits(0x3F7FFE00u); // 32767/32768: the interpolation filter's middle tap
     for (u32 s = 0; s < n; s++) {
         float* e = exc + s * sb;
-        // The adaptive codebook (nec_acb_generation): the past excitation at the lag, repeated each lag's samples,
-        // interpolated (10 taps of 11: Sony's programs leave out the last) at a fraction.
-        float acb[80] = {};
+        float acb[80];
         s32 ip, fp;
-        lag_of(lag_idx[s], &ip, &fp);
-        if (ip > 0) {
-            if (fp == 0) {
-                for (u32 smp = 0; smp < sb;)
-                    for (s32 i = 0; i < ip && smp < sb; i++, smp++) {
-                        const float v = fm(mem[150 - ip + i], fil0);
-                        acb[smp] = v;
-                        mem[150 + smp] = v;
-                    }
-            } else {
-                s32 f0 = 0;
-                for (u32 smp = 0; smp < sb;) {
-                    f0 += fp;
-                    const s32 i0 = ip + f0 / 6;
-                    f0 %= 6;
-                    for (s32 i = 0; i < i0 && smp < sb; i++, smp++) {
-                        float acc = 0.0f;
-                        for (s32 k = -5; k <= 4; k++) {
-                            const s32 kk = (k + 1) * 6 - f0;
-                            acc = fma(static_cast<float>(kNbFil[kk < 0 ? -kk : kk]) / 32768.0f, mem[149 - i0 + i - k], acc);
-                        }
-                        acb[smp] = acc;
-                        mem[150 + smp] = acc;
-                    }
-                }
-            }
-        }
+        mpe_lag(lag_idx[s], &ip, &fp);
+        mpe_acb(mem, lag_idx[s], sb, acb);
         // The pulses (nec_dec_mp): each pulse's position index and sign from the indices' low bits up, the last
         // pulse's first; then the comb filter at the lag (voiced frames).
         float comb[80] = {};

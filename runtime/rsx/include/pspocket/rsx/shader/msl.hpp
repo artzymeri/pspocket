@@ -171,6 +171,10 @@ struct FpOptions {
     // NV4097_SET_POLYGON_STIPPLE on a polygon draw: a fragment whose bit in the 32x32 pattern (row y % 32, bit x % 32)
     // is clear is discarded (RPCS3 RSXROPPrologue.glsl, D-263).
     bool polygon_stipple = false;
+    // The draw's depth is clamped to the viewport's range (NV4097_SET_ZMIN_MAX_CONTROL, D-258). Apple GPUs leave the
+    // depth of a fragment function that can discard unclamped: such a program exports its rasterized depth, which Metal
+    // clamps as it clamps every exported depth (D-266, D-941).
+    bool clamp_depth = false;
     bool operator==(const FpOptions&) const = default;
 };
 
@@ -189,6 +193,10 @@ struct TranslateResult {
 };
 
 TranslateResult translate_vertex_program(const VertexProgram& vp, const VpOptions& options = {});
+// The opcodes the translation supports (the shader interpreter, D-940, supports the same).
+bool vp_vec_op_supported(u32 op);
+bool vp_sca_op_supported(u32 op);
+bool fp_op_supported(u32 op);
 TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOptions& options = {});
 
 // The embedded constants of a fragment program as stored in guest memory now (games patch them between draws).
@@ -196,6 +204,8 @@ void read_fragment_constants(const FragmentProgram& fp, const u8* program_data, 
 
 // The shared MSL prologue (types, varyings, vertex fetch). Exposed for tests and the backend's own kernels.
 const std::string& msl_prologue();
+// The hand-written packs a program that packs gets (D-942), for tests.
+const std::string& msl_pack_helpers();
 
 // A fingerprint of the translation itself (D-272): the version, and the MSL made of two built-in programs with no
 // option and with every option. A change to what the translator writes changes it, so the shader cache drops records

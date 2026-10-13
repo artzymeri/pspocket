@@ -13,7 +13,8 @@ import UIKit
 ///   game/<TITLE_ID>/EBOOT.elf  the game's executable pushed from the Mac (`scripts/ios.sh push-game`); one decrypted
 ///                              here from the disc (D-121) goes to Library/Application Support/pspocket-games/<TITLE_ID>/
 ///   dev_flash/                 system files the game loads itself, from the user's firmware (D-067)
-///   hdd0/                      the game's /dev_hdd0: game data, saves, trophies
+///   hdd0/                      the game's /dev_hdd0: game data, saves, trophies; games and updates installed from
+///                              their packages (D-939)
 ///   game.log                   the last run's log
 @Observable
 final class GameModel {
@@ -51,8 +52,9 @@ final class GameModel {
     // MARK: running
 
     /// Boots the game from its disc image and decrypted executable, with its translated code from `library` (a game
-    /// library this iPhone made, D-152) when there is one; nil, or why it could not start.
-    func boot(iso: URL, elf: URL, library: URL? = nil) -> String? {
+    /// library this iPhone made, D-152) when there is one; nil, or why it could not start. `gameFolder` is the game's
+    /// folder in hdd0/game when it starts from there (D-939): an installed PSN game's (no disc), or the disc's update's.
+    func boot(iso: URL?, gameFolder: URL? = nil, elf: URL, library: URL? = nil) -> String? {
         guard !running else { return "A game is already running" }
         let layer = screen.metalLayer
         let docs = Self.documents
@@ -63,17 +65,20 @@ final class GameModel {
             ? installed : docs.appendingPathComponent("dev_flash")
         let hasFlash = FileManager.default.fileExists(atPath: flash.path)
         var error = [CChar](repeating: 0, count: 1024)
-        let status = iso.path.withCString { isoPath in
+        let status = (iso?.path ?? "").withCString { isoPath in
             elf.path.withCString { elfPath in
                 docs.appendingPathComponent("hdd0").path.withCString { hdd0 in
                     flash.path.withCString { flashPath in
                         docs.appendingPathComponent("game.log").path.withCString { log in
                             (library?.path ?? "").withCString { libraryPath in
-                                var options = ps_game_options(elf_path: elfPath, iso_path: isoPath, hdd0_dir: hdd0,
-                                    flash_dir: hasFlash ? flashPath : nil, log_path: log,
-                                    metal_layer: Unmanaged.passUnretained(layer).toOpaque(),
-                                    game_library: library == nil ? nil : libraryPath)
-                                return ps_game_boot(&options, &error, error.count)
+                                (gameFolder?.path ?? "").withCString { folderPath in
+                                    var options = ps_game_options(elf_path: elfPath, iso_path: iso == nil ? nil : isoPath,
+                                        hdd0_dir: hdd0, flash_dir: hasFlash ? flashPath : nil, log_path: log,
+                                        metal_layer: Unmanaged.passUnretained(layer).toOpaque(),
+                                        game_library: library == nil ? nil : libraryPath,
+                                        game_dir: gameFolder == nil ? nil : folderPath)
+                                    return ps_game_boot(&options, &error, error.count)
+                                }
                             }
                         }
                     }

@@ -89,7 +89,11 @@ void register_libsnd3(Registry& r);
 void register_libsynth2(Registry& r);
 void register_libmixer(Registry& r);
 void register_codec_cores(Registry& r);
+namespace vdec::avc {
+void register_avcdec(Registry& r);
+}
 void register_cellCelpEnc(Registry& r);
+void register_cellCelp8Enc(Registry& r);
 void register_cellCelpDec(Registry& r);
 void register_cellCelp8Dec(Registry& r);
 void register_cellRudp(Registry& r);
@@ -195,7 +199,9 @@ void register_all_modules(Registry& r)
     register_libsynth2(r);
     register_libmixer(r);
     register_codec_cores(r);
+    vdec::avc::register_avcdec(r);
     register_cellCelpEnc(r);
+    register_cellCelp8Enc(r);
     register_cellCelpDec(r);
     register_cellCelp8Dec(r);
     register_cellRudp(r);
