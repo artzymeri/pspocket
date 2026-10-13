@@ -59,7 +59,7 @@ target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compar
 
 # The CELP libraries (D-932): libcelpenc, libcelp8enc, libcelpdec and libcelp8dec, pspocket's own: test_hle "[celp]",
 # their comparisons with Sony's modules "[compare][celp]".
-target_sources(test_hle PRIVATE test_celp_compare.cpp test_celp_dec_compare.cpp)
+target_sources(test_hle PRIVATE test_celp_compare.cpp test_celp8_compare.cpp test_celp_dec_compare.cpp)
 
 # Libraries made as a console with no PSN, no PSP peer and no profiler attached (D-635 to D-639).
 target_sources(test_hle PRIVATE

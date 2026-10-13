@@ -13,7 +13,7 @@ namespace pspocket::hle::celp {
 float cos_spu(float x);
 void lsf_to_lpc20(const float lsf[20], float a[20]);
 float acos_spu(float x);
-int lpc_to_lsf(const float* a, int np, float* lsf);
+int lpc_to_lsf(const float* a, int np, float* lsf, bool nb = false);
 // One half of a wideband LSP vector (normalised) from its five indices (pan_lspdec), and the whole vector's
 // stabilisation (pan_stab), as Sony's programs compute them.
 void wb_lsp_half(const u32 idx[5], const float prev[10], float out[10], bool upper);
@@ -23,6 +23,13 @@ void wb_quantize(const float in[20], const float prev[20], float q[20], u32 idx[
 // a / b: the SDK's divf4 and GCC's inline division.
 float div_sdk(float a, float b);
 float div_gcc(float a, float b);
+// The SDK's reciprocal, square root, logarithms and 2^x as the narrowband programs inline them (celp_mpe.cpp).
+float recip_sdk(float x);
+float sqrt_sdk(float x);
+float log_sdk(float x, u32 hi_m, u32 hi_e, u32 lo_m, u32 lo_e, u32 lo_zt);
+float log10_sdk(float x);
+float log2_sdk(float x);
+float exp2_sdk(float x);
 
 // The wideband decoder (celp_rpe.cpp): libcelpdec's SPU program's state and frame decoding.
 struct RpeDecoder {
@@ -93,6 +100,10 @@ extern const MpeConfig kMpeConfigs[28];
 bool mpe_supported(u32 configuration);
 bool mpe_pulses(u32 configuration, u32 bit[12], u8 pos[12][80]);
 void lsf_to_lpc10(const float lsf[10], float a[10]);
+// An adaptive codebook index's lag and its sixths; its vector from the past excitation mem[0..150) (also written to
+// mem[150..150 + sb)).
+void mpe_lag(u32 idx, s32* ip, s32* fp);
+void mpe_acb(float* mem, u32 idx, u32 sb, float* acb);
 void nb_lsp_decode(const u32 idx[5], const float prev[10], float out[10]);
 
 // The narrowband decoder: libcelp8dec's SPU program's state (as its decoder's memory has it) and frame decoding.
@@ -115,6 +126,61 @@ struct MpeDecoder {
     // One frame into frame_size samples (in 16-bit units, unclamped); `mute` the frame's mute flag (the excitation's
     // largest samples zeroed when not 0). Inside a spu::Scope.
     void decode(const u8* au, u32 size, u32* consumed, float* y, u32 mute);
+};
+
+// The header libcelp8enc's Start writes for a configuration (its SPU program's): 29 bytes.
+u32 mpe_header(u32 configuration, u8* out);
+
+// The narrowband encoder (celp_mpe_enc.cpp): libcelp8enc's SPU program's state and frame encoding.
+struct MpeEncoder {
+    u32 config = 0;
+    MpeConfig cfg{};
+    u32 bit[12] = {};
+    u8 pos[12][80] = {};
+    u32 frame_ctr = 0;
+    u32 n_lpc = 0;            // LPC analyses a frame (one each 80 samples)
+    float raw[640] = {};      // the input, delayed: two frames less 40 samples
+    float pp[440] = {};       // the input the analyses window: 120 samples, then the frame's
+    float window[200] = {};   // the LPC analysis window
+    float prev_q[10] = {};    // the previous frame's quantised LSPs (normalised)
+    float lpc_a[4][10] = {};  // each analysis's LPC coefficients
+    float rfc0 = 0;           // the last analysis's first reflection coefficient
+    float lsp[10] = {};       // its LSPs (normalised)
+    u32 lsp_idx[5] = {};      // the quantiser's indices
+    float q_lsp[10] = {};     // the quantised LSPs
+    float lpc_q[4][10] = {};  // each subframe's LPC coefficients from them
+    // The perceptual weighting filters (each subframe's, of the unquantised LPC: numerator 0.9^k, denominator 0.5^k),
+    // their memories (past input, past output, newest first), the weighted speech's last 144 samples.
+    float gamma09[10] = {}, gamma05[10] = {};
+    float w_num[4][12] = {}, w_den[4][12] = {};
+    float pw_mem1[12] = {}, pw_mem2[12] = {};
+    float pst_wsp[144] = {};
+    u32 vu = 0;               // the signal mode (0 unvoiced to 3)
+    u32 lag_cand[4] = {};     // each subframe's open-loop lag index
+    // The excitation analysis: the target's memories (past input, past weighted input), the weighted synthesis
+    // filter's (past synthesis, past weighted synthesis), the past excitation; the RMS (each subframe's, the last
+    // frame's last) and its index; each subframe's normalised power and indices; the frame's excitation.
+    float mem_in[12] = {}, mem_win[12] = {}, mem_syn[12] = {}, mem_wsyn[12] = {};
+    float exc_mem[150] = {};
+    float qx[4] = {}, pq = 0;
+    u32 rms_idx = 0;
+    float renorm2[4] = {};
+    u32 lag_idx[4] = {}, pos_idx[4] = {}, sgn_idx[4] = {}, gain_idx[4] = {};
+    float exc[320] = {};
+
+    void reset(u32 configuration);
+    // One frame of frame_size samples (16-bit units) into an access unit; its size in bytes (0 for the first frame).
+    // Inside a spu::Scope.
+    u32 encode(const float* pcm, u8* au);
+    // One frame as libcelp8enc takes it: frame_size big-endian floats (full scale 1), times 32767 in the SPU's single
+    // precision. Inside a spu::Scope.
+    u32 encode_frame(const u8* pcm, u8* au);
+    void lpc_analysis();
+    void quantize_lsp();
+    void mode_decision();
+    void quantize_rms();
+    void excitation(u32 s);
+    u32 pack(u8* au) const;
 };
 
 } // namespace pspocket::hle::celp
