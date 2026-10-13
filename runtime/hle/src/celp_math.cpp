@@ -120,9 +120,10 @@ float cheb(float x, const float* c, int n)
 
 // The line spectral frequencies (radians) of an even order LPC polynomial 1 - a1 z^-1 - ...: P. Kabal's pc2lsf
 // (att_pc2lsf.c) as the SPU programs run it: the roots of the sum and difference polynomials' Chebyshev series, sampled
-// in steps of about pi/100, four bisections, a linear interpolation, acos; the next search starts where the bisection
-// ended (Sony's programs: the reference software starts it at the interpolated root). Returns the roots found.
-int lpc_to_lsf(const float* a, int np, float* lsf)
+// in steps of about pi/100, four bisections, a linear interpolation, acos. The wideband program starts the next search
+// where the bisection ended (the reference software at the interpolated root) and interpolates with GCC's division;
+// the narrowband one (`nb`) as the reference software, with the SDK's division. Returns the roots found.
+int lpc_to_lsf(const float* a, int np, float* lsf, bool nb)
 {
     const int nh = np / 2 + 1;
     float fa_[11], fb_[11], ta[11], tb[11];
@@ -168,15 +169,20 @@ int lpc_to_lsf(const float* a, int np, float* lsf)
             }
         }
         float ratio = 1.0f;
-        if (!(bits(ylow) == bits(yhigh) || (zero_class(ylow) && zero_class(yhigh)))) {
+        const bool equal = bits(ylow) == bits(yhigh) || (zero_class(ylow) && zero_class(yhigh));
+        if (!equal) {
             const float den = fs(ylow, yhigh);
-            const float y = fi(den, frest(den));
-            const float q = fm(ylow, y);
-            ratio = fma(fnms(q, den, ylow), y, q);
+            if (nb) {
+                ratio = div_sdk(ylow, den);
+            } else {
+                const float y = fi(den, frest(den));
+                const float q = fm(ylow, y);
+                ratio = fma(fnms(q, den, ylow), y, q);
+            }
         }
-        const float xmid = fma(ratio, d, xlow);
+        const float xmid = nb && equal ? fa(xlow, d) : fma(ratio, d, xlow);
         lsf[nf++] = acos_spu(xmid);
-        const float next = fs(xlow, fcgt(xroot, xmid) ? 0.0f : d);
+        const float next = nb ? (fcgt(xroot, xmid) ? xmid : fs(xlow, d)) : fs(xlow, fcgt(xroot, xmid) ? 0.0f : d);
         xroot = next;
         t = t == ta ? tb : ta;
         xlow = next;

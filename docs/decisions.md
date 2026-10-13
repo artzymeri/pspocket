@@ -14397,3 +14397,68 @@ The app (app/ios, through ps_game_options.game_dir, ps_game_probe_installed, ps_
 Tests: tests/disc/test_psn.cpp (an installed game from its package, an update found or not, its modules saved, its
 USRDIR as /app_home), tests/hle/test_sysPrxForUser.cpp (the boot check of each kind), ctest pspocket_boot_hdd_game (a
 synthetic installed game that exits 0 only when its argv[0] and /app_home are the HDD game's).
+
+### D-932, part 4: cellCelp8Enc, the 8 kHz encoder, pspocket's own
+
+libcelp8enc (cellCelp8Enc: QueryAttr, Open, OpenEx, Close, Start, End, EncodeFrame, WaitForOutput and GetAu; the
+module exports nothing else but its two module functions) is libcelpenc's design (part 1) for MPEG-4 CELP's
+narrowband coder (8 kHz, multi-pulse excitation). pspocket's (runtime/hle/src/cellCelp8Enc.cpp) answers as the library
+does and does the SPU program's work on the host, bit for bit (celp_mpe_enc.cpp, with the LSP decoding, adaptive
+codebook and pulse positions of part 3's decoder, celp_mpe.cpp). With it every function of the four CELP libraries is
+pspocket's own (23).
+
+What differs from libcelpenc:
+- QueryAttr: workMemSize 0xBB00 (0x4000 and the handle's 0x7B00), versions 0x04000000 and 0x200. Codes from
+  0x806140A1: SEQ 0x806140A2, ARG 0x806140A3; the SPU program's answers 0x4000 and 0x5000 become 0x806140B2 and
+  0x806140B3, any other but 0x1000 0x806140B1 (none can happen on the host).
+- The handle's memory is 0x7A80 bytes (the frame's copy at +0x1c80, the header or access unit at +0x2180, the SPU
+  program's state at +0x2200) and 0x4000 more are wanted after it. One OpenEx (no OpenExt).
+- Start: excitationMode 0 (multi-pulse), sampleRate 1 (8 kHz), a configuration of at most 26 that the library's table
+  marks (0, 2, 6, 9, 12, 15, 18, 21, 24 and 26), wordSize 0 (floats: there is no 16-bit input), else ARG; a frame is
+  320 samples (configurations 0 and 2), 160 (6 to 21) or 80 (24 and 26), its bytes four times that.
+- The header, 29 bytes: ".mp4", 0, 0x4003, 1, 8000, the bit rate (3850, 4650, 5700, 6600, 7300, 8700, 9900, 10700,
+  11800, 12200), a frame's bits twice (154, 186, 114, 132, 146, 174, 198, 214, 118, 122: the SPU program's fixed point,
+  as libcelpenc's), 32 bits of 0, 2, 11 (the CelpHeader's bits), then 14496-3's CelpHeader (multi-pulse, 8 kHz, no fine
+  rate control, the configuration, no enhancement layers, no bandwidth scalability), padded to a byte (232 bits; the
+  SPU program answers with the bits / 8).
+- Only the first access unit is empty (an access unit codes the frame before; the LPC analysis looks 40 samples
+  further); the others are a frame's bits in bytes (20, 24, 15, 17, 19, 22, 25, 27, 15 and 16). The SPU program
+  scales the frame by 32767 in its single precision.
+
+The SPU program is the reference encoder (ISO/IEC 14496-5: NEC's nec_mode_decision.c, nec_qrms_enc.c,
+nec_abs_exc_analysis.c, nec_exc_acb_enc.c, nec_exc_mp_enc.c and nec_exc_gain_enc.c, Matsushita's pan_lspqtz2_dd.c,
+Philips's phi_lpc.c, with the decoder's tables; external/usac-refsoft, never in the repository) compiled for the SPU
+and vectorised. pspocket's encoder does its arithmetic as part 3's decoder does (the SPU's single precision, the
+program's order and grouping of every sum, the SDK's division, reciprocal, square root, logarithms and 2^x). Where the
+SPU program differs from the reference software:
+- The input is not high-pass filtered (the reference's preprocessing is in the program, switched off).
+- The LPC analysis (every 80 samples, a 200-sample window: a 240-point Hamming window's first half, then a quarter
+  cosine over 80; the 10th-order lag window) is in single precision; Levinson-Durbin also stops when the residual
+  energy falls to a millionth of the first, and a window's energy of at most 1 gives all zeros. LSP roots not found
+  keep the previous frame's LSPs divided by pi once more.
+- The open-loop pitch search updates each lag's energy recursively; the voiced/unvoiced test of a quiet or unpitched
+  frame compares the pitch gain times the mean square (not the RMS) with 93750 (250 x 375): the reference's
+  gain x RMS > 375 only at an RMS of 250.
+- The adaptive codebook search tries the open-loop lag's index and one index either side (the reference 8 either side,
+  NEC_LAG_IDX_RNG 16).
+- The multi-pulse tree search keeps as many candidates as the next pulse has positions (the reference 32), each best
+  found as a tournament over vectors of four whose pairings the later side wins only when strictly greater (on ties
+  not always the reference's first largest); each pulse's sign is its position's correlation's (the reference searches
+  the sign combinations of its four best position sets below 8 pulses), and only the best candidate goes to the gain
+  search (the reference's four).
+- The comb filter's gains are 0.6 and 0.8 (as in the decoder).
+
+Not reproduced: no SPURS instance, task set or queue is made (their errors cannot happen); the SPU program's state
+(+0x2200) is kept on the host; float samples of exponent 255 are outside pspocket's SPU model.
+
+Compared: in the scratch harness (Sony's SPU program under pspocket's SPU interpreter, inventory/, never in the
+repository), every frame's LPC coefficients and LSPs, quantiser indices and quantised LSPs, each subframe's LPC
+coefficients, weighting filters and their memories, weighted speech, signal mode and open-loop lags, RMS index and
+values, each subframe's lag, pulse, sign and gain indices, the excitation's memories and the access unit, for 11
+kinds of synthetic audio with 10 seeds in each of the 10 configurations (56,100 frames: 30 a run with seeds 1 to 3, 60
+with seeds 4 to 10; every signal mode, 0 to 3, reached): 0 differences; the 10 headers: 0 differences. Under the library
+(tests/hle/test_celp8_compare.cpp, firmware 4.92): QueryAttr; Open's and OpenEx's checks, the handles and the
+resource OpenEx changes; every call in every state; Start's eleven parameter checks and ten headers; 446 frames
+(speech-like, sines, a chirp, noise, a square wave, impulses, noise in a sample's last bits, a constant, gated speech,
+speech past full scale, silence) and every access unit byte for byte: 0 of 2514 observations differ. Without the
+firmware, the test encodes speech through the library and decodes it with part 3's decoder: 6.9 to 8.8 dB SNR.
