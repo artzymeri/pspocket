@@ -227,8 +227,8 @@
         },
         {
           "name": "Draws while a shader compiles (a shader interpreter)",
-          "state": "todo",
-          "ref": "improve.md Shaders"
+          "state": "done",
+          "ref": "D-940: drawn by the interpreter while their own compile lands"
         },
         {
           "name": "Fewer render passes for the tile GPU",

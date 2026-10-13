@@ -241,6 +241,13 @@ bool MetalBackend::Impl::init()
         async = std::make_unique<AsyncCompiler>(device, config.async_threads);
         compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6);
     }
+    // The shader interpreter (D-940): its vertex function and the commonest fragment variant (one colour target, no
+    // depth export) made ahead in the background; the others when a draw first needs them.
+    force_interpreter = config.force_interpreter || std::getenv("PSPOCKET_RSX_INTERPRETER") != nullptr;
+    if (interpreter_on()) {
+        interpreter_program(true, 1, false);
+        interpreter_program(false, 1, false);
+    }
     PS_LOG_INFO(kChan, "Metal backend on {} (BC textures: {}), output {}x{}", device.name.UTF8String,
         bc_supported ? "yes" : "no", config.output_width, config.output_height);
     return true;
@@ -1024,6 +1031,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     fo.alpha_test = raster.alpha_test;
     fo.flat_colors = raster.shade_mode == static_cast<u32>(ShadeMode::Flat);
     fo.two_sided_lighting = raster.two_side_light; // D-257
+    // As setDepthClipMode below, where there is a depth buffer to store the clamped depth (D-941).
+    fo.clamp_depth = targets.depth && (raster.depth_clamp || !raster.depth_clip);
     // Polygon stipple (D-263; RPCS3 RSXThread.cpp: only on polygons).
     fo.polygon_stipple = raster.polygon_stipple && d.primitive >= Primitive::Triangles;
     if (points) { // point sprites (D-262; RPCS3 RSXThread.cpp: only on point draws)
@@ -1046,21 +1055,36 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
+    // A draw whose programs or pipeline are still compiling is drawn by the shader interpreter (D-940); with
+    // force_interpreter every draw is.
+    bool interpret = force_interpreter && fprog;
     skip_reason = compile_pending ? "fragment program compiling" : "fragment program";
     if (!fp) {
-        if (compile_pending) stats.draws_compiling++;
-        return skip("");
+        if (!(compile_pending && fprog && interpreter_on())) {
+            if (compile_pending) stats.draws_compiling++;
+            return skip("");
+        }
+        interpret = true;
     }
     if (pass_times && fprog) pass_last_fp = fprog->hash;
     if (skip_fp && fprog && fprog->hash == skip_fp) return skip("PSPOCKET_SKIP_FP");
     // The vertex program after the fragment program: an output the output mask leaves out matters only when the
     // fragment program reads it (D-267).
-    const CompiledProgram* vp = vertex_program_for(state, points, fp->shader.input_mask, fo.two_sided_lighting);
+    const CompiledProgram* vp = vertex_program_for(state, points, fp ? fp->shader.input_mask : fprog->input_mask,
+        fo.two_sided_lighting);
     skip_reason = compile_pending ? "vertex program compiling" : "vertex program";
     if (!vp) {
-        if (compile_pending) stats.draws_compiling++;
-        return skip("");
+        if (!(compile_pending && interp_vp && interpreter_on())) {
+            if (compile_pending) stats.draws_compiling++;
+            return skip("");
+        }
+        interpret = true;
     }
+    if (interpret && !interp_vp) return skip("");
+    // The units the programs sample and the attributes they read: the decoded programs' when the interpreter draws.
+    const u32 fp_textures = interpret ? fprog->texture_mask : fp->shader.texture_mask;
+    const u32 vp_textures = interpret ? interp_vp_textures : vp->shader.texture_mask;
+    const u32 vp_inputs = interpret ? interp_vp->input_mask : vp->shader.input_mask;
 
     // ---- scissor: RSX scissor and viewport rectangles within the surface (RPCS3 get_scissor, clip_viewport) ----
     u32 surf_w = ~0u, surf_h = ~0u;
@@ -1094,7 +1118,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     shader::MslFsParams fs{};
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         fs.tex_scale[t][0] = fs.tex_scale[t][1] = 1.f;
-        if (!(fp->shader.texture_mask & (1u << t))) continue;
+        if (!(fp_textures & (1u << t))) continue;
         const TextureInfo ti = state.fragment_texture(t);
         if (ti.is_unnormalized() && ti.width && ti.height) {
             fs.tex_scale[t][0] = 1.f / ti.width;
@@ -1154,7 +1178,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // ---- vertex textures (VP TXL, D-093): resolved before the pass opens, like the fragment textures ----
     std::array<id<MTLTexture>, 4> vbound{};
     for (u32 t = 0; t < 4; t++) {
-        if (!(vp->shader.texture_mask & (1u << t))) continue;
+        if (!(vp_textures & (1u << t))) continue;
         const TextureInfo vt = state.vertex_texture(t);
         bool ok = true;
         id<MTLTexture> tex = vt.enabled ? bind_texture(vt, 16 + t, ok) : nil;
@@ -1238,7 +1262,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     std::vector<DrawnIndices> drawn_indices; // per indexed range
     TransientAllocator::Allocation vertex_data{}, index_data{};
     u32 min_vi = ~0u, max_vi = 0;
-    const u32 inputs = vp->shader.input_mask & state.vertex_attrib_input_mask();
+    const u32 inputs = vp_inputs & state.vertex_attrib_input_mask();
     auto guest_ok = [&](u32 ea, u32 size) { return size != 0 && mem.is_committed(ea) && mem.is_committed(ea + size - 1); };
     auto register_value = [&](shader::MslAttrib& at, u32 i) {
         at = {};
@@ -1482,11 +1506,59 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     // ---- encode ----
     open_pass(targets);
-    id<MTLRenderPipelineState> pso = pipeline_for(*vp, *fp, state);
+    id<MTLRenderPipelineState> pso = interpret ? nil : pipeline_for(*vp, *fp, state);
     skip_reason = compile_pending ? "pipeline state compiling" : "pipeline state";
-    if (!pso) {
-        if (compile_pending) stats.draws_compiling++;
-        return skip("");
+    if (!interpret && !pso) {
+        if (!(compile_pending && interpreter_on())) {
+            if (compile_pending) stats.draws_compiling++;
+            return skip("");
+        }
+        interpret = true;
+    }
+    // The interpreter's functions, the programs encoded for it (once each) and its pipeline for these targets (D-940).
+    id<MTLBuffer> ivp_code = nil, ifp_code = nil;
+    shader::InterpVsOptions ivo{};
+    shader::InterpFsOptions ifo{};
+    if (interpret) {
+        const u64 vkey = interp_vp->hash ^ (u64{interp_vp->start} * 0x9e3779b97f4a7c15ull) ^ 0x5650ull;
+        const u64 fkey = fprog->hash ^ (u64{fprog->ucode_length} << 40) ^ 0x4650ull;
+        if (interp_refused.contains(vkey) || interp_refused.contains(fkey)) return skip("");
+        ivp_code = interp_code.contains(vkey) ? interp_code[vkey] : nil;
+        if (!ivp_code) {
+            const shader::EncodeResult e = shader::encode_vertex_program(*interp_vp);
+            if (!e.ok) {
+                interp_refused.insert(vkey);
+                return skip(e.error);
+            }
+            ivp_code = interpreter_code(vkey, e.words);
+        }
+        ifp_code = interp_code.contains(fkey) ? interp_code[fkey] : nil;
+        if (!ifp_code) {
+            const shader::EncodeResult e = shader::encode_fragment_program(*fprog);
+            if (!e.ok) {
+                interp_refused.insert(fkey);
+                return skip(e.error);
+            }
+            ifp_code = interpreter_code(fkey, e.words);
+        }
+        ivo = shader::interp_vs_options(*interp_vp, interp_vp_options);
+        ivo.count = static_cast<u32>(ivp_code.length / (shader::kVpWords * 4));
+        ifo = shader::interp_fs_options(fo);
+        const CompiledProgram* ivs = interpreter_program(true, 1, false);
+        // Its fragment function can discard: under the depth clamp it exports the depth too (D-941).
+        const CompiledProgram* ifs =
+            interpreter_program(false, std::min<u32>(fo.mrt_count, 4), (fo.shader_control & 0xe) != 0 || fo.clamp_depth);
+        skip_reason = "shader interpreter compiling";
+        if (!ivs || !ifs) {
+            stats.draws_compiling++;
+            return skip("");
+        }
+        pso = pipeline_for(*ivs, *ifs, state);
+        if (!pso) {
+            stats.draws_compiling++;
+            return skip("");
+        }
+        stats.draws_interpreted++;
     }
     id<MTLRenderCommandEncoder> enc = start_encoder();
     // Occlusion counting (D-102): this pass's counter for the current query.
@@ -1536,22 +1608,69 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     [enc setVertexBuffer:vertex_data.buffer offset:0 atIndex:shader::slot::kVsVertexData];
     [enc setVertexBuffer:index_data.buffer offset:0 atIndex:shader::slot::kVsIndexData];
     [enc setVertexBuffer:consts.buffer offset:consts.offset atIndex:shader::slot::kVsConstants];
-    [enc setFragmentBytes:fconst.data() length:fconst.size() * 16 atIndex:shader::slot::kFsConstants];
+    static constexpr std::array<float, 4> kNoConstants{}; // the interpreter reads the buffer by index: always bound
+    if (fconst.empty()) {
+        [enc setFragmentBytes:kNoConstants.data() length:sizeof(kNoConstants) atIndex:shader::slot::kFsConstants];
+    } else {
+        [enc setFragmentBytes:fconst.data() length:fconst.size() * 16 atIndex:shader::slot::kFsConstants];
+    }
     [enc setFragmentBytes:&fs length:sizeof(fs) atIndex:shader::slot::kFsParams];
-    for (u32 t = 0; t < kFragmentTextureCount; t++) {
-        if (!bound[t]) continue;
-        [enc setFragmentTexture:bound[t] atIndex:t];
-        [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
-    }
-    if (bounds_texture) [enc setFragmentTexture:bounds_texture atIndex:shader::slot::kFsDepthBounds];
-    if (fo.polygon_stipple) {
-        [enc setFragmentBytes:&state.regs[m::NV4097_SET_POLYGON_STIPPLE_PATTERN] length:32 * sizeof(u32)
-                      atIndex:shader::slot::kFsStipple];
-    }
-    for (u32 t = 0; t < 4; t++) {
-        if (!vbound[t]) continue;
-        [enc setVertexTexture:vbound[t] atIndex:t];
-        [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
+    if (interpret) {
+        // The interpreter's programs and options; its textures by kind (a unit's at its kind's slots, D-940), the
+        // other slots 1x1 stand-ins of their type, every sampler and the stipple pattern bound (it reads by index).
+        [enc setVertexBuffer:ivp_code offset:0 atIndex:shader::islot::kVsProgram];
+        [enc setVertexBytes:&ivo length:sizeof(ivo) atIndex:shader::islot::kVsOptions];
+        [enc setFragmentBuffer:ifp_code offset:0 atIndex:shader::islot::kFsProgram];
+        [enc setFragmentBytes:&ifo length:sizeof(ifo) atIndex:shader::islot::kFsOptions];
+        std::array<id<MTLTexture>, shader::islot::kFsDepthBounds + 1> ft;
+        for (u32 t = 0; t < kFragmentTextureCount; t++) {
+            ft[shader::islot::kFsTex2D + t] = dummy_texture;
+            ft[shader::islot::kFsTexCube + t] = dummy_cube;
+            ft[shader::islot::kFsTex3D + t] = dummy_volume;
+            ft[shader::islot::kFsTexDepth + t] = dummy_depth;
+            const shader::TextureKind k = fo.texture_kind[t];
+            const u32 base = k == shader::TextureKind::Cube  ? shader::islot::kFsTexCube
+                           : k == shader::TextureKind::Tex3D ? shader::islot::kFsTex3D
+                           : k == shader::TextureKind::Depth2D || k == shader::TextureKind::DepthShadow2D
+                               ? shader::islot::kFsTexDepth
+                               : shader::islot::kFsTex2D;
+            if (bound[t]) ft[base + t] = bound[t];
+            [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+        }
+        ft[shader::islot::kFsDepthBounds] = bounds_texture ? bounds_texture : dummy_depth;
+        [enc setFragmentTextures:ft.data() withRange:NSMakeRange(0, ft.size())];
+        static constexpr std::array<u32, 32> kNoStipple{};
+        [enc setFragmentBytes:fo.polygon_stipple ? &state.regs[m::NV4097_SET_POLYGON_STIPPLE_PATTERN] : kNoStipple.data()
+                       length:32 * sizeof(u32) atIndex:shader::slot::kFsStipple];
+        std::array<id<MTLTexture>, 12> vt;
+        for (u32 t = 0; t < 4; t++) {
+            vt[shader::islot::kVsTex2D + t] = dummy_texture;
+            vt[shader::islot::kVsTexCube + t] = dummy_cube;
+            vt[shader::islot::kVsTex3D + t] = dummy_volume;
+            const shader::TextureKind k = interp_vp_options.texture_kind[t];
+            const u32 base = k == shader::TextureKind::Cube ? shader::islot::kVsTexCube
+                           : k == shader::TextureKind::Tex3D ? shader::islot::kVsTex3D
+                                                             : shader::islot::kVsTex2D;
+            if (vbound[t]) vt[base + t] = vbound[t];
+            [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
+        }
+        [enc setVertexTextures:vt.data() withRange:NSMakeRange(0, vt.size())];
+    } else {
+        for (u32 t = 0; t < kFragmentTextureCount; t++) {
+            if (!bound[t]) continue;
+            [enc setFragmentTexture:bound[t] atIndex:t];
+            [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+        }
+        if (bounds_texture) [enc setFragmentTexture:bounds_texture atIndex:shader::slot::kFsDepthBounds];
+        if (fo.polygon_stipple) {
+            [enc setFragmentBytes:&state.regs[m::NV4097_SET_POLYGON_STIPPLE_PATTERN] length:32 * sizeof(u32)
+                          atIndex:shader::slot::kFsStipple];
+        }
+        for (u32 t = 0; t < 4; t++) {
+            if (!vbound[t]) continue;
+            [enc setVertexTexture:vbound[t] atIndex:t];
+            [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
+        }
     }
 
     MTLPrimitiveType ptype = MTLPrimitiveTypeTriangle;
@@ -1861,6 +1980,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.compile_ms =
             static_cast<double>(m.stats.compile_ns + m.stats.pipeline_ns + m.stats.compile_wait_ns - m.report_compile_ns) / 1e6;
         w.draws_compiling = per_frame(m.stats.draws_compiling, m.report_draws_compiling);
+        w.draws_interpreted = per_frame(m.stats.draws_interpreted, m.report_draws_interpreted);
         w.textures = m.textures.size();
         w.texture_mb = static_cast<double>(m.texture_bytes()) / 1048576.0;
         w.surfaces = m.surfaces.size();
@@ -1874,7 +1994,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {:.1f} textures decoded "
                            "({:.1f} over a target drawn to again, {:.1f} written); {} programs and {} pipelines "
-                           "made ({:.1f} ms, {:.2f} draws waiting for one); "
+                           "made ({:.1f} ms, {:.2f} draws waiting for one, {:.2f} drawn by the interpreter); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
                            "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures, {:.2f} "
                            "surface reloads; {:.2f} ms waiting for the GPU; GPU memory {:.0f} MB, {} deferred",
@@ -1884,7 +2004,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
             per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
-            w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.texture_mb, w.surfaces, w.surface_mb,
+            w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.draws_interpreted, w.textures, w.texture_mb,
+            w.surfaces, w.surface_mb,
             w.feedback_copies, w.depth_bounds_draws, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
             w.deferred_queue);
         if (m.config.on_window) m.config.on_window(w);
@@ -1892,6 +2013,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_pipelines = m.stats.pipelines_created;
         m.report_compile_ns = m.stats.compile_ns + m.stats.pipeline_ns + m.stats.compile_wait_ns;
         m.report_draws_compiling = m.stats.draws_compiling;
+        m.report_draws_interpreted = m.stats.draws_interpreted;
         m.report_texture_checks = m.stats.texture_checks;
         m.report_decoded = m.stats.textures_decoded;
         m.report_decoded_overlay = m.stats.textures_decoded_overlay;

@@ -28,6 +28,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/rsx.hpp"
+#include "pspocket/rsx/shader/interp.hpp"
 #include "pspocket/rsx/shader/ir.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
 #include "pspocket/rsx/texture.hpp"
@@ -486,6 +487,7 @@ struct MetalBackend::Impl {
     u64 report_faults = 0; // the tracker's write faults at the last report (D-134)
     u64 report_overlays = 0;
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
+    u64 report_draws_interpreted = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     u64 report_depth_bounds = 0; // D-261
     u64 report_load_bytes = 0, report_store_bytes = 0, report_clear_only = 0, report_clear_only_bytes = 0; // D-273
@@ -590,6 +592,19 @@ struct MetalBackend::Impl {
     std::vector<DecodedVertexProgram> vertex_programs;
     bool vertex_program_ok = false; // vertex_programs.front() is the program the state holds
     void forget_program_lookups();                                   // a program key now names another program
+    // The shader interpreter (D-940). vertex_program_for leaves the program it looked up and its options here, for a
+    // draw the interpreter draws; the programs it runs are encoded once each (by hash), in buffers of their own.
+    const shader::VertexProgram* interp_vp = nullptr;
+    shader::VpOptions interp_vp_options;
+    u8 interp_vp_textures = 0;
+    std::unordered_map<u64, id<MTLBuffer>> interp_code;
+    std::unordered_set<u64> interp_refused; // programs the interpreter refuses (as the translation does)
+    bool force_interpreter = false; // config.force_interpreter or PSPOCKET_RSX_INTERPRETER
+    bool interpreter_on() const { return async != nullptr && config.shader_interpreter; }
+    // The interpreter's vertex function (vertex) or fragment variant for `mrt` colour outputs and depth export: made
+    // in the background (as any program; the shader cache keeps them), nullptr until then. Synchronous without async.
+    const CompiledProgram* interpreter_program(bool vertex, u32 mrt, bool depth);
+    id<MTLBuffer> interpreter_code(u64 key, const std::vector<u32>& words);
     std::vector<id<MTLTexture>> outputs;
     u32 next_output = 0;
 

@@ -191,9 +191,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   - Bring the phone's pipelines.txt back into the app's seed (scripts/ios.sh can pull the Caches directory), so a new
     install starts with what the phone has seen.
   - ~~Compile a new pipeline off the RSX thread and draw without it for the frames that takes~~: done (D-158,
-    run 098), 4 ms of waiting per frame at most, then the draw is skipped. Next: a shader interpreter (one MSL
-    program that runs RSX microcode, RPCS3's "async with shader interpreter") would draw those instead of leaving
-    them out; tune the 4 ms on the phone.
+    run 098), 4 ms of waiting per frame at most, then the draw is skipped. **Done (D-940):** the shader interpreter
+    draws those instead, once its own pipeline for the draw's targets is made (the shader cache makes them ahead at
+    the next launch). Next, on the phone: how many draws a first session interprets and what they cost the GPU
+    (the report line's "drawn by the interpreter"), and the 4 ms wait, which can now be smaller.
   - **Weighed (2026-10-08), not started:** an interpreter only helps if its pipelines exist before the draw, and a
     Metal pipeline is compiled per vertex and fragment function *and* per attachment formats, blending and write masks:
     the interpreter's own pipelines would still be compiled on first sight of each such combination (fewer, but not

@@ -6,7 +6,9 @@
 
 #include "metal_internal.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include <format>
 
@@ -128,6 +130,9 @@ MTLCompileOptions* shader_compile_options()
 
 std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::TranslateResult& tr, const char* what)
 {
+    // PSPOCKET_RSX_DUMP_MSL: every program's MSL as it is compiled (debugging the translation).
+    static const bool dump = std::getenv("PSPOCKET_RSX_DUMP_MSL") != nullptr;
+    if (dump) PS_LOG_INFO(kChan, "compiling {} {}:\n{}", what, tr.shader.entry, tr.shader.source);
     // One library per program: entry names only need to be unique within it.
     NSError* error = nil;
     const auto t0 = std::chrono::steady_clock::now();
@@ -160,6 +165,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
 {
     take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
     take_async();        // ... and the background compiles (D-158)
+    interp_vp = nullptr;
     if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program_ok) {
         state.dirty_bits &= ~dirty::kVertexProgram;
         vertex_program_ok = false;
@@ -256,6 +262,15 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
                                                    : shader::TextureKind::Tex2D;
         kind_bits |= static_cast<u32>(kinds[t]) << (3 * t);
     }
+    // What the shader interpreter needs of the program, whatever comes of its compile (D-940).
+    interp_vp = &vp;
+    interp_vp_textures = current.texture_units;
+    interp_vp_options = {};
+    interp_vp_options.point_size = points;
+    interp_vp_options.user_clip = user_clip;
+    interp_vp_options.masked_outputs = masked;
+    interp_vp_options.read_outputs = read;
+    interp_vp_options.texture_kind = kinds;
     // The variants made of this program stay with it, by what tells them apart (D-109): point size, clip planes (two
     // bits a plane), masked outputs, the outputs the fragment program reads, the only ones it puts out (D-269), and the
     // vertex textures' kinds.
@@ -422,6 +437,14 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     shader::FpOptions options = requested;
     options.texture_convert_mask = static_cast<u16>(options.texture_convert_mask & fp.texture_mask);
     options.texture_alpha_kill_mask = static_cast<u16>(options.texture_alpha_kill_mask & fp.texture_mask);
+    // The depth clamp changes only a program that can discard (D-941): the others keep their compiles.
+    if (options.clamp_depth) {
+        const bool kills = std::any_of(fp.instructions.begin(), fp.instructions.end(), [](const shader::FpInstruction& in) {
+            return in.op == static_cast<u8>(shader::FpOp::KIL) && !in.never();
+        });
+        options.clamp_depth = kills || options.alpha_test || options.alpha_to_coverage || options.depth_bounds ||
+                              options.polygon_stipple || options.texture_alpha_kill_mask != 0;
+    }
     for (const auto& [o, c] : entry.compiled) {
         if (o == options) return c;
     }
@@ -437,13 +460,20 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     if (options.depth_bounds) opt += ".b";       // D-261
     if (options.point_coord_mask) opt += std::format(".p{:x}", options.point_coord_mask); // D-262
     if (options.polygon_stipple) opt += ".s"; // D-263
+    if (options.clamp_depth) opt += ".z";     // D-941
     for (u32 t = 0; t < 16; t++) {
         if (!(fp.texture_mask & (1u << t))) continue;
         opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
         if (options.texture_convert_mask & (1u << t)) opt += 'c'; // texel conversions (D-174)
         if (options.texture_alpha_kill_mask & (1u << t)) opt += 'k';
     }
-    const std::string key = std::format("fp:{:016x}:{}", fp.hash, opt);
+    // A program that packs (PK4, PKB, PK16, PKG) is translated since D-942 with packs by hand: a key of its own, so a
+    // shader cache recorded before holds none of the old translation.
+    const bool packs = std::any_of(fp.instructions.begin(), fp.instructions.end(), [](const shader::FpInstruction& in) {
+        const auto op = static_cast<shader::FpOp>(in.op);
+        return op == shader::FpOp::PK4 || op == shader::FpOp::PKB || op == shader::FpOp::PK16 || op == shader::FpOp::PKG;
+    });
+    const std::string key = std::format("fp:{:016x}:{}{}", fp.hash, opt, packs ? ":pk" : "");
     const auto remember = [&](const CompiledProgram* c) {
         if (entry.compiled.size() < 8) entry.compiled.emplace_back(options, c);
         return c;
@@ -607,6 +637,47 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
     pipelines[key] = pso;
     if (shader_cache) shader_cache->record_pipeline(vp.key, fp.key, p);
     return pso;
+}
+
+const CompiledProgram* MetalBackend::Impl::interpreter_program(bool vertex, u32 mrt, bool depth)
+{
+    // Keyed by the interpreter's source: a shader cache made by another version holds none of this one's (D-114).
+    static const u64 source_hash = [] {
+        u64 h = 0xcbf29ce484222325ull ^ shader::kInterpreterVersion;
+        for (unsigned char c : shader::interpreter_source()) h = (h ^ c) * 0x100000001b3ull;
+        return h;
+    }();
+    const std::string key = vertex ? std::format("interp:{:016x}:vs", source_hash)
+                                   : std::format("interp:{:016x}:fs{}{}", source_hash, mrt, depth ? "d" : "");
+    if (auto it = programs.find(key); it != programs.end()) return &it->second;
+    shader::TranslateResult tr;
+    tr.ok = true;
+    // The fragment variants differ in their outputs: the colour targets and depth export, as the translation's do.
+    tr.shader.source = std::format("#define RSX_MRT {}\n#define RSX_DEPTH {}\n", vertex ? 1 : mrt, depth && !vertex ? 1 : 0) +
+                       shader::interpreter_source();
+    tr.shader.entry = vertex ? shader::kInterpVsEntry : shader::kInterpFsEntry;
+    if (async) {
+        if (!async_failed_programs.contains(key) && !async->queued(key)) {
+            async->queue({key, tr.shader, {}, "shader interpreter"});
+        }
+        return nullptr;
+    }
+    auto compiled = compile(tr, "shader interpreter");
+    if (!compiled) return nullptr;
+    compiled->key = key;
+    auto [it, inserted] = programs.insert_or_assign(key, std::move(*compiled));
+    if (shader_cache) shader_cache->record_program(it->second);
+    return &it->second;
+}
+
+id<MTLBuffer> MetalBackend::Impl::interpreter_code(u64 key, const std::vector<u32>& words)
+{
+    if (auto it = interp_code.find(key); it != interp_code.end()) return it->second;
+    if (interp_code.size() >= 4096) interp_code.clear(); // a bound on what is kept (command buffers hold theirs)
+    id<MTLBuffer> b = [device newBufferWithBytes:words.data() length:std::max<usize>(words.size() * 4, 16)
+                                         options:MTLResourceStorageModeShared];
+    interp_code[key] = b;
+    return b;
 }
 
 id<MTLDepthStencilState> MetalBackend::Impl::depth_state_for(const RsxState& state)

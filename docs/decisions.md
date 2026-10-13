@@ -14462,3 +14462,76 @@ resource OpenEx changes; every call in every state; Start's eleven parameter che
 (speech-like, sines, a chirp, noise, a square wave, impulses, noise in a sample's last bits, a constant, gated speech,
 speech past full scale, silence) and every access unit byte for byte: 0 of 2514 observations differ. Without the
 firmware, the test encodes speech through the library and decodes it with part 3's decoder: 6.9 to 8.8 dB SNR.
+
+## D-940 · 2026-10-13 · The shader interpreter: a draw whose programs are still compiling is drawn, not left out
+
+The engine checklist's "Draws while a shader compiles". Since D-158 a draw whose vertex or fragment program, or
+pipeline, is still compiling in the background is left out once the frame's 4 ms wait is spent: a game's first
+session on the phone shows objects popping in as their shaders land. RPCS3's answer is its "async with shader
+interpreter" mode; pspocket's is the same in spirit:
+
+- **Two functions run any program** (runtime/rsx/shader/interp.hpp, interp.cpp): the vertex function rsx_vs_interp and
+  the fragment function rsx_fs_interp. The programs are decoded on the CPU as for the translation (ir.hpp) and encoded
+  into fixed-width words (8 a vertex instruction, 12 a fragment one, the fragment program's flow-control ends and elses
+  as instruction indices), once per program, in a buffer of their own. The MSL runs each operation as msl.cpp
+  translates it (same helpers, same order of modifiers, the same RPCS3 citations), and reads at run time what the
+  translator fixes at compile time from VpOptions and FpOptions (texture kinds, 2D coordinates, flat and two-sided
+  colours, point sprites, stipple, depth bounds, the texel conversions and alpha kill, sRGB, the alpha test and alpha
+  to coverage, output swizzles). Vertex flow control: a pc and a call stack of 8, the translation's 65536-jump guard;
+  fragment flow control: a stack of open IFE/LOOP/REP blocks, BRK, RET and the loop index of indexed inputs as the
+  translation's lexical blocks have them. What the translation refuses (its unsupported opcodes, an indexed input past
+  SSA outside a loop) the interpreter refuses too: the two draw the same.
+- **What cannot be read at run time is a variant**: the fragment function's colour outputs (0 to 4) and depth export are
+  preprocessor variants of one source (RSX_MRT, RSX_DEPTH), as the translation writes them. The vertex function puts
+  out every varying (flat copies of the colours beside the smooth ones, all six clip distances, the point size).
+- **Textures by kind**: a unit's texture goes to its kind's slot (fragment: 2D, 1D and shadow at 0-15, cube at 16-31, 3D
+  at 32-47, depth at 48-63, the depth bounds copy at 64; vertex: 0-3, 4-7, 8-11), every other slot a 1x1 stand-in of
+  its type, every sampler bound (the interpreter indexes them). 65 fragment textures need Apple GPU family 6 (A13) or
+  later, and the Macs; where a pipeline cannot be made the draw is left out as before.
+- **In the backend** (metal_backend.mm): at the three places a draw was left out for a compile (its fragment program,
+  vertex program, pipeline), it goes to the interpreter instead, when the interpreter's functions and its pipeline for
+  the draw's targets and blending are made; else it is left out as before. The interpreter's functions are programs like
+  any other (made in the background, the vertex function and the commonest fragment variant as soon as the backend
+  starts, the others when first needed), its pipelines are pipeline_for's like any pair: the shader cache records both
+  and makes them ahead at the next launch (D-114). The report line counts "drawn by the interpreter".
+  MetalBackendConfig::shader_interpreter (on) and force_interpreter, PSPOCKET_RSX_INTERPRETER=1: every draw through it.
+
+Cost: an interpreted draw is slower on the GPU (a loop over the instructions, registers in thread memory) and binds 77
+textures; it lasts only the frames until the draw's own compile lands. Tests (tests/rsx/test_metal.mm): the interpreter
+compiles in every variant into pipelines; every end-to-end draw of the suite again through it
+(test_rsx_metal_interpreted: the same pixels as the translation's); random programs drawn both ways into a 32-bit float
+target (64 fragment programs with every arithmetic, pack and unpack operation, modifiers, condition codes and IFE and
+LOOP blocks, and 64 vertex programs with dual issue and conditional writes a round; PSPOCKET_FUZZ_SEED,
+PSPOCKET_FUZZ_ITERS; PSPOCKET_TEST_ONLY=<n> draws that program alone and then each of its instructions as a NOP in
+turn): every float the same within 4e-6, a denormal counting as zero (the translation's constant folding flushes a packed
+value's denormal bits); the two disagreements it found were the translation's (D-941, D-942); and a game's view of it: a
+draw whose pipeline compiles, and one whose program was never seen, drawn at once by the interpreter. The phone's numbers (how many draws a first session
+interprets, and what they cost) come with the next phone session.
+
+## D-941 · 2026-10-13 · Under the depth clamp, a fragment program that can discard exports its depth
+
+Found while checking D-940 against the D-258 test: on Apple GPUs (the M4 here) a fragment function that can discard its
+fragment gets no depth clamp from MTLDepthClipModeClamp, the RSX's NV4097_SET_ZMIN_MAX_CONTROL clamp (D-258): with an
+alpha test on, the depth stored was the unclamped 0.75 where the clip range ends at 0.7. Metal does clamp an exported
+depth to the viewport's range (D-266). So FpOptions::clamp_depth, set where the backend sets the clamp mode: a program
+that can discard (KIL, a texture's alpha kill, the alpha test, alpha to coverage, depth bounds, polygon stipple) exports
+the depth it was rasterized at (in.position.z; r1.z when it exports its own). The backend clears the option for
+programs that cannot discard, so their keys and compiles, and the shader cache recorded on the Mac, stay as they were;
+the translation's version and fingerprint are unchanged (no existing key's MSL changed). The interpreter (which can
+always discard) takes its depth variant under the clamp. Regression: the D-258 test's alpha-tested draws, clamped to
+0.7 and clipped as before, translated and interpreted.
+
+## D-942 · 2026-10-13 · Metal's pack intrinsics miscompile next to another write to their register: pspocket packs by hand
+
+Found by D-940's random programs, where the translated program and the interpreter disagreed and the translated one
+contradicted its own MSL: `PK16R R0.zw, H3` then `DP2AR R0.xw, ...` drew R0.w as the pack's value (or 1.0), not the
+DP2A's, and the pack's own lanes came out wrong too. Reduced to plain MSL on the Mac's compiler (M4, safe and fast
+math alike): any of Metal's pack_float_to_unorm4x8, _snorm4x8, _unorm2x16 or _snorm2x16, bitcast to a float and written
+to some components of a vector that another write overlaps, is compiled wrongly. A plain bitcast, the half2 bitcast
+(PK2), the unpack functions and a pack written to a register of its own are not affected. So the translation (and the
+interpreter) pack by hand (msl.cpp kPackHelpers, emitted into the programs that pack): round(x * n) of the exact
+product, a float product that lands on k + 0.5 decided by its rounding error from an fma, which matches Metal's
+intrinsics bit for bit on every code's value and half-step and 100,000 random values (tests/rsx: "pspocket's packs are
+Metal's ... bit for bit"); the plain float product rounds a quarter of the half-steps the other way. A program that
+packs (PK4, PKB, PK16, PKG) gets a key of its own (":pk"), so a shader cache recorded before holds none of its old
+translation, and every other program keeps its cache. Regression: the reduced program, translated and interpreted.
