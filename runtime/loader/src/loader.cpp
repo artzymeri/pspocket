@@ -236,6 +236,7 @@ lv2::Config Executable::kernel_config(lv2::Config base) const
 
 void prepare_kernel_config(lv2::Config& cfg, BootState& state)
 {
+    if (!state.options.argv.empty()) cfg.executable_path = state.options.argv[0];
     state.inner = cfg.executor ? cfg.executor : lv2::default_executor;
     state.inner_user = cfg.executor_user;
     cfg.executor = main_executor;

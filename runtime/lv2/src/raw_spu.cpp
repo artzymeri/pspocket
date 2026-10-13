@@ -27,6 +27,7 @@
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -941,6 +942,13 @@ Result _sys_interrupt_thread_disestablish(PpuThread& t, u32 ih, u32 r13)
 }
 
 // Process exit: raw SPUs stop, interrupt threads end.
+u32 raw_spu_count(Kernel::Impl& s)
+{
+    RawSpus& r = raws(s);
+    std::lock_guard lock(r.mutex);
+    return static_cast<u32>(std::count_if(r.raw.begin(), r.raw.end(), [](const auto& p) { return p != nullptr; }));
+}
+
 void abort_raw_spus(Kernel::Impl& s)
 {
     if (!s.raw_spu_state) return;

@@ -99,6 +99,7 @@ public:
     const u32 spu_num; // the SPU number the game gave (the group DMA window's index)
     const std::string name;
     const u32 option;
+    std::vector<u8> info; // the image's INFO segment as initialize found it (at most 256 bytes); set before it runs
     u8* ls = nullptr;
     SPUContext ctx{};
     Waiter waiter; // sys_spu_thread_receive_event
@@ -191,5 +192,7 @@ std::optional<u32> spu_elf_entry(std::span<const u8> file);
 bool load_spu_elf(std::span<const u8> file, u8* ls, u32& entry);
 // Process exit / shutdown: raw SPUs are asked to stop, interrupt threads to end.
 void abort_raw_spus(Kernel::Impl& s);
+// The raw SPUs the process has created (sys_dbg_get_process_info).
+u32 raw_spu_count(Kernel::Impl& s);
 
 } // namespace pspocket::lv2

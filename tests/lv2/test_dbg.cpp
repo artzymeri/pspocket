@@ -462,3 +462,156 @@ TEST_CASE("lv2 sys_dbg: the PPU exception handler's queue, registered once and f
     CHECK(c.call(kDbgFinalizeExceptionHandler, q) == kDeHandleNotRegistered);
     REQUIRE(c.call(kDbgInitExceptionHandler, other) == CELL_OK); // registered anew
 }
+
+TEST_CASE("lv2 sys_dbg: the thread list, each thread's information, the process's and its memory containers'",
+    "[lv2][dbg]")
+{
+    enum : u32 {
+        kThreadList = 909,
+        kThreadInfo = 910,
+        kProcessInfo = 914,
+        kContainerInfo = 957,
+        kGroupCreate = 170,
+        kSpuInitialize = 172,
+    };
+    Fixture f;
+    Caller c(*f.kernel, "a main thread with a long name", 1500);
+
+    // A thread asleep on a semaphore.
+    const u32 out = f.alloc(4);
+    REQUIRE(c.call(kSemCreate, out, sync_attr(f, SYS_SYNC_FIFO), 0, 1) == CELL_OK);
+    const u32 sem = f.r32(out);
+    u32 sleeper = 0;
+    std::thread th([&] {
+        Caller me(*f.kernel, "sleeper", 2500);
+        sleeper = me.id();
+        THREAD_REQUIRE(me.call(kSemWait, sem, 0) == CELL_OK);
+    });
+    REQUIRE(eventually([&] { return queued<Semaphore>(*f.kernel, sem) == 1; }));
+
+    // An SPU thread group of two, one thread initialized: its image has an INFO segment.
+    const u32 gattr = f.alloc(16), gname = f.cstr("dbg group");
+    f.w32(gattr, 10);
+    f.w32(gattr + 4, gname);
+    REQUIRE(c.call(kGroupCreate, out, 2, 200, gattr) == CELL_OK);
+    const u32 group = f.r32(out);
+    const u32 code = f.alloc(16), info_bytes = f.alloc(16), segs = f.alloc(0x30, 8), img = f.alloc(16);
+    std::memcpy(f.base() + info_bytes, "spu program info", 16);
+    f.w32(segs, 1);
+    f.w32(segs + 8, 16);
+    f.w32(segs + 0x10, code);
+    f.w32(segs + 0x18, 4); // INFO
+    f.w32(segs + 0x20, 16);
+    f.w32(segs + 0x28, info_bytes);
+    f.w32(img, 0); // a user image
+    f.w32(img + 8, segs);
+    f.w32(img + 12, 2);
+    const u32 tattr = f.alloc(12), tname = f.cstr("spu one");
+    f.w32(tattr, tname);
+    f.w32(tattr + 4, 8);
+    REQUIRE(c.call(kSpuInitialize, out, group, 0, img, tattr, f.alloc(32)) == CELL_OK);
+    const u32 spu = f.r32(out);
+
+    // The list: the PPU threads (64-bit IDs), then the group (its ID in the first word).
+    const u32 list = f.alloc(16 * 8, 8), count = f.alloc(8, 8), all = f.alloc(8, 8);
+    f.w64(count, 8);
+    REQUIRE(c.call(kThreadList, 1, list, count, all) == CELL_OK);
+    CHECK(f.r64(all) == 3);
+    CHECK(f.r64(count) == 3);
+    CHECK(f.r32(list) == 0);
+    CHECK(f.r64(list + 8) == c.id());
+    CHECK(f.r32(list + 16) == 0);
+    CHECK(f.r64(list + 24) == sleeper);
+    CHECK(f.r32(list + 32) == 2);
+    CHECK(f.r32(list + 40) == group);
+    // Room for two: two written, *count left as it was; no list: only *all.
+    f.w64(count, 2);
+    f.w64(list + 32, 0);
+    REQUIRE(c.call(kThreadList, 1, list, count, all) == CELL_OK);
+    CHECK(f.r64(count) == 2);
+    CHECK(f.r64(all) == 3);
+    CHECK(f.r64(list + 32) == 0);
+    f.w64(all, 0);
+    REQUIRE(c.call(kThreadList, 1, 0, count, all) == CELL_OK);
+    CHECK(f.r64(all) == 3);
+    CHECK(c.call(kThreadList, 1, list, count, 0) == kDeInvalidArguments);
+    f.w64(count, 0x80000000ull);
+    CHECK(c.call(kThreadList, 1, list, count, all) == kDeInvalidArguments);
+    f.w64(count, 2);
+    CHECK(c.call(kThreadList, 7, list, count, all) == kDeInvalidArguments);
+
+    // Each one's information.
+    const u32 entry = f.alloc(16, 8), info = f.alloc(0x40, 8), name = f.alloc(0x80), name2 = f.alloc(0x200);
+    const auto ask = [&](u32 type, u64 id) {
+        f.w32(entry, type);
+        f.w64(entry + 8, id);
+        return c.call(kThreadInfo, entry, info);
+    };
+    f.w32(info + 0x14, name);
+    REQUIRE(ask(0, c.id()) == CELL_OK);
+    CHECK(f.r32(info) == 1500);
+    CHECK(f.r32(info + 0x04) == 2); // on a processor: the caller
+    CHECK(f.r32(info + 0x10) == 1);
+    CHECK(f.r32(info + 0x18) == 1500);
+    CHECK(std::string(reinterpret_cast<const char*>(f.base() + name)) == "a main thread with a long n"); // 27
+    REQUIRE(ask(0, sleeper) == CELL_OK);
+    CHECK(f.r32(info) == 2500);
+    CHECK(f.r32(info + 0x04) == 3); // sleeping
+    CHECK(std::string(reinterpret_cast<const char*>(f.base() + name)) == "sleeper");
+    CHECK(ask(0, 0x01FFFFFF) == static_cast<s32>(0x80010402));
+    f.w32(info + 0x08, name2);
+    f.w32(info + 0x0C, name);
+    REQUIRE(ask(1, u64{spu} << 32) == CELL_OK);
+    CHECK(f.r32(info) == group);
+    CHECK(f.r32(info + 0x04) == 1);
+    CHECK(std::string(reinterpret_cast<const char*>(f.base() + name)) == "spu one");
+    CHECK(std::memcmp(f.base() + name2, "spu program info", 16) == 0);
+    CHECK(f.r32(name2 + 16) == 0);
+    const u32 members = f.alloc(16);
+    f.w32(info + 0x10, 4);
+    f.w32(info + 0x18, members);
+    REQUIRE(ask(2, u64{group} << 32) == CELL_OK);
+    CHECK(f.r32(info) == 200);
+    CHECK(f.r32(info + 0x04) == 0); // not every thread initialized yet
+    CHECK(f.r32(info + 0x08) == 1);
+    CHECK(std::string(reinterpret_cast<const char*>(f.base() + name)) == "dbg group");
+    CHECK(f.r32(info + 0x10) == 1);
+    CHECK(f.r32(info + 0x14) == 2);
+    CHECK(f.r32(members) == spu);
+    CHECK(ask(3, 0) == static_cast<s32>(0x80010415));
+    CHECK(c.call(kThreadInfo, 0, info) == kDeInvalidArguments);
+
+    // The process.
+    const u32 pinfo = f.alloc(0x38, 8);
+    f.w32(pinfo + 0x18, 0);
+    REQUIRE(c.call(kProcessInfo, 1, pinfo) == CELL_OK);
+    CHECK(f.r32(pinfo) == 1);
+    CHECK(f.r32(pinfo + 0x04) == 2);
+    CHECK(f.r32(pinfo + 0x08) == 2);
+    CHECK(f.r32(pinfo + 0x0C) == 1);
+    CHECK(f.r32(pinfo + 0x10) == 0);
+    CHECK(c.call(kProcessInfo, 1, 0) == kDeInvalidArguments);
+    CHECK(c.call(kProcessInfo, 2, pinfo) == kDeInvalidArguments);
+
+    // Its memory containers: its own, then one made from it.
+    REQUIRE(c.call(kContainerCreate, out, 0x100000) == CELL_OK);
+    const u32 ct = f.r32(out);
+    const u32 cts = f.alloc(64, 8), n = f.alloc(4);
+    f.w32(n, 1);
+    CHECK(c.call(kContainerInfo, 1, cts, n) == rc(CELL_EINVAL));
+    f.w32(n, 4);
+    REQUIRE(c.call(kContainerInfo, 1, cts, n) == CELL_OK);
+    CHECK(f.r32(n) == 2);
+    CHECK(f.r32(cts + 8) == 0xFFFFFFFF);
+    CHECK(f.r32(cts + 12) == 0xFFFFFFFF);
+    CHECK(f.r32(cts + 16) == 0x100000);
+    CHECK(f.r32(cts + 20) == 0x100000);
+    CHECK(f.r32(cts + 24) == ct);
+    CHECK(f.r32(cts + 28) == 0xFFFFFFFF);
+    // Its own: what the new one took is not free (nor the SPU thread group's two local stores).
+    CHECK(f.r32(cts + 4) == f.r32(cts) - 0x100000 - 2 * 0x40000);
+    CHECK(c.call(kContainerInfo, 2, cts, n) == rc(CELL_ENOSYS));
+
+    REQUIRE(c.call(kSemPost, sem, 1) == CELL_OK);
+    th.join();
+}

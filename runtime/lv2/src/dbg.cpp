@@ -23,6 +23,7 @@
 #include <cstring>
 
 #include "internal.hpp"
+#include "spu.hpp"
 
 namespace pspocket::lv2 {
 
@@ -31,11 +32,13 @@ namespace {
 constexpr u32 kProcessId = 1; // sys_process_getpid
 
 // CELL_LV2DBG_ERROR_* (RPCS3 Modules/sys_lv2dbg.h).
+constexpr CellError kDeInvalidThreadId = static_cast<CellError>(0x80010402);
 constexpr CellError kDeNoMem = static_cast<CellError>(0x80010408);
 constexpr CellError kDeInvalidArguments = static_cast<CellError>(0x80010409);
 constexpr CellError kDeHandlerAlreadyRegistered = static_cast<CellError>(0x80010429);
 constexpr CellError kDeInvalidHandler = static_cast<CellError>(0x8001042A);
 constexpr CellError kDeHandleNotRegistered = static_cast<CellError>(0x8001042B);
+constexpr CellError kDeInvalidThreadType = static_cast<CellError>(0x80010415);
 
 // The calling process's control flags reach the system software's level (0x4000... and above).
 bool system_level(PpuThread& t) { return t.kernel.config().root; }
@@ -122,6 +125,67 @@ template <class T>
 std::shared_ptr<T> object(PpuThread& t, u32 id)
 {
     return t.kernel.impl().objects.get<T>(id);
+}
+
+// A string into a buffer the caller gave (the kernel's names and paths): `copy` characters at most, then zeros to
+// `size` bytes. False when the buffer is not guest memory.
+bool put_text(const Guest& g, u32 addr, const std::string& text, u32 copy, u32 size)
+{
+    if (!g.valid(addr, size)) return false;
+    std::memset(g.ptr(addr), 0, size);
+    std::memcpy(g.ptr(addr), text.data(), std::min<usize>(text.size(), copy));
+    return true;
+}
+
+// The process's PPU threads as the kernel lists them (0x8000000000090DA0): those alive, then those that ended and wait
+// for a join; each in creation order.
+std::vector<std::shared_ptr<PpuThread>> ppu_threads(Kernel::Impl& s)
+{
+    std::vector<std::shared_ptr<PpuThread>> alive, ended;
+    std::lock_guard lk(s.join_mutex);
+    for (const auto& [id, obj] : s.threads.list(PpuThread::kIdBase)) {
+        auto th = std::static_pointer_cast<PpuThread>(obj);
+        (th->finished ? ended : alive).push_back(std::move(th));
+    }
+    alive.insert(alive.end(), ended.begin(), ended.end());
+    return alive;
+}
+
+// A PPU thread's state as the debugging calls number them: the kernel's own state less one (0x800000000008F91C),
+// 0 created and not started, 1 runnable, 2 on a processor, 3 sleeping, 6 stopped by a debugger, 8 ended and not yet
+// joined. pspocket's threads run on host threads of their own: the caller is on a processor, a thread waiting in a
+// call sleeps, any other is runnable.
+u32 ppu_state(Kernel::Impl& s, const PpuThread& caller, PpuThread& th)
+{
+    {
+        std::lock_guard lk(s.join_mutex);
+        if (th.finished) return 8;
+    }
+    {
+        std::lock_guard lk(th.lock);
+        if (!th.started) return 0;
+    }
+    if (&th == &caller) return 2;
+    if (th.waiter.waiting_on().kind != WaitKind::None) return 3;
+    return 1;
+}
+
+// An SPU thread group's state as the debugging calls number it (0x800000000008FA28): the kernel's run flags read as
+// SYS_SPU_THREAD_GROUP_STATUS, a group that runs reading as ready (2); RUNNING (6) is never given.
+u32 group_state(SpuGroupState state)
+{
+    switch (state) {
+    case SpuGroupState::NotInitialized: return 0;
+    case SpuGroupState::Initialized: return 1;
+    case SpuGroupState::Ready:
+    case SpuGroupState::Running: return 2;
+    case SpuGroupState::Waiting: return 3;
+    case SpuGroupState::Suspended: return 4;
+    case SpuGroupState::WaitingAndSuspended: return 5;
+    case SpuGroupState::Stopped:
+    case SpuGroupState::Destroyed: return 7;
+    }
+    return 7;
 }
 
 } // namespace
@@ -449,8 +513,191 @@ Result sys_dbg_finalize_ppu_exception_handler(PpuThread& t, u32 queue_id)
     return CELL_OK;
 }
 
+// sys_dbg_get_thread_list(pid, list, count, all), 0x8000000000090DA0. The process's threads: its PPU threads (type 0,
+// the ID as 64 bits) then its SPU thread groups (type 2, the ID in the first word of the 64 bits), 16 bytes each.
+// *all (CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS without it) gets how many there are; *count (64 bits, CELL_EFAULT
+// when unreadable, at most 0x7FFFFFFF) is the room in `list`. With a list and room, as many as fit are written, and
+// when all fit *count becomes the number too.
+Result sys_dbg_get_thread_list(PpuThread& t, u32 pid, u32 list, u32 count, u32 all)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!all) return err(kDeInvalidArguments);
+    if (!g.valid(count, 8)) return err(CELL_EFAULT);
+    const u64 room = g.r64(count);
+    if (room > 0x7FFFFFFF) return err(kDeInvalidArguments);
+    if (const Result r = inspect(pid); r != CELL_OK) return r;
+    std::vector<std::pair<u32, u32>> entries; // type, ID
+    for (const auto& th : ppu_threads(s)) entries.emplace_back(0, th->id);
+    if (entries.empty()) return err(kDeInvalidThreadId);
+    for (const auto& [id, obj] : s.spu_groups.list(SpuThreadGroup::kIdBase)) entries.emplace_back(2, id);
+    const u64 total = entries.size();
+    if (list && room) {
+        if (const Result r = list_room("sys_dbg_get_thread_list", static_cast<u32>(room), 16); r != CELL_OK) return r;
+        const u32 n = static_cast<u32>(std::min<u64>(room, total));
+        if (!g.valid(list, u64{n} * 16)) return err(CELL_EFAULT);
+        for (u32 i = 0; i < n; i++) {
+            const auto [type, id] = entries[i];
+            g.w32(list + i * 16, type);
+            g.w32(list + i * 16 + 4, 0);
+            // A PPU thread's ID fills the 64 bits; an SPU thread group's is their first word.
+            g.w64(list + i * 16 + 8, type == 0 ? u64{id} : u64{id} << 32);
+        }
+        if (n == total && !g.put64(count, total)) return err(CELL_EFAULT);
+    }
+    if (!g.put64(all, total)) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+// sys_dbg_get_thread_info(thread, info), 0x8000000000090D5C: `thread` is a list entry (type, then the ID), `info`
+// what the type has; CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS without either, CELL_LV2DBG_ERROR_DEINVALIDTHREADTYPE for a
+// type other than 0, 1, 2. The kernel writes each field on its own, so a field it cannot write ends the call there.
+// - A PPU thread (0x800000000008E9A0): the process ID at +0x10, the priority at +0, the base priority at +0x18, the
+//   state at +4, the stack's address and size at +8; then, when +0x14 holds a buffer's address, the name (at most 27
+//   characters) in 128 bytes there.
+// - An SPU thread (0x800000000008EB90): the process ID at +4, the group's ID at +0; the name in the 128-byte buffer at
+//   +0xC, the image's INFO segment in the 512-byte buffer at +8 (each when given).
+// - An SPU thread group (0x800000000008ED50): the process ID at +8, the state at +4, the priority at +0, the name in
+//   the 128-byte buffer at +0xC; with a list at +0x18 and room at +0x10, its SPU threads' IDs (32 bits each), +0x14
+//   how many it has and +0x10 how many were written.
+// A thread or group that is not the process's: CELL_LV2DBG_ERROR_DEINVALIDTHREADID.
+Result sys_dbg_get_thread_info(PpuThread& t, u32 thread, u32 info)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (!info || !thread) return err(kDeInvalidArguments);
+    if (!g.valid(thread, 16)) return err(CELL_EFAULT);
+    const u32 type = g.r32(thread);
+    const u64 id = g.r64(thread + 8);
+    const auto put = [&](u32 at, u32 v) { return g.put32(info + at, v); };
+    if (type == 0) {
+        const auto th = s.threads.get<PpuThread>(static_cast<u32>(id));
+        if (!th) return err(kDeInvalidThreadId);
+        std::string name;
+        {
+            std::lock_guard lk(th->lock);
+            name = th->name;
+        }
+        if (!put(0x10, kProcessId) || !put(0x00, static_cast<u32>(th->priority())) ||
+            !put(0x18, static_cast<u32>(th->priority())) || !put(0x04, ppu_state(s, t, *th)) ||
+            !put(0x08, th->stack_addr) || !put(0x0C, th->stack_size) || !g.valid(info + 0x14, 4)) {
+            return err(CELL_EFAULT);
+        }
+        if (const u32 buf = g.r32(info + 0x14); buf && !put_text(g, buf, name, 27, 0x80)) return err(CELL_EFAULT);
+        return CELL_OK;
+    }
+    if (type != 1 && type != 2) return err(kDeInvalidThreadType);
+    const u32 sid = static_cast<u32>(id >> 32);
+    if (type == 1) {
+        const auto grp = s.spu_groups.get<SpuThreadGroup>((sid & 0xFFFFFF) | 0x04000000);
+        std::shared_ptr<SpuThread> th;
+        if (grp) {
+            std::lock_guard lk(grp->lock);
+            if ((sid >> 24) < grp->threads.size()) th = grp->threads[sid >> 24];
+        }
+        if (!th) return err(kDeInvalidThreadId);
+        if (!put(0x04, kProcessId) || !put(0x00, grp->id) || !g.valid(info + 0x0C, 4)) return err(CELL_EFAULT);
+        if (const u32 buf = g.r32(info + 0x0C); buf && !put_text(g, buf, th->name, 0x80, 0x80)) return err(CELL_EFAULT);
+        if (!g.valid(info + 0x08, 4)) return err(CELL_EFAULT);
+        if (const u32 buf = g.r32(info + 0x08); buf) {
+            if (!put_text(g, buf, std::string(th->info.begin(), th->info.end()), 0x100, 0x200)) return err(CELL_EFAULT);
+        }
+        return CELL_OK;
+    }
+    const auto grp = s.spu_groups.get<SpuThreadGroup>(sid);
+    if (!grp) return err(kDeInvalidThreadId);
+    u32 state = 0, slots = 0;
+    s32 prio = 0;
+    std::vector<u32> members;
+    {
+        std::lock_guard lk(grp->lock);
+        state = group_state(grp->state);
+        prio = grp->prio;
+        slots = grp->max_num;
+        for (u32 i = 0; i < grp->max_num; i++) {
+            if (grp->threads[i]) members.push_back(grp->threads[i]->id);
+        }
+    }
+    if (!put(0x08, kProcessId) || !put(0x04, state) || !put(0x00, static_cast<u32>(prio)) || !g.valid(info + 0x0C, 16)) {
+        return err(CELL_EFAULT);
+    }
+    if (const u32 buf = g.r32(info + 0x0C); buf && !put_text(g, buf, grp->name, 0x80, 0x80)) return err(CELL_EFAULT);
+    u32 n = g.r32(info + 0x10);
+    const u32 list = g.r32(info + 0x18);
+    if (!n || !list) return CELL_OK;
+    if (const Result r = list_room("sys_dbg_get_thread_info", n, 4); r != CELL_OK) return r;
+    n = static_cast<u32>(std::min<usize>(n, members.size()));
+    if (n && !g.valid(list, u64{n} * 4)) return err(CELL_EFAULT);
+    for (u32 i = 0; i < n; i++) g.w32(list + i * 4, members[i]);
+    if (!put(0x14, slots) || !put(0x10, n)) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+// sys_dbg_get_process_info(pid, info), 0x8000000000091AE4 (CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS without `info`); each
+// field on its own: the process ID at +0, its status at +4 (2, running), its PPU threads at +8 (those ended and not
+// joined too), its SPU thread groups at +0xC, its raw SPUs at +0x10, the parent's ID at +0x14 (as
+// sys_process_getppid), then, when +0x18 holds a buffer's address, the executable's path in 512 bytes there; +0x1C,
+// the byte at +0x20, +0x28 (64 bits: the process's debugging event flags without their top four bits) and +0x30 are
+// what the kernel keeps of a process pspocket has none of: 0.
+Result sys_dbg_get_process_info(PpuThread& t, u32 pid, u32 info)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (const Result r = inspect(pid); r != CELL_OK) return r;
+    if (!info) return err(kDeInvalidArguments);
+    const auto put = [&](u32 at, u32 v) { return g.put32(info + at, v); };
+    if (!put(0x00, kProcessId) || !put(0x04, 2) || !put(0x08, static_cast<u32>(ppu_threads(s).size())) ||
+        !put(0x0C, s.spu_groups.count(SpuThreadGroup::kIdBase)) || !put(0x10, raw_spu_count(s)) || !put(0x14, 0) ||
+        !put(0x1C, 0) || !g.valid(info + 0x18, 4)) {
+        return err(CELL_EFAULT);
+    }
+    if (const u32 buf = g.r32(info + 0x18); buf && !put_text(g, buf, t.kernel.config().executable_path, 0x1FF, 0x200)) {
+        return err(CELL_EFAULT);
+    }
+    if (!g.valid(info + 0x20, 1)) return err(CELL_EFAULT);
+    g.w8(info + 0x20, 0);
+    if (!put(0x30, 0) || !g.put64(info + 0x28, 0)) return err(CELL_EFAULT);
+    return CELL_OK;
+}
+
+// sys_dbg_get_process_memory_container_information(pid, list, count), 0x8000000000091AE8: the process's memory
+// containers, its own first, then those made from it, 16 bytes each (the size and what is free in bytes, the ID, the
+// parent's ID or -1; pspocket names the process's own container as the memory calls do, -1). *count (CELL_EFAULT when
+// unreadable) is the room; fewer than there are is CELL_EINVAL. *count becomes the number, then the entries are
+// written. Another process: CELL_ENOSYS on a retail console.
+Result sys_dbg_get_process_memory_container_information(PpuThread& t, u32 pid, u32 list, u32 count)
+{
+    Kernel::Impl& s = t.kernel.impl();
+    const Guest& g = s.guest;
+    if (pid != kProcessId) return err(CELL_ENOSYS);
+    if (!g.valid(count, 4)) return err(CELL_EFAULT);
+    const s32 room = static_cast<s32>(g.r32(count));
+    std::vector<std::array<u32, 4>> entries;
+    {
+        std::lock_guard lk(s.memory.mutex);
+        const MemoryContainer& root = s.memory.default_container;
+        entries.push_back({root.size, root.size - root.used, 0xFFFFFFFF, 0xFFFFFFFF});
+        for (const auto& [id, obj] : s.containers.list(MemoryContainer::kIdBase)) {
+            const auto& ct = static_cast<const MemoryContainer&>(*obj);
+            entries.push_back({ct.size, ct.size - ct.used, id, 0xFFFFFFFF});
+        }
+    }
+    if (room < static_cast<s32>(entries.size())) return err(CELL_EINVAL);
+    if (!g.put32(count, static_cast<u32>(entries.size()))) return err(CELL_EFAULT);
+    for (usize i = 0; i < entries.size(); i++) {
+        const u32 at = list + static_cast<u32>(i) * 16;
+        if (!g.valid(at, 16)) return err(CELL_EFAULT);
+        for (u32 w = 0; w < 4; w++) g.w32(at + w * 4, entries[i][w]);
+    }
+    return CELL_OK;
+}
+
 void register_dbg_syscalls(SyscallTable& table)
 {
+    PS_LV2_BIND(table, 909, sys_dbg_get_thread_list);
+    PS_LV2_BIND(table, 910, sys_dbg_get_thread_info);
+    PS_LV2_BIND(table, 914, sys_dbg_get_process_info);
+    PS_LV2_BIND(table, 957, sys_dbg_get_process_memory_container_information);
     PS_LV2_BIND(table, 933, sys_dbg_get_mutex_information);
     PS_LV2_BIND(table, 935, sys_dbg_get_cond_information);
     PS_LV2_BIND(table, 937, sys_dbg_get_rwlock_information);

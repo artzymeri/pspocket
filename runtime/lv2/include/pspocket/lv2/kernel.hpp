@@ -215,6 +215,8 @@ struct Config {
     u32 main_area_end = 0x10000000;
     // Title ID for _sys_process_get_paramsfo (empty: ENOENT).
     std::string title_id;
+    // The executable's guest path, as lv2 keeps it for the process (sys_dbg_get_process_info): argv[0].
+    std::string executable_path;
     // Debug/root process permissions (allows negative thread priorities and root-only syscalls).
     bool root = false;
     // The executable's sys_process_param ppc_seg: a process that may load overlay modules (RPCS3

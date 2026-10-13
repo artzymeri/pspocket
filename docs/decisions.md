@@ -14191,3 +14191,30 @@ not-implemented slot on a retail console (pspocket answers them).
 The rudp comparison's last step is a note now: after cellRudpEnd, Sony's I/O thread delivers the two SOCKET_RELEASED
 events End queued only when End finds it past its check of the stop request (1 run in 9), so what it delivered
 follows the clock (tests/hle/test_rudp_compare.cpp).
+
+### D-937, part 3: the process's threads, their information, the process's and its memory containers'
+
+Ported from the retail kernel (runtime/lv2/src/dbg.cpp):
+- **sys_dbg_get_thread_list (909):** the process's PPU threads (type 0, the ID as 64 bits; those alive, then those
+  that ended and wait for a join) and its SPU thread groups (type 2, the ID in the first word of the 64 bits), 16
+  bytes each. The total goes to *all (none: CELL_LV2DBG_ERROR_DEINVALIDARGUMENTS); *count (64 bits, at most
+  0x7FFFFFFF) is the room; as many as fit are written and, when all fit, *count becomes the total too.
+- **sys_dbg_get_thread_info (910):** for a list entry (types 0, 1, 2; another type
+  CELL_LV2DBG_ERROR_DEINVALIDTHREADTYPE; a thread not found CELL_LV2DBG_ERROR_DEINVALIDTHREADID). Each field is
+  written on its own, as the kernel does. A PPU thread: priority, state, stack, process, base priority, and the name
+  (27 characters at most) in a 128-byte buffer when one is given. States are the kernel's own less one: 0 created, 1
+  runnable, 2 on a processor, 3 sleeping, 6 stopped, 8 ended and not joined; pspocket's threads run on host threads
+  of their own, so the caller reads as on a processor, a thread waiting in a call as sleeping, any other as
+  runnable. An SPU thread: its group, the process, its name (128 bytes) and its image's INFO segment (512 bytes),
+  which sys_spu_thread_initialize now keeps as the kernel does (and refuses with CELL_EFAULT when it cannot read).
+  An SPU thread group: priority, state (the kernel's: 0 to 5 as SYS_SPU_THREAD_GROUP_STATUS, a running group reading
+  as ready, 7 stopped), the process, its name, and its threads' IDs (32 bits each) with how many it has.
+- **sys_dbg_get_process_info (914):** the ID, status 2 (running), the PPU threads, SPU thread groups and raw SPUs,
+  the parent (0, as sys_process_getppid), the executable's path (512 bytes; the loader now gives the kernel argv[0]),
+  and four words the kernel keeps of a process (its creation's memory parameter, a type byte, its debugging event
+  flags less the top four bits, an object ID) that pspocket's process has none of: 0.
+- **sys_dbg_get_process_memory_container_information (957):** another process is CELL_ENOSYS on a retail console;
+  the room at *count must hold every container (else CELL_EINVAL); *count becomes their number, then 16 bytes each:
+  size, free bytes, ID, parent's ID, the process's own container first (named -1, as the memory calls name it), then
+  those made from it.
+Tests: tests/lv2/test_dbg.cpp. Left: 353, 356, 361, 900, 902, 903, 906, 911 and 975.

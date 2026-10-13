@@ -927,6 +927,7 @@ Result sys_spu_thread_initialize(PpuThread& t, u32 thread_out, u32 group_id, u32
     // A user image's segments are checked (a kernel image's come from lv2): COPY 4-aligned, LS address and size
     // 16-aligned and inside the local store, no overlaps, at most one INFO of 256 bytes, at least one COPY.
     bool found_copy = type == SYS_SPU_IMAGE_TYPE_KERNEL, found_info = false;
+    std::vector<u8> info;
     for (usize i = 0; type == SYS_SPU_IMAGE_TYPE_USER && i < seg_list.size(); i++) {
         const SpuSegment& seg = seg_list[i];
         switch (seg.type) {
@@ -938,6 +939,9 @@ Result sys_spu_thread_initialize(PpuThread& t, u32 thread_out, u32 group_id, u32
         case SYS_SPU_SEGMENT_TYPE_INFO:
             if (seg.size > 256 || found_info) return err(CELL_EINVAL);
             found_info = true;
+            // The kernel keeps a copy of its bytes (the debugging calls' SPU thread information, D-937).
+            if (seg.size && !s.guest.valid(seg.addr, seg.size)) return err(CELL_EFAULT);
+            info.assign(s.guest.ptr(seg.addr), s.guest.ptr(seg.addr) + seg.size);
             continue;
         default: return err(CELL_EINVAL);
         }
@@ -969,6 +973,7 @@ Result sys_spu_thread_initialize(PpuThread& t, u32 thread_out, u32 group_id, u32
         const u32 index = g->init;
         const u32 tid = (index << 24) | (group_id & 0xFFFFFF);
         th = std::make_shared<SpuThread>(s, *g, tid, spu_num, name, option);
+        th->info = std::move(info);
         g->threads[index] = th;
         g->threads_map[spu_num] = static_cast<s8>(index);
         if (spu_num < 8) g->dma.members[spu_num] = &th->ctx;
