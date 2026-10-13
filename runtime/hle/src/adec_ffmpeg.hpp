@@ -84,6 +84,12 @@ struct Spec {
     // StartSeq's check of the parameters on the game's thread: CELL_OK or the error cellAdecStartSeq gives.
     s32 (*check)(const u8* param);
     std::unique_ptr<Codec> (*make)();
+    // Sony's core's answers where pspocket's take them (D-944, its module asked): getMemSize (0: pspocket's own
+    // need), getPcmHandleNum, and whether getMemSize also writes the version into the attributes (CellAdecAttr's
+    // adecVerLower), as libm2bcdec's and libm4aacdec's do.
+    u32 mem_size = 0;
+    s32 pcm_handles = 3;
+    bool version_in_attr = false;
 };
 
 #if PSPOCKET_HAVE_FFMPEG
@@ -130,6 +136,8 @@ public:
     bool open(const char* decoder, std::string_view name, const std::function<void(AVCodecContext*)>& setup = {});
     void close();
     bool is_open() const { return av_ != nullptr; }
+    // Forgets what the decoder carries from packet to packet (avcodec_flush_buffers): MP3's overlap and filter bank.
+    void flush();
     // One packet (copied, with FFmpeg's padding): every frame it gives appended to `out`, at most `max_samples` samples
     // per channel (more is left out, logged). FFmpeg's planar or interleaved floats, 16- and 32-bit samples become
     // planar floats (exactly, for samples of up to 24 bits: the lossless codecs' 16 and 24, D-620). 0, or FFmpeg's
@@ -153,10 +161,16 @@ private:
 enum class Format : u8 { F32, S16, S24, S32 };
 constexpr u32 bytes_of(Format f) { return f == Format::S16 ? 2 : 4; }
 
+// How a core's floats become its PCM.
+enum class Rounding : u8 {
+    Floor,   // libatxdec's (adec_atracx.cpp): floats held below 1, integers floored and held in range
+    Nearest, // libmp3dec's (D-944): floats as decoded, integers rounded half away from zero and held in range
+};
+
 // Writes `in` interleaved to the guest at `out`: output channel c of each sample from `in`'s channel map[c] (-1:
-// silence), times `gain`, converted as libatxdec converts (adec_atracx.cpp: floats held below 1, integers floored and
-// held in range). Returns the bytes written.
-u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain = 1.0f);
+// silence), times `gain`, converted as `rounding` says. Returns the bytes written.
+u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain = 1.0f,
+    Rounding rounding = Rounding::Floor);
 
 // The identity map for `n` channels.
 std::vector<int> straight(u32 n);

@@ -14603,3 +14603,55 @@ libvdec's H.264 lives: as a game that imports libvdec's unverified functions get
 firmware, some of the lives run through pspocket's core against Sony's recorded answers. Shared files changed:
 codec_cores.cpp (libavcdec no longer firmware-first), modules.cpp, test_codec_cores.cpp and
 test_codec_cores_compare.cpp (that mark), test_vdec_ext_compare.cpp (Sony's libvdec over pspocket's core).
+
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 1: their sizes, and MP3 call for call as libmp3dec)
+
+cellAdec's cores on FFmpeg (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3) were RPCS3's structures
+read by their names and served only where the firmware has no module (firmware first). They are now compared with
+Sony's: tests/hle/test_adec_cores.cpp's "the cores on FFmpeg against Sony's cores (D-944)" runs each feed through
+cellAdec twice, over pspocket's core and over Sony's core module from the user's firmware (FirmwareCores: libadec's
+front end is pspocket's in both, so only the cores differ), and compares every call's answer, the callbacks, the PCM
+items (handle, status, size, PTS, user data), the information blocks byte for byte and the PCM. It stays hidden
+([.compare-adec]) until every core agrees.
+
+Sony's answers taken for every core (Spec in adec_*.cpp): getMemSize (MP3 0x27300, layer I 0x64000, layer II 0x3E400,
+MPEG-4 AAC 0x299A9A, its 2-channel 0x1A2CF0 and 2-channel modified 0xBAC70, AC-3 0x5EB2F, ATRAC3 0x3CB80; a core
+fails loudly if FFmpeg's state does not fit, which it does), the versions (MP3 0x01030000, layer I 0x01080000, layer
+II 0x02040000, AAC 0x03070000, AC-3 0x20070323, ATRAC3 0x01020000; layers I and II and AAC also write theirs into the
+attribute at +8, as their getMemSize does), and the PCM handle counts (MP3 and ATRAC3 3, the MPEG layers and AAC 4,
+AC-3 8).
+
+MP3, as libmp3dec does it (adec_mp3.cpp):
+- The bit reservoir is the core's own: FFmpeg's ADU decoder (mp3adufloat, added to scripts/build-ffmpeg.sh) gets each
+  frame with its main data (main_data_begin bytes back from what the frames before left, then its own) right after its
+  side information. A frame whose main data begin before what the reservoir holds (a stream entered mid-way) gives a
+  PCM item of size 0 and no error, and its whole main data area stays for the frames after. After a frame whose main
+  data the decoder refuses, the reservoir is empty and the decoder silent (FFmpeg flushed: libmp3dec's next frame
+  starts from silence).
+- CellAdecMP3Info: ui_header the header's low 20 bits; ui_main_data_remain_size the reservoir held before the frame
+  (what the frame before left after its main data, uncapped: 820 seen); ui_main_data_now_size 0. The block lives from
+  frame to frame: a unit refused leaves the last frame's (zeros before any) and writes i_error_code as libmp3dec's own
+  number for the error. Its table (libmp3dec.sprx, 0x4998) pairs -1 to -7 with CELL_ADEC_ERROR_MP3_ERROR to
+  BAD_BLKTYPE, -10 to -12 with BAD_VERSION to BAD_MODE_EXT, -15 to -23 with HUFFMAN_NUM to PCMOUT.
+- Versions: a clear MPEG-2.5 bit is MPEG-2.5 whatever the version bit beside it, so the reserved version decodes as
+  MPEG-2.5 (FFmpeg gets the header as MPEG-2.5's); nothing is BAD_VERSION. The PTS correction is by the rate's index
+  (48, 44.1, 32 kHz and their halves and quarters: every frame steps 2160, 2351 or 3240 ticks).
+- A unit shorter than its frame is decoded, zeros past its end (libmp3dec reads its own buffer there; the same while
+  the main data are inside the unit). A wrong CRC is flagged and the frame decoded.
+- The PCM: floats as decoded (past 1 where the stream goes: 4.98 seen), 16-bit rounded half away from zero and held in
+  range (55,296 samples of Sony's float and 16-bit outputs: every one not at full scale rounds so). write_pcm has
+  Rounding::Nearest for it; the other cores keep libatxdec's (floats held below 1, integers floored).
+
+Not reproduced (documented tolerance): the padding byte before i_error_code, where libmp3dec leaves a byte of its own
+after an error (0x16 or 0x08 seen); libmp3dec's checks of the main data (HUFFMAN_NUM and the others), as FFmpeg decodes
+what it refuses; a unit shorter than a header (libmp3dec reads the rest from what its buffer held); the floats differ
+from libmp3dec's in their last bits (3.6e-7 at most, 121 dB), so a 16-bit sample at a rounding boundary can differ by
+one step.
+
+Compared (the user's firmware 4.92): MP3 float and 16-bit, the bit reservoir (in use, full past 511, entered
+mid-way with a refused unit), each header error and block type 0 between good frames, an error first, MPEG-2, MPEG-2.5
+and the reserved version, MPEG-2.5 without PTS, units of 0 bytes, of part of their frame and of two frames, CRC: 11 of
+11 agree. Still differing (part 2): layers I and II (the information's channel count and frame size), ATRAC3 (its
+first output and the information), MPEG-4 AAC (the PCM at 63.5 dB, a frame counter in the information), AC-3 (its
+first frame).
+

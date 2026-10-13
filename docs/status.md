@@ -44,6 +44,10 @@ run).
   alpha-tested (discarding) draw was stored unclamped on Apple GPUs; such programs now export their depth. D-942:
   Metal's pack intrinsics are miscompiled next to another write to the same register (programs with PK4, PKB, PK16 or
   PKG drew wrong components); pspocket packs by hand, bit for bit as the intrinsics.
+- **The audio cores against Sony's (D-944, part 1):** each of cellAdec's cores on FFmpeg runs beside Sony's from the
+  firmware; their memory sizes, versions and PCM handles are Sony's now, and MP3 agrees with libmp3dec in every case
+  compared (its bit reservoir kept by the core, MPEG-2.5, its information block from frame to frame, its rounding).
+  Next: layers I and II, ATRAC3, AAC and AC-3, then drop firmware-first for the cores that agree.
 - The script comparison harness (tests/hle/sysutil_sub_compare.hpp) now compares the TTY's text too (a script asks)
   and the file system calls' paths by their text; PSPOCKET_TEST_DUMP=2 prints both runs.
 

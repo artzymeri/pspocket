@@ -242,8 +242,9 @@ s32 check_multi(const u8* p)
 
 // libat3dec's version is not known (pspocket's word); the information block is CellAdecAtrac3Info's size. Two channels
 // of a frame's 1024 samples, 32 bits each at most.
-const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }};
+// libatrac3dec's answers (D-944): its version, getMemSize 0x3cb80, three PCM handles.
+const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01020000,
+    CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }, 0x3cb80, 3, false};
 // ATRAC3 multichannel (D-621): eight tracks of 1024 samples, 32 bits each at most; libadec's error codes.
 const Spec kAtrac3Multi = {CELL_ADEC_TYPE_ATRAC3MULTI, "ATRAC3 multichannel", mprm::size, kMultiInfoSize,
     1024 * kMaxTracks * 4, 0x01000000, CELL_ADEC_ERROR_BUSY, check_multi,

@@ -646,8 +646,9 @@ s32 check_ddp(const u8* p) { return check_params(p, true); }
 
 // libac3dec's version is not known (pspocket's word); the information block is CellAdecBsiAc3's size. Up to six
 // channels of a frame's 1536 samples.
-const Spec kAc3 = {CELL_ADEC_TYPE_AC3, "AC-3", prm::size, info::size, 1536 * 6 * 4, 0x01000000, CELL_ADEC_ERROR_AC3_BUSY,
-    check, [] { return std::unique_ptr<Codec>(std::make_unique<Ac3>(false)); }};
+// libac3dec's answers (D-944): its version, getMemSize 0x5eb2f, eight PCM handles.
+const Spec kAc3 = {CELL_ADEC_TYPE_AC3, "AC-3", prm::size, info::size, 1536 * 6 * 4, 0x20070323, CELL_ADEC_ERROR_AC3_BUSY,
+    check, [] { return std::unique_ptr<Codec>(std::make_unique<Ac3>(false)); }, 0x5eb2f, 8, false};
 // Dolby Digital Plus (D-621): AC-3's parameters and information block, libadec's error codes; up to four 1536-sample
 // frames of six channels per unit.
 const Spec kDdp = {CELL_ADEC_TYPE_EAC3, "E-AC-3", prm::size, info::size, 4 * 1536 * 6 * 4, 0x01000000,

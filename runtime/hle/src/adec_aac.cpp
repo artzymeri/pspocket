@@ -452,12 +452,17 @@ s32 check_m2(const u8* param) { return check_params(param, true); }
 
 // The cores' versions are not known (pspocket's word); the information block is CellAdecM4AacInfo's size. Up to 8
 // channels of 2048 samples (SBR's) for the full core, 2 for the others.
-const Spec kM4Aac = {CELL_ADEC_TYPE_M4AAC, "MPEG-4 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, false)); }};
-const Spec kM4Aac2ch = {CELL_ADEC_TYPE_M4AAC_2CH, "MPEG-4 AAC 2ch", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
-const Spec kM4Aac2chMod = {CELL_ADEC_TYPE_M4AAC_2CH_MOD, "MPEG-4 AAC 2ch mod", 16, info::size, 2048 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }};
+// libm4aacdec's and libm4aacdec2ch's answers (D-944): their version, getMemSize (the version written into the
+// attributes too), four PCM handles.
+const Spec kM4Aac = {CELL_ADEC_TYPE_M4AAC, "MPEG-4 AAC", 16, info::size, 2048 * 8 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, false)); }, 0x299a9a,
+    4, true};
+const Spec kM4Aac2ch = {CELL_ADEC_TYPE_M4AAC_2CH, "MPEG-4 AAC 2ch", 16, info::size, 2048 * 2 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }, 0x1a2cf0,
+    4, true};
+const Spec kM4Aac2chMod = {CELL_ADEC_TYPE_M4AAC_2CH_MOD, "MPEG-4 AAC 2ch mod", 16, info::size, 2048 * 2 * 4, 0x03070000,
+    CELL_ADEC_ERROR_M4AAC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(2, false)); }, 0xbac70,
+    4, true};
 // MPEG-2 AAC (D-621): MPEG-4 AAC's parameters and information block, libadec's error codes.
 const Spec kM2Aac = {CELL_ADEC_TYPE_M2AAC, "MPEG-2 AAC", 16, info::size, 2048 * 8 * 4, 0x01000000, CELL_ADEC_ERROR_BUSY,
     check_m2, [] { return std::unique_ptr<Codec>(std::make_unique<Aac>(8, true)); }};

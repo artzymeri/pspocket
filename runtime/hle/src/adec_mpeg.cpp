@@ -160,10 +160,12 @@ s32 check(const u8* param)
 } // namespace
 
 // The cores' versions are not known (pspocket's word); the information block is CellAdecMpmcInfo's size.
-const Spec kMpegL1 = {CELL_ADEC_TYPE_MPEG_L1, "MPEG layer I", 12, info::size, 384 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(1)); }};
-const Spec kMpegL2 = {CELL_ADEC_TYPE_MPEG_L2, "MPEG layer II", 12, info::size, 1152 * 2 * 4, 0x01000000,
-    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(2)); }};
+// The answers of Sony's cores (D-944): libmpl1dec's and libm2bcdec's versions, getMemSize 0x64000 and 0x3e400 (with the
+// version written into the attributes too), four PCM handles.
+const Spec kMpegL1 = {CELL_ADEC_TYPE_MPEG_L1, "MPEG layer I", 12, info::size, 384 * 2 * 4, 0x01080000,
+    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(1)); }, 0x64000, 4, true};
+const Spec kMpegL2 = {CELL_ADEC_TYPE_MPEG_L2, "MPEG layer II", 12, info::size, 1152 * 2 * 4, 0x02040000,
+    CELL_ADEC_ERROR_M2BC_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Mpeg>(2)); }, 0x3e400, 4, true};
 
 } // namespace pspocket::hle::adec::ffcore
 
