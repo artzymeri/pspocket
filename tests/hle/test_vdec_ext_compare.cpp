@@ -654,6 +654,15 @@ TEST_CASE("libvdec's D-920 functions against Sony's libvdec: H.264", "[.][hle][l
         [](const Observed&) {});
 }
 
+// pspocket's H.264 core (D-933) under Sony's libvdec, as a game that imports libvdec's unverified functions gets it:
+// the same life with Sony's libvdec in both halves, over pspocket's libavcdec in the first, Sony's in the second.
+TEST_CASE("The H.264 core under Sony's libvdec: pspocket's against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    Setup s = libvdec_setup();
+    s.ours_on_firmware = true;
+    run(s, "libavcdec under Sony's libvdec", [&](bool sony) { return avc(s, sony); }, [](const Observed&) {});
+}
+
 TEST_CASE("libvdec's D-920 functions against Sony's libvdec: VC-1", "[.][hle][lle][compare][vdec][vdec-ext]")
 {
     if (!avcodec_find_decoder(AV_CODEC_ID_VC1)) SKIP(kNoVc1);

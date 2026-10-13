@@ -14535,3 +14535,71 @@ intrinsics bit for bit on every code's value and half-step and 100,000 random va
 Metal's ... bit for bit"); the plain float product rounds a quarter of the half-steps the other way. A program that
 packs (PK4, PKB, PK16, PKG) gets a key of its own (":pk"), so a shader cache recorded before holds none of its old
 translation, and every other program keeps its cache. Regression: the reduced program, translated and interpreted.
+
+## D-933 · 2026-10-13 · The H.264 and MVC codec cores pspocket's own (part 1: libavcdec)
+
+libavcdec is the H.264 core Sony's libvdec loads (eight decoding calls; GetVersion and QueryCharacteristics were already
+pspocket's, D-575): a PPU library whose helper thread hands an SPU program on SPURS each access unit and gives the
+caller's callback what the program answers. pspocket's (runtime/hle/src/vdec_avc.cpp, with the H.264 syntax readers in
+vdec_h264.hpp) answers as the module does and does the SPU program's work on the host: it reads the stream itself
+(parameter sets, slice headers, SEI, picture order counts), keeps the decoded picture buffer as Sony's does (a model
+measured from Sony's outputs, below) and has FFmpeg decode the samples, written into Sony's frame buffer layout (D-196).
+libavcdec is no longer firmware-first (codec_cores.cpp).
+
+What Sony's core does, and pspocket's with it:
+- QueryMemory: the level's (10 to 42) or the caller's frame size (4 to 120 by 4 to 68 macroblocks, within the level's
+  largest frame), deblocking up to 2, buffers up to the level's; the memory is fourteen blocks (the frame buffers the
+  fifth, as many as the buffer and two) and 0x299500 bytes, to 128. Open: the arguments' checks (the SDK version picks
+  the access unit size limit), the memory zeroed up to +0x294300, the context in its last 0x1380 bytes (magic
+  0xBE264DEC), a SPURS instance of its own when given none ("_libvdec_avc"), a task set "_libvdec_avc_<handle>".
+- The states: open, flushing (Flush; AccessUnit is SEQ until the flush is done), resetting (Reset; Reset's flags 0
+  to 3, keep the parameter sets or not), closed. After Close, the calls that take the context's lock answer 0x80010005
+  (the lock is gone); Close again is SEQ.
+- AccessUnit: up to five access units queued (BUSY when fewer than two places are left), side data up to 0x40 bytes
+  copied into a table of 46 entries, freed when the access unit's pictures are released.
+- Messages: AU done (the access unit, its side data, discarded, in error, whether a sequence it decodes is active, the
+  error code), a picture (0x178 bytes of information), flush done, reset done, a severe error.
+- The decoded picture buffer: max_dec_frame_buffering when the stream gives it (num_reorder_frames is not used), else
+  the level's MaxDpbMbs, at most what the frame buffers the decoder was opened with hold (a 64 x 80 stream in a decoder
+  opened for 5 x 4 macroblocks gets 16 frame buffers and a buffer of 14). At each access unit: the caller's releases are
+  taken; the picture decoded last joins the buffer; an IDR picture outputs everything (or nothing, with
+  no_output_of_prior_pics_flag); a reference picture's marking (the sliding window or its memory management
+  operations) comes before pictures are output while the buffer holds more than its size; then the pictures whose PTS
+  this access unit's DTS reached are output (a picture whose PTS is before its DTS, or that has no DTS or PTS, leaves
+  only when the buffer outputs it). The outputs follow the access unit's AU done.
+- Frame buffers in turn from the second; a buffer is free once its picture left the buffer and the caller released it,
+  counting only those free before the access unit's buffer step. Frame IDs are the lowest free; skipped pictures (decode
+  modes 1 to 3 leave non-reference pictures out) are given 256 and up and need no release.
+- The GOP flag (+0xC of the information) is set on the first I picture after an SPS, in its access unit or an earlier
+  one; an IDR picture without one has none.
+- Errors: a sequence it refuses (0x10 a profile or level it does not know; 0x12 Extended, High 10, High 4:2:2, chroma
+  other than 4:2:0, more than 8 bits, a frame under 64 x 64, or any sequence after Reset with flags 0; 0x13 a frame
+  larger than the decoder was opened for) gives each access unit an AU done in error and a picture skipped and in error
+  at once, the code with the first only. An access unit with no slice to decode gives 0x11 (0x10 with a slice) before a
+  sequence, 0x51 (0x50) within one, with the last picture's type and order count. Before any frame buffers are laid out
+  the error picture is in the first, made blank (luma 0, chroma 0x80, its gaps too).
+
+Not reproduced (documented tolerance):
+- Within a sequence, an access unit with no slice makes Sony's core vary with its SPU side's timing (two runs differ):
+  the frame buffer of its error picture (blank, a copy of a picture a line down, or left as it was) and the NAL unit
+  flags of the pictures after it (their own, or another access unit's). pspocket leaves the buffer as it was and gives
+  each picture its own flags.
+- Before any sequence, access units with no slice and no SPS are taken by Sony's core as field pairs (an error picture
+  for every second one, one access unit late), as are High 4:4:4 and CAVLC 4:4:4 sequences, whose SPS its parser reads
+  as another profile's; pspocket gives each its error picture at once.
+- A damaged slice (cut short) is 0x50 in Sony's core, the next picture 0x66 (the frame number gap); pspocket decodes
+  what FFmpeg decodes.
+- The information's padding (+0xD to +0xF, +0xCA, +0xCB) is the helper thread's stack in Sony's module (0 in a new
+  thread, what its Reset left after one); pspocket writes 0. The SPU side's working memory, queues and task contexts
+  are not written.
+
+Compared (tests/hle/test_vdec_avc_compare.cpp, the user's firmware 4.92): QueryMemory over levels and sizes, Open's
+refusals, IDR, I/P, B, buffers of 1, 2 and the level's, non-reference pictures, IDR pictures between, decode modes 1 to
+3, the clock (PTS against DTS, missing stamps, 33 bits), held pictures and the queue, side data, every call in every
+state, Reset's flags, refused sequences, access units with no slice, GOP flags, a decoder opened smaller than its
+stream, its own SPURS, other sizes and levels; every answer, message, information byte and frame buffer: 0 of 2215
+observations differ. Sony's libvdec over pspocket's core against Sony's libvdec over Sony's (test_vdec_ext_compare.cpp,
+libvdec's H.264 lives: as a game that imports libvdec's unverified functions gets it): 0 of 1145 differ. Without the
+firmware, some of the lives run through pspocket's core against Sony's recorded answers. Shared files changed:
+codec_cores.cpp (libavcdec no longer firmware-first), modules.cpp, test_codec_cores.cpp and
+test_codec_cores_compare.cpp (that mark), test_vdec_ext_compare.cpp (Sony's libvdec over pspocket's core).
