@@ -181,14 +181,25 @@ Result sys_process_get_sdk_version(PpuThread& t, u32, u32 version)
     return CELL_OK;
 }
 
+// The 64 bytes the system software gives the process as it starts it (the retail kernel copies them from the process,
+// sc30 at 0x8000000000019AA0; CELL_ENOENT when it was given none): the title ID at +1 (RPCS3), flags at +0x10, a
+// debugging console's crash dump settings at +0x20 (0: pspocket's console is a retail one) and the executable's crash
+// dump declaration at +0x38. A declaration (sys_process_param's crash_dump_param_addr) sets flag 0x10 and its address,
+// as the retail kernel does when it reads the executable; libsysmodule and liblv2coredump read them (D-943).
 Result _sys_process_get_paramsfo(PpuThread& t, u32 buffer)
 {
     Guest& g = t.kernel.impl().guest;
-    const std::string& title = t.kernel.config().title_id;
+    const Config& c = t.kernel.config();
+    const std::string& title = c.title_id;
     if (title.empty()) return err(CELL_ENOENT);
     if (!g.valid(buffer, 0x40)) return err(CELL_EFAULT);
-    std::memset(g.ptr(buffer), 0, 0x40);
-    std::memcpy(g.ptr(buffer + 1), title.data(), std::min<usize>(title.size(), 9)); // RPCS3: title ID at +1
+    u8* p = g.ptr(buffer);
+    std::memset(p, 0, 0x40);
+    std::memcpy(p + 1, title.data(), std::min<usize>(title.size(), 9)); // RPCS3: title ID at +1
+    if (c.crash_dump_param_addr) {
+        ps_write64(p, 0x10, 0x10);
+        ps_write64(p, 0x38, c.crash_dump_param_addr);
+    }
     return CELL_OK;
 }
 

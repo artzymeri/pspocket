@@ -14655,3 +14655,63 @@ and the reserved version, MPEG-2.5 without PTS, units of 0 bytes, of part of the
 first output and the information), MPEG-4 AAC (the PCM at 63.5 dB, a frame counter in the information), AC-3 (its
 first frame).
 
+
+## D-943 · 2026-10-13 · sys_lv2coredump_D725F320 pspocket's own: a retail console's core file
+
+liblv2coredump.sprx is the module that writes a game's crash dumps. libsysmodule loads it as a process starts when
+the executable declares SYS_PROCESS_CRASH_DUMP_ENABLED (sys_process_param's crash_dump_param_addr). It exports
+sys_lv2coredump_D725F320(fd), the library chart's last function, and sys_crashdump's two log area functions
+(pspocket's own since D-607). pspocket's sys_lv2coredump (runtime/hle/src/sys_lv2coredump.cpp) does what Sony's module
+does on a retail console, step for step: the same lv2 calls, the same calls into the libraries it imports (liblv2's
+heap, lightweight mutex, thread and printf functions; cellGame; cellSysutil), the same heap blocks and the same bytes.
+
+**lv2.** _sys_process_get_paramsfo now reports the declaration as the retail kernel does: flag 0x10 at +0x10 and the
+declaration's address at +0x38 (the loader passes crash_dump_param_addr from the executable). +0x20 holds a debugging
+console's crash dump settings; it is 0, because pspocket's console is a retail one.
+
+**Start.** lv2coredump_start is the module_start that libsysmodule runs with no arguments. It reads the paramsfo and
+checks the declaration, which must be readable and hold {0x20, "dump", 1, 0, 0, 0}. A bad declaration prints the
+module's error and leaves the module idle. Otherwise start makes, in Sony's order:
+- the lightweight mutex "_l2cMTX";
+- the 64 KB heap "_LIBLV2COREDUMP_";
+- the event queue "_l2cDBG", registered as the PPU exception handler (944);
+- a sys_fsw_connect_event call;
+- the title information read through libsysutil_game: title ID, title, version, SDK version;
+- the thread "__COREDUMP_HANDLER__" (priority 1001, 16 KB stack), which waits on the queue.
+The configuration is the declaration's: crash reports to /dev_hdd0, no extra parts.
+
+**D725F320(fd)** writes an ELF64 core file (OS ABI 0x66, PPC64) into the open file: the program headers, then one
+PT_NOTE note per part.
+- SYSTEM_INFO: the console's OpenPSID and the system software version the module was built with.
+- DUMP_CAUSE_INFO: the handler's exception records (none here).
+- PROCESS_INFO: sys_dbg_get_process_info, the PPU thread and SPU thread group counts (from sys_dbg_get_thread_list),
+  and the PPU GUID.
+- GAME_APP_INFO: the title information start read.
+- The memory part, which is empty on a retail console.
+The ELF header's program header count grows as each note ends. The TTY gets the progress report: "Generating Core Dump
+File", one dot per 4 %, then " Done." or the error. The call answers CELL_ENOSPC when /dev_hdd0 has 10 KB or less
+free, or when start never configured the module.
+
+**Never written.** A debugging console's settings add parts: the PPU and SPU threads and registers, the SPU local
+stores, the synchronisation objects, memory, modules, the RSX state and SPURS. pspocket's lv2 reports no such
+settings, so pspocket never writes those parts and does not implement them, as Sony's module on a retail console never
+writes them.
+
+**Left as follow-ups:**
+- The user's log areas (USER_LOG_INFO, filled by sys_crash_dump_set_user_log_area). Sony's module keeps the areas
+  itself; pspocket's sys_crashdump, firmware-first, keeps them apart.
+- The handler thread's crash report after an exception. pspocket's lv2 sends the queue no exception yet. The handler
+  logs any event it gets (a game's 959 or 972, the queue's last from 945 or 988) and goes on waiting.
+- The libsysmodule hook, left out because it does not follow from what is known. RPCS3's cellSysmodule start
+  (rpcs3/Emu/Cell/Modules/cellSysmodule.cpp) loads liblv2coredump when bit 4 of paramsfo +0x10 is set. pspocket's
+  cellSysmodule has no start of its own to hang that on. Sony's module also serves the firmware-first sys_crashdump,
+  so which module a process gets (pspocket's or the firmware's) is a loader decision still to make. Until then the
+  start runs only where a test calls it, and a game's D725F320 answers CELL_ENOSPC, as the unstarted module does.
+
+**Compared** in tests/hle/test_lv2coredump_compare.cpp (firmware 4.92). The same process runs both halves: the
+declaration in memory, /dev_hdd0 on a directory of the test's. Sony's module is started by the LLE loader and
+pspocket's by lv2coredump_start; then D725F320 writes into a file.
+- With the declaration: the answer and the core file match byte for byte, note by note. 0 of 13 observations differ.
+- Without it: CELL_ENOSPC and an empty file in both. 0 of 4 observations differ.
+Without the firmware, the same file checks pspocket's start (the handler's queue hears a game's 959 only with the
+declaration) and the four notes. tests/lv2/test_process.cpp checks the paramsfo.
