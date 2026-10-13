@@ -353,7 +353,15 @@ cmd_gen() {
         libpng_src=""
         warn "no libpng (the host build's PSPOCKET_LIBPNG_DIR): games get the firmware's PNG decoder"
     fi
+    # FreeType 2.2.1 for the font libraries (D-500, D-525): the source tree the host build compiles it from. The
+    # runtime's font bridge needs it, as the host build does.
+    local freetype_dir=""
+    freetype_dir="$(sed -n 's/^PSPOCKET_FREETYPE_DIR:PATH=//p' "$HOST_BUILD/CMakeCache.txt" 2>/dev/null || true)"
+    [ -n "$freetype_dir" ] && [ -f "$freetype_dir/include/ft2build.h" ] \
+        || die "no FreeType 2.2.1 (the host build's PSPOCKET_FREETYPE_DIR, external/freetype-2.2.1)"
+    say "fonts: FreeType from $freetype_dir"
     say "xcodegen: $PROJECT"
+    PSPOCKET_FREETYPE_SRC="$freetype_dir/src" PSPOCKET_FREETYPE_INCLUDE="$freetype_dir/include" \
     PSPOCKET_HOST_BUILD_DIR="$HOST_BUILD" PSPOCKET_PPU_SRC="$ppu_src" PSPOCKET_GAME_SPU_SRC="$game_spu" \
         PSPOCKET_HAVE_GAME_SPU="$have_game_spu" PSPOCKET_GAME_PPU_SRC="$game_ppu" PSPOCKET_HAVE_GAME_PPU="$have_game_ppu" \
         PSPOCKET_GAME_SHADERS_SRC="$game_shaders" PSPOCKET_HAVE_CODEGEN="$have_codegen" PSPOCKET_CODEGEN_SRC="$codegen_src" \
