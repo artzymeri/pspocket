@@ -14836,3 +14836,42 @@ refused (up to 12 16-bit steps: libat3dec's state after its partial decode of th
 Compared: 45 cases of MP3, layers I and II, ATRAC3 and AAC agree, each in every answer, callback, item, information
 byte and PCM sample (floats within their last bits, 16-bit within one step). Still differing (part 3): AC-3.
 
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 3: AC-3; the compared cores no longer firmware-first)
+
+libac3dec's behaviour, from the comparison and probes of its output by parameter (adec_ac3.cpp):
+
+- StartSeq refuses only word size, LFE, compression, stereo, dual mono and karaoke modes past their enums, more than
+  six slots, and a channel pointer outside 0 to 5, with libadec's ARG (0x80610003). It does not check the output mode,
+  the scale factors or two pointers alike; -1 is no pointer (it is refused): a channel is left out by pointing past
+  numberOfChannels.
+- Routing: each channel of the output mode (L, C, R, Ls, Rs, then the LFE when outLfeOn), whether or not the stream
+  has it, goes to its pointer's slot in that order, a later one taking a slot an earlier one has; channels outside the
+  output mode write nothing; slots past numberOfChannels are not out (0 slots: no PCM).
+- Downmixes, nothing normalised: Lt/Rt L + 0.7071 C - 0.7071 (Ls + Rs), R + 0.7071 C + 0.7071 (Ls + Rs); Lo/Ro L + clev C
+  + slev Ls; 3/0 the surrounds into the fronts at slev; 2/1 and 3/1 the centre into the fronts at clev (2/1) and the
+  surround as half of each; 1/0 half of L, R, the centre at clev and the surrounds at slev; a mono stream into 2/0 both
+  sides at 0.7071; stereoMode auto is Lt/Rt (Lo/Ro only where annex D's dmixmod prefers it); the 1+1 output mode is
+  the 2/0 one.
+- pcmScaleFactor from -2 up to 2, anything else silence; floats held below 1, 16-bit rounded to nearest
+  (Rounding::HeldNearest: 85 dB against Sony's either way the precision allows, 82 dB floored).
+- CellAdecBsiAc3 is 0x50 bytes (so getMemSize's total grows by 12 bytes a PCM handle): codecType word 0x1001,
+  versionInfo 0x04990000, totalCallNum every call, the bit rate in bit/s, esSizeBit and validity 0, the rate as
+  MPEG-4's sampling frequency index (48 kHz 3, 44.1 kHz 4, 32 kHz 5), outputQuantization 0xFF float and 3 16-bit,
+  karaokeMode 2 for a stream that is no karaoke one, bsi() from bsid as 24-bit words cut at its end (A/52's bsi()
+  parsed to addbsi), execDmixType 1 Lt/Rt or 2 Lo/Ro for a 2/0 output whatever the stream, reported for the frame after
+  the one that set it up (0 on a sequence's first frame), and the flag at +0x20 when the frame's size or that kind is
+  not the frame before's (44.1 kHz's padded frames set it). A refused unit's block is left blank.
+
+Not reproduced (documented tolerance): libac3dec refuses (AC3_FRAME) the frame of FFmpeg's encoder where a sound starts
+after digital silence (its priming frame and any such onset; a sound that starts quiet is decoded), its CRCs good: some
+check of its own FFmpeg's decoder does not make, not found; the next frame's first block shows its partial decode. A
+professional encoder's frames are not expected to trip it, so pspocket decodes them, and the comparison's streams start
+past it. Output modes past 7 (not in CellAdecAc3OutputMode): libac3dec gives eight slots for mode 8; pspocket takes it
+as 3/2. AC-3's PCM differs from libac3dec's by up to two 16-bit steps (its decoder's precision, 85 to 105 dB).
+
+With this, the 67 cases of the comparison agree, and test_hle "[compare][adec-cores]" (hidden: three minutes) holds
+them. MP3, the MPEG audio layers, MPEG-4 AAC and its two 2-channel cores, AC-3 and ATRAC3 are no longer firmware-first
+(adec_tables.cpp): every game gets pspocket's cores for them, with or without the firmware. Still Sony's first, not
+compared: E-AC-3 (libddpdec), MPEG-2 AAC, MP3 Surround, ATRAC3 multichannel (libat3multidec), TrueHD, DTS (libdtslbrdec)
+and WMA (libwmadec); the firmware has modules for E-AC-3, ATRAC3 multichannel, DTS Express and WMA to compare with.
+

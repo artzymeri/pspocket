@@ -47,7 +47,10 @@ run).
 - **The audio cores against Sony's (D-944, part 1):** each of cellAdec's cores on FFmpeg runs beside Sony's from the
   firmware; their memory sizes, versions and PCM handles are Sony's now, and MP3, MPEG layers I and II, ATRAC3 and AAC
   agree with Sony's cores in all 45 cases compared (part 2: Sony's error codes and refused frames, ATRAC3's polarity
-  and first frame, AAC's restart after an error). Next: AC-3 (part 3), then drop firmware-first for the cores.
+  and first frame, AAC's restart after an error), and AC-3 in all 22 of its own (part 3: Sony's parameter checks,
+  routing, downmixes without normalising, its information block). These eight cores are no longer firmware-first:
+  every game gets pspocket's (the engine checklist's decoder item is done). Next to compare: E-AC-3, ATRAC3
+  multichannel, DTS Express and WMA, whose modules the firmware has.
 - The script comparison harness (tests/hle/sysutil_sub_compare.hpp) now compares the TTY's text too (a script asks)
   and the file system calls' paths by their text; PSPOCKET_TEST_DUMP=2 prints both runs.
 

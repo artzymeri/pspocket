@@ -7,37 +7,41 @@
 // pointers), the information block (CellAdecBsiAc3, 0x44 bytes), the error codes (CELL_ADEC_ERROR_AC3_*), and the
 // front end's fixed PTS step for AC-3 (ADEC_CORRECT_PTS_VALUE_TYPE_AC3, 1536 samples at 48 kHz). The parameters are
 // those of Dolby's decoder: its channels are numbered L 0, C 1, R 2, Ls 3, Rs 4 and LFE 5 (RPCS3's AC3_InputChannel
-// names them L, C, R, l, r and s: s is the LFE, the subwoofer). RPCS3 runs Sony's module, so what follows is
-// pspocket's reading of the names, to compare with libac3dec on the Mac:
-// - The output: numberOfChannels interleaved slots (1 to 6); decoded channel K goes to slot channelPointerK (-1: not
-//   out), the slots no channel points at silent. The channels are those of outputMode (Dolby's 1/0 to 3/2, a mono
-//   surround in Ls's place for 2/1 and 3/1), with the LFE when outLfeOn; 16-bit (wordSize 0) or float (1), big-endian,
-//   times pcmScaleFactor. StartSeq refuses (AC3_PARAM) a field past its enum, a channel count past 6, a pointer past
-//   the slots or two at one, a scale factor out of 0 to 1.
-// - The downmix to outputMode, after ATSC A/52 7.8: the centre into the front pair at the centre mix level (cmixlev)
-//   when the output has no centre; the surrounds into the front pair at the surround mix level (surmixlev; a mono
-//   surround at 0.7071 of it to each side) when the output has none; a pair of surrounds to a mono surround at 0.7071
-//   each, and a mono surround to a pair at 0.7071; the LFE never mixed. To 2/0 a Dolby Surround compatible Lt/Rt (the
-//   centre at -3 dB to both, the surrounds at -3 dB, subtracted on the left and added on the right) or a stereo Lo/Ro as
-//   stereoMode says, its auto taking the stream's preferred mode (A/52 annex D's dmixmod) and Lo/Ro when it names none
-//   (FFmpeg's default); annex D's own mix levels for Lt/Rt and Lo/Ro when the stream has them. To 1/0 the Lo/Ro pair's
-//   sum at 0.7071. Every output channel is then divided by its coefficients' sum when that passes 1, so a full-scale
-//   input cannot clip (FFmpeg's normalisation of its stereo downmix). Dual mono (1+1): dualmonoMode stereo puts Ch1 left
-//   and Ch2 right, left mono Ch1, right mono Ch2 and mixed mono their mean, a mono to the centre or, without one, at
-//   0.7071 to each side.
+// names them L, C, R, l, r and s: s is the LFE, the subwoofer). What the core does with them is libac3dec's, compared
+// with it on the Mac (D-944):
+// - The output: numberOfChannels interleaved slots (0 to 6); each channel of outputMode (Dolby's 1/0 to 3/2, a mono
+//   surround in Ls's place for 2/1 and 3/1; 1+1 taken as 2/0), with the LFE when outLfeOn, goes to slot
+//   channelPointerK in Dolby's order, a later one taking a slot an earlier one has (a channel the stream has not is
+//   silence there); channels outside the output mode write nothing, slots past numberOfChannels are not out, slots no
+//   channel takes are silent. 16-bit (wordSize 0) or float (1), big-endian, times pcmScaleFactor (from -2 up to 2,
+//   anything else silence); floats held below 1, 16-bit rounded to nearest. StartSeq refuses (libadec's ARG) a field
+//   past its enum, more than six slots, a pointer outside 0 to 5; not the output mode, the scale factors or two
+//   pointers alike.
+// - The downmix to outputMode, after ATSC A/52 7.8, nothing normalised: to 2/0 Lt/Rt (the centre at -3 dB to both, the
+//   surrounds at -3 dB, subtracted on the left and added on the right) or Lo/Ro (the centre at cmixlev, each surround
+//   to its side at surmixlev) as stereoMode says, its auto Lt/Rt unless annex D's dmixmod prefers Lo/Ro; annex D's own
+//   mix levels for Lt/Rt and Lo/Ro when the stream has them. 3/0: the surrounds into the fronts at surmixlev; 2/1 and
+//   3/1: the centre into the fronts at cmixlev (2/1), the surround half of each; 2/2: the centre into the fronts. 1/0:
+//   half of L, R, the centre at cmixlev and the surrounds at surmixlev; a mono stream into 2/0 both sides at -3 dB. The
+//   LFE is never mixed. Dual mono (1+1): dualmonoMode stereo puts Ch1 left and Ch2 right, left mono Ch1, right mono
+//   Ch2 and mixed mono their mean, a mono to the centre or, without one, at 0.7071 to each side.
 // - Dynamic range: FFmpeg's drc_scale takes drcCutScaleFactor for the custom and line modes (one factor for cut and
 //   boost: a boost factor of its own is logged once), heavy compression for RF remodulation. Dialogue normalisation is
 //   not applied (as FFmpeg); karaoke streams' vocal modes are not reproduced (logged once).
 // - One syncframe per access unit: no sync word, a reserved rate or frame size code, a bsid past 10 (E-AC-3 is
-//   cellDDPdec's), a unit shorter than its frame, or one FFmpeg refuses: AC3_FRAME. A CRC mismatch is flagged, and the
-//   frame concealed as FFmpeg conceals it by default (the previous frame's last block repeated), not an error.
-// - CellAdecBsiAc3: codecType 0; versionInfo the core's version; totalCallNum the frames decoded in the sequence
-//   (totalCallCarryRun 0); bitrateValue in kbit/s; pcmSize the PCM's bytes; esSizeBit the frame's bits; errorCode;
-//   validity 1 for a decoded frame; channelValue the stream's channels with its LFE; fsIndex fscod;
-//   outputQuantization wordSize; outputChannel numberOfChannels; monoFlag 1 for a 1/0 output; bsi the 64 bits from
-//   bsid on; frmSizeCod and the BSI's fields (acmod, lfeon, cmixlev, surmixlev, dsurmod, copyright, original, bsmod,
-//   bsid, and annex D's xbsi1e, dmixmod, xbsi2e, dsurexmod, dheadphonmod, adconvtyp); karaokeMode 1 for a karaoke
-//   stream (bsmod 7 past 2/0); crcErrorFlag; execDmixType 0 without a downmix, 1 Lt/Rt, 2 any other.
+//   cellDDPdec's), a unit shorter than its frame, or one FFmpeg refuses: AC3_FRAME, the information block left blank.
+//   A CRC mismatch is flagged, and the frame concealed as FFmpeg conceals it by default (the previous frame's last
+//   block repeated), not an error.
+// - CellAdecBsiAc3 as libac3dec fills it (0x50 bytes): codecType word 0x1001; versionInfo 0x04990000; totalCallNum
+//   every call of the sequence (totalCallCarryRun 0); bitrateValue in bit/s; pcmSize the PCM's bytes; esSizeBit 0;
+//   errorCode; the flag at +0x20 when the frame's size or execDmixType is not the frame before's; validity 0;
+//   channelValue the stream's channels with its LFE; fsIndex MPEG-4's sampling frequency index; outputQuantization
+//   0xFF float or 3 16-bit; outputChannel numberOfChannels; monoFlag 1 for a 1/0 output; bsi the bits of bsi() from
+//   bsid as two 24-bit words, cut at its end; frmSizeCod and the BSI's fields (acmod, lfeon, cmixlev, surmixlev,
+//   dsurmod, copyright, original, bsmod, bsid, and annex D's xbsi1e, dmixmod, xbsi2e, dsurexmod, dheadphonmod,
+//   adconvtyp); karaokeMode 2 for a stream that is no karaoke one (1 for one: not compared); crcErrorFlag;
+//   execDmixType 1 Lt/Rt or 2 Lo/Ro for a 2/0 output, whatever the stream, reported from the frame after the one that
+//   set it up (0 on a sequence's first frame).
 // - PTS: the front end's step for AC-3 (correctPtsValueType 5).
 //
 // Dolby Digital Plus (CELL_ADEC_TYPE_EAC3, for cellDDPdec's table 0xF5E9C15C, D-621) is the same core on FFmpeg's
@@ -102,7 +106,8 @@ constexpr u32 codec_type = 0x00, version_info = 0x04, total_call_carry_run = 0x0
               output_channel = 0x25, mono_flag = 0x26, bsi = 0x28, frm_size_cod = 0x30, acmod = 0x32, lfe_on = 0x33,
               karaoke_mode = 0x34, cmixlev = 0x35, surmixlev = 0x36, dsurmod = 0x37, copyright = 0x38, original = 0x39,
               bsmod = 0x3A, bsid = 0x3B, xbsi1e = 0x3C, dmixmod = 0x3D, xbsi2e = 0x3E, dsurexmod = 0x3F,
-              dheadphonmod = 0x40, adconvtyp = 0x41, crc_error_flag = 0x42, exec_dmix_type = 0x43, size = 0x44;
+              dheadphonmod = 0x40, adconvtyp = 0x41, crc_error_flag = 0x42, exec_dmix_type = 0x43,
+              size = 0x50; // libac3dec's (D-944): RPCS3's structure, then twelve bytes it leaves 0
 }
 
 enum : u32 { STEREO_AUTO = 0, STEREO_LTRT = 1, STEREO_LORO = 2 };
@@ -126,6 +131,7 @@ struct Bsi {
     u32 dmixmod = 0, ltrtcmixlev = 4, ltrtsurmixlev = 4, lorocmixlev = 4, lorosurmixlev = 4;
     u32 dsurexmod = 0, dheadphonmod = 0, adconvtyp = 0;
     u32 frame_bytes = 0, kbps = 0;
+    u32 bsi_bits = 0; // AC-3: bsi()'s length, bsid to the end of addbsi
     // The samples a channel and the rate; where bsi() starts (AC-3: bsid at byte 5; E-AC-3: strmtyp at byte 2).
     u32 samples = 1536, rate = 48000, raw_from = 5;
     // E-AC-3's own (annex E).
@@ -174,8 +180,14 @@ bool read_bsi(const u8* p, u32 size, Bsi& h)
             h.dsurexmod = b.get(2);
             h.dheadphonmod = b.get(2);
             h.adconvtyp = b.get(1);
+            b.skip(8 + 1); // xbsi2, encinfo
         }
+    } else {
+        if (b.flag()) b.skip(14); // timecod1e, timecod1
+        if (b.flag()) b.skip(14); // timecod2e, timecod2
     }
+    if (b.flag()) b.skip(8 * (b.get(6) + 1)); // addbsie: addbsil, addbsi
+    h.bsi_bits = b.pos() - 40;
     if (h.fscod == 3 || h.frmsizecod >= 38) return false;
     h.kbps = kKbps[h.frmsizecod / 2];
     const u32 words = h.fscod == 0 ? h.kbps * 2 : h.fscod == 2 ? h.kbps * 3 : h.kbps * 96000 / 44100 + (h.frmsizecod & 1);
@@ -301,6 +313,7 @@ public:
     {
         std::memcpy(p_, param, prm::size);
         frames_ = 0;
+        prev_frame_bytes_ = prev_dmix_ = dmix_set_ = 0;
         const float cut = ps_ldf32(p_ + prm::drc_cut), boost = ps_ldf32(p_ + prm::drc_boost);
         const bool rf = p_[prm::compression_mode] == RF_REMOD;
         if (!rf && boost != cut)
@@ -318,10 +331,14 @@ public:
         Decoded d;
         d.pts_type = ddp_ ? CORRECT_PTS_EAC3 : CORRECT_PTS_AC3;
         if (!ddp_) d.duration = ticks(1536, 48000);
+        frames_++; // every call, as libac3dec's totalCallNum counts them (D-944)
         const auto fail = [&](u32 code) { // E-AC-3: libadec's FATAL for every unit refused (D-621)
             const u32 c = ddp_ ? CELL_ADEC_ERROR_FATAL : code;
             d.error = error(c);
-            ps_write32(base, bsi + info::error_code, c);
+            // libac3dec leaves the information block blank for a unit it refuses (D-944); E-AC-3's (pspocket's reading)
+            // has the error.
+            if (ddp_) ps_write32(base, bsi + info::error_code, c);
+            else std::memset(base + bsi, 0, info::size);
             return d;
         };
         if (!configured_) {
@@ -329,13 +346,13 @@ public:
             return fail(CELL_ADEC_ERROR_AC3_FRAME);
         }
         Bsi h;
+        bool crc_error = false;
         pcm_.clear();
         if (ddp_) {
             if (!decode_program(base, au, size, bsi, h)) return fail(CELL_ADEC_ERROR_AC3_FRAME);
             d.duration = ticks(pcm_.samples, pcm_.rate);
         } else {
             if (!read_bsi(base + au, size, h)) return fail(CELL_ADEC_ERROR_AC3_FRAME);
-            write_bsi(base, bsi, base + au, size, h);
             if (h.bsid > 10) {
                 log_once("AC-3 E-AC-3", std::format("AC-3: a frame of bsid {} (E-AC-3: cellDDPdec's) to the AC-3 core",
                     h.bsid));
@@ -348,7 +365,7 @@ public:
             if (size > h.frame_bytes)
                 log_once("AC-3 longer", std::format("AC-3: an access unit of {} bytes holds more than its {}-byte frame: "
                     "the frame is decoded, the rest left", size, h.frame_bytes));
-            ps_write8(base, bsi + info::crc_error_flag, mpeg_crc(base + au + 2, 8 * (h.frame_bytes - 2), 0) != 0);
+            crc_error = mpeg_crc(base + au + 2, 8 * (h.frame_bytes - 2), 0) != 0;
             if (h.bsmod == 7 && h.acmod >= 2 && p_[prm::karaoke_mode] != 3)
                 log_once("AC-3 karaoke", "AC-3: a karaoke stream's vocal modes are not reproduced: every channel is decoded");
             if (const int e = ff_.decode(base + au, h.frame_bytes, pcm_, 1536); e < 0 || !pcm_.samples) {
@@ -395,23 +412,92 @@ public:
                 for (u32 i = 0; i < in.samples; i++) dolby.ch[o][i] += g * in.ch[k][i];
             }
         }
+        // Each output channel in its slot, in Dolby's order (a later one taking a slot an earlier one has); slots past
+        // numberOfChannels are not out.
         const u32 slots = p_[prm::number_of_channels];
         std::vector<int> map(slots, -1);
         for (u32 k = 0; k < 6; k++) {
             const s32 at = static_cast<s32>(ps_ld32(p_ + prm::channel_pointer + 4 * k));
             if (at >= 0 && static_cast<u32>(at) < slots && mx.out[k]) map[static_cast<usize>(at)] = static_cast<int>(k);
         }
-        d.size = write_pcm(base, out, dolby, map, p_[prm::word_size] ? Format::F32 : Format::S16,
-            ps_ldf32(p_ + prm::pcm_scale));
-        ps_write32(base, bsi + info::total_call_num, ++frames_);
-        ps_write32(base, bsi + info::pcm_size, d.size);
-        ps_write8(base, bsi + info::validity, 1);
-        ps_write8(base, bsi + info::exec_dmix_type, mx.folded ? (lt_rt(h) && p_[prm::output_mode] == 2 ? 1 : 2) : 0);
+        // pcmScaleFactor as libac3dec takes it: from -2 up to 2, anything else silence.
+        float scale = ps_ldf32(p_ + prm::pcm_scale);
+        if (!(scale >= -2.0f && scale < 2.0f)) scale = 0.0f;
+        d.size = write_pcm(base, out, dolby, map, p_[prm::word_size] ? Format::F32 : Format::S16, scale,
+            ddp_ ? Rounding::Floor : Rounding::HeldNearest);
+        if (ddp_) {
+            ps_write32(base, bsi + info::total_call_num, frames_);
+            ps_write32(base, bsi + info::pcm_size, d.size);
+            ps_write8(base, bsi + info::validity, 1);
+            ps_write8(base, bsi + info::exec_dmix_type, mx.folded ? (lt_rt(h) && p_[prm::output_mode] == 2 ? 1 : 2) : 0);
+        } else {
+            write_ac3_info(base, bsi, base + au, size, h, d.size, crc_error);
+        }
         return d;
     }
 
 private:
-    // `frame` has `size` bytes: a unit too short for its header's raw bytes gives zeros for those it lacks (D-605).
+    // libac3dec's 2/0 kind (its execDmixType): 1 Lt/Rt, 2 Lo/Ro for a 2/0 (or 1+1) output, else 0, whatever the stream.
+    u32 dmix_type(const Bsi& h) const
+    {
+        const u32 mode = p_[prm::output_mode];
+        return mode == 2 || mode == 0 ? (lt_rt(h) ? 1u : 2u) : 0u;
+    }
+
+    // CellAdecBsiAc3 as libac3dec fills it for a frame decoded (D-944).
+    void write_ac3_info(u8* base, u32 bsi, const u8* frame, u32 size, const Bsi& h, u32 pcm_size, bool crc_error)
+    {
+        // The rate as MPEG-4's sampling frequency index.
+        static constexpr u32 kMpeg4Rates[12] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000,
+            11025, 8000};
+        u32 fs_index = 0;
+        while (fs_index < 11 && kMpeg4Rates[fs_index] != h.rate) fs_index++;
+        // bsi(): its bits from bsid on in 24-bit words, past its end 0.
+        u8 raw[6]{};
+        if (size > 5) std::memcpy(raw, frame + 5, std::min<u32>(sizeof raw, size - 5));
+        u32 chunk[2] = {u32{raw[0]} << 16 | u32{raw[1]} << 8 | raw[2], u32{raw[3]} << 16 | u32{raw[4]} << 8 | raw[5]};
+        for (u32 c = 0; c < 2; c++) {
+            const u32 bits = std::min<u32>(24, h.bsi_bits > 24 * c ? h.bsi_bits - 24 * c : 0);
+            chunk[c] &= bits ? ~((1u << (24 - bits)) - 1) & 0xFFFFFF : 0;
+        }
+        // execDmixType is the 2/0 kind the frame before set up (0 before any), and the flag at +0x20 says the frame's
+        // size or that kind is not the frame before's.
+        const u32 dmix = dmix_set_;
+        dmix_set_ = dmix_type(h);
+        const bool changed = h.frame_bytes != prev_frame_bytes_ || dmix != prev_dmix_;
+        prev_frame_bytes_ = h.frame_bytes;
+        prev_dmix_ = dmix;
+        ps_write32(base, bsi + info::codec_type, 0x00001001);
+        ps_write32(base, bsi + info::version_info, 0x04990000);
+        ps_write32(base, bsi + info::total_call_carry_run, 0);
+        ps_write32(base, bsi + info::total_call_num, frames_);
+        ps_write32(base, bsi + info::bitrate_value, h.kbps * 1000);
+        ps_write32(base, bsi + info::pcm_size, pcm_size);
+        ps_write32(base, bsi + info::es_size_bit, 0);
+        ps_write32(base, bsi + info::error_code, 0);
+        ps_write8(base, bsi + info::lib_info_flag, changed);
+        ps_write8(base, bsi + info::validity, 0);
+        ps_write8(base, bsi + info::channel_value, static_cast<u8>(h.channels()));
+        ps_write8(base, bsi + info::fs_index, static_cast<u8>(fs_index));
+        ps_write8(base, bsi + info::output_quantization, p_[prm::word_size] ? 0xFF : 3);
+        ps_write8(base, bsi + info::output_channel, p_[prm::number_of_channels]);
+        ps_write8(base, bsi + info::mono_flag, p_[prm::output_mode] == 1);
+        ps_write32(base, bsi + info::bsi, chunk[0]);
+        ps_write32(base, bsi + info::bsi + 4, chunk[1]);
+        ps_write16(base, bsi + info::frm_size_cod, static_cast<u16>(h.frmsizecod));
+        // karaokeMode: 2 for a stream that is no karaoke one (libac3dec's); 1 for one (not compared: no such stream).
+        const std::pair<u32, u32> fields[] = {{info::acmod, h.acmod}, {info::lfe_on, h.lfeon},
+            {info::karaoke_mode, h.bsmod == 7 && h.acmod >= 2 ? 1u : 2u}, {info::cmixlev, h.cmixlev},
+            {info::surmixlev, h.surmixlev}, {info::dsurmod, h.dsurmod}, {info::copyright, h.copyright},
+            {info::original, h.original}, {info::bsmod, h.bsmod}, {info::bsid, h.bsid}, {info::xbsi1e, h.xbsi1e},
+            {info::dmixmod, h.dmixmod}, {info::xbsi2e, h.xbsi2e}, {info::dsurexmod, h.dsurexmod},
+            {info::dheadphonmod, h.dheadphonmod}, {info::adconvtyp, h.adconvtyp}, {info::crc_error_flag, crc_error},
+            {info::exec_dmix_type, dmix}};
+        for (const auto& [at, v] : fields) ps_write8(base, bsi + at, static_cast<u8>(v));
+    }
+
+    // E-AC-3's block (pspocket's reading of CellAdecBsiAc3, D-621). `frame` has `size` bytes: a unit too short for its
+    // header's raw bytes gives zeros for those it lacks (D-605).
     void write_bsi(u8* base, u32 bsi, const u8* frame, u32 size, const Bsi& h)
     {
         u8 raw[8]{}; // the bytes from bsi()'s start on (AC-3: 5, E-AC-3: 2)
@@ -498,20 +584,24 @@ private:
         return true;
     }
 
-    // Whether a 2/0 output of this stream is Lt/Rt (stereoMode, or its auto: annex D's preferred mode, else Lo/Ro).
+    // Whether a 2/0 output of this stream is Lt/Rt (stereoMode, or its auto: Lt/Rt as libac3dec's, D-944, unless annex
+    // D's preferred mode is Lo/Ro).
     bool lt_rt(const Bsi& h) const
     {
         const u32 mode = p_[prm::stereo_mode];
         if (mode == STEREO_LTRT) return true;
         if (mode == STEREO_LORO) return false;
-        return h.xbsi1e && h.dmixmod == 1;
+        return !(h.xbsi1e && h.dmixmod == 2);
     }
 
-    // The downmix from the stream's channels to outputMode (see the file's head).
+    // The downmix from the stream's channels to outputMode, as libac3dec's (D-944, see the file's head): A/52's levels,
+    // nothing normalised.
     Matrix matrix(const Bsi& h, const std::array<bool, 6>& have) const
     {
         Matrix x;
-        const u32 mode = p_[prm::output_mode];
+        u32 mode = p_[prm::output_mode];
+        if (mode == 0) mode = 2; // its 1+1 output is its 2/0 one
+        if (mode > 7) mode = 7;  // (Sony's gives eight slots for 8: not reproduced)
         const std::array<bool, 6> out = channels_of(mode);
         for (u32 k = 0; k < 5; k++) x.out[k] = out[k];
         x.out[LFE] = p_[prm::out_lfe_on] != 0;
@@ -530,34 +620,52 @@ private:
                     for (u32 k = 0; k < 6; k++) x.m[L][k] = x.m[R][k] = k3dB * mono[k];
             }
             x.folded = dm != DUALMONO_STEREO || !out[L];
-            return normalised(x);
+            return x;
         }
         const bool stereo_surrounds = have[LS] && have[RS], mono_surround = have[LS] && !have[RS];
-        const bool two = mode == 2 || mode == 1; // 2/0, and 1/0 made from the 2/0 downmix
         const bool ltrt = mode == 2 && lt_rt(h);
         float clev = h.acmod & 1 && h.acmod != 1 ? kClev[h.cmixlev] : k3dB;
         float slev = h.acmod & 4 ? kSlev[h.surmixlev] : k3dB;
-        if (h.xbsi1e && two) { // annex D's own levels for Lt/Rt and Lo/Ro
+        if (h.xbsi1e && mode == 2) { // annex D's own levels for Lt/Rt and Lo/Ro
             clev = kXlev[ltrt ? h.ltrtcmixlev : h.lorocmixlev];
             slev = kXlev[std::max<u32>(3, ltrt ? h.ltrtsurmixlev : h.lorosurmixlev)];
         }
-        if (ltrt && !h.xbsi1e) clev = slev = k3dB;
+        if (ltrt && !h.xbsi1e) clev = slev = k3dB; // Lt/Rt's centre and surrounds at -3 dB
+        if (mode == 1) {
+            // 1/0: half of L, R, the centre at its level and the surrounds at theirs; a mono stream's centre whole.
+            std::array<float, 6> mono{};
+            if (have[L] || have[R]) {
+                mono[L] = have[L] ? 0.5f : 0.0f;
+                mono[R] = have[R] ? 0.5f : 0.0f;
+                if (have[C]) mono[C] = 0.5f * clev;
+            } else if (have[C]) {
+                mono[C] = 1.0f;
+            }
+            if (have[LS]) mono[LS] = 0.5f * slev * (mono_surround ? k3dB * 2.0f : 1.0f);
+            if (have[RS]) mono[RS] = 0.5f * slev;
+            x.m[C] = mono;
+            x.folded = have[L] || have[LS];
+            return x;
+        }
         // Front.
         if (have[L]) x.m[L][L] = 1.0f;
         if (have[R]) x.m[R][R] = 1.0f;
         if (have[C]) {
-            if (out[C] && !two) {
+            if (out[C]) {
                 x.m[C][C] = 1.0f;
-            } else {
-                x.m[L][C] = x.m[R][C] = have[L] ? clev : 1.0f; // a mono stream's centre is both sides
-                x.folded |= have[L];
+            } else if (have[L]) {
+                x.m[L][C] = x.m[R][C] = clev;
+                x.folded = true;
+            } else { // a mono stream's centre to both sides at -3 dB
+                x.m[L][C] = x.m[R][C] = k3dB;
+                x.folded = true;
             }
         }
         // Surround.
         if (stereo_surrounds || mono_surround) {
-            // A mono surround goes to each side at 0.7071 of slev for Lo/Ro; Lt/Rt takes it whole, at its -3 dB.
-            const float s_mono = mono_surround && !ltrt ? k3dB : 1.0f;
-            if (two || !out[LS]) {
+            if (!out[LS]) { // into the front pair: 2/0, 3/0
+                // A mono surround goes to each side at 0.7071 of slev for Lo/Ro; Lt/Rt takes it whole, at its -3 dB.
+                const float s_mono = mono_surround && !ltrt ? k3dB : 1.0f;
                 const float sign = ltrt ? -1.0f : 1.0f;
                 x.m[L][LS] = sign * slev * s_mono;
                 if (stereo_surrounds) {
@@ -577,32 +685,14 @@ private:
                     x.m[LS][LS] = x.m[RS][LS] = k3dB;
                     x.folded = true;
                 }
-            } else { // one surround out
+            } else { // one surround out: half of each
                 if (stereo_surrounds) {
-                    x.m[LS][LS] = x.m[LS][RS] = k3dB;
+                    x.m[LS][LS] = x.m[LS][RS] = 0.5f;
                     x.folded = true;
                 } else {
                     x.m[LS][LS] = 1.0f;
                 }
             }
-        }
-        if (mode == 1) { // 1/0: the 2/0 Lo/Ro pair's sum
-            for (u32 k = 0; k < 6; k++) x.m[C][k] = k3dB * (x.m[L][k] + x.m[R][k]);
-            x.m[L] = {};
-            x.m[R] = {};
-            x.folded = true;
-        }
-        return normalised(x);
-    }
-
-    // Each output channel over its coefficients' sum, when that passes 1.
-    static Matrix normalised(Matrix x)
-    {
-        for (u32 o = 0; o < 5; o++) {
-            float sum = 0;
-            for (u32 k = 0; k < 5; k++) sum += std::abs(x.m[o][k]);
-            if (sum > 1.0f)
-                for (u32 k = 0; k < 5; k++) x.m[o][k] /= sum;
         }
         return x;
     }
@@ -612,32 +702,25 @@ private:
     FfDecoder ff_;
     Planar pcm_;
     u8 p_[prm::size] = {};
-    u32 frames_ = 0;
+    u32 frames_ = 0;                           // the calls of the sequence (totalCallNum)
+    u32 prev_frame_bytes_ = 0, prev_dmix_ = 0; // the frame before's size and 2/0 kind (AC-3's flag at +0x20)
+    u32 dmix_set_ = 0;                         // the 2/0 kind the last frame set up
     bool configured_ = false;
 };
 
-// cellAdecStartSeq: every field within its enum, 1 to 6 slots, each pointer a slot or -1 and none twice, the scale
-// factors between 0 and 1. `ddp`: E-AC-3's, refused with libadec's ARG.
+// cellAdecStartSeq, as libac3dec checks it (D-944): word size, LFE and the mode fields within their enums, at most six
+// slots, each channel pointer 0 to 5; the output mode, the scale factors and two pointers alike are not checked.
+// Refused with libadec's ARG (E-AC-3's too).
 s32 check_params(const u8* p, bool ddp)
 {
-    bool ok = p[prm::word_size] <= 1 && p[prm::output_mode] >= 1 && p[prm::output_mode] <= 7 && p[prm::out_lfe_on] <= 1 &&
-              p[prm::compression_mode] <= 3 && p[prm::stereo_mode] <= 2 && p[prm::dualmono_mode] <= 3 &&
-              p[prm::karaoke_mode] <= 3 && p[prm::number_of_channels] >= 1 && p[prm::number_of_channels] <= 6;
-    for (const u32 at : {prm::drc_cut, prm::drc_boost, prm::pcm_scale}) {
-        const float v = ps_ldf32(p + at);
-        ok = ok && v >= 0.0f && v <= 1.0f;
-    }
-    u32 taken = 0;
-    for (u32 k = 0; k < 6 && ok; k++) {
-        const s32 at = static_cast<s32>(ps_ld32(p + prm::channel_pointer + 4 * k));
-        if (at == -1) continue;
-        ok = at >= 0 && at < p[prm::number_of_channels] && !(taken & (1u << at));
-        taken |= 1u << (at & 31);
-    }
+    bool ok = p[prm::word_size] <= 1 && p[prm::out_lfe_on] <= 1 && p[prm::compression_mode] <= 3 &&
+              p[prm::stereo_mode] <= 2 && p[prm::dualmono_mode] <= 3 && p[prm::karaoke_mode] <= 3 &&
+              p[prm::number_of_channels] <= 6;
+    for (u32 k = 0; k < 6 && ok; k++) ok = ps_ld32(p + prm::channel_pointer + 4 * k) <= 5;
     if (ok) return lv2::CELL_OK;
     PS_LOG_ERROR("cellAdec", "{}: parameters refused (word {}, output mode {}, LFE {}, {} channels)",
         ddp ? "E-AC-3" : "AC-3", p[prm::word_size], p[prm::output_mode], p[prm::out_lfe_on], p[prm::number_of_channels]);
-    return error(ddp ? u32{CELL_ADEC_ERROR_ARG} : u32{CELL_ADEC_ERROR_AC3_PARAM});
+    return error(CELL_ADEC_ERROR_ARG);
 }
 s32 check(const u8* p) { return check_params(p, false); }
 s32 check_ddp(const u8* p) { return check_params(p, true); }

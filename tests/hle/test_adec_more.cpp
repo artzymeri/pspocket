@@ -1100,7 +1100,7 @@ TEST_CASE("cellAdec: Dolby Digital Plus on FFmpeg: the stream's Lo/Ro levels, un
     feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 12);
     const CoreRun full = run_core(f.base(), hle_calls(f, t), kTypeEac3, ac3_param({}), feed);
     const CoreRun loro = run_core(f.base(), hle_calls(f, t), kTypeEac3,
-        ac3_param({.mode = 2, .lfe = 0, .channels = 2, .pointers = {0, -1, 1, -1, -1, -1}}), feed);
+        ac3_param({.mode = 2, .lfe = 0, .channels = 2, .pointers = {0, 2, 1, 3, 4, 5}}), feed);
     INFO(all(loro));
     REQUIRE(full.outs.size() == 12);
     REQUIRE(loro.outs.size() == 12);
@@ -1113,14 +1113,15 @@ TEST_CASE("cellAdec: Dolby Digital Plus on FFmpeg: the stream's Lo/Ro levels, un
         CHECK(o.bsi[0x38] == 1); // copyright
         CHECK(o.bsi[0x39] == 1); // original
         CHECK(o.bsi[0x43] == 2); // a downmix, not Lt/Rt
-        // Lo = L + 0.5 C + 0.5 Ls, over the coefficients' sum 2 (and Ro likewise), from the full output's channels.
+        // Lo = L + 0.5 C + 0.5 Ls (and Ro likewise), not normalised (libac3dec's, D-944), from the full output's
+        // channels.
         const auto l = channel_of(full.outs[k].pcm, 6, 0), r = channel_of(full.outs[k].pcm, 6, 1),
                    c = channel_of(full.outs[k].pcm, 6, 2), ls = channel_of(full.outs[k].pcm, 6, 4),
                    rs = channel_of(full.outs[k].pcm, 6, 5);
         std::vector<float> lo, ro;
         for (usize i = 0; i < l.size(); i++) {
-            lo.push_back(0.5f * l[i] + 0.25f * c[i] + 0.25f * ls[i]);
-            ro.push_back(0.5f * r[i] + 0.25f * c[i] + 0.25f * rs[i]);
+            lo.push_back(l[i] + 0.5f * c[i] + 0.5f * ls[i]);
+            ro.push_back(r[i] + 0.5f * c[i] + 0.5f * rs[i]);
         }
         CHECK(close_to(channel_of(o.pcm, 2, 0), lo, 1e-5));
         CHECK(close_to(channel_of(o.pcm, 2, 1), ro, 1e-5));
@@ -1159,7 +1160,7 @@ TEST_CASE("cellAdec: Dolby Digital Plus on FFmpeg: the stream's Lo/Ro levels, un
     ac3_feed.step = 2880;
     ac3_feed.aus.assign(ac3.packets.begin(), ac3.packets.begin() + 4);
     const CoreRun a = run_core(f.base(), hle_calls(f, t), kTypeEac3,
-        ac3_param({.mode = 2, .lfe = 0, .channels = 2, .pointers = {0, -1, 1, -1, -1, -1}}), ac3_feed);
+        ac3_param({.mode = 2, .lfe = 0, .channels = 2, .pointers = {0, 2, 1, 3, 4, 5}}), ac3_feed);
     REQUIRE(a.outs.size() == 4);
     const Ref ac3_ref = reference("eac3", ac3_feed.aus);
     for (u32 k = 0; k < 4; k++) {
@@ -1181,8 +1182,9 @@ TEST_CASE("cellAdec: Dolby Digital Plus on FFmpeg: the stream's Lo/Ro levels, un
     CHECK(e.outs[1].size == 0);
     CHECK(be32(e.outs[1].bsi, 0x1C) == kFatal);
     CHECK(e.outs[3].size == 1536 * 6 * 4);
-    for (const Ac3Param& refused : {Ac3Param{.word = 2}, Ac3Param{.mode = 0}, Ac3Param{.channels = 7},
-             Ac3Param{.pointers = {0, 0, 1, 2, 3, 4}}}) {
+    // (AC-3's checks, libac3dec's: D-944.)
+    for (const Ac3Param& refused : {Ac3Param{.word = 2}, Ac3Param{.channels = 7}, Ac3Param{.pointers = {0, 2, 1, 4, 5, 6}},
+             Ac3Param{.pointers = {0, -1, 1, 4, 5, 3}}}) {
         const CoreRun r = run_core(f.base(), hle_calls(f, t), kTypeEac3, ac3_param(refused), Feed{});
         CHECK(std::find(r.lines.begin(), r.lines.end(), "cellAdecStartSeq -> 0x80610003") != r.lines.end());
     }

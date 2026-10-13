@@ -53,6 +53,8 @@ target_sources(test_hle PRIVATE
     test_module_management.cpp
     test_sail_rec_compare.cpp)
 
+# The audio cores on FFmpeg against Sony's (D-944, in test_adec_cores.cpp): test_hle "[compare][adec-cores]" (about three
+# minutes).
 # libvdec's last functions (D-920) against Sony's libvdec: test_hle "[compare][vdec-ext]". The video codec cores
 # pspocket's own (D-920): test_hle "[vdec-cores]", their comparisons with Sony's "[compare][vdec-cores]".
 target_sources(test_hle PRIVATE test_vdec_ext_compare.cpp test_vdec_cores_compare.cpp test_vdec_score_compare.cpp)

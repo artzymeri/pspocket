@@ -166,8 +166,9 @@ constexpr u32 bytes_of(Format f) { return f == Format::S16 ? 2 : 4; }
 
 // How a core's floats become its PCM.
 enum class Rounding : u8 {
-    Floor,   // libatxdec's (adec_atracx.cpp): floats held below 1, integers floored and held in range
-    Nearest, // libmp3dec's (D-944): floats as decoded, integers rounded half away from zero and held in range
+    Floor,       // libatxdec's (adec_atracx.cpp): floats held below 1, integers floored and held in range
+    Nearest,     // libmp3dec's (D-944): floats as decoded, integers rounded half away from zero and held in range
+    HeldNearest, // libac3dec's (D-944): floats held below 1, integers rounded half away from zero and held in range
 };
 
 // Writes `in` interleaved to the guest at `out`: output channel c of each sample from `in`'s channel map[c] (-1:

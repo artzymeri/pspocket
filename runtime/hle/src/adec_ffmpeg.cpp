@@ -717,7 +717,7 @@ std::vector<int> straight(u32 n)
 u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, Format fmt, float gain, Rounding rounding)
 {
     const u32 nch = static_cast<u32>(map.size()), bytes = bytes_of(fmt);
-    const bool nearest = rounding == Rounding::Nearest;
+    const bool nearest = rounding != Rounding::Floor, held = rounding != Rounding::Nearest;
     // An integer sample of `scale` steps per unit, rounded as `rounding` says and held in [lo, hi].
     const auto integer = [&](f32 s, double scale, s64 lo, s64 hi) {
         const double v = static_cast<double>(s) * scale;
@@ -732,7 +732,7 @@ u32 write_pcm(u8* base, u32 out, const Planar& in, std::span<const int> map, For
             const u32 at = out + bytes * (i * nch + c);
             switch (fmt) {
             case Format::F32:
-                if (nearest) ps_write32(base, at, std::bit_cast<u32>(s));
+                if (!held) ps_write32(base, at, std::bit_cast<u32>(s));
                 else if (s >= std::bit_cast<f32>(std::bit_cast<u32>(1.f) - 1)) ps_write32(base, at, 0x3F7FFFFF);
                 else ps_write32(base, at, std::bit_cast<u32>(s <= -1.f ? -1.f : s));
                 break;
