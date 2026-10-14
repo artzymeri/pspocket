@@ -23,8 +23,8 @@
 <text x="838" y="151" font-size="12.5" fill="#24292f">100%  (4/4 done)</text>
 <text x="4" y="177" font-size="12.5" fill="#24292f">Graphics (RSX to Metal)</text>
 <rect x="300" y="165" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="165" width="457.7" height="16" rx="3" fill="#57ab5a"/>
-<text x="838" y="177" font-size="12.5" fill="#24292f">86%  (9/11 done)</text>
+<rect x="300" y="165" width="492.1" height="16" rx="3" fill="#2da44e"/>
+<text x="838" y="177" font-size="12.5" fill="#24292f">93%  (12/14 done)</text>
 <text x="4" y="203" font-size="12.5" fill="#24292f">Sound</text>
 <rect x="300" y="191" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="191" width="397.5" height="16" rx="3" fill="#57ab5a"/>
@@ -39,6 +39,6 @@
 <text x="838" y="255" font-size="12.5" fill="#24292f">100%  (5/5 done)</text>
 <text x="4" y="281" font-size="12.5" fill="#24292f">Speed and stability on the iPhone</text>
 <rect x="300" y="269" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="269" width="318.0" height="16" rx="3" fill="#d4a72c"/>
-<text x="838" y="281" font-size="12.5" fill="#24292f">60%  (2/5 done)</text>
+<rect x="300" y="269" width="371.0" height="16" rx="3" fill="#d4a72c"/>
+<text x="838" y="281" font-size="12.5" fill="#24292f">70%  (2/5 done)</text>
 </svg>

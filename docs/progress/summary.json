@@ -1,5 +1,5 @@
 {
-  "engine_percent": 91.9,
+  "engine_percent": 93.0,
   "libraries": {
     "own": 6625,
     "answered_as_rpcs3": 0,
@@ -24,11 +24,11 @@
     "PPU code (the main processor)": 100,
     "SPU code (the six co-processors)": 86,
     "SPURS and the kernel": 100,
-    "Graphics (RSX to Metal)": 86,
+    "Graphics (RSX to Metal)": 93,
     "Sound": 75,
     "Video and images": 90,
     "System services": 100,
-    "Speed and stability on the iPhone": 60
+    "Speed and stability on the iPhone": 70
   },
   "games": {
     "BLES01807": "Playable",
