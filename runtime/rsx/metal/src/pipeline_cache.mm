@@ -23,6 +23,19 @@ bool PipelineKey::operator<(const PipelineKey& o) const
         std::tie(o.vp, o.fp, o.color_formats, o.depth_format, o.stencil_format, o.write_masks, o.blend, o.blend_ops);
 }
 
+size_t PipelineKeyHash::operator()(const PipelineKey& k) const
+{
+    u64 h = k.vp * 0x9e3779b97f4a7c15ull;
+    const auto mix = [&](u64 v) { h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 32; };
+    mix(k.fp);
+    for (u32 i = 0; i < 4; i++) {
+        mix(u64{k.color_formats[i]} | (u64{k.write_masks[i]} << 32));
+        mix(u64{k.blend[i]} | (u64{k.blend_ops[i]} << 32));
+    }
+    mix(u64{k.depth_format} | (u64{k.stencil_format} << 32));
+    return static_cast<size_t>(h);
+}
+
 namespace {
 
 MTLBlendFactor blend_factor(u32 f)
@@ -163,8 +176,10 @@ std::optional<CompiledProgram> MetalBackend::Impl::compile(const shader::Transla
 const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& state, bool points, u32 fp_inputs,
     bool two_sided)
 {
-    take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
-    take_async();        // ... and the background compiles (D-158)
+    if (!fast(kFastLookups)) { // else once a draw, before its lookups (do_draw, D-953)
+        take_shader_cache(); // programs and pipelines the shader cache made since (D-114)
+        take_async();        // ... and the background compiles (D-158)
+    }
     interp_vp = nullptr;
     if ((state.dirty_bits & dirty::kVertexProgram) || !vertex_program_ok) {
         state.dirty_bits &= ~dirty::kVertexProgram;
@@ -173,10 +188,12 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
         const u32 start = state.transform_program_start();
         const u32* at = state.transform_program.data() + std::min<usize>(start, kMaxVertexProgramInstructions) * 4;
         const usize room = state.transform_program.size() - static_cast<usize>(at - state.transform_program.data());
+        vp_lookups[ab_half()]++;
         for (usize i = 0; i < vertex_programs.size(); i++) {
             const DecodedVertexProgram& d = vertex_programs[i];
-            if (d.program.start != start || d.words.size() > room || std::memcmp(at, d.words.data(), d.words.size() * 4))
-                continue;
+            if (d.program.start != start || d.words.size() > room) continue;
+            vp_compares[ab_half()]++;
+            if (std::memcmp(at, d.words.data(), d.words.size() * 4)) continue;
             std::rotate(vertex_programs.begin(), vertex_programs.begin() + static_cast<std::ptrdiff_t>(i),
                 vertex_programs.begin() + static_cast<std::ptrdiff_t>(i) + 1);
             vertex_program_ok = true;
@@ -184,6 +201,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
         }
         if (!vertex_program_ok) {
             std::string why;
+            vp_decodes[ab_half()]++;
             auto vp = shader::decode_vertex_program(state.transform_program.data(), kMaxVertexProgramInstructions,
                 start, &why);
             if (!vp) {
@@ -255,7 +273,7 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     u32 kind_bits = 0;
     for (u32 t = 0; t < 4; t++) {
         if (!(current.texture_units & (1u << t))) continue;
-        const TextureInfo vt = state.vertex_texture(t);
+        const TextureInfo& vt = vertex_texture(state, t); // once a draw (D-954)
         kinds[t] = vt.cubemap && vt.dimension == 2 ? shader::TextureKind::Cube
                  : vt.dimension == 3               ? shader::TextureKind::Tex3D
                  : vt.dimension == 1               ? shader::TextureKind::Tex1D
@@ -279,12 +297,28 @@ const CompiledProgram* MetalBackend::Impl::vertex_program_for(const RsxState& st
     const u64 variant = (points ? 1ull : 0ull) | (clip_bits << 1) | (u64{masked} << 13) | (u64{read} << 29) |
         (u64{kind_bits} << 45);
     const auto remember = [&](const CompiledProgram* c) {
+        if (fast(kFastLookups)) { // the newest first; the one drawn with least lately forgotten past 16 (D-953)
+            if (vertex_compiled.size() >= 16) vertex_compiled.pop_back();
+            vertex_compiled.emplace(vertex_compiled.begin(), variant, c);
+            return c;
+        }
         if (vertex_compiled.size() >= 8) vertex_compiled.erase(vertex_compiled.begin());
         vertex_compiled.emplace_back(variant, c);
         return c;
     };
-    for (const auto& [v, c] : vertex_compiled)
-        if (v == variant) return c;
+    if (fast(kFastLookups)) {
+        // The variants most recently drawn with first: a program drawn with many fragment programs (the outputs they
+        // read tell its variants apart) wore out a list of 8 kept in the order made, and built its key every draw.
+        for (usize i = 0; i < vertex_compiled.size(); i++) {
+            if (vertex_compiled[i].first != variant) continue;
+            if (i) std::rotate(vertex_compiled.begin(), vertex_compiled.begin() + static_cast<std::ptrdiff_t>(i),
+                       vertex_compiled.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            return vertex_compiled.front().second;
+        }
+    } else {
+        for (const auto& [v, c] : vertex_compiled)
+            if (v == variant) return c;
+    }
     const std::vector<u32>& ucode = current.words;
     std::string key = std::format("vp:{:016x}:{}", vp.hash, (points ? 1u : 0u) | (user_clip << 1));
     if (masked) key += std::format(":m{:x}", masked);
@@ -345,7 +379,7 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     }
     // Readable bytes: up to 64 KB, within committed guest memory.
     u32 max_len = 0;
-    const u32 page = static_cast<u32>(GuestMemory::host_page_size());
+    static const u32 page = static_cast<u32>(GuestMemory::host_page_size()); // sysconf, once
     for (u32 a = *ea & ~(page - 1); max_len < 0x10000 && mem.is_committed(a); a += page) {
         max_len = a + page - *ea;
     }
@@ -356,8 +390,10 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         return nullptr;
     }
 
-    take_shader_cache(); // D-114
-    take_async();        // D-158
+    if (!fast(kFastLookups)) { // else once a draw (D-953)
+        take_shader_cache(); // D-114
+        take_async();        // D-158
+    }
     FragmentProgramSlot& slot = fragment_programs[*ea];
     // A deferred copy to the program (or its constants, read every draw) lands first (D-107). A program not seen yet:
     // its first instruction (a copy that writes a program writes its start).
@@ -437,6 +473,13 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     shader::FpOptions options = requested;
     options.texture_convert_mask = static_cast<u16>(options.texture_convert_mask & fp.texture_mask);
     options.texture_alpha_kill_mask = static_cast<u16>(options.texture_alpha_kill_mask & fp.texture_mask);
+    // Nor do the kinds of the units it does not sample (D-953): their stale registers made draws of one program look
+    // different, past the short list's room, and each such draw built its key again. The key and the translation read
+    // the kinds of the sampled units only.
+    if (fast(kFastLookups)) {
+        for (u32 t = 0; t < kFragmentTextureCount; t++)
+            if (!(fp.texture_mask & (1u << t))) options.texture_kind[t] = shader::TextureKind::Tex2D;
+    }
     // The depth clamp changes only a program that can discard (D-941): the others keep their compiles.
     if (options.clamp_depth) {
         const bool kills = std::any_of(fp.instructions.begin(), fp.instructions.end(), [](const shader::FpInstruction& in) {
@@ -445,8 +488,20 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
         options.clamp_depth = kills || options.alpha_test || options.alpha_to_coverage || options.depth_bounds ||
                               options.polygon_stipple || options.texture_alpha_kill_mask != 0;
     }
-    for (const auto& [o, c] : entry.compiled) {
-        if (o == options) return c;
+    if (fast(kFastLookups)) {
+        // The variants most recently drawn with first (D-953).
+        for (usize i = 0; i < entry.compiled.size(); i++) {
+            if (!(entry.compiled[i].first == options)) continue;
+            if (i) std::rotate(entry.compiled.begin(), entry.compiled.begin() + static_cast<std::ptrdiff_t>(i),
+                       entry.compiled.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            fp_variant_hits[ab_half()]++;
+            return entry.compiled.front().second;
+        }
+        fp_variant_misses[ab_half()]++;
+    } else {
+        for (const auto& [o, c] : entry.compiled) {
+            if (o == options) return c;
+        }
     }
 
     std::vector<u32> ucode;
@@ -476,7 +531,12 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     });
     const std::string key = std::format("fp:{:016x}:{}{}", fp.hash, opt, packs ? ":pk" : "");
     const auto remember = [&](const CompiledProgram* c) {
-        if (entry.compiled.size() < 8) entry.compiled.emplace_back(options, c);
+        if (fast(kFastLookups)) { // the newest first, the one drawn with least lately forgotten past 16 (D-953)
+            if (entry.compiled.size() >= 16) entry.compiled.pop_back();
+            entry.compiled.emplace(entry.compiled.begin(), options, c);
+        } else if (entry.compiled.size() < 8) {
+            entry.compiled.emplace_back(options, c);
+        }
         return c;
     };
     if (auto it = programs.find(key); it != programs.end() && it->second.ucode == ucode) return remember(&it->second);
@@ -570,10 +630,8 @@ MTLRenderPipelineDescriptor* pipeline_descriptor(const PipelineParams& p, id<MTL
 }
 
 id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp,
-    const RsxState& state)
+    const BlendInfo& blend, const ColorMaskInfo& masks)
 {
-    const BlendInfo blend = state.blend();
-    const ColorMaskInfo masks = state.color_mask();
     PipelineParams p;
     p.color_count = pass.color_count;
     for (u32 i = 0; i < pass.color_count; i++) {
@@ -590,10 +648,21 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
         p.depth_format = static_cast<u32>(pass.depth->pixel_format);
         if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) p.stencil_format = p.depth_format;
     }
-    take_shader_cache(); // pipelines the shader cache made since (D-114)
-    take_async();        // ... and the background compiles (D-158)
+    if (!fast(kFastLookups)) {
+        take_shader_cache(); // pipelines the shader cache made since (D-114)
+        take_async();        // ... and the background compiles (D-158)
+    }
     const PipelineKey key = pipeline_key(p, vp.function, fp.function);
-    if (auto it = pipelines.find(key); it != pipelines.end()) return it->second;
+    if (fast(kFastLookups)) { // D-953
+        if (last_pipeline && key == last_pipeline_key) return last_pipeline;
+        if (auto it = pipelines.find(key); it != pipelines.end()) {
+            last_pipeline_key = key;
+            last_pipeline = it->second;
+            return it->second;
+        }
+    } else if (auto it = pipelines_ordered.find(key); it != pipelines_ordered.end()) {
+        return it->second;
+    }
     const auto made = [&] { return pipelines.contains(key); };
     if (async && async->queued(key)) {
         if (!wait_async(made)) {
@@ -642,7 +711,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
         return nil;
     }
     stats.pipelines_created++;
-    pipelines[key] = pso;
+    add_pipeline(key, pso);
     if (shader_cache) shader_cache->record_pipeline(vp.key, fp.key, p);
     return pso;
 }
@@ -688,10 +757,9 @@ id<MTLBuffer> MetalBackend::Impl::interpreter_code(u64 key, const std::vector<u3
     return b;
 }
 
-id<MTLDepthStencilState> MetalBackend::Impl::depth_state_for(const RsxState& state)
+id<MTLDepthStencilState> MetalBackend::Impl::depth_state_for(const DepthStencilInfo& ds)
 {
     // No test means no write, for depth and stencil alike (RPCS3 RSXThread.cpp get_framebuffer_layout note).
-    const DepthStencilInfo ds = state.depth_stencil();
     const bool has_depth = pass.depth != nullptr;
     const bool has_stencil = has_depth && pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8;
     const bool depth_test = has_depth && ds.depth_test;

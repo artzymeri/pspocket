@@ -181,7 +181,7 @@ void MetalBackend::Impl::take_async()
         stats.async_compile_ns += ns;
     }
     for (auto& pl : r.pipelines) {
-        pipelines[pl.key] = pl.pso;
+        add_pipeline(pl.key, pl.pso);
         if (shader_cache) shader_cache->record_pipeline(pl.vp_key, pl.fp_key, pl.params);
         stats.pipelines_created++;
         stats.async_pipelines++;

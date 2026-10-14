@@ -556,13 +556,8 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             if (!c.texture || c.generation != s->generation) {
                 // A new texture at each change: copying into the one earlier draws read would make the GPU wait for
                 // them (D-148); the old one goes when the GPU is done with it.
-                MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->pixel_format
-                                                                                             width:t.width
-                                                                                            height:t.height
-                                                                                         mipmapped:NO];
-                d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-                d.storageMode = MTLStorageModePrivate;
-                c.texture = [device newTextureWithDescriptor:d];
+                pool_texture(c.texture); // D-956
+                c.texture = copy_texture(s->pixel_format, t.width, t.height);
                 c.views.clear();
                 stats.corner_textures++;
                 end_pass_for(kEndCornerCopy);

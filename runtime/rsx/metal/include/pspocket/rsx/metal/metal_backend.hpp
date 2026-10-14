@@ -161,6 +161,7 @@ struct BackendStats {
     u64 programs_compiled = 0;
     u64 fragment_programs_decoded = 0;     // fragment programs decoded (each content once, D-240)
     u64 fragment_programs_found_again = 0; // programs at an address that changed found decoded before (D-240)
+    u64 pooled_textures_taken = 0; // feedback copies and corners made into a texture an earlier one left (D-956)
     u64 textures_decoded = 0;
     u64 texture_cache_hits = 0;
     // Of the textures decoded, the ones cached before that were decoded again because the target laid over them was

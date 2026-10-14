@@ -6,17 +6,20 @@
 #include <cstdlib>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
 
+#include <span>
 #include <thread>
 #include <unordered_set>
 
 #include "kernels.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/rsx/gcm.hpp"
+#include "pspocket/rsx/index_scan.hpp"
 
 namespace pspocket::rsx::metal {
 
@@ -217,6 +220,12 @@ bool MetalBackend::Impl::init()
     check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
     if (const char* f = std::getenv("PSPOCKET_SKIP_FP")) skip_fp = std::strtoull(f, nullptr, 16); // a measuring aid
     if (const char* f = std::getenv("PSPOCKET_GPU_AB")) ab_period = static_cast<u32>(std::max(1, std::atoi(f)));
+    if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) { // D-953: N[:MASK of FastPath items]
+        ab_period = static_cast<u32>(std::max(1, std::atoi(f)));
+        ab_cpu = true;
+        if (const char* m = std::strchr(f, ':')) ab_items = static_cast<u32>(std::strtoul(m + 1, nullptr, 0));
+        PS_LOG_INFO(kChan, "RSX CPU A/B: fast paths {:#x} off in every other {} frames", ab_items, ab_period);
+    }
     if (std::getenv("PSPOCKET_GPU_PASS_TIMES")) {
         pass_times = std::make_shared<PassTimes>();
         if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
@@ -336,7 +345,7 @@ void MetalBackend::Impl::submit(bool wait)
         transient.retire(render_cb);
         auto gpu = gpu_ns;
         auto ab = ab_period ? ab_ns : nullptr;
-        const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_on() ? 1 : 0;
+        const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_half();
         [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             const double s = cb.GPUEndTime - cb.GPUStartTime;
             if (s > 0) gpu->fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
@@ -363,6 +372,7 @@ bool MetalBackend::Impl::select_targets(const RsxState& state, PassTargets& out,
     // RPCS3 RSXThread.cpp get_framebuffer_layout: size from the surface clip, colour buffers for the active
     // targets, the depth buffer only when the draw (or clear) uses it, misconfigured pitches dropped.
     const SurfaceInfo si = state.surface();
+    draw_surface = si; // the draw's, for do_draw (D-954)
     out = {};
     draw_targets = {};
     // Multisampled targets (D-250): the RSX keeps a pixel's samples side by side in memory, two across for AA modes 3 to
@@ -652,7 +662,7 @@ void MetalBackend::Impl::end_pass()
     if (timed) {
         // The pass alone in a command buffer, timed (PSPOCKET_GPU_PASS_TIMES).
         auto times = pass_times;
-        const u32 place = pass_place++ + (ab_period && ab_on() ? 1000u : 0u); // with PSPOCKET_GPU_AB: 1000 + place when on
+        const u32 place = pass_place++ + (ab_half() ? 1000u : 0u); // with PSPOCKET_GPU_AB: 1000 + place when on
         const u64 draws = stats.draws - pass_draws_start;
         std::string targets = describe_targets(pass) + std::format("; last fp {:016x}", pass_last_fp);
         for (u32 i = 0; i < pass.color_count; i++) {
@@ -1046,6 +1056,7 @@ void MetalBackend::Impl::encode_clear_quad(id<MTLRenderCommandEncoder> enc, cons
         static_cast<float>(color.alpha)};
     [enc setFragmentBytes:c length:sizeof(c) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    forget_encoder_state(); // the next draw sets all of its own again (D-954)
 }
 
 // The passes that took most GPU time (PSPOCKET_GPU_PASS_TIMES): by their place in the frame, since the game draws its
@@ -1349,11 +1360,6 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
 
 namespace {
 
-struct Range {
-    u32 first;
-    u32 count;
-};
-
 // The clip range as Metal's viewport takes it (D-258): its ends in order, inside [0, 1]; [0, 1] when they are not
 // numbers.
 std::pair<float, float> depth_range(const ViewportInfo& v)
@@ -1375,42 +1381,43 @@ bool native_primitive(Primitive p, MTLPrimitiveType& type)
     }
 }
 
-// Index list for line loops, fans, quads, quad strips and polygons, in positions 0..count-1.
-std::vector<u32> convert_primitive(Primitive p, u32 count, MTLPrimitiveType& type)
+// Index list for line loops, fans, quads, quad strips and polygons, in positions 0..count-1 plus `add`, appended to
+// `out` (kept from draw to draw, D-956).
+void convert_primitive(Primitive p, u32 count, MTLPrimitiveType& type, std::vector<u32>& out, u32 add = 0)
 {
-    std::vector<u32> out;
     switch (p) {
     case Primitive::LineLoop:
         type = MTLPrimitiveTypeLine;
-        for (u32 i = 0; i + 1 < count; i++) out.insert(out.end(), {i, i + 1});
-        if (count > 2) out.insert(out.end(), {count - 1, 0});
+        for (u32 i = 0; i + 1 < count; i++) out.insert(out.end(), {add + i, add + i + 1});
+        if (count > 2) out.insert(out.end(), {add + count - 1, add});
         break;
     case Primitive::TriangleFan:
     case Primitive::Polygon:
         type = MTLPrimitiveTypeTriangle;
-        for (u32 i = 1; i + 1 < count; i++) out.insert(out.end(), {0, i, i + 1});
+        for (u32 i = 1; i + 1 < count; i++) out.insert(out.end(), {add, add + i, add + i + 1});
         break;
     case Primitive::Quads:
         type = MTLPrimitiveTypeTriangle;
-        for (u32 q = 0; q + 3 < count; q += 4) out.insert(out.end(), {q, q + 1, q + 2, q, q + 2, q + 3});
+        for (u32 q = 0; q + 3 < count; q += 4)
+            out.insert(out.end(), {add + q, add + q + 1, add + q + 2, add + q, add + q + 2, add + q + 3});
         break;
     case Primitive::QuadStrip:
         type = MTLPrimitiveTypeTriangle;
-        for (u32 q = 0; q + 3 < count; q += 2) out.insert(out.end(), {q, q + 1, q + 3, q, q + 3, q + 2});
+        for (u32 q = 0; q + 3 < count; q += 2)
+            out.insert(out.end(), {add + q, add + q + 1, add + q + 3, add + q, add + q + 3, add + q + 2});
         break;
     default: break;
     }
-    return out;
 }
 
 // Index list (positions from `first`) for a range whose indices include the restart index at `restarts` (positions in
 // the range, ascending), as RPCS3 uploads them (Emu/RSX/Common/BufferUtils.cpp upload_untouched,
 // expand_indexed_triangle_fan, expand_indexed_quads): strips restart at Metal's own restart index (0xFFFFFFFF, always
 // on for strips); points, lines and triangles drop the restart indices and go on; fans, polygons, quads, quad strips
-// and line loops start again after each one. Empty: nothing to draw.
-std::vector<u32> restart_list(Primitive p, u32 first, u32 count, const std::vector<u32>& restarts, MTLPrimitiveType& type)
+// and line loops start again after each one. Appended to `out`; nothing appended: nothing to draw.
+void restart_list(Primitive p, u32 first, u32 count, std::span<const u32> restarts, MTLPrimitiveType& type,
+    std::vector<u32>& out)
 {
-    std::vector<u32> out;
     if (native_primitive(p, type)) {
         const bool strip = type == MTLPrimitiveTypeTriangleStrip || type == MTLPrimitiveTypeLineStrip;
         usize next = 0;
@@ -1422,26 +1429,37 @@ std::vector<u32> restart_list(Primitive p, u32 first, u32 count, const std::vect
             }
             out.push_back(first + k);
         }
-        return out;
+        return;
     }
     u32 start = 0;
     const auto segment = [&](u32 end) {
         if (end <= start) return;
-        for (u32 v : convert_primitive(p, end - start, type)) out.push_back(first + start + v);
+        convert_primitive(p, end - start, type, out, first + start);
     };
     for (u32 r : restarts) {
         segment(r);
         start = r + 1;
     }
     segment(count);
-    return out;
 }
 
 } // namespace
 
+// The draw's fragment texture units, once (D-954).
+void MetalBackend::Impl::decode_textures(const RsxState& state)
+{
+    for (u32 t = 0; t < kFragmentTextureCount; t++) {
+        frag_tex[t] = state.fragment_texture(t);
+        frag_tex_control[t] = frag_tex[t].enabled ? texture_control(frag_tex[t]) : 0u;
+    }
+    vert_tex_decoded = 0;
+}
+
 void MetalBackend::Impl::do_draw(const RsxState& state)
 {
     tick++;
+    if (fast(kFastScratch)) draw_scratch.clear();
+    else draw_scratch = {}; // allocated anew each draw, as before D-956 (PSPOCKET_RSX_CPU_AB's other half)
     const DrawClause& d = state.draw;
     // A skipped draw names why in the frame trace too (D-084): a draw the trace does not show cannot be told apart from
     // one the game never made.
@@ -1455,6 +1473,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (!why.empty()) unsupported(std::move(why));
     };
 
+    // Programs and pipelines made in the background since the last draw (D-114, D-158), once before its lookups
+    // (D-953; they took them three times a draw).
+    if (fast(kFastLookups)) {
+        take_shader_cache();
+        take_async();
+    }
+    decode_textures(state); // D-954
+
     // ---- targets and programs ----
     PassTargets targets;
     skip_reason = "no render target";
@@ -1466,16 +1492,17 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         bind_epoch++;
     }
     cache_epoch = state.texture_cache_epoch;
-    feedback_fp = state.shader_program().offset;
+    const ShaderProgramInfo shader_program = state.shader_program();
+    feedback_fp = shader_program.offset;
     const bool points = d.primitive == Primitive::Points;
     compile_pending = false;
     shader::FpOptions fo;
-    fo.shader_control = state.shader_program().control;
+    fo.shader_control = shader_program.control;
     fo.mrt_count = targets.color_count;
     for (u32 i = 0; i < targets.color_count; i++) fo.output_swizzle[i] = surface_output_swizzle(targets.color[i]->gcm_format);
     std::array<Surface*, kFragmentTextureCount> depth_source{}; // depth buffers sampled directly (D-106)
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
-        const TextureInfo ti = state.fragment_texture(t);
+        const TextureInfo& ti = frag_tex[t];
         fo.texture_kind[t] = ti.cubemap && ti.dimension == 2 ? shader::TextureKind::Cube
             : ti.dimension == 1                               ? shader::TextureKind::Tex1D
             : ti.dimension == 3                               ? shader::TextureKind::Tex3D
@@ -1493,7 +1520,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         // Texel conversions and the alpha kill (D-174): compiled in for the units that have them, as RPCS3's
         // TEXTURE_FORMAT_CONVERT and TEXTURE_ALPHA_KILL; the bits reach the shader in fs.tex_control.
         if (ti.enabled) {
-            const u32 control = texture_control(ti);
+            const u32 control = frag_tex_control[t];
             if (control & texctl::kConvertMask) fo.texture_convert_mask = static_cast<u16>(fo.texture_convert_mask | (1u << t));
             if (control & texctl::kAlphaKill) fo.texture_alpha_kill_mask = static_cast<u16>(fo.texture_alpha_kill_mask | (1u << t));
         }
@@ -1511,12 +1538,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (sprite & 1) fo.point_coord_mask = static_cast<u16>((sprite >> 8) & 0x3ff);
     }
     // The depth bounds test (D-261), when its bounds can leave something out.
-    const DepthStencilInfo bounds = state.depth_stencil();
+    const DepthStencilInfo ds = state.depth_stencil();
+    const DepthStencilInfo& bounds = ds;
     fo.depth_bounds = targets.depth && bounds.depth_bounds_test &&
         (bounds.depth_bounds_min > 0.f || bounds.depth_bounds_max < 1.f || !(bounds.depth_bounds_min <= bounds.depth_bounds_max));
     // D-174 (RPCS3 RSXThread.cpp): NV4097_SET_SHADER_PACKER turns the colours sRGB on the 8-bit targets, never from
     // 32-bit exports; alpha to coverage is emulated (one sample here, as RPCS3 without hardware support).
-    const u32 colour_format = state.surface().color_format;
+    const u32 colour_format = draw_surface.color_format;
     const bool float_target = colour_format == static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) ||
                               colour_format == static_cast<u32>(SurfaceColorFormat::F_W32Z32Y32X32) ||
                               colour_format == static_cast<u32>(SurfaceColorFormat::F_X32);
@@ -1583,7 +1611,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         surf_h = std::min(surf_h, targets.depth->height);
     }
     // A multisampled target is drawn in samples (D-250): the scissor and the viewport are in pixels.
-    const AaFactors aa = aa_factors(state.surface().antialias);
+    const AaFactors aa = aa_factors(draw_surface.antialias);
     const u32 pix_w = surf_w / aa.x, pix_h = surf_h / aa.y;
     const ScissorInfo sc = state.scissor();
     const ViewportInfo vpi = state.viewport();
@@ -1617,7 +1645,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         fs.tex_scale[t][0] = fs.tex_scale[t][1] = 1.f;
         if (!(fp_textures & (1u << t))) continue;
-        const TextureInfo ti = state.fragment_texture(t);
+        const TextureInfo& ti = frag_tex[t];
         if (ti.is_unnormalized() && ti.width && ti.height) {
             fs.tex_scale[t][0] = 1.f / ti.width;
             fs.tex_scale[t][1] = 1.f / ti.height;
@@ -1628,7 +1656,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             fs.tex_scale[t][3] = static_cast<float>((ti.mag_filter != static_cast<u32>(tex::MagFilter::Nearest) ? 1u : 0u) |
                                                     (bf == tex::DEPTH16 || bf == tex::DEPTH24_D8 ? 2u : 0u));
         }
-        fs.tex_control[t] = ti.enabled ? texture_control(ti) : 0u; // D-174
+        fs.tex_control[t] = ti.enabled ? frag_tex_control[t] : 0u; // D-174
         if (Surface* zs = depth_source[t]) {
             bound[t] = zs->texture;
             zs->last_used = tick;
@@ -1677,7 +1705,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     std::array<id<MTLTexture>, 4> vbound{};
     for (u32 t = 0; t < 4; t++) {
         if (!(vp_textures & (1u << t))) continue;
-        const TextureInfo vt = state.vertex_texture(t);
+        const TextureInfo& vt = vertex_texture(state, t);
         bool ok = true;
         id<MTLTexture> tex = vt.enabled ? bind_texture(vt, 16 + t, ok) : nil;
         // Of the kind the program was translated for (D-274: 1D textures are 2D ones a texel high).
@@ -1743,21 +1771,19 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // A multisampled target is drawn one texel per sample (D-250): a point's pixels are that many texels (D-275). A
     // point is square, so with two samples across and one down it takes the larger count.
     {
-        const AaFactors point_aa = aa_factors(state.surface().antialias);
+        const AaFactors point_aa = aa_factors(draw_surface.antialias);
         vs.point_scale = static_cast<float>(std::max(point_aa.x, point_aa.y));
     }
     vs.restart_index = raster.restart_index;
 
     // ---- vertex and index data: raw guest bytes, decoded by the vertex shader (vertex pulling) ----
-    std::vector<Range> ranges;
-    std::vector<u32> index_offsets; // per range, for pulled indices
-    std::vector<std::vector<u32>> restarts; // per indexed range: where its restart indices are (D-249)
-    struct DrawnIndices {
-        bool ok;     // Metal can run the range over its indices as they are (D-271)
-        u32 offset;  // of its first index in index_data's buffer
-        u32 size;    // 2 or 4
-    };
-    std::vector<DrawnIndices> drawn_indices; // per indexed range
+    // The draw's lists, kept from draw to draw (D-956).
+    auto& ranges = draw_scratch.ranges;
+    auto& index_offsets = draw_scratch.index_offsets; // per range, for pulled indices
+    auto& restarts = draw_scratch.restarts; // per indexed range: where its restart indices are (D-249)
+    auto& restart_begin = draw_scratch.restart_begin;
+    auto& drawn_indices = draw_scratch.drawn_indices; // per indexed range
+    restart_begin.push_back(0);
     TransientAllocator::Allocation vertex_data{}, index_data{};
     u32 min_vi = ~0u, max_vi = 0;
     const u32 inputs = vp_inputs & state.vertex_attrib_input_mask();
@@ -1795,23 +1821,31 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             before_access(*ea, bytes, false); // a deferred copy to it lands first (D-107)
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
-            std::vector<u32> at_restart;
-            const u32 all_ones = isize == 2 ? 0xffffu : 0xffffffffu;
             bool has_all_ones = false;
-            for (u32 i = 0; i < r.count; i++) {
-                const u32 raw = isize == 2 ? ps_ld16(dst + i * 2) : ps_ld32(dst + i * 4);
-                has_all_ones |= raw == all_ones;
-                if (restart_on && raw == raster.restart_index) {
-                    at_restart.push_back(i); // not a vertex: it must not widen the vertex range
-                    continue;
+            if (fast(kFastIndexScan)) { // in NEON (D-957)
+                IndexScan scan{min_vi, max_vi, false};
+                scan_indices_be(dst, r.count, isize, vs.base_index, restart_on, raster.restart_index, scan, restarts);
+                min_vi = scan.min_vi;
+                max_vi = scan.max_vi;
+                has_all_ones = scan.has_all_ones;
+            } else {
+                const u32 all_ones = isize == 2 ? 0xffffu : 0xffffffffu;
+                for (u32 i = 0; i < r.count; i++) {
+                    const u32 raw = isize == 2 ? ps_ld16(dst + i * 2) : ps_ld32(dst + i * 4);
+                    has_all_ones |= raw == all_ones;
+                    if (restart_on && raw == raster.restart_index) {
+                        restarts.push_back(i); // not a vertex: it must not widen the vertex range
+                        continue;
+                    }
+                    const u32 vi = (raw + vs.base_index) & 0xfffff;
+                    min_vi = std::min(min_vi, vi);
+                    max_vi = std::max(max_vi, vi);
                 }
-                const u32 vi = (raw + vs.base_index) & 0xfffff;
-                min_vi = std::min(min_vi, vi);
-                max_vi = std::max(max_vi, vi);
             }
+            const bool no_restarts = restarts.size() == restart_begin.back();
+            restart_begin.push_back(static_cast<u32>(restarts.size()));
             // Metal runs it over these very bytes (D-271), unless an index of all ones would restart a strip there.
-            drawn_indices.push_back({at_restart.empty() && !has_all_ones, index_data.offset + at, isize});
-            restarts.push_back(std::move(at_restart));
+            drawn_indices.push_back({no_restarts && !has_all_ones, index_data.offset + at, isize});
             ranges.push_back({r.first, r.count});
             index_offsets.push_back(index_data.offset + at - r.first * isize); // wraps; so does the shader
             at += (bytes + 3) & ~3u;
@@ -1879,10 +1913,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         skip_reason = "no vertices";
         if (ranges.empty()) return skip("");
         if (max_vi - min_vi > 0x100000) return skip(std::format("vertex range {}..{} is too large", min_vi, max_vi));
-        struct Copy {
-            u32 attr, ea, size;
-        };
-        std::vector<Copy> copies;
+        using Copy = DrawScratch::Copy;
+        auto& copies = draw_scratch.copies;
         u32 total = 0;
         const u32 freq_mask = state.frequency_divider_mask();
         for (u32 i = 0; i < kVertexAttributeCount; i++) {
@@ -1917,10 +1949,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         // vertex): each overlapping or touching group is copied once, and its attributes point into that copy
         // (D-211). The shader reads bytes at any offset.
         std::sort(copies.begin(), copies.end(), [](const Copy& x, const Copy& y) { return x.ea < y.ea; });
-        struct Span {
-            u32 ea, end, offset;
-        };
-        std::vector<Span> spans;
+        using Span = DrawScratch::Span;
+        auto& spans = draw_scratch.spans;
         for (const Copy& c : copies) {
             if (!spans.empty() && c.ea <= spans.back().end) spans.back().end = std::max(spans.back().end, c.ea + c.size);
             else spans.push_back({c.ea, c.ea + c.size, 0});
@@ -1967,7 +1997,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const TransientAllocator::Allocation& consts = consts_upload;
 
     // Fragment constants: patched by games between draws, so read every draw.
-    std::vector<std::array<float, 4>> fconst;
+    auto& fconst = draw_scratch.fconst;
     shader::read_fragment_constants(*fprog, mem.host(fp_ea), fconst);
     if (fconst.empty()) fconst.push_back({0.f, 0.f, 0.f, 0.f});
     const ShaderWindow win = state.shader_window();
@@ -2008,7 +2038,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         stats.clears_waited += clears_waiting_on_pass;
         clears_waiting_on_pass = 0;
     }
-    id<MTLRenderPipelineState> pso = interpret ? nil : pipeline_for(*vp, *fp, state);
+    const ColorMaskInfo cm = state.color_mask();
+    id<MTLRenderPipelineState> pso = interpret ? nil : pipeline_for(*vp, *fp, draw_blend, cm);
     skip_reason = compile_pending ? "pipeline state compiling" : "pipeline state";
     if (!interpret && !pso) {
         if (!(compile_pending && interpreter_on())) {
@@ -2055,7 +2086,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             stats.draws_compiling++;
             return skip("");
         }
-        pso = pipeline_for(*ivs, *ifs, state);
+        pso = pipeline_for(*ivs, *ifs, draw_blend, cm);
         if (!pso) {
             stats.draws_compiling++;
             return skip("");
@@ -2077,46 +2108,108 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
         encoder_zpass_slot = -1;
     }
-    [enc setRenderPipelineState:pso];
-    [enc setDepthStencilState:depth_state_for(state)];
-    const DepthStencilInfo ds = state.depth_stencil();
-    [enc setStencilFrontReferenceValue:ds.front.ref backReferenceValue:ds.back.ref];
-    [enc setViewport:MTLViewport{0, 0, static_cast<double>(surf_w), static_cast<double>(surf_h), static_cast<double>(z_near),
-                                 static_cast<double>(z_far)}];
+    // The encoder's state, each part set only when it changes (D-954).
+    EncoderState& es = enc_state;
+    if (!fast(kFastSetters) || es.encoder != enc) {
+        forget_encoder_state();
+        es.encoder = enc;
+    }
+    if (es.pso != pso) {
+        [enc setRenderPipelineState:pso];
+        es.pso = pso;
+    }
+    if (id<MTLDepthStencilState> depth = depth_state_for(ds); es.depth != depth) {
+        [enc setDepthStencilState:depth];
+        es.depth = depth;
+    }
+    if (es.stencil_front != ds.front.ref || es.stencil_back != ds.back.ref) {
+        [enc setStencilFrontReferenceValue:ds.front.ref backReferenceValue:ds.back.ref];
+        es.stencil_front = ds.front.ref;
+        es.stencil_back = ds.back.ref;
+    }
+    const MTLViewport viewport{0, 0, static_cast<double>(surf_w), static_cast<double>(surf_h), static_cast<double>(z_near),
+        static_cast<double>(z_far)};
+    if (!es.viewport_set || std::memcmp(&es.viewport, &viewport, sizeof(viewport)) != 0) {
+        [enc setViewport:viewport];
+        es.viewport = viewport;
+        es.viewport_set = true;
+    }
     // NV4097_SET_ZMIN_MAX_CONTROL: depth clamped rather than clipped (RPCS3 VKGSRender.cpp: clamp, or no clip).
-    [enc setDepthClipMode:raster.depth_clamp || !raster.depth_clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-    [enc setScissorRect:MTLScissorRect{sx0 * aa.x, sy0 * aa.y, (sx1 - sx0) * aa.x, (sy1 - sy0) * aa.y}];
-    if (raster.cull_enable) {
-        [enc setCullMode:static_cast<CullFace>(raster.cull_face) == CullFace::Front ? MTLCullModeFront : MTLCullModeBack];
-    } else {
-        [enc setCullMode:MTLCullModeNone];
+    const MTLDepthClipMode clip = raster.depth_clamp || !raster.depth_clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
+    if (es.clip_mode != static_cast<s32>(clip)) {
+        [enc setDepthClipMode:clip];
+        es.clip_mode = static_cast<s32>(clip);
+    }
+    const MTLScissorRect scissor{sx0 * aa.x, sy0 * aa.y, (sx1 - sx0) * aa.x, (sy1 - sy0) * aa.y};
+    if (!es.scissor_set || es.scissor.x != scissor.x || es.scissor.y != scissor.y || es.scissor.width != scissor.width ||
+        es.scissor.height != scissor.height) {
+        [enc setScissorRect:scissor];
+        es.scissor = scissor;
+        es.scissor_set = true;
+    }
+    const MTLCullMode cull = !raster.cull_enable                                           ? MTLCullModeNone
+                           : static_cast<CullFace>(raster.cull_face) == CullFace::Front ? MTLCullModeFront
+                                                                                        : MTLCullModeBack;
+    if (es.cull != static_cast<s32>(cull)) {
+        [enc setCullMode:cull];
+        es.cull = static_cast<s32>(cull);
     }
     // Facing is judged in window coordinates with memory row 0 at the top, in Metal as for the RSX (the viewport
     // transform keeps that orientation), so the winding passes through.
-    [enc setFrontFacingWinding:raster.front_face == static_cast<u32>(FrontFace::CW) ? MTLWindingClockwise
-                                                                                   : MTLWindingCounterClockwise];
-    [enc setTriangleFillMode:raster.front_polygon_mode == static_cast<u32>(PolygonMode::Line) ? MTLTriangleFillModeLines
-                                                                                               : MTLTriangleFillModeFill];
-    if (raster.poly_offset_fill) {
-        [enc setDepthBias:raster.poly_offset_bias slopeScale:raster.poly_offset_scale clamp:0];
-    } else {
-        [enc setDepthBias:0 slopeScale:0 clamp:0];
+    const MTLWinding winding =
+        raster.front_face == static_cast<u32>(FrontFace::CW) ? MTLWindingClockwise : MTLWindingCounterClockwise;
+    if (es.winding != static_cast<s32>(winding)) {
+        [enc setFrontFacingWinding:winding];
+        es.winding = static_cast<s32>(winding);
     }
-    const BlendInfo blend = state.blend();
-    [enc setBlendColorRed:((blend.color >> 16) & 0xff) / 255.f
-                    green:((blend.color >> 8) & 0xff) / 255.f
-                     blue:(blend.color & 0xff) / 255.f
-                    alpha:(blend.color >> 24) / 255.f];
-    [enc setVertexBuffer:vertex_data.buffer offset:0 atIndex:shader::slot::kVsVertexData];
-    [enc setVertexBuffer:index_data.buffer offset:0 atIndex:shader::slot::kVsIndexData];
-    [enc setVertexBuffer:consts.buffer offset:consts.offset atIndex:shader::slot::kVsConstants];
+    const MTLTriangleFillMode fill = raster.front_polygon_mode == static_cast<u32>(PolygonMode::Line)
+        ? MTLTriangleFillModeLines
+        : MTLTriangleFillModeFill;
+    if (es.fill != static_cast<s32>(fill)) {
+        [enc setTriangleFillMode:fill];
+        es.fill = static_cast<s32>(fill);
+    }
+    const float bias = raster.poly_offset_fill ? raster.poly_offset_bias : 0.f;
+    const float slope = raster.poly_offset_fill ? raster.poly_offset_scale : 0.f;
+    if (!es.bias_set || std::bit_cast<u32>(es.bias) != std::bit_cast<u32>(bias) ||
+        std::bit_cast<u32>(es.slope) != std::bit_cast<u32>(slope)) {
+        [enc setDepthBias:bias slopeScale:slope clamp:0];
+        es.bias = bias;
+        es.slope = slope;
+        es.bias_set = true;
+    }
+    const BlendInfo& blend = draw_blend;
+    if (!es.blend_color_set || es.blend_color != blend.color) {
+        [enc setBlendColorRed:((blend.color >> 16) & 0xff) / 255.f
+                        green:((blend.color >> 8) & 0xff) / 255.f
+                         blue:(blend.color & 0xff) / 255.f
+                        alpha:(blend.color >> 24) / 255.f];
+        es.blend_color = blend.color;
+        es.blend_color_set = true;
+    }
+    const auto vertex_buffer = [&](id<MTLBuffer> buffer, NSUInteger offset, u32 slot) {
+        if (es.vbuf[slot] == buffer && es.voff[slot] == offset) return;
+        [enc setVertexBuffer:buffer offset:offset atIndex:slot];
+        es.vbuf[slot] = buffer;
+        es.voff[slot] = offset;
+    };
+    vertex_buffer(vertex_data.buffer, 0, shader::slot::kVsVertexData);
+    vertex_buffer(index_data.buffer, 0, shader::slot::kVsIndexData);
+    vertex_buffer(consts.buffer, consts.offset, shader::slot::kVsConstants);
     static constexpr std::array<float, 4> kNoConstants{}; // the interpreter reads the buffer by index: always bound
-    if (fconst.empty()) {
-        [enc setFragmentBytes:kNoConstants.data() length:sizeof(kNoConstants) atIndex:shader::slot::kFsConstants];
-    } else {
-        [enc setFragmentBytes:fconst.data() length:fconst.size() * 16 atIndex:shader::slot::kFsConstants];
+    {
+        const void* fc = fconst.empty() ? static_cast<const void*>(kNoConstants.data()) : fconst.data();
+        const usize fc_bytes = fconst.empty() ? sizeof(kNoConstants) : fconst.size() * 16;
+        if (es.fconst.size() != fc_bytes || std::memcmp(es.fconst.data(), fc, fc_bytes) != 0) {
+            [enc setFragmentBytes:fc length:fc_bytes atIndex:shader::slot::kFsConstants];
+            es.fconst.assign(static_cast<const u8*>(fc), static_cast<const u8*>(fc) + fc_bytes);
+        }
     }
-    [enc setFragmentBytes:&fs length:sizeof(fs) atIndex:shader::slot::kFsParams];
+    if (!es.fs_set || std::memcmp(es.fs.data(), &fs, sizeof(fs)) != 0) {
+        [enc setFragmentBytes:&fs length:sizeof(fs) atIndex:shader::slot::kFsParams];
+        std::memcpy(es.fs.data(), &fs, sizeof(fs));
+        es.fs_set = true;
+    }
     if (interpret) {
         // The interpreter's programs and options; its textures by kind (a unit's at its kind's slots, D-940), the
         // other slots 1x1 stand-ins of their type, every sampler and the stipple pattern bound (it reads by index).
@@ -2137,7 +2230,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                                ? shader::islot::kFsTexDepth
                                : shader::islot::kFsTex2D;
             if (bound[t]) ft[base + t] = bound[t];
-            [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+            [enc setFragmentSamplerState:sampler_for(frag_tex[t]) atIndex:t];
         }
         ft[shader::islot::kFsDepthBounds] = bounds_texture ? bounds_texture : dummy_depth;
         [enc setFragmentTextures:ft.data() withRange:NSMakeRange(0, ft.size())];
@@ -2154,24 +2247,45 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                            : k == shader::TextureKind::Tex3D ? shader::islot::kVsTex3D
                                                              : shader::islot::kVsTex2D;
             if (vbound[t]) vt[base + t] = vbound[t];
-            [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
+            [enc setVertexSamplerState:sampler_for(vertex_texture(state, t)) atIndex:t];
         }
         [enc setVertexTextures:vt.data() withRange:NSMakeRange(0, vt.size())];
+        // Its bindings are not the translation's: the next draw binds its own again.
+        es.ftex = {};
+        es.fsamp = {};
+        es.bounds_tex = nil;
+        es.vtex = {};
+        es.vsamp = {};
     } else {
         for (u32 t = 0; t < kFragmentTextureCount; t++) {
             if (!bound[t]) continue;
-            [enc setFragmentTexture:bound[t] atIndex:t];
-            [enc setFragmentSamplerState:sampler_for(state.fragment_texture(t)) atIndex:t];
+            if (es.ftex[t] != bound[t]) {
+                [enc setFragmentTexture:bound[t] atIndex:t];
+                es.ftex[t] = bound[t];
+            }
+            if (id<MTLSamplerState> sampler = sampler_for(frag_tex[t]); es.fsamp[t] != sampler) {
+                [enc setFragmentSamplerState:sampler atIndex:t];
+                es.fsamp[t] = sampler;
+            }
         }
-        if (bounds_texture) [enc setFragmentTexture:bounds_texture atIndex:shader::slot::kFsDepthBounds];
+        if (bounds_texture && es.bounds_tex != bounds_texture) {
+            [enc setFragmentTexture:bounds_texture atIndex:shader::slot::kFsDepthBounds];
+            es.bounds_tex = bounds_texture;
+        }
         if (fo.polygon_stipple) {
             [enc setFragmentBytes:&state.regs[m::NV4097_SET_POLYGON_STIPPLE_PATTERN] length:32 * sizeof(u32)
                           atIndex:shader::slot::kFsStipple];
         }
         for (u32 t = 0; t < 4; t++) {
             if (!vbound[t]) continue;
-            [enc setVertexTexture:vbound[t] atIndex:t];
-            [enc setVertexSamplerState:sampler_for(state.vertex_texture(t)) atIndex:t];
+            if (es.vtex[t] != vbound[t]) {
+                [enc setVertexTexture:vbound[t] atIndex:t];
+                es.vtex[t] = vbound[t];
+            }
+            if (id<MTLSamplerState> sampler = sampler_for(vertex_texture(state, t)); es.vsamp[t] != sampler) {
+                [enc setVertexSamplerState:sampler atIndex:t];
+                es.vsamp[t] = sampler;
+            }
         }
     }
 
@@ -2180,7 +2294,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     const u32 pulled_mode = vs.index_mode;
     for (usize r = 0; r < ranges.size(); r++) {
         if (r < index_offsets.size()) vs.index_offset = index_offsets[r];
-        const Range rg = ranges[r];
+        const DrawScratch::Range rg = ranges[r];
         // An indexed range Metal runs over the game's indices: each vertex they share runs once (D-271).
         const bool drawn = native && r < drawn_indices.size() && drawn_indices[r].ok;
         vs.index_mode = !drawn ? pulled_mode
@@ -2193,18 +2307,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                            indexBuffer:index_data.buffer indexBufferOffset:drawn_indices[r].offset];
             continue;
         }
-        const bool restart = r < restarts.size() && !restarts[r].empty();
+        const bool restart = r + 1 < restart_begin.size() && restart_begin[r + 1] > restart_begin[r];
         if (native && !restart) {
             [enc drawPrimitives:ptype vertexStart:rg.first vertexCount:rg.count];
             continue;
         }
         MTLPrimitiveType ctype = MTLPrimitiveTypeTriangle;
-        std::vector<u32> list;
-        if (restart) {
-            list = restart_list(d.primitive, rg.first, rg.count, restarts[r], ctype); // positions, restarts (D-249)
+        auto& list = draw_scratch.list;
+        list.clear();
+        if (restart) { // positions, restarts (D-249)
+            restart_list(d.primitive, rg.first, rg.count,
+                std::span<const u32>(restarts).subspan(restart_begin[r], restart_begin[r + 1] - restart_begin[r]), ctype,
+                list);
         } else {
-            list = convert_primitive(d.primitive, rg.count, ctype);
-            for (u32& v : list) v += rg.first; // vertex_id = position in the range, as for native draws
+            convert_primitive(d.primitive, rg.count, ctype, list, rg.first); // vertex_id = position in the range
         }
         if (list.empty()) continue;
         auto ib = transient.alloc(static_cast<u32>(list.size() * 4), 16);
@@ -2215,7 +2331,6 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     stats.draws++;
     // What the draw wrote is new (D-105): colour targets it does not mask out, the depth buffer when it writes depth or
     // stencil.
-    const ColorMaskInfo cm = state.color_mask();
     for (u32 i = 0; i < targets.color_count; i++)
         if (cm.mask[targets.rsx_index[i]] != 0) targets.color[i]->generation++;
     if (targets.depth) {
@@ -2233,7 +2348,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     finish_closing(false); // the frame's stores are counted in it (D-945)
-    const usize half = ab_on() ? 1 : 0; // the PSPOCKET_GPU_AB half of the frame that ends here
+    const usize half = ab_half(); // the PSPOCKET_GPU_AB half of the frame that ends here
     if (ab_period) {
         // The RSX thread's CPU time of the frame that ends here, to the half its draws were in (D-278): with GPU time
         // alone a change on the CPU side could not be told within one run.
@@ -2245,6 +2360,8 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         ab_load_bytes[half] += stats.attachment_load_bytes - ab_last[1];
         ab_store_bytes[half] += stats.attachment_store_bytes - ab_last[2];
         ab_last = {stats.render_passes, stats.attachment_load_bytes, stats.attachment_store_bytes};
+        ab_draws[half] += stats.draws - ab_last_draws;
+        ab_last_draws = stats.draws;
     }
     stats.flips++;
     if (pass_times) {
@@ -2263,13 +2380,29 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
                 per(ab_cpu_ns[0], 0) / 1e6, per(ab_cpu_ns[1], 1) / 1e6, per(ab_passes[0], 0), per(ab_passes[1], 1),
                 per(ab_load_bytes[0], 0) / 1048576.0, per(ab_load_bytes[1], 1) / 1048576.0,
                 per(ab_store_bytes[0], 0) / 1048576.0, per(ab_store_bytes[1], 1) / 1048576.0);
+            if (ab_cpu) {
+                const auto us = [&](usize h) {
+                    return ab_draws[h] ? static_cast<double>(ab_cpu_ns[h]) / 1e3 / static_cast<double>(ab_draws[h]) : 0.0;
+                };
+                PS_LOG_INFO(kChan, "RSX CPU A/B (PSPOCKET_RSX_CPU_AB): fast paths off {:.3f} us a draw ({:.0f} draws a "
+                    "frame), on {:.3f} us a draw ({:.0f} draws a frame): {:+.1f}%; a frame off and on: fragment programs "
+                    "{:.1f} and {:.1f} found in their lists, {:.1f} and {:.1f} not; vertex programs {:.1f} and {:.1f} "
+                    "looked up, {:.1f} and {:.1f} decoded, {:.1f} and {:.1f} compared", us(0), per(ab_draws[0], 0), us(1),
+                    per(ab_draws[1], 1), us(0) > 0 ? (us(1) / us(0) - 1) * 100 : 0.0, per(fp_variant_hits[0], 0),
+                    per(fp_variant_hits[1], 1), per(fp_variant_misses[0], 0), per(fp_variant_misses[1], 1),
+                    per(vp_lookups[0], 0), per(vp_lookups[1], 1), per(vp_decodes[0], 0), per(vp_decodes[1], 1),
+                    per(vp_compares[0], 0), per(vp_compares[1], 1));
+                fp_variant_hits = fp_variant_misses = vp_lookups = vp_decodes = vp_compares = {};
+            }
             ab_frames = {};
             ab_cpu_ns = {};
+            ab_draws = {};
             ab_passes = ab_load_bytes = ab_store_bytes = {};
         }
     }
     compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)
     if (stats.flips % std::clamp<u64>(config.evict_after_flips / 2, 1, 150) == 0) evict_unused(config.evict_after_flips); // D-116
+    trim_texture_pool(false); // D-956
     if (trim_requested.exchange(false, std::memory_order_acq_rel)) trim();
     if (tracing && request.flip_index >= config.trace_frame) {
         PS_LOG_INFO("rsx.trace", "frame {} ends: flip {} shows {:#010x}; {} clears and draws, {} colour targets",
@@ -2382,6 +2515,7 @@ void MetalBackend::Impl::trim()
     const usize textures_before = textures.size(), surfaces_before = surfaces.size();
     const u64 texture_mb = texture_bytes() >> 20, surface_mb = surface_bytes() >> 20;
     evict_unused(60);
+    trim_texture_pool(true);
     for (auto& s : surfaces) {
         if (!draw_targets.contains(s.get()) && !(pass_open && pass.contains(s.get()))) s->feedback = {};
     }
@@ -2518,8 +2652,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "({:.1f} over a target drawn to again, {:.1f} written); {} programs and {} pipelines "
                            "made ({:.1f} ms, {:.2f} draws waiting for one, {:.2f} drawn by the interpreter); "
                            "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
-                           "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures, {:.2f} "
-                           "surface reloads; {:.2f} ms waiting for the GPU; GPU memory {:.0f} MB, {} deferred",
+                           "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures ({:.2f} "
+                           "copies into pooled textures), {:.2f} surface reloads; {:.2f} ms waiting for the GPU; GPU "
+                           "memory {:.0f} MB, {} deferred",
             w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.attachment_load_mb, w.attachment_store_mb,
             w.attachment_store_skipped_mb, per_frame(m.stats.clear_only_passes, m.report_clear_only),
             per_frame(m.stats.clear_only_store_bytes, m.report_clear_only_bytes) / 1048576.0, w.clears_folded,
@@ -2530,18 +2665,21 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.draws_interpreted, w.textures, w.texture_mb,
             w.surfaces, w.surface_mb,
-            w.feedback_copies, w.depth_bounds_draws, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
+            w.feedback_copies, w.depth_bounds_draws, w.corner_textures,
+            per_frame(m.stats.pooled_textures_taken, m.report_pooled), w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
             w.deferred_queue);
         // The draws that sampled a target they drew to (D-947): copies made and why, copies kept as the texture
         // cache, the game's invalidations, and the draws behind most of them.
         if (w.feedback_copies + w.feedback_reused >= 1.0) {
-            std::vector<std::pair<std::string, Impl::FeedbackSource>> top(m.feedback_sources.begin(), m.feedback_sources.end());
+            std::vector<std::pair<Impl::FeedbackKey, Impl::FeedbackSource>> top(m.feedback_sources.begin(),
+                m.feedback_sources.end());
             std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
                 return a.second.made + a.second.reused > b.second.made + b.second.reused;
             });
             std::string most;
             for (usize i = 0; i < top.size() && i < 3; i++) {
-                most += std::format("{}{} ({:.1f} copies, {:.1f} kept a frame)", i ? "; " : "", top[i].first,
+                most += std::format("{}{} ({:.1f} copies, {:.1f} kept a frame)", i ? "; " : "",
+                    Impl::feedback_source_name(top[i].first),
                     static_cast<double>(top[i].second.made) / n, static_cast<double>(top[i].second.reused) / n);
             }
             PS_LOG_INFO(kChan, "feedback (last {}): {:.2f} copies a frame ({:.2f} the first, {:.2f} after a write and "
@@ -2589,6 +2727,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_clears_waited = m.stats.clears_waited;
         m.report_clear_passes = m.stats.clear_passes;
         m.report_corners = m.stats.corner_textures;
+        m.report_pooled = m.stats.pooled_textures_taken;
         m.report_reloads = m.stats.surface_reloads;
         m.report_gpu_wait_ns = m.stats.gpu_wait_ns;
         m.report_flips = 0;
@@ -2692,6 +2831,7 @@ bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u
         m.submit(false);
         m.stats.readbacks++;
         m.stats.deferred_readbacks++;
+        m.note_deferred(later);
         m.deferred.push_back(std::move(later));
     }
     return true;
@@ -2749,6 +2889,7 @@ bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 wr
             d.buffer = m.render_buffer();
             m.submit(false);
         }
+        m.note_deferred(d);
         m.deferred.push_back(std::move(d));
     }
     return true;
@@ -2763,6 +2904,7 @@ void MetalBackend::defer(u32 addr, u32 size, std::function<void()> action)
     Impl::Deferred d;
     d.then = std::move(action);
     d.write_addr = addr, d.write_size = size;
+    impl_->note_deferred(d);
     impl_->deferred.push_back(std::move(d));
 }
 

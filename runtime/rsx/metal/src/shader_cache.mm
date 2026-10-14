@@ -440,7 +440,11 @@ void MetalBackend::Impl::take_shader_cache()
         const auto vp = programs.find(pl.vp_key), fp = programs.find(pl.fp_key);
         if (vp == programs.end() || fp == programs.end() || vp->second.function != pl.vp || fp->second.function != pl.fp)
             continue;
-        if (pipelines.emplace(pipeline_key(pl.params, pl.vp, pl.fp), pl.pso).second) stats.pipelines_prewarmed++;
+        const PipelineKey key = pipeline_key(pl.params, pl.vp, pl.fp);
+        if (!pipelines.contains(key)) {
+            add_pipeline(key, pl.pso);
+            stats.pipelines_prewarmed++;
+        }
     }
 }
 

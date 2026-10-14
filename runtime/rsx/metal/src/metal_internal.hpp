@@ -197,6 +197,10 @@ struct PipelineKey {
     std::array<u32, 4> blend{}; // enable | factors | ops packed per target (see pipeline_cache.mm)
     std::array<u32, 4> blend_ops{};
     bool operator<(const PipelineKey& o) const;
+    bool operator==(const PipelineKey& o) const = default;
+};
+struct PipelineKeyHash { // D-953
+    size_t operator()(const PipelineKey& k) const;
 };
 
 MTLCompileOptions* shader_compile_options(); // pipeline_cache.mm: what every program compiles with
@@ -470,7 +474,25 @@ struct MetalBackend::Impl {
     std::array<u64, 2> ab_passes{}, ab_load_bytes{}, ab_store_bytes{};
     std::array<u64, 3> ab_last{};
     s32 submit_half = -1; // the flip's submit: the half of the frame its buffer holds (ab_on() has moved on by then)
-    bool ab_on() const { return !ab_period || (stats.flips / ab_period) % 2 == 1; } // the change applies
+    // PSPOCKET_RSX_CPU_AB=N (D-953): the same halves, but what they switch is the RSX thread's per-draw fast paths
+    // (fast()), the GPU-side experiments staying on in both; each half's draws are counted for its CPU time a draw.
+    bool ab_cpu = false;
+    std::array<u64, 2> ab_draws{};
+    u64 ab_last_draws = 0;
+    // Each half's program lookups (D-953): fragment programs found in their own list or not; vertex programs looked
+    // up, decoded, and compared with one decoded before.
+    std::array<u64, 2> fp_variant_hits{}, fp_variant_misses{}, vp_lookups{}, vp_decodes{}, vp_compares{};
+    usize ab_half() const { return ab_period && (stats.flips / ab_period) % 2 == 1 ? 1 : 0; }
+    bool ab_on() const { return !ab_period || ab_cpu || (stats.flips / ab_period) % 2 == 1; } // the change applies
+    // The fast paths by item (PSPOCKET_RSX_CPU_AB=N:MASK switches only those in MASK; all by default).
+    enum FastPath : u32 {
+        kFastLookups = 1,   // surfaces by address, pipelines by hash, one take a draw, the fragment program's list (D-953)
+        kFastSetters = 4,   // encoder state set only when it changes (D-954)
+        kFastScratch = 8,   // the draw's lists kept from draw to draw (D-956)
+        kFastIndexScan = 16 // the index scan in NEON (D-957)
+    };
+    u32 ab_items = ~0u;
+    bool fast(u32 item = ~0u) const { return !ab_cpu || !(ab_items & item) || ab_half() == 1; }
     // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets. The
     // copies between targets are told apart (D-148): an NV0039 copy on the GPU, a target sampled while drawn to, a
     // corner of a larger target, pixels between a target and its parent, a target grown over a smaller one.
@@ -494,6 +516,7 @@ struct MetalBackend::Impl {
     u64 report_programs = 0, report_pipelines = 0, report_compile_ns = 0, report_draws_compiling = 0;
     u64 report_draws_interpreted = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
+    u64 report_pooled = 0; // D-956
     u64 report_depth_bounds = 0; // D-261
     u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
     u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947
@@ -534,7 +557,18 @@ struct MetalBackend::Impl {
     struct FeedbackSource {
         u64 made = 0, reused = 0;
     };
-    std::unordered_map<std::string, FeedbackSource> feedback_sources; // this report window's
+    // By the draw's fragment program and unit and the target's address, size and format; named only when reported
+    // (D-956: a name formatted for every copy and every draw that read a kept one).
+    using FeedbackKey = std::array<u32, 6>;
+    struct FeedbackKeyHash {
+        size_t operator()(const FeedbackKey& k) const
+        {
+            u64 h = 0;
+            for (u32 v : k) h = (h ^ v) * 0x100000001b3ull;
+            return static_cast<size_t>(h);
+        }
+    };
+    std::unordered_map<FeedbackKey, FeedbackSource, FeedbackKeyHash> feedback_sources; // this report window's
     bool pass_open = false;    // targets chosen (descriptor built)
     bool pass_partial = false; // the pass draws in part of an attachment: its load-action clear would clear the rest
     bool pass_started = false; // encoder created
@@ -625,9 +659,44 @@ struct MetalBackend::Impl {
 
     // Caches
     std::vector<std::unique_ptr<Surface>> surfaces;
+    // The surfaces at each guest address, in the order they were made (D-953): a surface's address is set when it is
+    // made (make_surface) and it leaves only through remove_surface. The lookups by address read these instead of
+    // scanning every surface (some 150 in GTA V, up to four scans for each texture a draw binds); they meet them in
+    // the order the scans did.
+    std::unordered_map<u32, std::vector<Surface*>> surfaces_at;
+    const std::vector<Surface*>& surfaces_at_address(u32 address) const
+    {
+        static const std::vector<Surface*> kNone;
+        const auto it = surfaces_at.find(address);
+        return it == surfaces_at.end() ? kNone : it->second;
+    }
+    // Calls f on each surface at `address` in that order until it returns true; the surface it stopped at, or null.
+    template <class F>
+    Surface* visit_surfaces_at(u32 address, F&& f) const
+    {
+        if (!fast(kFastLookups)) { // the scan, for PSPOCKET_RSX_CPU_AB's other half
+            for (const auto& s : surfaces)
+                if (s->address == address && f(s.get())) return s.get();
+            return nullptr;
+        }
+        for (Surface* s : surfaces_at_address(address))
+            if (f(s)) return s;
+        return nullptr;
+    }
     std::unordered_map<u64, std::unique_ptr<CachedTexture>> textures; // key: hash of decode inputs
     std::unordered_set<u64> reinterpretations; // (target format, texture format, width) pairs logged once
-    std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines;
+    // By hash, and the last one found again first (D-953): an ordered map's compares of the 72-byte key were most of
+    // each draw's lookup.
+    std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines;
+    std::map<PipelineKey, id<MTLRenderPipelineState>> pipelines_ordered; // PSPOCKET_RSX_CPU_AB's other half
+    PipelineKey last_pipeline_key{};
+    id<MTLRenderPipelineState> last_pipeline = nil; // nil: none; forgotten whenever `pipelines` changes
+    void add_pipeline(const PipelineKey& key, id<MTLRenderPipelineState> pso)
+    {
+        pipelines[key] = pso;
+        pipelines_ordered[key] = pso;
+        last_pipeline = nil;
+    }
     std::unordered_map<std::string, CompiledProgram> programs; // by program hash and translation options
     std::unique_ptr<ShaderCache> shader_cache;                 // D-114; null: none configured
     std::unique_ptr<AsyncCompiler> async;                      // D-158; null: draws wait for their compiles
@@ -699,6 +768,116 @@ struct MetalBackend::Impl {
     std::vector<id<MTLTexture>> outputs;
     u32 next_output = 0;
 
+    // A draw's working lists, kept from draw to draw (D-956): made anew, they were a dozen heap allocations a draw.
+    struct DrawScratch {
+        struct Range {
+            u32 first, count;
+        };
+        struct DrawnIndices {
+            bool ok;    // Metal can run the range over its indices as they are (D-271)
+            u32 offset; // of its first index in index_data's buffer
+            u32 size;   // 2 or 4
+        };
+        struct Copy {
+            u32 attr, ea, size;
+        };
+        struct Span {
+            u32 ea, end, offset;
+        };
+        std::vector<Range> ranges;
+        std::vector<u32> index_offsets;
+        std::vector<u32> restarts;      // the indexed ranges' restart positions, range after range (D-249)
+        std::vector<u32> restart_begin; // range r's are restarts[restart_begin[r] .. restart_begin[r + 1])
+        std::vector<DrawnIndices> drawn_indices;
+        std::vector<Copy> copies;
+        std::vector<Span> spans;
+        std::vector<std::array<float, 4>> fconst;
+        std::vector<u32> list; // a range's index list (restarts, converted primitives)
+        void clear()
+        {
+            ranges.clear();
+            index_offsets.clear();
+            restarts.clear();
+            restart_begin.clear();
+            drawn_indices.clear();
+            copies.clear();
+            spans.clear();
+            fconst.clear();
+            list.clear();
+        }
+    };
+    DrawScratch draw_scratch;
+
+    // The textures copies of targets are made into (D-956): a feedback copy (D-148, D-947) and a corner (D-120) go into
+    // a new texture at each change, so the GPU never waits for the draws that read the old one. The old one waits here
+    // until the frame that last used it has run, then serves the next copy of its format and size: making them was
+    // some 3% of the RSX thread in GTA V (six of each a frame). One not taken within kPoolFrames frames goes.
+    struct PooledTexture {
+        __strong id<MTLTexture> texture;
+        u64 frame; // the frame being recorded when it was put here: free once the frame event has reached it
+    };
+    static constexpr u64 kPoolFrames = 8;
+    static constexpr usize kPoolTextures = 64;
+    std::vector<PooledTexture> texture_pool;
+    u64 frames_done = 0; // the frame event's value as last read
+    id<MTLTexture> copy_texture(MTLPixelFormat format, u32 width, u32 height);
+    void pool_texture(id<MTLTexture> texture);
+    void trim_texture_pool(bool all);
+
+    // The draw's texture units decoded once (D-954): the fragment units for its program options, then again for the
+    // units it samples and their samplers; the vertex units its program samples when first wanted.
+    std::array<TextureInfo, kFragmentTextureCount> frag_tex{};
+    std::array<u32, kFragmentTextureCount> frag_tex_control{}; // texture_control() of the enabled ones
+    std::array<TextureInfo, kVertexTextureCount> vert_tex{};
+    u32 vert_tex_decoded = 0; // this draw's
+    void decode_textures(const RsxState& state);
+    const TextureInfo& vertex_texture(const RsxState& state, u32 t)
+    {
+        if (!(vert_tex_decoded & (1u << t))) {
+            vert_tex[t] = state.vertex_texture(t);
+            vert_tex_decoded |= 1u << t;
+        }
+        return vert_tex[t];
+    }
+    SurfaceInfo draw_surface{}; // the surface registers select_targets decoded for the draw
+
+    // The draw encoder's state as the draws set it (D-954): a setter whose value the encoder already holds is left
+    // out (each is a message send and the driver's own bookkeeping, nothing changed or not). Forgotten at each new
+    // encoder and whenever something else sets state on it (encode_clear_quad, the shader interpreter's bindings).
+    struct EncoderState {
+        __strong id<MTLRenderCommandEncoder> encoder = nil; // held: no other encoder can take its address meanwhile
+        __strong id<MTLRenderPipelineState> pso = nil;
+        __strong id<MTLDepthStencilState> depth = nil;
+        u32 stencil_front = ~0u, stencil_back = ~0u;
+        bool viewport_set = false;
+        MTLViewport viewport{};
+        s32 clip_mode = -1, cull = -1, winding = -1, fill = -1;
+        bool scissor_set = false;
+        MTLScissorRect scissor{};
+        bool bias_set = false;
+        float bias = 0, slope = 0;
+        bool blend_color_set = false;
+        u32 blend_color = 0;
+        std::array<__strong id<MTLBuffer>, 4> vbuf{}; // slot::kVsVertexData .. kVsIndexData
+        std::array<NSUInteger, 4> voff{};
+        std::array<__strong id<MTLTexture>, kFragmentTextureCount> ftex{};
+        std::array<__strong id<MTLSamplerState>, kFragmentTextureCount> fsamp{};
+        __strong id<MTLTexture> bounds_tex = nil;
+        std::array<__strong id<MTLTexture>, kVertexTextureCount> vtex{};
+        std::array<__strong id<MTLSamplerState>, kVertexTextureCount> vsamp{};
+        std::vector<u8> fconst;        // the fragment constants' bytes as last set
+        std::array<u8, sizeof(shader::MslFsParams)> fs{};
+        bool fs_set = false;
+    };
+    EncoderState enc_state;
+    void forget_encoder_state()
+    {
+        std::vector<u8> keep = std::move(enc_state.fconst); // its room, for the next
+        enc_state = {};
+        enc_state.fconst = std::move(keep);
+        enc_state.fconst.clear();
+    }
+
     // ---- core (metal_backend.mm) ----
     bool init();
     id<MTLCommandBuffer> render_buffer();
@@ -764,6 +943,21 @@ struct MetalBackend::Impl {
         u32 write_addr = 0, write_size = 0; // what `then` writes
     };
     std::deque<Deferred> deferred;
+    // What the queued actions touch, together (D-953): an access outside it conflicts with none of them, and is not
+    // compared with each (GTA V keeps some 250 queued, its labels behind readbacks, and a draw makes ten accesses).
+    // Widened as actions queue, made again as they leave.
+    u64 deferred_lo = ~0ull, deferred_hi = 0;
+    void note_deferred(const Deferred& d)
+    {
+        const auto add = [&](u64 a, u64 n) {
+            if (!n) return;
+            deferred_lo = std::min(deferred_lo, a);
+            deferred_hi = std::max(deferred_hi, a + n);
+        };
+        add(d.read_addr, d.read_size);
+        add(d.write_addr, d.write_size);
+        for (const Readback& r : d.readbacks) add(r.image.address, u64{r.image.pitch} * r.image.height);
+    }
     bool readback_supported(const Surface& s);
     Readback encode_readback(Surface& s);
     void store_readback(const Readback& r);
@@ -811,7 +1005,8 @@ struct MetalBackend::Impl {
     void remove_surface(Surface* s);
     // D-148; `depth_only`: a stencil written since does not matter (the depth bounds test reads the depth, D-261).
     id<MTLTexture> feedback_copy(Surface& s, bool depth_only = false);
-    std::string feedback_source(const Surface& s) const; // the report's name for a feedback copy's draw (D-947)
+    FeedbackKey feedback_source(const Surface& s) const; // a feedback copy's draw, for the report (D-947)
+    static std::string feedback_source_name(const FeedbackKey& k);
     void log_pass_times();
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
@@ -849,8 +1044,9 @@ struct MetalBackend::Impl {
     const CompiledProgram* fragment_program_for(const RsxState& state, const shader::FpOptions& options,
         const shader::FragmentProgram** program_out, u32& program_ea);
     std::optional<CompiledProgram> compile(const shader::TranslateResult& tr, const char* what);
-    id<MTLRenderPipelineState> pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp, const RsxState& state);
-    id<MTLDepthStencilState> depth_state_for(const RsxState& state);
+    id<MTLRenderPipelineState> pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp, const BlendInfo& blend,
+        const ColorMaskInfo& masks);
+    id<MTLDepthStencilState> depth_state_for(const DepthStencilInfo& ds);
     // The clear quad's pipeline for `t`'s attachments: the colour ones in the `cleared` bit mask written with
     // `color_mask`, the others not.
     id<MTLRenderPipelineState> clear_pipeline_for(const PassTargets& t, u32 cleared, u32 color_mask, bool depth,

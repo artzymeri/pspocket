@@ -60,9 +60,10 @@ std::array<u8, 4> surface_output_swizzle(u32 gcm_format)
 Surface* MetalBackend::Impl::find_surface(u32 address, bool depth) const
 {
     Surface* best = nullptr;
-    for (const auto& s : surfaces) {
-        if (s->address == address && s->depth == depth && (!best || s->last_used > best->last_used)) best = s.get();
-    }
+    visit_surfaces_at(address, [&](Surface* s) { // D-953
+        if (s->depth == depth && (!best || s->last_used > best->last_used)) best = s;
+        return false;
+    });
     return best;
 }
 
@@ -84,6 +85,10 @@ void MetalBackend::Impl::remove_surface(Surface* s)
     for (ClearOp& op : pending_clears) drop_target(op, s);
     std::erase_if(pending_clears, [](const ClearOp& op) { return !op.targets.color_count && !op.targets.depth; });
     tracker.unwatch(s->watch);
+    if (const auto at = surfaces_at.find(s->address); at != surfaces_at.end()) { // D-953
+        std::erase(at->second, s);
+        if (at->second.empty()) surfaces_at.erase(at);
+    }
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }
 
@@ -216,21 +221,23 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     s->last_frame = impl.stats.flips;
     impl.stats.surfaces_created++;
     impl.note_guest(*s);
+    impl.surfaces_at[address].push_back(s.get()); // D-953
     impl.surfaces.push_back(std::move(s));
     return impl.surfaces.back().get();
 }
 
 Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool swizzled)
 {
-    for (const auto& s : surfaces) {
-        if (s->address == address && !s->depth && s->gcm_format == format && s->width == width &&
-            s->height == height && s->pitch == pitch && s->swizzled == swizzled) {
-            s->last_used = tick;
-            s->last_frame = stats.flips;
-            check_cpu_writes(*s);
-            sync_surface(*s);
-            return s.get();
-        }
+    // The surfaces at the address, in the order they were made (D-953).
+    if (Surface* s = visit_surfaces_at(address, [&](const Surface* c) {
+            return !c->depth && c->gcm_format == format && c->width == width && c->height == height && c->pitch == pitch &&
+                c->swizzled == swizzled;
+        })) {
+        s->last_used = tick;
+        s->last_frame = stats.flips;
+        check_cpu_writes(*s);
+        sync_surface(*s);
+        return s;
     }
     // A target at the start of a larger one, with its pitch and format, is its top-left corner: the same memory, so
     // the same texture, drawn in that corner (the pass is the surface clip). A larger one over a smaller one takes
@@ -239,16 +246,18 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
     // sampled the half that was never cleared (black, D-120).
     Surface* inner = nullptr;
     if (!swizzled) {
-        for (const auto& s : surfaces) {
-            if (s->address != address || s->depth || s->swizzled || s->gcm_format != format || s->pitch != pitch) continue;
-            if (s->width >= width && s->height >= height) {
-                s->last_used = tick;
-                s->last_frame = stats.flips;
-                check_cpu_writes(*s);
-                sync_surface(*s);
-                return s.get();
-            }
-            if (s->width <= width && s->height <= height) inner = s.get();
+        Surface* larger = visit_surfaces_at(address, [&](Surface* c) {
+            if (c->depth || c->swizzled || c->gcm_format != format || c->pitch != pitch) return false;
+            if (c->width >= width && c->height >= height) return true;
+            if (c->width <= width && c->height <= height) inner = c;
+            return false;
+        });
+        if (larger) {
+            larger->last_used = tick;
+            larger->last_frame = stats.flips;
+            check_cpu_writes(*larger);
+            sync_surface(*larger);
+            return larger;
         }
     }
     Surface* parent = swizzled || inner ? nullptr : find_parent(address, pitch, width, height, format);
@@ -303,23 +312,20 @@ void MetalBackend::Impl::grow_surface(Surface& outer, Surface& inner)
 Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth_float)
 {
     (void)depth_float; // Depth32Float holds both the fixed and the float 24-bit encodings
-    for (const auto& s : surfaces) {
-        if (s->address == address && s->depth && s->gcm_format == format && s->width == width && s->height == height &&
-            s->pitch == pitch) {
-            s->last_used = tick;
-            s->last_frame = stats.flips;
-            return s.get();
-        }
-    }
+    Surface* s = visit_surfaces_at(address, [&](const Surface* c) { // D-953
+        return c->depth && c->gcm_format == format && c->width == width && c->height == height && c->pitch == pitch;
+    });
     // A smaller clip over a depth buffer with its pitch: its top-left corner (D-120). GTA V's character pass uses its
     // 1280x720 depth buffer at 1280x512, which made a new one each frame and lost what the frame had drawn.
-    for (const auto& s : surfaces) {
-        if (s->address == address && s->depth && s->gcm_format == format && s->pitch == pitch && s->width >= width &&
-            s->height >= height) {
-            s->last_used = tick;
-            s->last_frame = stats.flips;
-            return s.get();
-        }
+    if (!s) {
+        s = visit_surfaces_at(address, [&](const Surface* c) {
+            return c->depth && c->gcm_format == format && c->pitch == pitch && c->width >= width && c->height >= height;
+        });
+    }
+    if (s) {
+        s->last_used = tick;
+        s->last_frame = stats.flips;
+        return s;
     }
     const u32 row = width * surface_bytes_per_pixel(format, true);
     evict_overlapping(address, pitch ? pitch : row, row, height, nullptr);
@@ -372,13 +378,9 @@ id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s, bool depth_only)
         feedback_sources[feedback_source(s)].made++;
     }
     if (fresh) {
-        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s.texture.pixelFormat
-                                                                                     width:s.texture.width
-                                                                                    height:s.texture.height
-                                                                                 mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        d.storageMode = MTLStorageModePrivate;
-        c.texture = [device newTextureWithDescriptor:d];
+        pool_texture(c.texture); // D-956
+        c.texture = copy_texture(s.texture.pixelFormat, static_cast<u32>(s.texture.width),
+            static_cast<u32>(s.texture.height));
         c.views.clear();
         end_pass_for(kEndFeedbackCopy);
         id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
@@ -393,10 +395,15 @@ id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s, bool depth_only)
     return c.texture;
 }
 
-std::string MetalBackend::Impl::feedback_source(const Surface& s) const
+MetalBackend::Impl::FeedbackKey MetalBackend::Impl::feedback_source(const Surface& s) const
 {
-    return std::format("fragment program {:#x} unit {} reading target {:#010x} {}x{} format {}", feedback_fp,
-        feedback_unit, s.address, s.width, s.height, s.gcm_format);
+    return {feedback_fp, feedback_unit, s.address, s.width, s.height, s.gcm_format};
+}
+
+std::string MetalBackend::Impl::feedback_source_name(const FeedbackKey& k)
+{
+    return std::format("fragment program {:#x} unit {} reading target {:#010x} {}x{} format {}", k[0], k[1], k[2], k[3],
+        k[4], k[5]);
 }
 
 Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)
@@ -965,6 +972,7 @@ bool MetalBackend::Impl::write_back(Surface& s, const char* why)
 
 usize MetalBackend::Impl::deferred_conflict(u32 addr, u32 size, bool write) const
 {
+    if (fast(kFastLookups) && !(size && addr < deferred_hi && u64{addr} + size > deferred_lo)) return 0; // D-953
     const auto overlaps = [&](u32 a, u32 n) { return n && size && u64{a} < u64{addr} + size && addr < u64{a} + n; };
     usize count = 0;
     for (usize i = 0; i < deferred.size(); i++) {
@@ -993,8 +1001,57 @@ void MetalBackend::Impl::before_access(u32 addr, u32 size, bool write)
     }
 }
 
+id<MTLTexture> MetalBackend::Impl::copy_texture(MTLPixelFormat format, u32 width, u32 height)
+{
+    if (fast(kFastScratch)) {
+        for (usize i = 0; i < texture_pool.size(); i++) {
+            const PooledTexture& p = texture_pool[i];
+            if (p.texture.pixelFormat != format || p.texture.width != width || p.texture.height != height) continue;
+            if (p.frame > frames_done) frames_done = frame_event.signaledValue;
+            if (p.frame > frames_done) continue; // the GPU may still read it
+            id<MTLTexture> t = p.texture;
+            texture_pool[i] = std::move(texture_pool.back());
+            texture_pool.pop_back();
+            stats.pooled_textures_taken++;
+            return t;
+        }
+    }
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                 width:width
+                                                                                height:height
+                                                                             mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    d.storageMode = MTLStorageModePrivate;
+    return [device newTextureWithDescriptor:d];
+}
+
+void MetalBackend::Impl::pool_texture(id<MTLTexture> texture)
+{
+    if (!texture || !fast(kFastScratch)) return;
+    if (texture_pool.size() >= kPoolTextures) texture_pool.erase(texture_pool.begin()); // the oldest
+    texture_pool.push_back({texture, frame_event_value + 1});
+}
+
+void MetalBackend::Impl::trim_texture_pool(bool all)
+{
+    std::erase_if(texture_pool, [&](const PooledTexture& p) { return all || p.frame + kPoolFrames <= frame_event_value; });
+}
+
 void MetalBackend::Impl::run_deferred(bool wait, usize count)
 {
+    const usize queued = deferred.size();
+    // What the actions left touch (D-953), once they have run.
+    struct Envelope {
+        Impl& m;
+        usize queued;
+        ~Envelope()
+        {
+            if (m.deferred.size() == queued) return;
+            m.deferred_lo = ~0ull;
+            m.deferred_hi = 0;
+            for (const Deferred& d : m.deferred) m.note_deferred(d);
+        }
+    } envelope{*this, queued};
     for (; count && !deferred.empty(); count--) {
         Deferred& d = deferred.front();
         if (d.buffer && d.buffer.status < MTLCommandBufferStatusCompleted) {
