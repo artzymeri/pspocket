@@ -15618,6 +15618,11 @@ game loads this build, so it is a table entry, not a title check), and tail-call
   file's bytes there), its rval (stored 101 times, never loaded, its address never taken) and the stack below the
   caller's stack pointer. Everything the module writes in its own variables (init_layer3's tables of pointers, the
   frame header, the timers, the bit position) and the link register in the caller's frame is written as it writes it.
+- **The registers its callers read** (D-967's spu-live): the module reads $3-$12 at its entry and nothing else
+  volatile; after it returns into either decode job (bb12970d at 0x074A4 and 0x07944, d07a95df at 0x06DD4 and
+  0x07274, with the wrapper's tail call at 0x04F3C declared and indirect calls as ABI callbacks) the jobs read $3 and
+  no other volatile register but $16-$19, which only the wrapper's next tail call into the module could pass as
+  arguments, and the module does not read them. So $3 is the contract's (PSPOCKET_SPU_NATIVE_SCRAMBLE walk below).
 - **Captures freeze the decrementer** through the captured call (the module times itself with SPU_RdDec): replays of
   such a function are deterministic; the decrementer runs on afterwards as if the call took no time.
 - **Checked:** 1,161 calls captured over two prologue walks (every 10th of the first 6,000, and every 131st of 72,916):
@@ -15632,6 +15637,9 @@ game loads this build, so it is a table entry, not a title check), and tail-call
 - **Speed:** the captures x7.9 (59.8 us lifted, 7.6 native a call, the fastest of three on the shared Mac); in the
   walk (PSPOCKET_SPU_NATIVE_TIME, D-976) 126.9 us lifted, 21.3 native a call (x6.0): at about 630 calls a second,
   80 ms of the mixer's SPU time a second becomes 13.
+- **Walks:** the gate's prologue walk with both replacements on (90,873 MP3 calls native, 40,130 inflate calls native,
+  2 declined): 19 of 19 checks; a PSPOCKET_SPU_NATIVE_SCRAMBLE walk (every register outside the contracts garbage
+  after each call; 82,772 and 39,098 native calls) ran to its timeout with no fault, no RSX failure, no new message.
 
 ## D-975 · 2026-10-15 · zlib 1.2.3's inflate natively on its stream in local store (GTA V's inflateServer task)
 
@@ -15655,6 +15663,8 @@ kept across calls (inflateReset between streams: the window stays allocated).
 - **Listed for a direct call:** the main loop calls inflate with brsl, so the program is lifted again (D-966) for the
   call to go through the table: scripts/lift-spu.sh, or the phone's own translation. Its generated code differs from
   the frozen game library's at that one call; -DPSPOCKET_GAME_SPU_EXTRA links the re-lifted program on the Mac.
+- **Registers:** after inflate returns (0x0767C) the task reads $3 and no other volatile register (spu-live, zalloc and
+  zfree as ABI callbacks).
 - **Dead regions** (D-974's regions): the stack below the caller's stack pointer, and the task's copy routine's scratch
   quadword at 0x9720 (zmemcpy's routine at 0x03110 writes it before reading it: 400 captured calls replayed with it
   scrambled at entry leave everything else as they did).
