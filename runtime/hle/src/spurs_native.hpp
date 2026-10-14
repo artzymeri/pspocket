@@ -175,6 +175,9 @@ public:
     // Where the workers' time went since the last report (D-131): each workload's runs, policy polls that found no
     // work, waits. The first worker reports every 5 s.
     std::array<std::atomic<u64>, CELL_SPURS_MAX_WORKLOAD2> workload_ns{};
+    // The part of it run in PSPOCKET_SPU_AB's half B (D-962): with a period of a second or two, both halves see the
+    // same scenes, and each time line gives both.
+    std::array<std::atomic<u64>, CELL_SPURS_MAX_WORKLOAD2> workload_b_ns{};
     // Workers inside each workload right now (D-136): a join waits for them to leave before the game frees its memory.
     std::array<std::atomic<u32>, CELL_SPURS_MAX_WORKLOAD2> inside{};
     std::atomic<u64> idle_poll_ns{0}, wait_ns{0};

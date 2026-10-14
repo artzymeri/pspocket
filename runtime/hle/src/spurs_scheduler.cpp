@@ -346,6 +346,7 @@ void Worker::body()
             }
         } else {
             sched.workload_ns[sel.wid].fetch_add(dt, std::memory_order_relaxed);
+            if (in_b) sched.workload_b_ns[sel.wid].fetch_add(dt, std::memory_order_relaxed);
             ns_work += dt;
             idle_streak = 0;
             backoff_ns = 0;
@@ -373,9 +374,13 @@ void Scheduler::report_time(u64 now_ns)
     const double secs = static_cast<double>(now_ns - last_report_ns) / 1e9;
     last_report_ns = now_ns;
     std::array<std::pair<u64, u32>, CELL_SPURS_MAX_WORKLOAD2> taken{};
-    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) taken[i] = {workload_ns[i].exchange(0, std::memory_order_relaxed), i};
+    std::array<u64, CELL_SPURS_MAX_WORKLOAD2> taken_b{};
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
+        taken[i] = {workload_ns[i].exchange(0, std::memory_order_relaxed), i};
+        taken_b[i] = workload_b_ns[i].exchange(0, std::memory_order_relaxed);
+    }
     std::sort(taken.begin(), taken.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::string parts;
+    std::string parts, parts_b;
     {
         std::lock_guard lock(host_mutex);
         for (const auto& [t, wid] : taken) {
@@ -384,6 +389,9 @@ void Scheduler::report_time(u64 now_ns)
             const std::string name = it != inst.workloads.end() && !it->second.name.empty() ? it->second.name
                                                                                            : std::format("workload {}", wid);
             parts += std::format("{}{} {:.2f} s", parts.empty() ? "" : ", ", name, static_cast<double>(t) / 1e9);
+            if (ab_period_ns)
+                parts_b += std::format("{}{} {:.2f} s", parts_b.empty() ? "" : ", ", name,
+                    static_cast<double>(taken_b[wid]) / 1e9);
         }
     }
     // The workloads' time by host CPU (D-950), as shares.
@@ -398,7 +406,7 @@ void Scheduler::report_time(u64 now_ns)
         }
     }
     std::string half;
-    if (ab_period_ns) half = std::format("; half {}", in_b(now_ns) ? "B" : "A");
+    if (ab_period_ns) half = std::format("; half {}; in half B: {}", in_b(now_ns) ? "B" : "A", parts_b.empty() ? "nothing" : parts_b);
     PS_LOG_INFO(kSchedChan, "SPURS {:#x}, SPU time in {:.1f} s on {} SPUs: {}; empty policy polls {:.2f} s; waiting "
         "for work {:.2f} s{}{}", spurs, secs, workers_.size(), parts.empty() ? "nothing" : parts,
         static_cast<double>(idle_poll_ns.exchange(0, std::memory_order_relaxed)) / 1e9,
