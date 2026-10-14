@@ -15091,3 +15091,59 @@ The other four with modules in the firmware stay firmware-first, each needing mo
   streams to compare with.
 - MPEG-2 AAC, MP3 Surround, TrueHD and DTS have no module in the firmware.
 
+
+## D-947 · 2026-10-14 · A target a draw samples while drawing to it: read through the texture cache, not copied each time
+
+The first long play of GTA V on the iPhone 18 Pro Max (run 327) went from 30 fps to 4 to 12 in some scenes for minutes
+at a time, with the sound late in up to half of its periods. The per-frame lines show why: up to 335 feedback copies a
+frame (D-148: a copy of a target a draw samples while drawing to it), each ending the render pass, so up to 411 passes
+and 3.3 GB of attachments loaded and stored a frame, 80 to 155 ms of GPU time (about 0.4 ms a copy; 7 to 11 copies a
+frame elsewhere). The copies, each a new texture held until the GPU ran the frame, took the GPU's allocations to 8.9 GB
+and brought two memory warnings. D-148 shared a copy only between draws that write nothing to the target they sample;
+these draws write it.
+
+- **The RSX's texture cache:** the RSX reads such a target through its texture cache, which sees what draws wrote only
+  after the game invalidates it (cellGcmSetInvalidateTextureCache, NV4097_INVALIDATE_L2); until then a draw may read
+  what the cache took in before. The copy now plays that cache: kept, though the target was written since, while the
+  draws go on to the same targets (the pass's targets; a change of them ends it, as the RSX's small cache would have let
+  go by then) and no invalidation came. A write and an invalidation, or a write and a change of targets, make it again.
+  RPCS3 samples the target in place unless its strict rendering mode is on (texture_cache_helpers.h
+  force_strict_fbo_sampling: "MSAA disabled. All access is fast"), which a tile GPU cannot do inside a pass.
+- **The RSX front end** counts NV4097_INVALIDATE_L2 commands (RsxState::texture_cache_epoch); the command still marks
+  the fragment program dirty, as RPCS3's set_shader_program_dirty.
+- **Not changed:** the depth bounds test's copy of the depth buffer (D-261) and D-105's depth conversions.
+- **Report:** a line after the per-frame one when a window had such draws: copies a frame (the first, after a write and
+  an invalidation, after the targets changed, with the rule off), draws that read a kept copy, invalidations a frame,
+  and the three draws behind most of it (fragment program offset, texture unit, target address, size and format).
+  WindowStats gains feedback_reused and texture_cache_invalidations.
+- **Measuring and switching on the phone:** PSPOCKET_RSX_STRICT_FEEDBACK=1 is D-148's rule (a copy after every
+  write); PSPOCKET_GPU_AB=N alternates the two every N frames. The app now reads Documents/pspocket-env.txt at boot
+  (PSPOCKET_ names only, one NAME=VALUE a line, each logged), so a switch reaches a phone run over USB without a build.
+- Tests: tests/rsx/test_metal.mm, "D-947": without an invalidation 20 draws that read their target after a write read
+  the first draw's copy, one copy and two passes; after NV4097_INVALIDATE_L2 the draw sees the write (D-148's test, the
+  invalidation added); after the draws went to another target and back, a new copy. tests/rsx/test_methods.cpp: the
+  command counts and marks the fragment program dirty.
+
+## D-948 · 2026-10-14 · The signed blend equations done in the shader (programmable blending)
+
+The user's screenshots of run 327 (GTA V on the iPhone): a bright patch around the car where the road is in shadow,
+a dark ragged one where it is in the sun, flat light in a parking garage. GTA V blends those with
+NV4097_SET_BLEND_EQUATION ADD_SIGNED (0xf006 for colour and alpha, logged once a run: "blend equation 0xf006/0xf006
+(signed) is not implemented"), which Metal's blending has not: drawn as add, a source byte meant to darken (0xf0 is -16)
+lit the target nearly to white.
+
+- **The equations** (RPCS3 RSXProgrammableBlendPrologue.glsl): ADD_SIGNED adds the source to the target,
+  REVERSE_SUBTRACT_SIGNED takes it away, REVERSE_ADD_SIGNED adds the target to the source; on a target of bytes the
+  signed side's byte is two's complement over 255, and no factors apply. RPCS3 switches to blending in the shader for
+  them (RSXThread.cpp evaluate_programmable_blending_state).
+- **pspocket:** a draw with a signed equation has its fragment program translated with FpOptions::blend_in_shader set
+  for the outputs it blends on four-channel targets (RGBA8 and BGRA8, which read bytes as signed; RGBA16F and RGBA32F):
+  the function takes each one's pixel from the target ([[color(n)]], programmable blending on Apple GPUs, read from
+  tile memory, no copy) and blends it with MslFsParams' equations, factors and blend colour after the output is moved to
+  the target's channels, as Metal's blending would; the pipeline does not blend those attachments. The other equations
+  in the same function work as RPCS3's (min, max, add, subtract, reverse subtract with the factors, the source term
+  saturated on byte targets). A draw the shader interpreter draws while its compile runs (D-940) blends as Metal can,
+  as before; B8 and G8B8 targets too (logged).
+- Tests: tests/rsx/test_metal.mm, "D-948": over a 0x808080 target a source of r 0xf0, g 0x10 gives 0x70 and 0x90 with
+  ADD_SIGNED (0xff with Metal's add, the bug: it fails without the shader's blending), the reverse with
+  REVERSE_SUBTRACT_SIGNED, and REVERSE_ADD_SIGNED takes the target's bytes as signed.

@@ -112,8 +112,17 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   efficiency core (it was 85-90% busy there): try the raise again in a phone session, with the threads' core types
   in the log. Reverted until then (rule 8).
 - **State:** open; making the SPU work faster is what moves it.
+- **Seen (run 327, iPhone 18 Pro Max):** 12.5% of the periods late over the session, none at 30 fps, up to 52% in the
+  stretches where feedback copies held the frame at 4 to 12 fps (D-947): the sound follows the frame loop there.
 
 ## RSX and Metal: the GPU
+
+- **Seen (run 327):** up to 335 feedback copies a frame (a draw sampling a target it writes, copied each time), 411
+  passes and 3.3 GB of attachments loaded and stored a frame, 80 to 155 ms of GPU time and 8.9 GB of GPU allocations.
+  **Done (D-947):** the copy kept as the RSX's texture cache keeps what it read, until the game invalidates the cache
+  or the draws change targets. **Check on the phone:** the "feedback" report line in the same scenes (copies a frame,
+  copies kept, invalidations a frame, the draws behind them); if GTA V invalidates between such draws, the copies stay
+  and the next step is reading the pixel being drawn from tile memory (programmable blending) instead of a copy.
 
 - **Seen (run 221):** the RSX thread is the busiest single thread of GTA V's frame (42% of a core), 78% of it in draws:
   fragment programs (19%: re-decoding those GTA V writes again into memory it reuses), texture binds (9%), vertex data
@@ -262,9 +271,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 ## Heat
 
 - **Seen:** nominal in this session's first five minutes; "fair" after a minute of play in run 088.
-- **Try:** keep the heat level in every session's notes; lower work (fewer threads, a frame cap) only if it reaches
-  "serious".
-- **State:** watch.
+- **Seen (run 327):** "serious" in every window of a 24-minute session that began right after 5.5 minutes of
+  preparation at full CPU, the phone charging on USB. In-session SPU translation (D-236) waits while the heat is
+  serious, so the SPU programs met in play stayed in the interpreter all session (844 million SPU instructions), and the
+  interpreter's load kept the heat up.
+- **Try:** let the in-session translation run at "serious" on one efficiency core (it is what lowers the CPU load) and
+  stop it only at "critical"; keep the heat level in every session's notes; lower work (fewer threads, a frame cap)
+  only if it reaches "critical".
+- **State:** open.
 
 ## The iOS app (library)
 
