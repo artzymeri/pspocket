@@ -1,9 +1,9 @@
 #pragma once
 
-// libavcdec, the H.264 codec core, pspocket's own (D-933; libmvcdec, the MVC core, is the same design for one view or
-// two): its memory's layout and its frame buffers (vdec_avc.cpp). Its PPU side keeps a context at the end of the
-// decoder's memory, command queues and a helper thread that gives the caller's callback the SPU side's answers.
-// Nothing here is Sony's code or data (CLAUDE.md rule 1).
+// libavcdec and libmvcdec, the H.264 and MVC codec cores, pspocket's own (D-933): their memory's layouts and their
+// frame buffers (vdec_avc.cpp). Their PPU side keeps a context at the end of the decoder's memory, command queues and a
+// helper thread that gives the caller's callback the SPU side's answers. Nothing here is Sony's code or data
+// (CLAUDE.md rule 1).
 
 #include <array>
 #include <optional>
@@ -21,7 +21,7 @@ namespace pspocket::hle::vdec::avc {
 // fixed 0x298180 bytes of task contexts, queues, SPURS and taskset), the whole size, and the frame buffers' offset in
 // the dynamic part.
 struct Layout {
-    std::array<u32, 14> blocks{};
+    std::array<u32, 16> blocks{}; // libavcdec's fourteen, libmvcdec's sixteen
     u32 dynamic = 0, size = 0, frames = 0, au_buffer = 0;
     u32 frame_mbs = 0; // the largest frame it holds, in macroblocks
 };
@@ -30,10 +30,14 @@ struct Layout {
 // frame in macroblocks (0, 0: the level's worst case); none for a combination libavcdec refuses.
 std::optional<Layout> layout(u32 level, u32 buffers, u32 width_mbs, u32 height_mbs);
 
+// libmvcdec's (mvcDecQueryMemory): two views' frame buffers (the buffer count even, at most 32) and its own blocks.
+std::optional<Layout> mvc_layout(u32 level, u32 buffers, u32 width_mbs, u32 height_mbs);
+
 // A frame buffer slot's bytes and Sony's layout of a picture in it (D-196).
 u32 frame_slot_bytes(u32 width, u32 height);
 void write_frame(u8* base, u32 at, u32 width, u32 height, const u8* y, const u8* u, const u8* v);
 
 void register_avcdec(Registry& r);
+void register_mvcdec(Registry& r);
 
 } // namespace pspocket::hle::vdec::avc

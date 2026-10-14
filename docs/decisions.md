@@ -14772,6 +14772,60 @@ firmware, some of the lives run through pspocket's core against Sony's recorded 
 codec_cores.cpp (libavcdec no longer firmware-first), modules.cpp, test_codec_cores.cpp and
 test_codec_cores_compare.cpp (that mark), test_vdec_ext_compare.cpp (Sony's libvdec over pspocket's core).
 
+## D-933 · 2026-10-14 · The H.264 and MVC codec cores pspocket's own (part 2: libmvcdec, the MVC core)
+
+libmvcdec (seven decoding calls) is libavcdec's PPU program with other numbers, over an SPU program of its own for one
+view or two (Blu-ray 3D's stereo pairs). pspocket's shares vdec_avc.cpp with libavcdec (a Core of each module's
+numbers: errors 0x806159xx, open mark 0xBE264DDC, a context of 0x1F80 bytes, 82 side data entries of 0x48 bytes that
+count their pictures' releases, 36 other commands, the memory cleared to +0x4F6400, its own SPURS and task set at
++0x4F6400 and +0x4F7400, "_libvdec_mvc"); its memory is sixteen blocks, the frame buffers two views' (the buffer count
+even, at most 32). libmvcdec is no longer firmware-first.
+
+What Sony's core does, and pspocket's with it:
+- Open has no SDK version. AccessUnit takes its pieces in a structure (the base view's, its continuation, the second
+  view's, its continuation, each with its size); the first access unit fixes whether there is a second view (one with
+  the other is ARG). No GetStatus.
+- The AU done message has every piece and its size, the flags spread out, and the pictures the access unit gives. A
+  picture's information is 0x158 bytes after a 0x44-byte message: libavcdec's fields with the view (0, 1), whether it
+  is its access unit's first picture and how many pictures that gives where libavcdec has its GOP flag (which
+  follows), the rest moved, no frame packing, the flags as one doubleword (the SPU side's, libavcdec's one bit down,
+  spread over bits 33 to 63).
+- Its decoded picture buffer is not libavcdec's: a picture is stored as soon as it is decoded, as H.264's reference
+  decoder (JM) does (its marking, then pictures output while the buffer is full, a non-reference picture that would
+  come first output at once instead of stored); the clock as libavcdec's. With one view a picture output at once comes
+  with the next access unit's messages (after its AU done); with two views the base view picture comes at once and its
+  second view picture with the next access unit's (before its AU done). An IDR picture's outputs come after the AU done
+  with one view, before it with two. The frame buffers are split for two views with one view too (half the buffer);
+  each picture of a pair takes the next one in turn.
+- Frame IDs as libavcdec's (free once released and out of the buffer); a picture output at once before takes its ID
+  after the access unit's marking; a flush counts IDs freed since.
+- What the VUI leaves out of the video signal is inferred (5, 2, 2, 2) where libavcdec gives 0.
+- Skipped pictures (the decode modes) and error pictures have no frame buffer (frame 0); an error picture passes over
+  one in turn (the second of two in a row none); an unknown profile's or level's has no IDR flag.
+- After Close the calls that lock answer 2: the module maps the lock's failure through its own codes, which have none
+  for it, and answers what its stack held there.
+
+The second view: FFmpeg has no MVC decoder, so pspocket decodes the second view with a second FFmpeg H.264 decoder
+given a one-view stream made from it (vdec_mvc_view.cpp): each access unit's base view picture as decoded, as an I
+picture of I_PCM macroblocks, then the second view's slices as one view's, their reference lists spelt out
+(ref_pic_list_modification) as MVC builds them with that I picture as the inter-view reference, their marking spelt out
+(memory management operations), a copy of their PPS whose id's length and delta_pic_order_cnt_bottom keep a CAVLC
+slice's data on its byte alignment. Not so (the base view's samples stand for the second view, logged once): field
+pictures, other than 4:2:0 8-bit samples, long-term references, more than two second-view PPSs. Not exact: direct
+prediction from a B picture's first list 1 reference when that is the base view's (the I picture has no motion).
+
+Not reproduced: the information's padding (+0x71 to +0x77 and the flags' low 33 bits, stack leftovers in Sony's
+module); errors with two views (not measured).
+
+Compared (tests/hle/test_vdec_avc_compare.cpp, "The MVC core (libmvcdec) against Sony's"): QueryMemory (in a scratch
+sweep 720 parameter sets agree), every life of libavcdec's comparison with one view, and two views' lives (I_PCM
+second views, anchors predicted from the base view, P pictures from the second view's last, buffers of 1 and 2,
+non-reference and B pictures, IDR pictures between, decode modes 1 to 3, the views changing, side data released a view
+at a time): 0 of 2782 observations differ, frame buffers included; libavcdec's comparison after the change: 0 of 2215.
+Without the firmware, a test runs some of the lives through pspocket's core against Sony's recorded answers. Shared
+files changed: codec_cores.cpp (libmvcdec no longer firmware-first; with libsjvtd's, D-920 part 8, no codec core
+is), modules.cpp, test_codec_cores.cpp and test_codec_cores_compare.cpp (that mark).
+
 ## D-944 · 2026-10-13 · The audio cores against Sony's (part 1: their sizes, and MP3 call for call as libmp3dec)
 
 cellAdec's cores on FFmpeg (D-577: MP3, MPEG audio layers I and II, MPEG-4 AAC, AC-3, ATRAC3) were RPCS3's structures

@@ -156,6 +156,7 @@ add_library(pspocket_hle STATIC
     src/libmixer.cpp
     src/codec_cores.cpp
     src/vdec_avc.cpp
+    src/vdec_mvc_view.cpp
     src/cellCelpEnc.cpp
     src/cellCelp8Enc.cpp
     src/sys_lv2coredump.cpp

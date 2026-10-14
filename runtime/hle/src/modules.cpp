@@ -91,6 +91,7 @@ void register_libmixer(Registry& r);
 void register_codec_cores(Registry& r);
 namespace vdec::avc {
 void register_avcdec(Registry& r);
+void register_mvcdec(Registry& r);
 }
 void register_cellCelpEnc(Registry& r);
 void register_cellCelp8Enc(Registry& r);
@@ -201,6 +202,7 @@ void register_all_modules(Registry& r)
     register_libmixer(r);
     register_codec_cores(r);
     vdec::avc::register_avcdec(r);
+    vdec::avc::register_mvcdec(r);
     register_cellCelpEnc(r);
     register_cellCelp8Enc(r);
     register_sys_lv2coredump(r);

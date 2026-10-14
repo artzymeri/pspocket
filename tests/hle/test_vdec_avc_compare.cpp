@@ -1,12 +1,12 @@
-// libavcdec, the H.264 codec core, against Sony's module (D-933): the core called directly as Sony's libvdec (or a
-// game) calls it, with the same synthetic streams through pspocket's core and through Sony's module (the user's
-// installed system software), each in a process of its own. Sony's core decodes on SPURS: each half makes a SPURS
-// instance (pspocket's cellSpurs) and gives it to the core's open, or lets the core make its own. Compared: every answer,
-// every message the core gives its callback (in order, with what they point at: the side data, the picture's
-// information), the frame buffers' places (as offsets into the core's memory) and their contents, the status. The
-// core's own memory past what its messages point at (its SPU side's working memory, queues, task contexts) is opaque:
-// not compared. Skipped without the firmware (compare_util.hpp). No game data: the streams are written by the tests
-// (h264_streams.hpp).
+// libavcdec and libmvcdec, the H.264 and MVC codec cores, against Sony's modules (D-933): each core called directly as
+// Sony's libvdec (or a game) calls it (libmvcdec with the same lives with one view, and its own with two), with the
+// same synthetic streams through pspocket's core and through Sony's module (the user's installed system software), each
+// in a process of its own. Sony's core decodes on SPURS: each half makes a SPURS instance (pspocket's cellSpurs) and
+// gives it to the core's open, or lets the core make its own. Compared: every answer, every message the core gives its
+// callback (in order, with what they point at: the side data, the picture's information), the frame buffers' places (as
+// offsets into the core's memory) and their contents, the status. The core's own memory past what its messages point at
+// (its SPU side's working memory, queues, task contexts) is opaque: not compared. Skipped without the firmware
+// (compare_util.hpp). No game data: the streams are written by the tests (h264_streams.hpp).
 
 #include <catch_amalgamated.hpp>
 
@@ -39,6 +39,11 @@ namespace {
 const std::vector<std::string>* g_only = nullptr;
 std::chrono::milliseconds g_quiet{400}, g_timeout{15000};
 
+// Which core a life drives: libavcdec, or libmvcdec (the same lives with one view, and its two views' own).
+bool g_mvc = false;
+std::string fn(std::string_view name) { return std::string(g_mvc ? "mvcDec" : "avcDec") + std::string(name); }
+std::string library() { return g_mvc ? "libmvcdec" : "libavcdec"; }
+
 bool pick(std::string_view life)
 {
     if (!selected(life)) return false;
@@ -49,11 +54,11 @@ bool pick(std::string_view life)
 }
 
 // Guest memory: the core's memory, SPURS, the callback and its log, the arguments and the streams.
-constexpr u32 kMem = 0x01000000, kMemSize = 0x04000000;
+constexpr u32 kMem = 0x01000000, kMemSize = 0x06000000;
 constexpr u32 kSpursAttr = kData + 0x1000, kSpurs = kData + 0x2000;
 constexpr u32 kCode = kData + 0x8000, kOpd = kData + 0x8800, kArg = kData + 0x9000;
 constexpr u32 kParam = kArg, kAttr = kArg + 0x20, kMemDesc = kArg + 0x40, kHandle = kArg + 0x60, kTaskset = kArg + 0x80,
-              kPrios = kArg + 0xA0, kStatus = kArg + 0xC0, kSide = kArg + 0x100;
+              kPrios = kArg + 0xA0, kStatus = kArg + 0xC0, kSide = kArg + 0x100, kPieces = kArg + 0x180;
 constexpr u32 kLog = kData + 0x40000, kEntry = 0x300, kLogMax = 0x200;
 constexpr u32 kStream = kData + 0x180000, kStreamSize = 0x60000;
 
@@ -107,10 +112,11 @@ struct Asm {
     }
 };
 
-// The callback (r3: the message): an entry of kEntry bytes in the log at kLog + 16: the message's 0x40 bytes, then for
+// The callback (r3: the message): an entry of kEntry bytes in the log at kLog + 16: the message's 0x50 bytes, then for
 // a picture (type 1) 0x200 bytes from the information it points at (+8), for an access unit done (type 0) 0x40 bytes
-// of the side data it points at (+0x10, when it points). The count at kLog is raised last, through the reservation
-// (as vdec_test_util.hpp's callback, so ThreadSanitizer sees the order).
+// of the side data it points at (+0x10; libmvcdec's +0x28, when it points). The count at kLog is raised last, through
+// the reservation (as vdec_test_util.hpp's callback, so ThreadSanitizer sees the order).
+constexpr u32 kPayload = 0x50; // an entry's payload after the message
 void write_callback(u8* b)
 {
     Asm a;
@@ -121,7 +127,7 @@ void write_callback(u8* b)
     a.emit(as::add(11, 11, 10));
     a.emit(as::addi(11, 11, 16));
     a.emit(as::mr(4, 3));
-    a.copy_words(16, "c1");
+    a.copy_words(kPayload / 4, "c1");
     a.emit(as::lwz(5, 0, 3));
     a.emit(as::cmpwi(0, 5, 1));
     a.bc(4, 2, "t0");
@@ -131,7 +137,7 @@ void write_callback(u8* b)
     a.label("t0");
     a.emit(as::cmpwi(0, 5, 0));
     a.bc(4, 2, "end");
-    a.emit(as::lwz(4, 0x10, 3));
+    a.emit(as::lwz(4, g_mvc ? 0x28 : 0x10, 3));
     a.emit(as::cmpwi(0, 4, 0));
     a.bc(12, 2, "end");
     a.copy_words(16, "c3");
@@ -178,6 +184,36 @@ void params(u8* b, u32 level, u32 deblock = 0, u32 buffers = 0, u32 wmbs = 0, u3
 // The frame buffer bytes of a picture of this coded size (Sony's layout, D-196).
 u32 frame_bytes(u32 w, u32 h) { return (w + 64) * h + (w + 64) * h / 2 + 2048; }
 
+// Open as each core takes it: libavcdec's thirteen arguments; libmvcdec's twelve (no SDK version, the seventh).
+u64 call_open(Run& r, std::vector<u64> a)
+{
+    if (g_mvc) {
+        a.erase(a.begin() + 6);
+        return r.side.call("mvcDecOpen", {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]})
+            .value_or(~0ull);
+    }
+    return r.side.call("avcDecOpen", {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12]})
+        .value_or(~0ull);
+}
+
+// AccessUnit as each core takes it: libavcdec's pieces and stamps as arguments (the side data's two past eight),
+// libmvcdec's pieces in a structure of eight words (the base view's, then the second view's).
+u64 call_au(Run& r, u32 handle, u32 addr, u32 size, u32 cont, u32 cont_size, u64 dts, u64 pts, u32 mode, u32 side = 0,
+    u32 side_size = 0, u32 dep = 0, u32 dep_size = 0, u32 pieces = kPieces)
+{
+    if (g_mvc) {
+        if (pieces == kPieces) {
+            const u32 words[8] = {addr, size, cont, cont_size, dep, dep_size, 0, 0};
+            for (u32 i = 0; i < 8; i++) ps_write32(r.b, kPieces + 4 * i, words[i]);
+        }
+        return r.side.call("mvcDecAccessUnit", {handle, pieces, dts, pts, mode, side, side_size}).value_or(~0ull);
+    }
+    if (side || side_size)
+        return r.side.call("avcDecAccessUnit", {handle, addr, size, cont, cont_size, dts, pts, mode, side, side_size})
+            .value_or(~0ull);
+    return r.side.call("avcDecAccessUnit", {handle, addr, size, cont, cont_size, dts, pts, mode}).value_or(~0ull);
+}
+
 struct Avc {
     Run& r;
     u32 handle = 0, mem = kMem, size = 0;
@@ -193,6 +229,7 @@ struct Avc {
     bool error_frames = true, nal_flags = true;
     u32 pictures = 0;
     std::string label{};
+    std::vector<std::vector<u8>> seconds{}; // libmvcdec: the second views stream() gives
 
     std::string in_mem(u32 addr) const
     {
@@ -201,7 +238,7 @@ struct Avc {
     }
     std::string in_ctx(u32 addr) const
     {
-        if (handle && addr >= handle && addr < handle + 0x1380) return std::format("ctx+{:#x}", addr - handle);
+        if (handle && addr >= handle && addr < handle + (g_mvc ? 0x1F80u : 0x1380u)) return std::format("ctx+{:#x}", addr - handle);
         return in_mem(addr);
     }
 
@@ -231,24 +268,40 @@ struct Avc {
             const u32 e = kLog + 16 + seen * kEntry;
             const u32 type = ps_read32(b, e);
             const std::string key = std::format("{}{}: message {}", label, when, seen);
-            if (type == 0) {
+            if (type == 0 && g_mvc) {
+                // libmvcdec's: every piece and its size, then the flags, the code and the pictures it gives
+                const u32 side = ps_read32(b, e + 0x28), side_size = ps_read32(b, e + 0x2C);
+                r.o.line(key, std::format("AU done: pieces {} arg {} side {} ({} bytes{}) flags {}",
+                    compare::hex(b + e + 8, 0x20), hex32(ps_read32(b, e + 4)), in_ctx(side), side_size,
+                    side_size ? " " + compare::hex(b + e + kPayload, std::min<u32>(side_size, 0x40)) : std::string(),
+                    compare::hex(b + e + 0x30, 0x11)));
+            } else if (type == 0) {
                 const u32 side = ps_read32(b, e + 0x10), side_size = ps_read32(b, e + 0x14);
                 r.o.line(key, std::format("AU done: au {} cont {} arg {} side {} ({} bytes{}) flags {}", hex32(ps_read32(b, e + 8)),
                     hex32(ps_read32(b, e + 0x0C)), hex32(ps_read32(b, e + 4)), in_ctx(side), side_size,
-                    side_size ? " " + compare::hex(b + e + 0x40, std::min<u32>(side_size, 0x40)) : std::string(),
+                    side_size ? " " + compare::hex(b + e + kPayload, std::min<u32>(side_size, 0x40)) : std::string(),
                     compare::hex(b + e + 0x18, 8)));
             } else if (type == 1) {
-                std::vector<u8> info(b + e + 0x40, b + e + 0x40 + 0x178);
-                const u32 frame = ps_read32(info.data(), 0xA4);
-                const u32 side0 = ps_read32(info.data(), 0x94), side1 = ps_read32(info.data(), 0x98);
+                // libavcdec's information (0x178 bytes) or libmvcdec's (0x158): the frame buffer and side data
+                // pointers shown apart
+                const u32 bytes = g_mvc ? 0x158 : 0x178, at_frame = g_mvc ? 0xAC : 0xA4, at_sides = g_mvc ? 0x9C : 0x94;
+                std::vector<u8> info(b + e + kPayload, b + e + kPayload + bytes);
+                const u32 frame = ps_read32(info.data(), at_frame);
+                const u32 side0 = ps_read32(info.data(), at_sides), side1 = ps_read32(info.data(), at_sides + 4);
                 const u32 id = ps_read32(info.data(), 0);
-                std::memset(info.data() + 0xA4, 0, 4);
-                std::memset(info.data() + 0x94, 0, 8);
+                std::memset(info.data() + at_frame, 0, 4);
+                std::memset(info.data() + at_sides, 0, 8);
                 // Padding Sony's PPU side never writes: its helper thread's stack as it was (0 in a new thread, what
                 // its Reset left after one). Not compared (D-933).
-                std::memset(info.data() + 0x0D, 0, 3);
-                std::memset(info.data() + 0xCA, 0, 2);
-                if (!nal_flags) info[0x174] &= 0x03;
+                if (g_mvc) {
+                    std::memset(info.data() + 0x71, 0, 7);  // between the last byte and the DTS
+                    info[0x153] &= 0xFE;                    // the flags' low 33 bits
+                    std::memset(info.data() + 0x154, 0, 4);
+                } else {
+                    std::memset(info.data() + 0x0D, 0, 3);
+                    std::memset(info.data() + 0xCA, 0, 2);
+                }
+                if (!nal_flags) info[g_mvc ? 0x150 : 0x174] &= g_mvc ? 0x1F : 0x03;
                 r.o.line(key, std::format("picture: arg {} frame {} sides {} {}", hex32(ps_read32(b, e + 4)), in_mem(frame),
                     in_ctx(side0), in_ctx(side1)));
                 r.o.line(key + ": information", compare::hex(info));
@@ -268,33 +321,36 @@ struct Avc {
         while (held.size() > keep) {
             const u32 id = held.front();
             held.erase(held.begin());
-            r.r("avcDecRlsFrame", {handle, id}, std::format("{}{}: RlsFrame({})", label, when, id));
+            r.r(fn("RlsFrame"), {handle, id}, std::format("{}{}: RlsFrame({})", label, when, id));
         }
     }
 
     void status(const std::string& when)
     {
+        if (g_mvc) return; // libmvcdec has no GetStatus
         std::memset(r.b + kStatus, 0xEE, 8);
-        r.r("avcDecGetStatus", {handle, kStatus}, std::format("{}{}: GetStatus", label, when));
+        r.r(fn("GetStatus"), {handle, kStatus}, std::format("{}{}: GetStatus", label, when));
         r.o.line(std::format("{}{}: the status", label, when), compare::hex(r.b + kStatus, 8));
     }
 
-    // One access unit: its answer, the messages it made, the pictures released (as `release` says).
+    // One access unit: its answer, the messages it made, the pictures released (as `release` says). `second`: the
+    // second view's piece (libmvcdec).
     u64 au(const std::string& key, const std::vector<u8>& data, u32 mode = 0, u64 dts = 0, u64 pts = 0, u32 side = 0,
-        u32 side_size = 0, u32 want = 1)
+        u32 side_size = 0, u32 want = 1, const std::vector<u8>& second = {})
     {
         u8* b = r.b;
-        if (at + data.size() > kStream + kStreamSize) at = kStream;
+        if (at + data.size() + second.size() + 0x100 > kStream + kStreamSize) at = kStream;
         std::memcpy(b + at, data.data(), data.size());
-        u64 v;
-        if (side_size || side) {
-            // Ten arguments: the side data's two through the caller's parameter save area.
-            v = r.side.call("avcDecAccessUnit", {handle, at, data.size(), 0, 0, dts, pts, mode, side, side_size}).value_or(~0ull);
-            r.o.line(label + key, compare::answer(v));
-        } else {
-            v = r.r("avcDecAccessUnit", {handle, at, data.size(), 0, 0, dts, pts, mode}, label + key);
-        }
+        const u32 first_at = at;
         at = (at + static_cast<u32>(data.size()) + 0x7F) & ~0x7Fu;
+        const u32 second_at = at;
+        if (!second.empty()) {
+            std::memcpy(b + at, second.data(), second.size());
+            at = (at + static_cast<u32>(second.size()) + 0x7F) & ~0x7Fu;
+        }
+        const u64 v = call_au(r, handle, first_at, static_cast<u32>(data.size()), 0, 0, dts, pts, mode, side, side_size,
+            second.empty() ? 0 : second_at, static_cast<u32>(second.size()));
+        r.o.line(label + key, compare::answer(v));
         if (static_cast<u32>(v) == 0) settle(want);
         messages(key);
         if (release) release_all(key);
@@ -303,7 +359,7 @@ struct Avc {
 
     void flush(const std::string& key)
     {
-        if (r.r("avcDecFlush", {handle, 0}, label + key) == 0) settle(1, g_quiet + std::chrono::milliseconds(200));
+        if (r.r(fn("Flush"), {handle, 0}, label + key) == 0) settle(1, g_quiet + std::chrono::milliseconds(200));
         messages(key);
         if (release) release_all(key);
     }
@@ -319,10 +375,15 @@ struct Seq {
     hs::Sps sps;
     hs::Pps pps;
     std::vector<std::vector<u8>> aus;
-    std::vector<int> display; // each access unit's display index
+    std::vector<int> display;               // each access unit's display index
+    std::vector<std::vector<u8>> seconds;   // libmvcdec: each access unit's second view (see `second`)
 };
 
-Seq sequence(const std::string& tokens, u32 w = 64, u32 hgt = 64, const std::function<void(hs::Sps&)>& setup = {})
+// `second` (libmvcdec): each access unit's second view (its subset SPS and PPS with the first): 'I' I_PCM pictures of
+// their own, 'A' anchors predicted from the base view (P_Skip), 'T' P_Skip from the second view's last picture (B_Skip
+// for B pictures; I_PCM at an IDR picture).
+Seq sequence(const std::string& tokens, u32 w = 64, u32 hgt = 64, const std::function<void(hs::Sps&)>& setup = {},
+    char second = 0)
 {
     Seq s;
     s.sps.width_mbs = w / 16;
@@ -377,6 +438,24 @@ Seq sequence(const std::string& tokens, u32 w = 64, u32 hgt = 64, const std::fun
         sl.poc_lsb = static_cast<u32>(2 * idx) % (1u << s.sps.log2_max_poc_lsb);
         s.aus.push_back(hs::access_unit(s.sps, s.pps, sl, h::pattern(static_cast<int>(w), static_cast<int>(hgt), idx), parts));
         s.display.push_back(idx);
+        if (second) {
+            hs::Pps dpps = s.pps;
+            dpps.id = 1;
+            hs::Slice ds = sl;
+            ds.pps_id = 1;
+            bool anchor = sl.idr;
+            if (second == 'I') {
+                ds.kind = hs::Kind::I;
+            } else if (second == 'A') {
+                ds.kind = hs::Kind::P;
+                anchor = true;
+            } else {
+                ds.kind = sl.idr ? hs::Kind::I : sl.kind;
+            }
+            const bool with_sets = s.seconds.empty();
+            s.seconds.push_back(hs::dependent_unit(s.sps, dpps, ds,
+                h::pattern(static_cast<int>(w), static_cast<int>(hgt), 100 + idx), anchor, with_sets, with_sets));
+        }
     }
     return s;
 }
@@ -395,7 +474,7 @@ u32 open(Run& r, Avc& a, const std::string& key, u32 level, u32 buffers = 0, u32
     u8* b = r.b;
     params(b, level, 0, buffers, wmbs, hmbs);
     std::memset(b + kAttr, 0xEE, 12);
-    if (r.r("avcDecQueryMemory", {kParam, kAttr}, key + ": QueryMemory") != 0) return 0;
+    if (r.r(fn("QueryMemory"), {kParam, kAttr}, key + ": QueryMemory") != 0) return 0;
     r.o.line(key + ": the memory", compare::hex(b + kAttr + 4, 8));
     a.size = ps_read32(b, kAttr + 4);
     ps_write32(b, kMemDesc + 0, kMem);
@@ -411,8 +490,7 @@ u32 open(Run& r, Avc& a, const std::string& key, u32 level, u32 buffers = 0, u32
     else for (u32 i = 0; i < a.size; i += 4) ps_write32(b, kMem + i, 0xA5A50000u | (i & 0xFFFF));
     ps_write32(b, kHandle, 0xEEEEEEEE);
     ps_write32(b, kTaskset, 0xEEEEEEEE);
-    const u64 v = r.side.call("avcDecOpen", {kHandle, spurs, kTaskset, kParam, kMemDesc, 0x4000, sdk, kOpd, 0x1234, 1,
-                                                kPrios, 200, 1000}).value_or(~0ull);
+    const u64 v = call_open(r, {kHandle, spurs, kTaskset, kParam, kMemDesc, 0x4000, sdk, kOpd, 0x1234, 1, kPrios, 200, 1000});
     r.o.line(key + ": Open", compare::answer(v));
     if (static_cast<u32>(v) != 0) return 0;
     a.handle = ps_read32(b, kHandle);
@@ -424,7 +502,7 @@ u32 open(Run& r, Avc& a, const std::string& key, u32 level, u32 buffers = 0, u32
 void close(Run& r, Avc& a, const std::string& key)
 {
     a.release_all(key + ": before Close");
-    r.r("avcDecClose", {a.handle}, key + ": Close");
+    r.r(fn("Close"), {a.handle}, key + ": Close");
 }
 
 // A whole stream: each access unit, its pictures taken and released; then the flush.
@@ -433,7 +511,8 @@ void stream(Run& r, Avc& a, const std::string& key, const std::vector<std::vecto
 {
     for (usize i = 0; i < aus.size(); i++) {
         const auto [dts, pts] = stamps(i, i < display.size() ? display[i] : static_cast<int>(i));
-        a.au(std::format("{}: AccessUnit {}", key, i), aus[i], mode, dts, pts);
+        a.au(std::format("{}: AccessUnit {}", key, i), aus[i], mode, dts, pts, 0, 0, 1,
+            i < a.seconds.size() ? a.seconds[i] : std::vector<u8>{});
     }
     a.status(key + ": before Flush");
     a.flush(key + ": Flush");
@@ -443,7 +522,7 @@ void stream(Run& r, Avc& a, const std::string& key, const std::vector<std::vecto
 
 Observed avc_life(const Setup& s, bool sony_half)
 {
-    Run r(s, sony_half, "libavcdec");
+    Run r(s, sony_half, library());
     u8* b = r.b;
     write_callback(b);
     make_spurs(r);
@@ -452,7 +531,7 @@ Observed avc_life(const Setup& s, bool sony_half)
     for (const u32 level : {9u, 10u, 11u, 12u, 13u, 20u, 21u, 22u, 30u, 31u, 32u, 40u, 41u, 42u, 43u, 50u}) {
         params(b, level);
         std::memset(b + kAttr, 0xEE, 12);
-        r.r("avcDecQueryMemory", {kParam, kAttr}, std::format("QueryMemory level {}", level));
+        r.r(fn("QueryMemory"), {kParam, kAttr}, std::format("QueryMemory level {}", level));
         r.o.line(std::format("QueryMemory level {}: the attribute", level), compare::hex(b + kAttr, 12));
     }
     struct Q {
@@ -466,22 +545,22 @@ Observed avc_life(const Setup& s, bool sony_half)
         std::memset(b + kAttr, 0xEE, 12);
         const std::string key = std::format("QueryMemory level {} deblock {} buffers {} {}x{} MBs", q.level, q.deblock,
             q.buffers, q.w, q.h);
-        r.r("avcDecQueryMemory", {kParam, kAttr}, key);
+        r.r(fn("QueryMemory"), {kParam, kAttr}, key);
         r.o.line(key + ": the attribute", compare::hex(b + kAttr, 12));
     }
     params(b, 21);
-    r.r("avcDecQueryMemory", {0, kAttr}, "QueryMemory with no parameters");
-    r.r("avcDecQueryMemory", {kParam, 0}, "QueryMemory with no attribute");
+    r.r(fn("QueryMemory"), {0, kAttr}, "QueryMemory with no parameters");
+    r.r(fn("QueryMemory"), {kParam, 0}, "QueryMemory with no attribute");
 
     // Open's refusals.
     {
         params(b, 21);
-        r.r("avcDecQueryMemory", {kParam, kAttr}, "Open's refusals: QueryMemory");
+        r.r(fn("QueryMemory"), {kParam, kAttr}, "Open's refusals: QueryMemory");
         const u32 need = ps_read32(b, kAttr + 4);
-        const auto open_with = [&](const std::string& what, std::initializer_list<u64> args) {
-            const u64 v = r.side.call("avcDecOpen", args).value_or(~0ull);
+        const auto open_with = [&](const std::string& what, std::vector<u64> args) {
+            const u64 v = call_open(r, std::move(args));
             r.o.line("Open " + what, compare::answer(v));
-            if (static_cast<u32>(v) == 0) r.side.call("avcDecClose", {ps_read32(b, kHandle)});
+            if (static_cast<u32>(v) == 0) r.side.call(fn("Close"), {ps_read32(b, kHandle)});
         };
         ps_write32(b, kMemDesc + 0, kMem);
         ps_write32(b, kMemDesc + 4, need);
@@ -664,9 +743,9 @@ Observed avc_life(const Setup& s, bool sony_half)
                 for (u32 k = 0; k < 0x40; k++) ps_write8(b, kSide + k, static_cast<u8>(0x10 * i + k));
                 a.au(std::format("AccessUnit {}", i), sq.aus[i], 0, 0x1000 + i, 0x800 + i, kSide, i == 0 ? 0x40 : 8 * i);
             }
-            const u64 v = r.side.call("avcDecAccessUnit", {a.handle, kStream, 16, 0, 0, 0, 0, 0, kSide, 0x41}).value_or(~0ull);
+            const u64 v = call_au(r, a.handle, kStream, 16, 0, 0, 0, 0, 0, kSide, 0x41);
             r.o.line("side data: 0x41 bytes", compare::answer(v));
-            const u64 w = r.side.call("avcDecAccessUnit", {a.handle, kStream, 16, 0, 0, 0, 0, 0, 0, 8}).value_or(~0ull);
+            const u64 w = call_au(r, a.handle, kStream, 16, 0, 0, 0, 0, 0, 0, 8);
             r.o.line("side data: 8 bytes at 0", compare::answer(w));
             a.flush("Flush");
             close(r, a, "side data");
@@ -677,22 +756,22 @@ Observed avc_life(const Setup& s, bool sony_half)
         Avc a{r};
         a.label = "states: ";
         if (open(r, a, "states", 21)) {
-            r.r("avcDecRlsFrame", {a.handle, 0}, "states: RlsFrame before any picture");
-            r.r("avcDecFlush", {a.handle, 1}, "states: Flush mode 1");
-            r.r("avcDecReset", {a.handle, 0, 4}, "states: Reset flags 4");
-            r.r("avcDecAccessUnit", {a.handle, 0, 16, 0, 0, 0, 0, 0}, "states: AccessUnit with no address");
-            r.r("avcDecAccessUnit", {a.handle, kStream, 0, 0, 0, 0, 0, 0}, "states: AccessUnit with no size");
-            r.r("avcDecAccessUnit", {a.handle, kStream, 16, 0, 16, 0, 0, 0}, "states: AccessUnit with a continuation size alone");
-            r.r("avcDecAccessUnit", {a.handle, kStream, 16, 0, 0, 0, 0, 4}, "states: AccessUnit mode 4");
-            r.r("avcDecAccessUnit", {0, kStream, 16, 0, 0, 0, 0, 0}, "states: AccessUnit with no handle");
-            r.r("avcDecGetStatus", {a.handle, 0}, "states: GetStatus with no status");
-            r.r("avcDecClose", {kMem}, "states: Close with a handle that is not one");
+            r.r(fn("RlsFrame"), {a.handle, 0}, "states: RlsFrame before any picture");
+            r.r(fn("Flush"), {a.handle, 1}, "states: Flush mode 1");
+            r.r(fn("Reset"), {a.handle, 0, 4}, "states: Reset flags 4");
+            r.o.line("states: AccessUnit with no address", compare::answer(call_au(r, a.handle, 0, 16, 0, 0, 0, 0, 0)));
+            r.o.line("states: AccessUnit with no size", compare::answer(call_au(r, a.handle, kStream, 0, 0, 0, 0, 0, 0)));
+            r.o.line("states: AccessUnit with a continuation size alone", compare::answer(call_au(r, a.handle, kStream, 16, 0, 16, 0, 0, 0)));
+            r.o.line("states: AccessUnit mode 4", compare::answer(call_au(r, a.handle, kStream, 16, 0, 0, 0, 0, 4)));
+            r.o.line("states: AccessUnit with no handle", compare::answer(call_au(r, 0, kStream, 16, 0, 0, 0, 0, 0)));
+            if (!g_mvc) r.r(fn("GetStatus"), {a.handle, 0}, "states: GetStatus with no status");
+            r.r(fn("Close"), {kMem}, "states: Close with a handle that is not one");
             const Seq sq = sequence("I0 P1", 64, 64, {});
             a.au("AccessUnit 0", sq.aus[0]);
             a.flush("Flush");
-            r.r("avcDecAccessUnit", {a.handle, kStream, 16, 0, 0, 0, 0, 0}, "states: AccessUnit after Flush");
-            r.r("avcDecFlush", {a.handle, 0}, "states: Flush again");
-            r.r("avcDecReset", {a.handle, 1, 3}, "states: Reset");
+            r.o.line("states: AccessUnit after Flush", compare::answer(call_au(r, a.handle, kStream, 16, 0, 0, 0, 0, 0)));
+            r.r(fn("Flush"), {a.handle, 0}, "states: Flush again");
+            r.r(fn("Reset"), {a.handle, 1, 3}, "states: Reset");
             a.settle(1);
             a.messages("after Reset");
             a.status("after Reset");
@@ -700,9 +779,9 @@ Observed avc_life(const Setup& s, bool sony_half)
             a.au("AccessUnit 1 after Reset", sq.aus[1]);
             a.flush("Flush after Reset");
             close(r, a, "states");
-            r.r("avcDecClose", {a.handle}, "states: Close again");
-            r.r("avcDecGetStatus", {a.handle, kStatus}, "states: GetStatus after Close");
-            r.r("avcDecAccessUnit", {a.handle, kStream, 16, 0, 0, 0, 0, 0}, "states: AccessUnit after Close");
+            r.r(fn("Close"), {a.handle}, "states: Close again");
+            if (!g_mvc) r.r(fn("GetStatus"), {a.handle, kStatus}, "states: GetStatus after Close");
+            r.o.line("states: AccessUnit after Close", compare::answer(call_au(r, a.handle, kStream, 16, 0, 0, 0, 0, 0)));
         }
     }
     // The core's own SPURS.
@@ -750,11 +829,11 @@ Observed avc_life(const Setup& s, bool sony_half)
         a.label = "Reset flags 0: ";
         if (open(r, a, "Reset flags 0", 21)) {
             const Seq sq = sequence("I0 P1 P2", 64, 64, {});
-            r.r("avcDecReset", {a.handle, 0, 0}, "Reset flags 0: Reset(0, 0)");
+            r.r(fn("Reset"), {a.handle, 0, 0}, "Reset flags 0: Reset(0, 0)");
             a.settle(1);
             a.messages("after Reset(0, 0)");
             stream(r, a, "the stream", sq.aus);
-            r.r("avcDecReset", {a.handle, 0, 1}, "Reset flags 0: Reset(0, 1)");
+            r.r(fn("Reset"), {a.handle, 0, 1}, "Reset flags 0: Reset(0, 1)");
             a.settle(1);
             a.messages("after Reset(0, 1)");
             stream(r, a, "the stream again", sq.aus);
@@ -833,6 +912,102 @@ Observed avc_life(const Setup& s, bool sony_half)
             const Seq sq = sequence("I0 P1 P2 P3", 64, 64, {});
             stream(r, a, "the stream", sq.aus);
             close(r, a, "64x64 at 4, 4 buffers");
+        }
+    }
+    // libmvcdec's two views: each access unit a base view picture and a second view picture.
+    struct TwoViews {
+        const char* name;
+        const char* tokens;
+        char second;
+        std::function<void(hs::Sps&)> setup;
+    };
+    const auto buffer_of = [](u32 n) {
+        return [n](hs::Sps& q) {
+            q.vui.present = q.vui.restriction = true;
+            q.vui.max_dec_frame_buffering = n;
+            q.max_num_ref_frames = 1;
+        };
+    };
+    const TwoViews two_views[] = {
+        {"two views: I_PCM second views", "I0 P1 P2 P3", 'I', {}},
+        {"two views: anchors from the base view", "I0 P1 P2 P3", 'A', {}},
+        {"two views: from the second view's last", "I0 P1 P2 P3 P4 P5", 'T', {}},
+        {"two views: a buffer of 1", "I0 P1 P2 P3 P4 P5 P6", 'T', buffer_of(1)},
+        {"two views: non-reference pictures", "I0 p1 P2 p3 P4 p5", 'T', buffer_of(1)},
+        {"two views: B pictures", "I0 P3 b1 b2 P6 b4 b5 P9 b7 b8", 'T', [](hs::Sps& q) {
+             q.vui.present = q.vui.restriction = true;
+             q.vui.max_dec_frame_buffering = 2;
+         }},
+        {"two views: IDR between", "I0 P1 P2 I3 P4 P5", 'T', buffer_of(1)},
+    };
+    for (const TwoViews& tv : two_views) {
+        if (!g_mvc || !pick(tv.name)) continue;
+        Avc a{r};
+        a.label = std::string(tv.name) + ": ";
+        if (!open(r, a, tv.name, 21)) continue;
+        const Seq sq = sequence(tv.tokens, 64, 64, tv.setup, tv.second);
+        a.seconds = sq.seconds;
+        stream(r, a, "the stream", sq.aus);
+        close(r, a, tv.name);
+    }
+    if (g_mvc && pick("two views: modes")) {
+        for (const u32 mode : {1u, 2u, 3u}) {
+            Avc a{r};
+            a.label = std::format("two views: mode {}: ", mode);
+            if (!open(r, a, std::format("two views: mode {}", mode), 21)) continue;
+            const Seq sq = sequence("I0 P3 b1 b2 P6 b4 b5", 64, 64, [](hs::Sps& q) {
+                q.vui.present = q.vui.restriction = true;
+                q.vui.max_dec_frame_buffering = 2;
+            }, 'T');
+            a.seconds = sq.seconds;
+            stream(r, a, "the stream", sq.aus, mode);
+            close(r, a, std::format("two views: mode {}", mode));
+        }
+    }
+    if (g_mvc && pick("two views: the views change")) {
+        // The first access unit says how many views; an access unit with the other count is refused.
+        Avc a{r};
+        a.label = "two views: the views change: ";
+        if (open(r, a, "two views: the views change", 21)) {
+            const Seq sq = sequence("I0 P1 P2", 64, 64, {}, 'I');
+            a.au("AccessUnit 0", sq.aus[0], 0, 0x1000, 0x800, 0, 0, 1, sq.seconds[0]);
+            a.au("AccessUnit 1 without its second view", sq.aus[1], 0, 0x1001, 0x801);
+            a.au("AccessUnit 1", sq.aus[1], 0, 0x1001, 0x801, 0, 0, 1, sq.seconds[1]);
+            a.flush("Flush");
+            close(r, a, "two views: the views change");
+        }
+        Avc o{r};
+        o.label = "one view: the views change: ";
+        if (open(r, o, "one view: the views change", 21)) {
+            const Seq sq = sequence("I0 P1 P2", 64, 64, {}, 'I');
+            o.au("AccessUnit 0", sq.aus[0], 0, 0x1000, 0x800);
+            o.au("AccessUnit 1 with a second view", sq.aus[1], 0, 0x1001, 0x801, 0, 0, 1, sq.seconds[1]);
+            o.au("AccessUnit 1", sq.aus[1], 0, 0x1001, 0x801);
+            o.flush("Flush");
+            close(r, o, "one view: the views change");
+        }
+    }
+    if (g_mvc && pick("two views: side data")) {
+        Avc a{r};
+        a.label = "two views: side data: ";
+        a.release = false;
+        if (open(r, a, "two views: side data", 21)) {
+            const Seq sq = sequence("I0 P1 P2 P3", 64, 64, buffer_of(1), 'A');
+            for (usize i = 0; i < sq.aus.size(); i++) {
+                for (u32 k = 0; k < 0x40; k++) ps_write8(b, kSide + k, static_cast<u8>(0x20 * i + k));
+                a.au(std::format("AccessUnit {}", i), sq.aus[i], 0, 0x1000 + i, 0x800 + i, kSide, 0x10 + 8 * static_cast<u32>(i),
+                    1, sq.seconds[i]);
+                // the base view picture released alone first, then the second view's
+                if (a.held.size() >= 2) {
+                    const u32 base_id = a.held[0], second_id = a.held[1];
+                    a.held.erase(a.held.begin(), a.held.begin() + 2);
+                    r.r(fn("RlsFrame"), {a.handle, base_id}, std::format("two views: side data: AccessUnit {}: RlsFrame({})", i, base_id));
+                    r.r(fn("RlsFrame"), {a.handle, second_id}, std::format("two views: side data: AccessUnit {}: RlsFrame({})", i, second_id));
+                }
+            }
+            a.release = true;
+            a.flush("Flush");
+            close(r, a, "two views: side data");
         }
     }
     end_spurs(r);
@@ -918,5 +1093,72 @@ TEST_CASE("The H.264 core (libavcdec): pspocket's own, answering as Sony's did (
 TEST_CASE("The H.264 core (libavcdec) against Sony's", "[.][hle][lle][compare][vdec-cores]")
 {
     const Setup s = setup();
+    g_mvc = false;
     run(s, "libavcdec against Sony's", [&](bool sony) { return avc_life(s, sony); }, [](const Observed&) {});
+}
+
+TEST_CASE("libmvcdec: the comparison calls Sony's exports by their names; pspocket's own", "[hle][vdec-cores]")
+{
+    check_names("libmvcdec", {"mvcDecQueryMemory", "mvcDecOpen", "mvcDecClose", "mvcDecReset", "mvcDecAccessUnit",
+                                 "mvcDecRlsFrame", "mvcDecFlush", "mvcDecGetVersion", "mvcDecQueryCharacteristics"},
+        false);
+}
+
+TEST_CASE("The MVC core (libmvcdec): pspocket's own, answering as Sony's did (D-933)", "[hle][vdec-cores]")
+{
+    Setup s;
+    s.mode = Mode::Self;
+    const std::vector<std::string> only = {"QueryMemory", "non-reference P, a buffer of 1", "states", "two views: I_PCM",
+        "two views: B pictures", "two views: modes", "two views: the views change"};
+    g_only = &only;
+    g_quiet = std::chrono::milliseconds(40);
+    g_timeout = std::chrono::milliseconds(1500);
+    g_mvc = true;
+    const Observed o = avc_life(s, false);
+    g_mvc = false;
+    g_only = nullptr;
+    g_quiet = std::chrono::milliseconds(400);
+    g_timeout = std::chrono::milliseconds(15000);
+    // Sony's answers (this file's comparison, firmware 4.92).
+    CHECK(o.value("QueryMemory level 21: the attribute") == "hex:eeeeeeee013f138000000080");
+    CHECK(o.value("QueryMemory level 41: the attribute") == "hex:eeeeeeee0487ed0000000080");
+    CHECK(o.value("QueryMemory level 21 deblock 0 buffers 4 0x0 MBs: the attribute") == "hex:eeeeeeee00d2538000000080");
+    CHECK(o.value("QueryMemory level 21 deblock 0 buffers 15 0x0 MBs") == "0x80615901"); // two views' buffers: even
+    // One view: the store as each picture is decoded; one output at once comes with the next access unit.
+    CHECK(o.value("non-reference P, a buffer of 1: the stream: AccessUnit 1: message 2") ==
+        "picture: arg 0x1234 frame mem+0x81e380 sides ctx+0x584 0x0");
+    CHECK(o.value("non-reference P, a buffer of 1: the stream: AccessUnit 2: message 4") ==
+        "picture: arg 0x1234 frame mem+0x821b80 sides ctx+0x5cc 0x0");
+    CHECK(o.value("states: AccessUnit after Close") == "0x2");
+    // Two views: each picture's second view picture in the next frame buffer, right after it.
+    CHECK(o.value("two views: I_PCM second views: the stream: AccessUnit 0: message 0") ==
+        "AU done: pieces hex:0028000000001843000000000000000000281880000018460000000000000000 arg 0x1234 side ctx+0x584 "
+        "(0 bytes) flags hex:0000000000000000010000000000000002");
+    CHECK(o.value("two views: I_PCM second views: the stream: Flush: message 5") ==
+        "picture: arg 0x1234 frame mem+0x821b80 sides ctx+0x584 0x0");
+    const std::string second = o.value("two views: I_PCM second views: the stream: Flush: message 5: information");
+    CHECK(byte_of(second, 0x0D) == 1); // the second view
+    CHECK(byte_of(second, 0x0E) == 0); // not its access unit's first picture
+    CHECK(byte_of(second, 0x0F) == 2); // two pictures in its access unit
+    // A B picture output at once: its second view picture comes before the next access unit is done.
+    CHECK(o.value("two views: B pictures: the stream: AccessUnit 3: message 6") ==
+        "picture: arg 0x1234 frame mem+0x82fb80 sides ctx+0x614 0x0");
+    CHECK(o.value("two views: B pictures: the stream: AccessUnit 3: message 7").starts_with("AU done"));
+    // Skipped pictures have no frame buffer.
+    CHECK(o.value("two views: mode 1: the stream: AccessUnit 2: message 5") == "picture: arg 0x1234 frame 0x0 sides ctx+0x614 0x0");
+    CHECK(o.value("two views: the views change: AccessUnit 1 without its second view") == "0x80615901");
+    CHECK(o.value("one view: the views change: AccessUnit 1 with a second view") == "0x80615901");
+    // The second view decoded (its own I_PCM pictures, through the made one-view stream): its frame buffer's samples.
+    const Data* frame = o.find_data("two views: I_PCM second views: the stream: Flush: message 5: its frame buffer");
+    REQUIRE(frame);
+    const h::Picture want = h::pattern(64, 64, 100);
+    CHECK(frame->bytes[2 * 16 * 64] == want.y[0]); // the picture's first sample, after two strips of edge
+}
+
+TEST_CASE("The MVC core (libmvcdec) against Sony's", "[.][hle][lle][compare][vdec-cores]")
+{
+    const Setup s = setup();
+    g_mvc = true;
+    run(s, "libmvcdec against Sony's", [&](bool sony) { return avc_life(s, sony); }, [](const Observed&) {});
+    g_mvc = false;
 }

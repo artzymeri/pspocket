@@ -1,12 +1,15 @@
-// libavcdec, the H.264 codec core Sony's libvdec drives (and a game may call directly), pspocket's own (D-933): its
-// functions answering as Sony's module (firmware 4.92) does, its PPU side reproduced (the checks, the context at the
-// end of the decoder's memory, the command queues' room, the side data and frame tables, the helper thread and the
-// messages it gives the caller's callback), and what its SPU programs do with an access unit done on the host: the
-// stream's syntax read as Sony's decoder reports it (vdec_h264.hpp), the samples decoded by FFmpeg into the frame
-// buffer Sony's decoder takes, and the pictures output when its decoded picture buffer outputs them. Compared call for
-// call with Sony's module in tests/hle/test_vdec_avc_compare.cpp.
+// libavcdec and libmvcdec, the H.264 and MVC codec cores Sony's libvdec drives (and a game may call directly),
+// pspocket's own (D-933): their functions answering as Sony's modules (firmware 4.92) do, their PPU side reproduced
+// (the checks, the context at the end of the decoder's memory, the command queues' room, the side data and frame
+// tables, the helper thread and the messages it gives the caller's callback: one program with each module's numbers,
+// Core), and what their SPU programs do with an access unit done on the host: the stream's syntax read as Sony's
+// decoders report it (vdec_h264.hpp), the samples decoded by FFmpeg into the frame buffer Sony's decoders take (an MVC
+// stream's second view through vdec_mvc_view.cpp), and the pictures output when each decoded picture buffer outputs
+// them (libavcdec's and libmvcdec's SPU programs keep theirs differently). Compared call for call with Sony's modules
+// in tests/hle/test_vdec_avc_compare.cpp.
 //
-// The API (the names RPCS3 has, rpcs3/Emu/Cell/Modules/libavcdec.cpp; their arguments read in Sony's module):
+// The API (the names RPCS3 has, rpcs3/Emu/Cell/Modules/libavcdec.cpp and libmvcdec.cpp; their arguments read in
+// Sony's modules):
 // - avcDecQueryMemory(param {level, deblocking, buffers, -, width and height in macroblocks}, attr {-, size, align})
 // - avcDecOpen(&handle, spurs, &taskset, param, mem {addr, size, align}, stack, sdk, callback, arg, spus, priorities,
 //   spu priority, ppu priority)
@@ -14,6 +17,10 @@
 // - avcDecRlsFrame(handle, frame id), avcDecFlush(handle, 0), avcDecReset(handle, keep sps, flags),
 //   avcDecGetStatus(handle, status[2]), avcDecClose(handle); avcDecGetVersion and avcDecQueryCharacteristics stay in
 //   codec_cores.cpp (D-575).
+// - mvcDecQueryMemory, mvcDecOpen (libavcdec's without the SDK version), mvcDecAccessUnit(handle, pieces {base view,
+//   size, its continuation, size, second view, size, its continuation, size}, dts, pts, mode, side data, side size),
+//   mvcDecRlsFrame, mvcDecFlush, mvcDecReset, mvcDecClose (no GetStatus); mvcDecGetVersion and
+//   mvcDecQueryCharacteristics stay in codec_cores.cpp.
 // The callback gets one argument, a message on the helper thread's stack: {type, arg, ...}: 0 an access unit done,
 // 1 a picture (its information at +8), 2 the flush done, 3 the reset done, 4 a severe error.
 //
@@ -45,6 +52,7 @@
 #include "pspocket/lv2/syscalls.hpp"
 #include "vdec_avc.hpp"
 #include "vdec_h264.hpp"
+#include "vdec_mvc_view.hpp"
 
 #if PSPOCKET_HAVE_FFMPEG
 extern "C" {
@@ -129,6 +137,42 @@ std::optional<Layout> layout(u32 level, u32 buffers, u32 width_mbs, u32 height_m
     return l;
 }
 
+std::optional<Layout> mvc_layout(u32 level, u32 buffers, u32 width_mbs, u32 height_mbs)
+{
+    const Level* lv = level_of(level);
+    if (!lv) return std::nullopt;
+    u32 width = lv->width, height = lv->height, frame_mbs = lv->max_fs;
+    if (width_mbs && height_mbs) {
+        if (width_mbs > 120 || width_mbs < 4 || height_mbs > 68 || height_mbs < 4) return std::nullopt;
+        frame_mbs = width_mbs * height_mbs;
+        if (lv->max_fs < frame_mbs) return std::nullopt;
+        width = width_mbs * 16;
+        height = height_mbs * 16;
+    }
+    // Two views' buffers: twice the level's, made even, at most 32; the caller's count even and no more.
+    u32 dpb = static_cast<u32>((((u64{lv->dpb_x10 & 0x3FFFFF} << 10) / 10) << 2) / (width * height * 3));
+    if (dpb & 1) dpb++;
+    dpb = std::min<u32>(dpb, 32);
+    if (buffers) {
+        if (buffers > dpb || (buffers & 1)) return std::nullopt;
+        dpb = buffers;
+    }
+    const u32 min_cr = level > 40 ? 4 : lv->min_cr;
+    const u32 au = ((((static_cast<u32>(u64{lv->mbps} * 384384 / (u64{min_cr} * 24000)) + 0x2000) * 2) + 0x7F) & ~0x7Fu) + 0x4400;
+    Layout l;
+    l.blocks = {0xE9400, frame_mbs * 0x600, frame_mbs * 0x200, au * 2,
+        ((width + 64) * height + ((width + 64) * height >> 1) + 0x800) * (dpb + 4), 0x480, 0x4380, 0x1B7E00, 0x2700,
+        0x9F600, 0x1F80, 0x280, 0x40000, 0x100, 0x300, ((dpb + 3) * frame_mbs * 0x50 + 0x7F) & ~0x7Fu};
+    if (l.blocks[4] & 127) return std::nullopt;
+    l.dynamic = l.blocks[1] + l.blocks[2] + l.blocks[3] + l.blocks[4] + l.blocks[15] + 0x3BD400;
+    l.size = l.dynamic + 0x4FC100;
+    if (l.size % 128) l.size += 128 - l.size % 128;
+    l.frames = l.blocks[0] + l.blocks[1] + l.blocks[2] + l.blocks[3];
+    l.au_buffer = au;
+    l.frame_mbs = frame_mbs;
+    return l;
+}
+
 // =================================================================================================== the frame buffer
 
 // Sony's H.264 frame buffer (D-196): 16-byte strips of luma, two of repeated edge on each side, a gap of 0x400 bytes,
@@ -160,23 +204,39 @@ namespace {
 constexpr std::string_view kChan = "libavcdec";
 constexpr s32 error(u32 code) { return static_cast<s32>(code); }
 
-enum : u32 {
-    AVC_ARG = 0x80615201,
-    AVC_SEQ = 0x80615202,  // not in a state for the call
-    AVC_BUSY = 0x80615203, // a command queue (or a table) full
-    AVC_FATAL = 0x80615281,
+// What tells libavcdec's PPU side from libmvcdec's: the same program with other numbers (read in Sony's modules).
+struct Core {
+    std::string_view library; // the module's name (and the log's channel)
+    const char* prefix;       // its own SPURS instance's name prefix; its task set "<prefix>_<handle>", its thread's name
+    u32 err;                  // its error codes: ARG +1, SEQ +2 (not in a state for the call), BUSY +3 (a queue or a
+                              // table full), FATAL +0x81
+    u32 magic;                // the open mark at +0 of the context
+    // The context: the last bytes of the decoder's memory, the handle. What a caller may see of it: the open mark, the
+    // side data each access unit carried (its table's entries: the size, then the data; libmvcdec's then count the
+    // releases). The rest is Sony's PPU side's bookkeeping, kept on the host here.
+    u32 context_bytes;
+    u32 side_at, side_entries, side_entry;
+    u32 frame_entries;          // the frame table (what a release frees)
+    u32 au_room, other_room;    // the queues' entries: a queue answers BUSY with fewer than two free
+    // The fixed part of the memory before the SPU side's working memory (task contexts, queues; Open clears it up to
+    // the core's own SPURS), its own SPURS, the task set.
+    u32 spurs_at, taskset_at, dynamic_at;
+    u32 extra;                  // QueryMemory: the size past the dynamic part
+    u32 helper_nid;             // the helper thread's entry (pspocket's own function)
+    const char* helper;
+    bool mvc;
+
+    s32 arg() const { return error(err + 1); }
+    s32 seq() const { return error(err + 2); }
+    s32 busy() const { return error(err + 3); }
+    s32 fatal() const { return error(err + 0x81); }
 };
 
-// The context: the last 0x1380 bytes of the decoder's memory, the handle. What a caller may see of it: the open mark
-// at +0, the side data each access unit carried (its table's entries at +0x550, 0x44 bytes each: the size, then the
-// data). The rest is Sony's PPU side's bookkeeping, kept on the host here.
-constexpr u32 kMagic = 0xBE264DEC;
-constexpr u32 kContextBytes = 0x1380;
-constexpr u32 kSideData = 0x550, kSideEntries = 46, kSideEntry = 0x44;
-constexpr u32 kFrameEntries = 36;
-constexpr u32 kAuQueueRoom = 5, kOtherQueueRoom = 20; // a queue answers BUSY with fewer than two entries free
-// The fixed part of the memory before the SPU side's working memory: task contexts, queues, SPURS, the taskset.
-constexpr u32 kSpursAt = 0x294300, kTasksetAt = 0x295300, kDynamicAt = 0x298180;
+constexpr Core kAvc{"libavcdec", "_libvdec_avc", 0x80615200, 0xBE264DEC, 0x1380, 0x550, 46, 0x44, 36, 5, 20, 0x294300,
+    0x295300, 0x298180, 0x299500, 0x2D9EA30D, "_pspocket_avcdec_thread", false};
+constexpr Core kMvc{"libmvcdec", "_libvdec_mvc", 0x80615900, 0xBE264DDC, 0x1F80, 0x580, 82, 0x48, 36, 5, 36, 0x4F6400,
+    0x4F7400, 0x4FA180, 0x4FC100, 0xC7AA1D3D, "_pspocket_mvcdec_thread", true};
+constexpr u32 kMaxSideEntries = 82, kMaxFrameEntries = 36;
 
 // The decoder's states (Sony's context +0x1a0).
 enum State : u32 {
@@ -278,6 +338,10 @@ struct FrameReport {
     std::array<u8, 0x88> pan_scan{};       // response +0xA8 to +0x12F
     std::array<u8, 0x30> cc{};             // response +0x130 to +0x15F
     std::array<u8, 6> tail{};              // response +0x160 to +0x165
+    // libmvcdec: the picture's view (0 the base view, 1 the second), whether it is its access unit's first picture,
+    // and how many pictures its access unit gives
+    u16 view = 0;
+    u8 first_of_unit = 1, pictures = 1;
 };
 
 // Response flag bits (Sony's debug output names them).
@@ -401,9 +465,84 @@ void write_info(u8* base, u32 info, const FrameReport& r, u32 frame_id, u8 count
     ps_write8(base, info + 0x177, b3);
 }
 
+// libmvcdec's information of a picture (0x158 bytes after its message's 0x44): libavcdec's fields with the view's
+// (its index, whether it is the first of its access unit's, how many pictures the access unit has) where libavcdec has
+// its GOP flag (which follows them), the fields after it moved by 4 and those from the DTS on by 8, no frame packing,
+// and the flags as one doubleword: the SPU side's flags (libavcdec's one bit down) spread over its bits 33 to 63 (the
+// low bits as the helper thread's stack had them: not written).
+constexpr u32 kMvcInfoBytes = 0x158;
+
+void write_mvc_info(u8* base, u32 info, const FrameReport& r, u32 frame_id, u8 count, u32 side_ptr[2], u32 side_size[2],
+    u16 view, u8 first_of_unit, u8 pictures)
+{
+    for (u32 i = 0; i < kMvcInfoBytes; i++) ps_write8(base, info + i, 0);
+    ps_write32(base, info + 0x00, frame_id);
+    ps_write8(base, info + 0x04, r.skipped);
+    ps_write8(base, info + 0x05, r.error);
+    ps_write32(base, info + 0x08, external_error(r.error_code));
+    ps_write16(base, info + 0x0C, view);
+    ps_write8(base, info + 0x0E, first_of_unit);
+    ps_write8(base, info + 0x0F, pictures);
+    ps_write8(base, info + 0x10, r.gop_boundary);
+    ps_write32(base, info + 0x14, r.height);
+    ps_write32(base, info + 0x18, r.width);
+    ps_write32(base, info + 0x1C, r.crop_right);
+    ps_write32(base, info + 0x20, r.crop_left);
+    ps_write32(base, info + 0x24, r.crop_top);
+    ps_write32(base, info + 0x28, r.crop_bottom);
+    ps_write8(base, info + 0x2C, r.type[0]);
+    ps_write8(base, info + 0x2D, r.type[1]);
+    ps_write8(base, info + 0x2E, r.aspect_ratio_idc);
+    ps_write8(base, info + 0x2F, r.video_format);
+    ps_write8(base, info + 0x30, r.primaries);
+    ps_write8(base, info + 0x31, r.transfer);
+    ps_write8(base, info + 0x32, r.matrix);
+    for (u32 i = 0; i < 0x18; i++) ps_write8(base, info + 0x33 + i, r.cc[i]);
+    ps_write8(base, info + 0x4B, r.cc_length[0]);
+    ps_write8(base, info + 0x4C, r.cc_length[1]);
+    for (u32 i = 0; i < 0x18; i++) ps_write8(base, info + 0x4D + i, r.cc[0x18 + i]);
+    ps_write8(base, info + 0x65, r.colour_length[0]);
+    ps_write8(base, info + 0x66, r.colour_length[1]);
+    ps_write8(base, info + 0x67, r.structure);
+    ps_write8(base, info + 0x68, r.coded_as);
+    for (u32 i = 0; i < 6; i++) ps_write8(base, info + 0x69 + i, r.tail[i]);
+    ps_write8(base, info + 0x6F, count);
+    ps_write8(base, info + 0x70, r.word5[3]);
+    ps_write64(base, info + 0x78, r.dts[0]);
+    ps_write64(base, info + 0x80, r.dts[1]);
+    ps_write64(base, info + 0x88, r.pts[0]);
+    ps_write64(base, info + 0x90, r.pts[1]);
+    ps_write16(base, info + 0x98, r.field_interval);
+    ps_write32(base, info + 0x9C, side_ptr[0]);
+    ps_write32(base, info + 0xA0, side_ptr[1]);
+    ps_write32(base, info + 0xA4, side_size[0]);
+    ps_write32(base, info + 0xA8, side_size[1]);
+    ps_write32(base, info + 0xAC, r.frame);
+    ps_write32(base, info + 0xB0, static_cast<u32>(r.poc[0]));
+    ps_write32(base, info + 0xB4, static_cast<u32>(r.poc[1]));
+    ps_write32(base, info + 0xB8, r.time_scale);
+    ps_write32(base, info + 0xBC, r.units_in_tick);
+    for (u32 i = 0; i < 0x10; i++) ps_write8(base, info + 0xC0 + i, r.pan_scan[i]);
+    ps_write8(base, info + 0xD0, r.pan_scan_cancel[0]);
+    ps_write8(base, info + 0xD1, r.pan_scan_cancel[1]);
+    for (u32 i = 0; i < 0x78; i++) ps_write8(base, info + 0xD4 + i, r.pan_scan[0x10 + i]);
+    ps_write16(base, info + 0x14C, r.sar_width);
+    ps_write16(base, info + 0x14E, r.sar_height);
+    // the flags: response bit k (libavcdec's bit k + 1) at these bits of the doubleword
+    static constexpr std::array<u8, 31> kAt{48, 49, 47, 50, 51, 52, 53, 39, 55, 56, 57, 58, 59, 60, 61, 62, 63, 40, 41, 42,
+        43, 44, 45, 46, 33, 34, 54, 35, 36, 37, 38};
+    u64 flags = 0;
+    for (u32 k = 0; k < kAt.size(); k++)
+        if ((r.flags >> (k + 1)) & 1) flags |= u64{1} << kAt[k];
+    ps_write32(base, info + 0x150, static_cast<u32>(flags >> 32));
+}
+
 // What the SPU side says of an access unit when it is done with it (its AU complete response).
 struct AuReport {
     u32 addr = 0, cont = 0;
+    // libmvcdec's message has every piece and its size, and how many pictures the access unit gives
+    u32 size = 0, cont_size = 0, dep = 0, dep_size = 0, dep_cont = 0, dep_cont_size = 0;
+    u8 pictures = 1;
     u8 discarded = 0, skipped = 0, error = 0, side_id = 0;
     u8 error_code = 0, bd_cv = 0, bd_decodable = 1;
 };
@@ -426,14 +565,32 @@ struct Picture {
     bool adaptive = false;
     std::vector<Mmco> mmco;
     FrameReport report;
+    // libmvcdec: a base view picture's second view picture (in a frame buffer of its own, output right after it), and
+    // a second view picture's base view picture (it is in the buffer while that is)
+    std::shared_ptr<Picture> second;
+    std::weak_ptr<Picture> first;
 };
 using PicturePtr = std::shared_ptr<Picture>;
+
+// Whether a picture is in the decoded picture buffer (a second view picture: its base view picture).
+bool in_buffer(const Picture& p)
+{
+    if (p.in_dpb) return true;
+    if (const PicturePtr f = p.first.lock()) return f->in_dpb;
+    return false;
+}
+
+constexpr u32 kNoSlot = ~0u; // a picture with no frame buffer (libmvcdec's skipped pictures)
+
+// Whether `slot` is a picture's (or its second view picture's) frame buffer.
+bool uses_slot(const Picture& p, u32 slot) { return p.slot == slot || (p.second && p.second->slot == slot); }
 
 // A command for the SPU side, as libavcdec's PPU side queues them.
 struct Command {
     enum class Kind { Au, Flush, Release, Reset, Close } kind = Kind::Au;
-    // an access unit
+    // an access unit (libmvcdec's with its second view's pieces)
     u32 addr = 0, size = 0, cont = 0, cont_size = 0;
+    u32 dep = 0, dep_size = 0, dep_cont = 0, dep_cont_size = 0;
     u64 dts = 0, pts = 0;
     u32 mode = 0;
     u8 side_id = 0;
@@ -551,6 +708,7 @@ private:
 // The decoder: its PPU side's state (what the caller's calls and the helper thread share, under m) and its SPU side's
 // (the helper thread's alone).
 struct Decoder {
+    const Core* core = &kAvc;
     std::mutex m;
     u32 handle = 0, mem = 0, mem_size = 0;
     Layout lay;
@@ -571,18 +729,27 @@ struct Decoder {
     struct SideEntry {
         bool used = false;
         u32 key = 0, size = 0;
+        // libmvcdec's: the releases its pictures need (0xFF: none frees it), those taken, and whether its access unit
+        // is done (the entry is freed when both are so)
+        u8 expected = 0xFF, released = 0;
+        bool done = false;
     };
-    std::array<SideEntry, kSideEntries> side{};
+    std::array<SideEntry, kMaxSideEntries> side{};
     struct FrameEntry {
         bool used = false;
         u32 key = 0;
         u8 count = 0, skipped = 0;
         u32 side[2] = {0, 0};
     };
-    std::array<FrameEntry, kFrameEntries> frames{};
+    std::array<FrameEntry, kMaxFrameEntries> frames{};
     std::deque<Command> au_queue, other_queue;
     lv2::WaitQueue waiters; // the helper thread, waiting for a command
     bool thread_started = false;
+
+    u8 views = 0; // libmvcdec: the first access unit's views (1, or 2 with the second view's piece); 0 before it
+    // libmvcdec: a picture output at once (stored never), whose message comes with the next access unit's: one view's
+    // (after its AU done), or with two views a second view picture (before it; its base view picture's came at once)
+    PicturePtr pending_second;
 
     // SPU side (the helper thread)
     u32 reset_flags = 3;         // Reset's flags: 0 refuses every sequence
@@ -592,6 +759,7 @@ struct Decoder {
     // The last decoded picture's type and order count: an error picture within a sequence reports them.
     u8 last_type = 0;
     s32 last_poc = 0;
+    bool last_failed = false; // libmvcdec: the access unit before was one in error
     std::array<std::optional<Sps>, 32> sps{};
     std::array<std::optional<Pps>, 256> pps{};
     std::optional<Sps> active;
@@ -619,6 +787,9 @@ struct Decoder {
 #if PSPOCKET_HAVE_FFMPEG
     Samples samples;
 #endif
+    // libmvcdec's second view: its decoder, and its subset SPS (its pictures' sequence fields)
+    SecondView second_view;
+    std::array<std::optional<Sps>, 32> subset{};
 };
 
 struct Decoders {
@@ -673,7 +844,7 @@ void fill_error_frame(u8* base, u32 at, u32 width, u32 height)
     std::memset(base + at + luma, 0x80, bytes - luma);
 }
 
-u32 slot_addr(const Decoder& d, u32 slot) { return d.mem + kDynamicAt + d.lay.frames + slot * d.slot_bytes; }
+u32 slot_addr(const Decoder& d, u32 slot) { return d.mem + d.core->dynamic_at + d.lay.frames + slot * d.slot_bytes; }
 
 // The frame buffers for pictures of this size: the slots past the SPU side's first four blocks, as many as the decoded
 // picture buffer and two more, each the picture's size (Sony's decoder lays them out again when the size changes).
@@ -682,7 +853,7 @@ void lay_out_frames(Decoder& d, u32 width, u32 height, u32 dpb)
     d.frame_width = width;
     d.frame_height = height;
     d.slot_bytes = frame_slot_bytes(width, height);
-    d.slots = dpb + 2;
+    d.slots = (dpb + 2) * (d.views == 2 ? 2 : 1); // libmvcdec's two views: each picture's two frame buffers
     d.last_slot = 0;
     d.slot_used.assign(d.slots, false);
 }
@@ -692,10 +863,10 @@ void lay_out_frames(Decoder& d, u32 width, u32 height, u32 dpb)
 bool slot_busy(const Decoder& d, u32 slot)
 {
     for (const PicturePtr& p : d.dpb)
-        if (p->slot == slot) return true;
-    if (d.current && d.current->slot == slot) return true;
+        if (uses_slot(*p, slot)) return true;
+    if (d.current && uses_slot(*d.current, slot)) return true;
     for (const PicturePtr& p : d.queued)
-        if (p->slot == slot) return true;
+        if (uses_slot(*p, slot)) return true;
     for (const Decoder::Output& o : d.outputs)
         if (o.pic->slot == slot) return true;
     return false;
@@ -718,7 +889,7 @@ std::optional<u32> take_slot(Decoder& d, const std::vector<bool>& was_free = {})
 // The frame IDs free again: released, and their pictures out of the buffer.
 void free_ids(Decoder& d)
 {
-    std::erase_if(d.outputs, [](const Decoder::Output& o) { return o.released && !o.pic->in_dpb; });
+    std::erase_if(d.outputs, [](const Decoder::Output& o) { return o.released && !in_buffer(*o.pic); });
 }
 
 // The lowest frame ID not in use.
@@ -908,7 +1079,6 @@ void adaptive_marking(Decoder& d, const PicturePtr& p)
 
 // =================================================================================================== the helper thread
 
-constexpr u32 NID_helper_thread = 0x2D9EA30D; // nid_of("_pspocket_avcdec_thread"): pspocket's own
 
 // The access unit's bytes: its piece and its continuation.
 std::vector<u8> au_bytes(u8* base, const Command& c)
@@ -919,7 +1089,7 @@ std::vector<u8> au_bytes(u8* base, const Command& c)
 }
 
 // What the stream says of the sequence, for a picture's report (the flags and the VUI's fields).
-void sequence_fields(const Sps& s, FrameReport& r)
+void sequence_fields(const Sps& s, FrameReport& r, bool mvc = false)
 {
     r.width = s.width();
     r.height = s.height();
@@ -946,6 +1116,11 @@ void sequence_fields(const Sps& s, FrameReport& r)
                 r.sar_height = v.sar_height;
             }
         }
+        if (mvc) {
+            // libmvcdec's SPU side infers what the VUI leaves out (libavcdec's leaves it 0)
+            r.video_format = 5;
+            r.primaries = r.transfer = r.matrix = 2;
+        }
         if (v.video_signal_type) {
             r.flags |= F_VIDEO_SIGNAL_TYPE;
             r.video_format = v.video_format;
@@ -970,7 +1145,7 @@ void sequence_fields(const Sps& s, FrameReport& r)
 }
 
 // The messages a picture leaving the decoder makes: its frame ID taken.
-void emit_output(Decoder& d, const PicturePtr& p, std::vector<Message>& msgs)
+void emit_output(Decoder& d, const PicturePtr& p, std::vector<Message>& msgs, bool with_second = true)
 {
     Message m;
     m.type = MSG_FRAME;
@@ -978,6 +1153,7 @@ void emit_output(Decoder& d, const PicturePtr& p, std::vector<Message>& msgs)
     m.frame.frame = p->frame;
     m.frame.frame_id = static_cast<u8>(take_frame_id(d, p));
     msgs.push_back(m);
+    if (p->second && with_second) emit_output(d, p->second, msgs);
 }
 
 // The caller's releases taken (they free frame IDs and frame buffers): the SPU side takes them when it starts an access
@@ -1110,7 +1286,9 @@ SeqCheck check_sequence(const Decoder& d, const Sps& s)
 u32 effective_dpb(const Decoder& d, const Sps& s)
 {
     const u32 want = dpb_size_of(s);
-    const u32 fit = d.lay.blocks[4] / frame_slot_bytes(s.width(), s.height());
+    // libmvcdec's frame buffers are two views' (with one view too)
+    const u32 views = d.core->mvc ? 2 : 1;
+    const u32 fit = d.lay.blocks[4] / frame_slot_bytes(s.width(), s.height()) / views;
     return fit >= want + 2 ? want : std::max<u32>(fit, 3) - 2;
 }
 
@@ -1145,7 +1323,19 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
     const bool valid = kind == Failed::InSequence;
     const bool own_size = kind == Failed::InSequence || kind == Failed::Refused;
     PicturePtr p;
-    if (picture) {
+    if (picture && d.core->mvc) {
+        // libmvcdec's error pictures have no frame buffer, though one is passed over in turn (none by the second of two
+        // in a row: measured)
+        if (d.slots && !d.last_failed) {
+            std::lock_guard lk(d.m);
+            (void)take_slot(d);
+        }
+        d.last_failed = true;
+        p = std::make_shared<Picture>();
+        p->slot = kNoSlot;
+        p->width = own_size ? sps->width() : 64;
+        p->height = own_size ? sps->height() : 64;
+    } else if (picture) {
         u32 slot = 0;
         if (d.slots) {
             std::lock_guard lk(d.m);
@@ -1157,7 +1347,7 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
         p->slot = slot;
         p->width = own_size ? sps->width() : 64;
         p->height = own_size ? sps->height() : 64;
-        p->frame = d.slots ? slot_addr(d, slot) : d.mem + kDynamicAt + d.lay.frames;
+        p->frame = d.slots ? slot_addr(d, slot) : d.mem + d.core->dynamic_at + d.lay.frames;
         // A frame buffer no decoded picture was in since the layout (or the first, before any layout) is made blank;
         // one that held a picture is left as it was (Sony's core at times conceals into it: a copy of a picture moved
         // by a line; not reproduced, D-933).
@@ -1167,7 +1357,7 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
     if (p) {
         FrameReport& r = p->report;
         r.flags = a.flags;
-        if (own_size) sequence_fields(*sps, r);
+        if (own_size) sequence_fields(*sps, r, d.core->mvc);
         r.width = p->width;
         r.height = p->height;
         if (kind == Failed::InSequence) {
@@ -1176,7 +1366,7 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
         } else if (a.first) {
             const SliceHeader& first = *a.first;
             const bool idr = a.first_nal->type == NAL_IDR;
-            if (idr) r.flags |= F_IDR;
+            if (idr && !(d.core->mvc && kind == Failed::Unknown)) r.flags |= F_IDR; // libmvcdec's lacks it there
             if (a.first_pps && a.first_pps->cabac) r.flags |= F_CABAC;
             r.type[0] = r.type[1] = static_cast<u8>(first.is_i() ? 0 : first.is_p() ? 1 : 2);
             r.poc[0] = picture_order_count(*a.first_sps, first, idr, a.first_nal->ref_idc, d.poc_state).top;
@@ -1198,6 +1388,13 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
     m.type = MSG_AU_DONE;
     m.au.addr = c.addr;
     m.au.cont = c.cont;
+    m.au.size = c.size;
+    m.au.cont_size = c.cont_size;
+    m.au.dep = c.dep;
+    m.au.dep_size = c.dep_size;
+    m.au.dep_cont = c.dep_cont;
+    m.au.dep_cont_size = c.dep_cont_size;
+    m.au.pictures = d.core->mvc && d.views == 2 ? 2 : 1;
     m.au.side_id = c.side_id;
     m.au.error = 1;
     m.au.error_code = code;
@@ -1211,6 +1408,100 @@ bool error_au(u8* base, Decoder& d, const Command& c, const AuContent& a, Failed
     return true;
 }
 
+// libmvcdec's second view picture of an access unit: its own frame buffer, its report the base view picture's with the
+// second view's NAL units' flags, its sequence's fields and its slice's type, view 1; its samples decoded from the
+// second view (vdec_mvc_view.cpp), or the base view's when they cannot be.
+void second_view_picture(u8* base, Decoder& d, const Command& c, const PicturePtr& p, u32 slot, bool skip,
+    const BaseView& decoded)
+{
+    std::vector<u8> bytes;
+    if (c.dep && c.dep_size) bytes.assign(base + c.dep, base + c.dep + c.dep_size);
+    if (c.dep_cont && c.dep_cont_size) bytes.insert(bytes.end(), base + c.dep_cont, base + c.dep_cont + c.dep_cont_size);
+    auto q = std::make_shared<Picture>();
+    q->slot = slot;
+    q->frame = slot == kNoSlot ? 0 : slot_addr(d, slot);
+    if (slot < d.slot_used.size()) d.slot_used[slot] = true;
+    q->width = p->width;
+    q->height = p->height;
+    q->poc = p->poc;
+    q->first = p;
+    FrameReport& r = q->report;
+    r = p->report;
+    r.view = 1;
+    r.first_of_unit = 0;
+    r.flags = 0;
+    const std::vector<Nal> nals = split_nals(bytes);
+    const Sps* sps = nullptr;
+    for (const Nal& n : nals) {
+        switch (n.type) {
+        case NAL_SUBSET_SPS: {
+            Rbsp b = payload_of(n);
+            Sps s = parse_sps(b, true);
+            if (s.valid && s.id < 32) d.subset[s.id] = s;
+            r.flags |= F_SPS;
+            break;
+        }
+        case NAL_PPS: r.flags |= F_PPS; break;
+        case NAL_AUD: r.flags |= F_AUD; break;
+        case NAL_END_SEQ: r.flags |= F_END_OF_SEQ; break;
+        case NAL_END_STREAM: r.flags |= F_END_OF_STREAM; break;
+        case NAL_FILLER: r.flags |= F_FILLER; break;
+        case NAL_SLICE_EXT:
+            if (!sps) {
+                Rbsp b = payload_of(n);
+                b.ue();
+                const u32 type = b.ue() % 5;
+                r.type[0] = r.type[1] = static_cast<u8>(type == SLICE_I || type == SLICE_SI ? 0 : type == SLICE_B ? 2 : 1);
+                for (const auto& s : d.subset)
+                    if (s) sps = &*s;
+            }
+            break;
+        default: break;
+        }
+    }
+    if (sps) sequence_fields(*sps, r, true);
+    else r.flags |= p->report.flags & (F_FRAME_MBS_ONLY | (3u << F_CHROMA_FORMAT_SHIFT));
+    p->second = q;
+    if (skip || decoded.y.empty()) return;
+    ViewSamples out;
+    if (d.second_view.decode(bytes, decoded, out))
+        write_frame(base, q->frame, q->width, q->height, out.y.data(), out.u.data(), out.v.data());
+    else
+        write_frame(base, q->frame, q->width, q->height, decoded.y.data(), decoded.u.data(), decoded.v.data());
+}
+
+// libmvcdec's decoded picture buffer (its SPU side's program, not libavcdec's): a picture is stored as soon as it is
+// decoded, as H.264's reference decoder (JM) does: an IDR picture outputs (or drops) what is there, a reference
+// picture's marking comes first, then pictures are output while the buffer is full, a non-reference picture that would
+// come first being output at once instead of stored (measured: a buffer of one outputs the picture before when the
+// next is decoded, a non-reference picture at once).
+// Its marking first (a reference picture's sliding window or memory management operations; an IDR picture emptied the
+// buffer before), then the store.
+void mark_now(Decoder& d, const Sps& sps, const PicturePtr& p)
+{
+    if (p->idr || !p->reference) return;
+    update_wraps(d, sps, p->frame_num);
+    if (p->adaptive) adaptive_marking(d, p);
+    else sliding_window(d, sps);
+}
+
+void store_now(Decoder& d, const Sps& sps, const PicturePtr& p, std::vector<PicturePtr>& out)
+{
+    d.dpb_size = std::max<u32>(1, effective_dpb(d, sps));
+    while (d.dpb.size() >= d.dpb_size) {
+        const PicturePtr first = smallest_poc(d);
+        if (!p->reference && (!first || p->poc < first->poc)) {
+            p->output_done = true;
+            out.push_back(p);
+            return;
+        }
+        if (!first) break;
+        output(d, first, out);
+    }
+    p->in_dpb = true;
+    d.dpb.push_back(p);
+}
+
 // The SPU side's work on one access unit: false when it waits for a frame buffer (nothing of the decoder changed).
 bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Message>& msgs)
 {
@@ -1222,6 +1513,14 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
     au.addr = c.addr;
     au.cont = c.cont;
     au.side_id = c.side_id;
+    au.size = c.size;
+    au.cont_size = c.cont_size;
+    au.dep = c.dep;
+    au.dep_size = c.dep_size;
+    au.dep_cont = c.dep_cont;
+    au.dep_cont_size = c.dep_cont_size;
+    const bool two_views = d.core->mvc && d.views == 2;
+    au.pictures = two_views ? 2 : 1;
     if (!a.first) {
         // No slice it decodes (none, one cut short, or one whose parameter sets are missing): with a sequence active
         // 0x50 (a slice there) or 0x51 (none); before any, 0x10 or 0x11 for the first such access unit, 0 for the
@@ -1230,7 +1529,7 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
         bool slice_nal = false;
         for (const Nal& n : a.nals)
             if (n.type == NAL_SLICE || n.type == NAL_IDR) slice_nal = true;
-        PS_LOG_WARN(kChan, "decoder {:#x}: an access unit with no slice to decode ({} bytes)", d.handle, a.data.size());
+        PS_LOG_WARN(d.core->library, "decoder {:#x}: an access unit with no slice to decode ({} bytes)", d.handle, a.data.size());
         u8 code = 0;
         if (d.seq_valid) code = slice_nal ? 0x50 : 0x51;
         else if (!d.error_reported) code = slice_nal ? 0x10 : 0x11;
@@ -1249,7 +1548,7 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
     const bool reference = ref_idc != 0;
     // A sequence the core refuses: an error picture for each access unit, the code with the first only.
     if (const SeqCheck chk = check_sequence(d, sps); chk.code) {
-        PS_LOG_WARN(kChan, "decoder {:#x}: a sequence it does not decode (profile {}, level {}, {}x{}): error {:#x}", d.handle,
+        PS_LOG_WARN(d.core->library, "decoder {:#x}: a sequence it does not decode (profile {}, level {}, {}x{}): error {:#x}", d.handle,
             sps.profile_idc, sps.level_idc, sps.width(), sps.height(), chk.code);
         const Failed kind = chk.code == 0x10 ? Failed::Unknown : Failed::Refused;
         if (!error_au(base, d, c, a, kind, &sps, d.error_reported ? 0 : chk.code, chk.pictures, msgs)) return false;
@@ -1263,7 +1562,7 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
     // are output until the buffer holds no more than its size, and those whose PTS this access unit's DTS reached. The
     // outputs wait for this access unit's AUDONE.
     std::vector<bool> was_free;
-    if (!d.previous_stored) {
+    if (!d.core->mvc && !d.previous_stored) {
         {
             std::lock_guard lk(d.m);
             for (u32 k = 0; k < d.slots; k++) was_free.push_back(!slot_busy(d, k));
@@ -1302,27 +1601,57 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
     // The frame buffers, laid out again for a new frame size or buffer; the picture's.
     const u32 dpb = effective_dpb(d, sps);
     const bool relayout = d.slots == 0 || d.frame_width != sps.width() || d.frame_height != sps.height() || d.dpb_size != dpb;
-    std::optional<u32> slot;
-    if (relayout) {
+    // The decode modes 1 to 3 leave non-reference pictures out (as B pictures are skipped); libmvcdec gives them no
+    // frame buffer.
+    const bool skip = c.mode != 0 && !reference;
+    const bool no_buffer = d.core->mvc && skip;
+    std::optional<u32> slot, slot2;
+    if (no_buffer) {
+        slot = kNoSlot;
+        if (two_views) slot2 = kNoSlot;
+    } else if (relayout) {
         slot = 1;
+        if (two_views) slot2 = 2;
     } else {
         std::lock_guard lk(d.m);
+        const u32 last = d.last_slot;
         slot = take_slot(d, was_free);
+        if (slot && two_views) {
+            slot2 = take_slot(d, was_free);
+            if (!slot2) {
+                slot.reset();
+                d.last_slot = last;
+            }
+        }
     }
     if (!slot) return false;
     // From here on the access unit is decoded.
     d.previous_stored = false;
-    if (relayout) {
+    if (two_views && idr) {
+        // libmvcdec with two views: an IDR picture outputs (or drops) what is in the buffer before its access unit is
+        // done (with one view, after).
+        std::vector<PicturePtr> out;
+        if (first.no_output_of_prior_pics) {
+            for (const PicturePtr& q : d.dpb) q->in_dpb = false;
+            d.dpb.clear();
+        } else {
+            flush_dpb(d, out);
+        }
+        std::lock_guard lk(d.m);
+        for (const PicturePtr& q : out) emit_output(d, q, msgs);
+    }
+    if (relayout && !no_buffer) {
         lay_out_frames(d, sps.width(), sps.height(), dpb);
-        d.last_slot = 1;
+        d.last_slot = two_views ? 2 : 1;
     }
     d.dpb_size = dpb;
     d.seq_valid = true;
     d.error_reported = false;
+    d.last_failed = false;
     commit_params(d, a);
     auto p = std::make_shared<Picture>();
     p->slot = *slot;
-    p->frame = slot_addr(d, *slot);
+    p->frame = *slot == kNoSlot ? 0 : slot_addr(d, *slot);
     if (*slot < d.slot_used.size()) d.slot_used[*slot] = true;
     p->width = sps.width();
     p->height = sps.height();
@@ -1337,7 +1666,7 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
     p->poc = poc.frame();
     FrameReport& r = p->report;
     r.flags = a.flags;
-    sequence_fields(sps, r);
+    sequence_fields(sps, r, d.core->mvc);
     if (idr) r.flags |= F_IDR;
     if (pps.cabac) r.flags |= F_CABAC;
     r.dts[0] = c.dts;
@@ -1357,24 +1686,48 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
         d.sps_pending = false;
     }
     r.tail = {4, 4, 4, 4, 4, 4};
-    // The decode modes 1 to 3 leave non-reference pictures out (as B pictures are skipped).
-    const bool skip = c.mode != 0 && !reference;
     if (skip) r.skipped = 1;
+    if (two_views) r.pictures = 2;
+    BaseView decoded;
 #if PSPOCKET_HAVE_FFMPEG
     if (!d.samples.is_open() && !d.samples.open())
-        PS_LOG_ERROR(kChan, "decoder {:#x}: FFmpeg's H.264 decoder did not open", d.handle);
+        PS_LOG_ERROR(d.core->library, "decoder {:#x}: FFmpeg's H.264 decoder did not open", d.handle);
     bool damaged = false;
     const bool got = d.samples.decode(a.data.data(), static_cast<u32>(a.data.size()), skip, damaged);
-    if (got && !skip) {
-        std::vector<u8> y, u, v;
-        if (d.samples.planes(p->width, p->height, y, u, v))
-            write_frame(base, p->frame, p->width, p->height, y.data(), u.data(), v.data());
+    if (got && !skip && d.samples.planes(p->width, p->height, decoded.y, decoded.u, decoded.v)) {
+        write_frame(base, p->frame, p->width, p->height, decoded.y.data(), decoded.u.data(), decoded.v.data());
+        decoded.width = p->width;
+        decoded.height = p->height;
+        decoded.poc = p->poc;
     }
 #else
-    PS_LOG_ERROR(kChan, "decoder {:#x}: pspocket was built without FFmpeg: nothing is decoded", d.handle);
+    PS_LOG_ERROR(d.core->library, "decoder {:#x}: pspocket was built without FFmpeg: nothing is decoded", d.handle);
 #endif
+    if (two_views) second_view_picture(base, d, c, p, *slot2, skip, decoded);
     d.active = sps;
-    d.current = p;
+    const auto emit_pending = [&] {
+        if (!d.pending_second) return;
+        emit_output(d, d.pending_second, msgs);
+        d.pending_second.reset();
+    };
+    std::vector<PicturePtr> idr_out;
+    if (d.core->mvc) {
+        // libmvcdec: the picture's marking (with one view an IDR picture empties the buffer now, its outputs given
+        // after the access unit is done), then (two views) the picture output at once before (its frame ID taken
+        // now), before the access unit is done.
+        if (!two_views && idr) {
+            if (first.no_output_of_prior_pics) {
+                for (const PicturePtr& q : d.dpb) q->in_dpb = false;
+                d.dpb.clear();
+            } else {
+                flush_dpb(d, idr_out);
+            }
+        }
+        mark_now(d, sps, p);
+        std::lock_guard lk(d.m);
+        free_ids(d);
+        if (two_views) emit_pending();
+    }
     // The access unit is done; then the pictures the store output.
     {
         Message m;
@@ -1383,6 +1736,27 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
         m.au.skipped = skip ? 1 : 0;
         msgs.push_back(m);
     }
+    if (d.core->mvc) {
+        // libmvcdec stores the picture now. With one view the picture output at once before comes first, and an IDR
+        // picture's outputs next. A picture output at once has its message (two views: its second view picture's)
+        // with the next access unit's; a skipped one's comes at once.
+        std::vector<PicturePtr> out = idr_out;
+        // the pictures whose PTS this access unit's DTS reached leave by the clock (as libavcdec's)
+        if (c.dts != kNoTime) output_by_time(d, c.dts, out);
+        store_now(d, sps, p, out);
+        std::lock_guard lk(d.m);
+        if (!two_views) emit_pending();
+        for (const PicturePtr& q : out) {
+            if (q == p && !skip) {
+                if (two_views) emit_output(d, q, msgs, false);
+                d.pending_second = two_views ? p->second : p;
+                continue;
+            }
+            emit_output(d, q, msgs);
+        }
+        return true;
+    }
+    d.current = p;
     for (const PicturePtr& q : d.queued) {
         std::lock_guard lk(d.m);
         emit_output(d, q, msgs);
@@ -1395,6 +1769,16 @@ bool decode_au(PPUContext& ctx, Decoder& d, const Command& c, std::vector<Messag
 void flush(Decoder& d, std::vector<Message>& msgs)
 {
     std::vector<PicturePtr> out;
+    if (d.core->mvc) {
+        // libmvcdec: the IDs of released pictures that left the buffer since are free for the flush's outputs
+        std::lock_guard lk(d.m);
+        free_ids(d);
+    }
+    if (d.pending_second) {
+        std::lock_guard lk(d.m);
+        emit_output(d, d.pending_second, msgs);
+        d.pending_second.reset();
+    }
     if (d.current) {
         d.current->in_dpb = true;
         d.dpb.push_back(d.current);
@@ -1413,11 +1797,11 @@ void flush(Decoder& d, std::vector<Message>& msgs)
 // ---------------------------------------------------------------------------------------------------- messages
 
 // A side data entry's place in the context, as the messages point at it.
-u32 side_entry_addr(const Decoder& d, u32 index) { return d.handle + kSideData + kSideEntry * index; }
+u32 side_entry_addr(const Decoder& d, u32 index) { return d.handle + d.core->side_at + d.core->side_entry * index; }
 
 int side_index(const Decoder& d, u32 key)
 {
-    for (u32 i = 0; i < kSideEntries; i++)
+    for (u32 i = 0; i < d.core->side_entries; i++)
         if (d.side[i].used && d.side[i].key == key) return static_cast<int>(i);
     return -1;
 }
@@ -1426,7 +1810,9 @@ int side_index(const Decoder& d, u32 key)
 void deliver(PPUContext& ctx, Decoder& d, const Message& msg)
 {
     u8* base = guest_base(ctx);
-    StackVar var(ctx, base, 0x40 + kInfoBytes + 0x10);
+    // The message and the picture's information on the helper thread's stack, with room past them (a callback may
+    // read a little more than the information).
+    StackVar var(ctx, base, 0x300);
     const u32 at = var.addr();
     switch (msg.type) {
     case MSG_AU_DONE: {
@@ -1441,20 +1827,51 @@ void deliver(PPUContext& ctx, Decoder& d, const Message& msg)
                 side_ptr = side_entry_addr(d, static_cast<u32>(i)) + 4;
                 side_size = d.side[static_cast<usize>(i)].size;
             } else {
-                PS_LOG_WARN(kChan, "decoder {:#x}: side data tag {} not in its table", d.handle, a.side_id);
+                PS_LOG_WARN(d.core->library, "decoder {:#x}: side data tag {} not in its table", d.handle, a.side_id);
             }
         }
-        ps_write32(base, at + 0x00, MSG_AU_DONE);
-        ps_write32(base, at + 0x04, d.cb_arg);
-        ps_write32(base, at + 0x08, a.addr);
-        ps_write32(base, at + 0x0C, a.cont);
-        ps_write32(base, at + 0x10, side_ptr);
-        ps_write32(base, at + 0x14, side_size);
-        ps_write8(base, at + 0x18, a.discarded);
-        ps_write8(base, at + 0x19, a.error);
-        ps_write8(base, at + 0x1A, a.bd_decodable);
-        ps_write8(base, at + 0x1B, a.bd_cv);
-        ps_write32(base, at + 0x1C, external_error(a.error_code));
+        if (d.core->mvc) {
+            // libmvcdec's: every piece with its size, then the same flags spread out, and the pictures the access
+            // unit gives (its side data is freed once they are all released).
+            {
+                std::lock_guard lk(d.m);
+                if (const int i = side_index(d, a.side_id); i >= 0) {
+                    d.side[static_cast<usize>(i)].expected = a.pictures;
+                    d.side[static_cast<usize>(i)].done = true;
+                }
+            }
+            for (u32 o = 0; o < 0x44; o += 4) ps_write32(base, at + o, 0);
+            ps_write32(base, at + 0x00, MSG_AU_DONE);
+            ps_write32(base, at + 0x04, d.cb_arg);
+            ps_write32(base, at + 0x08, a.addr);
+            ps_write32(base, at + 0x0C, a.size);
+            ps_write32(base, at + 0x10, a.cont);
+            ps_write32(base, at + 0x14, a.cont_size);
+            ps_write32(base, at + 0x18, a.dep);
+            ps_write32(base, at + 0x1C, a.dep_size);
+            ps_write32(base, at + 0x20, a.dep_cont);
+            ps_write32(base, at + 0x24, a.dep_cont_size);
+            ps_write32(base, at + 0x28, side_ptr);
+            ps_write32(base, at + 0x2C, side_size);
+            ps_write8(base, at + 0x30, a.discarded);
+            ps_write32(base, at + 0x34, a.error);
+            ps_write8(base, at + 0x38, a.bd_decodable);
+            ps_write8(base, at + 0x39, a.bd_cv);
+            ps_write32(base, at + 0x3C, external_error(a.error_code));
+            ps_write8(base, at + 0x40, a.pictures);
+        } else {
+            ps_write32(base, at + 0x00, MSG_AU_DONE);
+            ps_write32(base, at + 0x04, d.cb_arg);
+            ps_write32(base, at + 0x08, a.addr);
+            ps_write32(base, at + 0x0C, a.cont);
+            ps_write32(base, at + 0x10, side_ptr);
+            ps_write32(base, at + 0x14, side_size);
+            ps_write8(base, at + 0x18, a.discarded);
+            ps_write8(base, at + 0x19, a.error);
+            ps_write8(base, at + 0x1A, a.bd_decodable);
+            ps_write8(base, at + 0x1B, a.bd_cv);
+            ps_write32(base, at + 0x1C, external_error(a.error_code));
+        }
         if (d.callback) call_guest(ctx, d.callback, {at});
         if (a.discarded) {
             std::lock_guard lk(d.m);
@@ -1464,7 +1881,7 @@ void deliver(PPUContext& ctx, Decoder& d, const Message& msg)
     }
     case MSG_FRAME: {
         const FrameReport& r = msg.frame;
-        const u32 info = at + 0x24;
+        const u32 info = at + (d.core->mvc ? 0x44 : 0x24);
         u32 side_ptr[2] = {0, 0}, side_size[2] = {0, 0};
         u32 frame_id = r.frame_id;
         const u8 count = (r.structure > 2 && r.structure <= 6 && !r.decode_pair) ? 2 : 1;
@@ -1480,19 +1897,20 @@ void deliver(PPUContext& ctx, Decoder& d, const Message& msg)
             for (u32 k = 0; k < count; k++) {
                 const int i = side_index(d, r.side[k]);
                 if (i < 0) {
-                    PS_LOG_WARN(kChan, "decoder {:#x}: side data tag {} (field {}) not in its table", d.handle, r.side[k], k);
+                    PS_LOG_WARN(d.core->library, "decoder {:#x}: side data tag {} (field {}) not in its table", d.handle, r.side[k], k);
                     continue;
                 }
                 side_ptr[k] = side_entry_addr(d, static_cast<u32>(i)) + 4;
                 side_size[k] = d.side[static_cast<usize>(i)].size;
+                if (d.core->mvc && k == 0) d.side[static_cast<usize>(i)].expected = r.pictures;
             }
             // The frame table: what the frame's release frees.
             bool added = false;
-            for (auto& e : d.frames)
-                if (e.used && e.key == frame_id) added = true; // a key twice: Sony's table refuses it (logged)
+            for (u32 f = 0; f < d.core->frame_entries; f++)
+                if (d.frames[f].used && d.frames[f].key == frame_id) added = true; // a key twice: refused (logged)
             if (!added) {
-                for (auto& e : d.frames)
-                    if (!e.used) {
+                for (u32 f = 0; f < d.core->frame_entries; f++)
+                    if (auto& e = d.frames[f]; !e.used) {
                         e.used = true;
                         e.key = frame_id;
                         e.count = count;
@@ -1502,12 +1920,13 @@ void deliver(PPUContext& ctx, Decoder& d, const Message& msg)
                         added = true;
                         break;
                     }
-                if (!added) PS_LOG_WARN(kChan, "decoder {:#x}: its frame table is full", d.handle);
+                if (!added) PS_LOG_WARN(d.core->library, "decoder {:#x}: its frame table is full", d.handle);
             } else {
-                PS_LOG_WARN(kChan, "decoder {:#x}: frame {} given again before its release", d.handle, frame_id);
+                PS_LOG_WARN(d.core->library, "decoder {:#x}: frame {} given again before its release", d.handle, frame_id);
             }
         }
-        write_info(base, info, r, frame_id, count, side_ptr, side_size);
+        if (d.core->mvc) write_mvc_info(base, info, r, frame_id, count, side_ptr, side_size, r.view, r.first_of_unit, r.pictures);
+        else write_info(base, info, r, frame_id, count, side_ptr, side_size);
         ps_write32(base, at + 0x00, MSG_FRAME);
         ps_write32(base, at + 0x04, d.cb_arg);
         ps_write32(base, at + 0x08, info);
@@ -1542,6 +1961,7 @@ void reset_decoder(Decoder& d, const Command& c)
     for (const PicturePtr& q : d.dpb) q->in_dpb = false;
     d.dpb.clear();
     d.current.reset();
+    d.pending_second.reset();
     d.stalled.reset();
     d.previous_stored = false;
     d.queued.clear();
@@ -1564,6 +1984,9 @@ void reset_decoder(Decoder& d, const Command& c)
 #if PSPOCKET_HAVE_FFMPEG
     d.samples.reset();
 #endif
+    d.second_view.reset();
+    if (!c.keep_sps)
+        for (auto& s : d.subset) s.reset();
 }
 
 // The helper thread: the SPU side's work in command order, then the messages.
@@ -1621,86 +2044,85 @@ void run(PPUContext& ctx, Decoder& d)
     }
 }
 
-// The helper thread's entry (an internal function of pspocket's libavcdec): the decoder's handle its argument.
-void _pspocket_avcdec_thread(PPUContext& ctx, u64 handle)
-{
-    lv2::PpuThread& t = thread_of(ctx);
-    if (const std::shared_ptr<Decoder> d = decoder_at(static_cast<u32>(handle))) run(ctx, *d);
-    else PS_LOG_ERROR(kChan, "the helper thread started for an unknown decoder {:#x}", handle);
-    lv2::_sys_ppu_thread_exit(t, 0);
-}
-
 // =================================================================================================== the API
 
-// The decoder at `handle` when its memory holds the open mark (Sony's check).
-std::shared_ptr<Decoder> decoder_of(PPUContext& ctx, u32 handle)
+// The decoder at `handle` when its memory holds the core's open mark (Sony's check).
+std::shared_ptr<Decoder> decoder_of(PPUContext& ctx, const Core& core, u32 handle)
 {
     if (!handle || !guest_readable(thread_of(ctx), handle, 4)) return nullptr;
-    if (ps_read32(guest_base(ctx), handle) != kMagic) return nullptr;
-    return decoder_at(handle);
+    if (ps_read32(guest_base(ctx), handle) != core.magic) return nullptr;
+    std::shared_ptr<Decoder> d = decoder_at(handle);
+    return d && d->core == &core ? d : nullptr;
 }
 
-// avcDecQueryMemory(param, attr): the memory for the parameters, to 128 bytes, and its alignment (128).
-s32 avcDecQueryMemory(PPUContext& ctx, u32 param, u32 attr)
+std::optional<Layout> core_layout(const Core& core, u32 level, u32 buffers, u32 width_mbs, u32 height_mbs)
+{
+    return core.mvc ? mvc_layout(level, buffers, width_mbs, height_mbs) : layout(level, buffers, width_mbs, height_mbs);
+}
+
+// QueryMemory(param, attr): the memory for the parameters, to 128 bytes, and its alignment (128).
+s32 query_memory(PPUContext& ctx, const Core& core, u32 param, u32 attr)
 {
     u8* base = guest_base(ctx);
     if (!writable(ctx, param, 8) || ps_read8(base, param + 1) > 2 || !writable(ctx, attr, 12)) {
-        PS_LOG_ERROR(kChan, "avcDecQueryMemory({:#x}, {:#x}): bad parameter", param, attr);
-        return error(AVC_ARG);
+        PS_LOG_ERROR(core.library, "QueryMemory({:#x}, {:#x}): bad parameter", param, attr);
+        return core.arg();
     }
-    const std::optional<Layout> l = layout(ps_read8(base, param), ps_read8(base, param + 2), ps_read16(base, param + 4),
-        ps_read16(base, param + 6));
-    if (!l) return error(AVC_ARG);
+    const std::optional<Layout> l = core_layout(core, ps_read8(base, param), ps_read8(base, param + 2),
+        ps_read16(base, param + 4), ps_read16(base, param + 6));
+    if (!l) return core.arg();
     ps_write32(base, attr + 4, l->size);
     ps_write32(base, attr + 8, 0x80);
     return lv2::CELL_OK;
 }
 
-s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 param, u32 memdesc, u32 stack, u32 sdk,
-    u32 callback)
+// Open's arguments (libavcdec's and libmvcdec's in their order, past eight in the caller's parameter save area).
+struct OpenArgs {
+    u32 handle_out = 0, spurs = 0, taskset_out = 0, param = 0, memdesc = 0, stack = 0, sdk = 0, callback = 0, cb_arg = 0;
+    u32 nspus = 0, prios = 0;
+    s32 spu_prio = 0, ppu_prio = 0;
+};
+
+s32 open_decoder(PPUContext& ctx, const Core& core, const OpenArgs& o)
 {
     u8* base = guest_base(ctx);
-    const u32 sp = static_cast<u32>(ctx.gpr[1]);
-    // The arguments past eight, in the caller's parameter save area.
-    const u32 cb_arg = ps_read32(base, sp + 0x74);
-    const u32 nspus = ps_read8(base, sp + 0x7F);
-    const u32 prios = ps_read32(base, sp + 0x84);
-    const s32 spu_prio = static_cast<s32>(ps_read32(base, sp + 0x8C));
-    const s32 ppu_prio = static_cast<s32>(ps_read32(base, sp + 0x94));
-    const bool params_ok = writable(ctx, param, 8) && ps_read8(base, param) <= 42 && ps_read8(base, param + 1) <= 2;
-    const bool mem_ok = writable(ctx, memdesc, 12) && ps_read32(base, memdesc) && !(ps_read32(base, memdesc) & 0x7F);
-    if (!handle_out || !writable(ctx, handle_out, 4) || (spurs && !prios) || !params_ok || !callback || !mem_ok ||
-        stack < 0x1000 || nspus == 0 || nspus > 8 || spu_prio < 0 || spu_prio > 0xFF || ppu_prio < 0 || ppu_prio > 0xBFF) {
-        PS_LOG_ERROR(kChan, "avcDecOpen: bad parameter");
-        return error(AVC_ARG);
+    const bool params_ok = writable(ctx, o.param, 8) && ps_read8(base, o.param) <= 42 && ps_read8(base, o.param + 1) <= 2;
+    const bool mem_ok = writable(ctx, o.memdesc, 12) && ps_read32(base, o.memdesc) && !(ps_read32(base, o.memdesc) & 0x7F);
+    if (!o.handle_out || !writable(ctx, o.handle_out, 4) || (o.spurs && !o.prios) || !params_ok || !o.callback ||
+        !mem_ok || o.stack < 0x1000 || o.nspus == 0 || o.nspus > 8 || o.spu_prio < 0 || o.spu_prio > 0xFF ||
+        o.ppu_prio < 0 || o.ppu_prio > 0xBFF) {
+        PS_LOG_ERROR(core.library, "Open: bad parameter");
+        return core.arg();
     }
-    const u32 level = ps_read8(base, param), deblock = ps_read8(base, param + 1), buffers = ps_read8(base, param + 2);
-    const u32 wmbs = ps_read16(base, param + 4), hmbs = ps_read16(base, param + 6);
-    const u32 version = sdk_level(sdk);
-    const std::optional<Layout> l = layout(level, buffers, wmbs, hmbs);
+    const u32 level = ps_read8(base, o.param), deblock = ps_read8(base, o.param + 1), buffers = ps_read8(base, o.param + 2);
+    const u32 wmbs = ps_read16(base, o.param + 4), hmbs = ps_read16(base, o.param + 6);
+    const u32 version = core.mvc ? 0x10C00 : sdk_level(o.sdk);
+    const std::optional<Layout> l = core_layout(core, level, buffers, wmbs, hmbs);
     if (!l) {
-        if (version >= 0x10C00) return error(AVC_ARG);
-        PS_LOG_ERROR(kChan, "avcDecOpen: parameters the memory query refuses, from an SDK before 3.3 (Sony's module goes "
-                            "on with sizes it never set): refused");
-        return error(AVC_ARG);
+        if (version >= 0x10C00) return core.arg();
+        PS_LOG_ERROR(core.library, "Open: parameters the memory query refuses, from an SDK before 3.3 (Sony's module goes "
+                                   "on with sizes it never set): refused");
+        return core.arg();
     }
-    const u32 mem = ps_read32(base, memdesc), mem_size = ps_read32(base, memdesc + 4), align = ps_read32(base, memdesc + 8);
+    const u32 mem = ps_read32(base, o.memdesc), mem_size = ps_read32(base, o.memdesc + 4),
+              align = ps_read32(base, o.memdesc + 8);
     if (mem_size < l->size) {
-        PS_LOG_ERROR(kChan, "avcDecOpen: memory is too small ({:#x} < {:#x})", mem_size, l->size);
-        return error(AVC_ARG);
+        PS_LOG_ERROR(core.library, "Open: memory is too small ({:#x} < {:#x})", mem_size, l->size);
+        return core.arg();
     }
     if (align < 0x80) {
-        PS_LOG_ERROR(kChan, "avcDecOpen: memory alignment is incorrect ({:#x})", align);
-        return error(AVC_ARG);
+        PS_LOG_ERROR(core.library, "Open: memory alignment is incorrect ({:#x})", align);
+        return core.arg();
     }
     if (!writable(ctx, mem, l->size)) {
-        PS_LOG_ERROR(kChan, "avcDecOpen: the memory ({:#x}, {:#x} bytes) is not guest memory", mem, l->size);
-        return error(AVC_ARG);
+        PS_LOG_ERROR(core.library, "Open: the memory ({:#x}, {:#x} bytes) is not guest memory", mem, l->size);
+        return core.arg();
     }
     // The fixed part cleared, as Sony's (its task contexts and queues).
-    std::memset(base + mem, 0, 0x294300);
+    std::memset(base + mem, 0, core.spurs_at);
     auto d = std::make_shared<Decoder>();
-    d->handle = mem + l->size - kContextBytes;
+    d->core = &core;
+    d->handle = mem + l->size - core.context_bytes;
     d->mem = mem;
     d->mem_size = l->size;
     d->lay = *l;
@@ -1710,46 +2132,47 @@ s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 
     d->width_mbs = wmbs;
     d->height_mbs = hmbs;
     d->sdk = version;
-    d->callback = callback;
-    d->cb_arg = cb_arg;
+    d->callback = o.callback;
+    d->cb_arg = o.cb_arg;
     // SPURS: the caller's, or the core's own in its memory.
-    if (!spurs) {
+    if (!o.spurs) {
         StackVar attr(ctx, base, 0x200);
         s32 r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursAttributeInitialize,
-            {attr.addr(), 2, 0x330000, nspus, static_cast<u64>(spu_prio), static_cast<u64>(ppu_prio), 1}));
+            {attr.addr(), 2, 0x330000, o.nspus, static_cast<u64>(o.spu_prio), static_cast<u64>(o.ppu_prio), 1}));
         if (r != lv2::CELL_OK) return r;
         StackVar name(ctx, base, 16);
-        std::memcpy(base + name.addr(), "_libvdec_avc", 13);
+        std::memcpy(base + name.addr(), core.prefix, std::strlen(core.prefix) + 1);
         r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursAttributeSetNamePrefix, {attr.addr(), name.addr(), 12}));
         if (r != lv2::CELL_OK) return r;
-        r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursInitializeWithAttribute, {mem + kSpursAt, attr.addr()}));
+        r = static_cast<s32>(
+            call_import(ctx, "cellSpurs", NID_cellSpursInitializeWithAttribute, {mem + core.spurs_at, attr.addr()}));
         if (r != lv2::CELL_OK) return r;
         d->own_spurs = true;
-        d->spurs = mem + kSpursAt;
+        d->spurs = mem + core.spurs_at;
     } else {
-        d->spurs = spurs;
+        d->spurs = o.spurs;
     }
     // The taskset, named after the handle, its priorities the caller's (or all ones for the core's own SPURS).
     {
         StackVar attr(ctx, base, 0x200);
         StackVar prio(ctx, base, 16);
-        if (spurs) std::memcpy(base + prio.addr(), base + prios, 8);
+        if (o.spurs) std::memcpy(base + prio.addr(), base + o.prios, 8);
         else std::memset(base + prio.addr(), 1, 8);
         s32 r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursTasksetAttributeInitialize,
-            {attr.addr(), 1, 0x330000, d->handle + 0x80, prio.addr(), nspus}));
+            {attr.addr(), 1, 0x330000, d->handle + 0x80, prio.addr(), o.nspus}));
         if (r != lv2::CELL_OK) return r;
         StackVar name(ctx, base, 32);
-        const std::string n = std::format("_libvdec_avc_{:08x}", d->handle);
+        const std::string n = std::format("{}_{:08x}", core.prefix, d->handle);
         std::memcpy(base + name.addr(), n.c_str(), n.size() + 1);
         r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursTasksetAttributeSetName, {attr.addr(), name.addr()}));
         if (r != lv2::CELL_OK) return r;
         r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursTasksetAttributeSetTasksetSize, {attr.addr(), 0x2900}));
         if (r != lv2::CELL_OK) return r;
         r = static_cast<s32>(call_import(ctx, "cellSpurs", NID_cellSpursCreateTasksetWithAttribute,
-            {d->spurs, mem + kTasksetAt, attr.addr()}));
+            {d->spurs, mem + core.taskset_at, attr.addr()}));
         if (r != lv2::CELL_OK) return r;
-        d->taskset = mem + kTasksetAt;
-        if (taskset_out && writable(ctx, taskset_out, 4)) ps_write32(base, taskset_out, d->taskset);
+        d->taskset = mem + core.taskset_at;
+        if (o.taskset_out && writable(ctx, o.taskset_out, 4)) ps_write32(base, o.taskset_out, d->taskset);
     }
     {
         Decoders& all = decoders();
@@ -1759,23 +2182,24 @@ s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 
     // The helper thread.
     lv2::PpuThread& t = thread_of(ctx);
     HleProcess& p = *HleProcess::current();
-    u32 entry = p.descriptor_of("libavcdec", NID_helper_thread);
-    if (!entry) entry = p.link_function("libavcdec", NID_helper_thread, "_pspocket_avcdec_thread");
+    u32 entry = p.descriptor_of(std::string(core.library), core.helper_nid);
+    if (!entry) entry = p.link_function(std::string(core.library), core.helper_nid, core.helper);
     d->tls = p.alloc_tls();
     StackVar sv(ctx, base, 0x40);
     ps_write32(base, sv.addr() + 8, entry);
     ps_write32(base, sv.addr() + 12, d->tls ? d->tls + kTlsR13Offset : 0);
-    std::memcpy(base + sv.addr() + 0x10, "_libvdec_avc", 13);
-    s32 r = entry ? lv2::_sys_ppu_thread_create(t, sv.addr(), sv.addr() + 8, d->handle, 0, ppu_prio, stack, 1, sv.addr() + 0x10)
-                  : error(AVC_FATAL);
+    std::memcpy(base + sv.addr() + 0x10, core.prefix, std::strlen(core.prefix) + 1);
+    s32 r = entry ? lv2::_sys_ppu_thread_create(t, sv.addr(), sv.addr() + 8, d->handle, 0, o.ppu_prio, o.stack, 1,
+                        sv.addr() + 0x10)
+                  : core.fatal();
     if (r == lv2::CELL_OK) r = lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, sv.addr())));
     if (r != lv2::CELL_OK) {
-        PS_LOG_ERROR(kChan, "avcDecOpen: the helper thread: {:#x}", static_cast<u32>(r));
+        PS_LOG_ERROR(core.library, "Open: the helper thread: {:#x}", static_cast<u32>(r));
         if (d->tls) p.free_tls(d->tls);
         Decoders& all = decoders();
         std::lock_guard lk(all.m);
         all.by_handle.erase(d->handle);
-        return error(AVC_FATAL);
+        return core.fatal();
     }
     d->thread_id = ps_read64(base, sv.addr());
     {
@@ -1783,8 +2207,8 @@ s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 
         d->seq += 2; // Open's command (and the helper thread's start)
         d->state = ST_READY;
     }
-    ps_write32(base, d->handle, kMagic);
-    ps_write32(base, handle_out, d->handle);
+    ps_write32(base, d->handle, core.magic);
+    ps_write32(base, o.handle_out, d->handle);
     return lv2::CELL_OK;
 }
 
@@ -1792,15 +2216,19 @@ s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 
 // decoder's memory keeps its mark, but its critical section (an lv2 mutex) is destroyed: the calls that lock it get
 // sys_mutex_lock's ESRCH.
 constexpr u32 kLockGone = 0x80010005;
-s32 avcDecClose(PPUContext& ctx, u32 handle)
+// libmvcdec maps its lock's failure through its own error codes, which have none for it: the answer is what its stack
+// held there, 2 (measured).
+s32 lock_gone(const Decoder& d) { return d.core->mvc ? 2 : error(kLockGone); }
+
+s32 close_decoder(PPUContext& ctx, const Core& core, u32 handle)
 {
-    if (!handle) return error(AVC_ARG);
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
+    if (!handle) return core.arg();
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, core, handle);
+    if (!d) return core.arg();
     lv2::PpuThread& t = thread_of(ctx);
     {
         std::lock_guard lk(d->m);
-        if (d->state == ST_CLOSED || t.id == d->thread_id) return error(AVC_SEQ);
+        if (d->state == ST_CLOSED || t.id == d->thread_id) return core.seq();
         if (d->state != ST_FAILED) d->seq += 2;
         d->state = ST_CLOSED;
         d->closing = true;
@@ -1823,15 +2251,15 @@ s32 avcDecClose(PPUContext& ctx, u32 handle)
     return r;
 }
 
-s32 avcDecReset(PPUContext& ctx, u32 handle, u32 keep_sps, u32 flags)
+s32 reset_call(PPUContext& ctx, const Core& core, u32 handle, u32 keep_sps, u32 flags)
 {
-    if (!handle || flags > 3) return error(AVC_ARG);
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
+    if (!handle || flags > 3) return core.arg();
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, core, handle);
+    if (!d) return core.arg();
     std::lock_guard lk(d->m);
-    if (d->destroyed) return error(kLockGone);
-    if (d->state == ST_FLUSHING || d->state == ST_RESETTING || d->state == ST_CLOSED) return error(AVC_SEQ);
-    if (d->other_queue.size() + 2 > kOtherQueueRoom) return error(AVC_BUSY);
+    if (d->destroyed) return lock_gone(*d);
+    if (d->state == ST_FLUSHING || d->state == ST_RESETTING || d->state == ST_CLOSED) return core.seq();
+    if (d->other_queue.size() + 2 > core.other_room) return core.busy();
     d->seq++;
     Command c;
     c.kind = Command::Kind::Reset;
@@ -1843,62 +2271,79 @@ s32 avcDecReset(PPUContext& ctx, u32 handle, u32 keep_sps, u32 flags)
     return lv2::CELL_OK;
 }
 
-s32 avcDecAccessUnit(PPUContext& ctx, u32 handle, u32 addr, u32 size, u32 cont, u32 cont_size, u64 dts, u64 pts,
-    u32 mode)
+// An access unit's arguments: its pieces (libmvcdec's second view's too), its stamps, the decode mode, the side data.
+struct AuArgs {
+    u32 addr = 0, size = 0, cont = 0, cont_size = 0;
+    u32 dep = 0, dep_size = 0, dep_cont = 0, dep_cont_size = 0;
+    u64 dts = 0, pts = 0;
+    u32 mode = 0, side = 0, side_size = 0;
+};
+
+s32 access_unit(PPUContext& ctx, const Core& core, u32 handle, const AuArgs& a)
 {
     u8* base = guest_base(ctx);
-    const u32 sp = static_cast<u32>(ctx.gpr[1]);
-    const u32 side = ps_read32(base, sp + 0x74), side_size = ps_read32(base, sp + 0x7C);
-    if (!handle || !addr || !size || (cont_size && !cont) || mode > 3 || side_size > 0x40 || (side_size && !side)) {
-        PS_LOG_ERROR(kChan, "avcDecAccessUnit: bad parameter");
-        return error(AVC_ARG);
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, core, handle);
+    if (!d) return core.arg();
+    if (core.mvc) {
+        if (u64{a.size} + a.cont_size > 0x1FFFFF80 || u64{a.dep_size} + a.dep_cont_size > 0x1FFFFF80) return core.arg();
+        // The first access unit fixes the views: one, or two (the second view's piece given); later ones must agree.
+        if ((d->views == 2 && !a.dep_size) || (d->views == 1 && a.dep_size)) {
+            PS_LOG_ERROR(core.library, "AccessUnit: the views differ from the first access unit's");
+            return core.arg();
+        }
+    } else if (d->sdk > 0x105FF && (a.size > 0x1FFFFF80 || a.cont_size > 0x1FFFFF80 - a.size)) {
+        return core.arg();
     }
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
-    if (d->sdk > 0x105FF && (size > 0x1FFFFF80 || cont_size > 0x1FFFFF80 - size)) return error(AVC_ARG);
-    if (!writable(ctx, addr, size) || (cont_size && !writable(ctx, cont, cont_size)) ||
-        (side_size && !writable(ctx, side, side_size))) {
-        PS_LOG_ERROR(kChan, "avcDecAccessUnit: the access unit ({:#x}, {:#x} bytes) is not guest memory", addr, size);
-        return error(AVC_ARG);
+    if (!writable(ctx, a.addr, a.size) || (a.cont_size && !writable(ctx, a.cont, a.cont_size)) ||
+        (a.dep_size && !writable(ctx, a.dep, a.dep_size)) || (a.dep_cont_size && !writable(ctx, a.dep_cont, a.dep_cont_size)) ||
+        (a.side_size && !writable(ctx, a.side, a.side_size))) {
+        PS_LOG_ERROR(core.library, "AccessUnit: the access unit ({:#x}, {:#x} bytes) is not guest memory", a.addr, a.size);
+        return core.arg();
     }
     std::lock_guard lk(d->m);
-    if (d->destroyed) return error(kLockGone);
-    if (d->state != ST_READY && d->state != ST_DECODING) return error(AVC_SEQ);
-    if (d->au_queue.size() + 2 > kAuQueueRoom) return error(AVC_BUSY);
+    if (d->destroyed) return lock_gone(*d);
+    if (d->state != ST_READY && d->state != ST_DECODING) return core.seq();
+    if (d->au_queue.size() + 2 > core.au_room) return core.busy();
     // The side data, under a tag: the next one free of the counter's.
     int slot = -1;
     for (u32 tries = 0; tries < 256; tries++) {
         bool taken = false;
-        for (const auto& e : d->side)
-            if (e.used && e.key == d->side_counter) taken = true;
+        for (u32 i = 0; i < core.side_entries; i++)
+            if (d->side[i].used && d->side[i].key == d->side_counter) taken = true;
         if (!taken) break;
         d->side_counter++;
     }
-    for (u32 i = 0; i < kSideEntries; i++)
+    for (u32 i = 0; i < core.side_entries; i++)
         if (!d->side[i].used) {
             slot = static_cast<int>(i);
             break;
         }
     if (slot < 0) {
-        PS_LOG_ERROR(kChan, "avcDecAccessUnit: the side data table is full");
-        return error(AVC_BUSY);
+        PS_LOG_ERROR(core.library, "AccessUnit: the side data table is full");
+        return core.busy();
     }
     auto& e = d->side[static_cast<usize>(slot)];
+    e = {};
     e.used = true;
     e.key = d->side_counter;
-    e.size = side_size;
-    const u32 entry = d->handle + kSideData + kSideEntry * static_cast<u32>(slot);
-    ps_write32(base, entry, side_size);
-    for (u32 i = 0; i < 0x40; i++) ps_write8(base, entry + 4 + i, i < side_size ? ps_read8(base, side + i) : 0);
+    e.size = a.side_size;
+    const u32 entry = d->handle + core.side_at + core.side_entry * static_cast<u32>(slot);
+    ps_write32(base, entry, a.side_size);
+    for (u32 i = 0; i < 0x40; i++) ps_write8(base, entry + 4 + i, i < a.side_size ? ps_read8(base, a.side + i) : 0);
+    if (core.mvc && !d->views) d->views = a.dep_size ? 2 : 1;
     Command c;
     c.kind = Command::Kind::Au;
-    c.addr = addr;
-    c.size = size;
-    c.cont = cont;
-    c.cont_size = cont_size;
-    c.dts = dts;
-    c.pts = pts;
-    c.mode = mode;
+    c.addr = a.addr;
+    c.size = a.size;
+    c.cont = a.cont;
+    c.cont_size = a.cont_size;
+    c.dep = a.dep;
+    c.dep_size = a.dep_size;
+    c.dep_cont = a.dep_cont;
+    c.dep_cont_size = a.dep_cont_size;
+    c.dts = a.dts;
+    c.pts = a.pts;
+    c.mode = a.mode;
     c.side_id = d->side_counter;
     d->seq++;
     d->au_queue.push_back(c);
@@ -1909,17 +2354,31 @@ s32 avcDecAccessUnit(PPUContext& ctx, u32 handle, u32 addr, u32 size, u32 cont, 
     return lv2::CELL_OK;
 }
 
-s32 avcDecRlsFrame(PPUContext& ctx, u32 handle, u32 frame_id)
+// A side data entry's release (libmvcdec): freed once every picture of its access unit was released and the access unit
+// is done.
+void count_release(Decoder& d, u32 key)
 {
-    if (!handle) return error(AVC_ARG);
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
+    for (u32 i = 0; i < d.core->side_entries; i++) {
+        auto& s = d.side[i];
+        if (!s.used || s.key != key) continue;
+        s.released++;
+        if (s.expected != 0xFF && s.expected <= s.released && s.done) s.used = false;
+        return;
+    }
+}
+
+s32 release_frame(PPUContext& ctx, const Core& core, u32 handle, u32 frame_id)
+{
+    if (!handle) return core.arg();
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, core, handle);
+    if (!d) return core.arg();
     std::lock_guard lk(d->m);
-    if (d->destroyed) return error(kLockGone);
-    if (d->state != ST_FLUSHING && d->state != ST_FLUSHED && d->state != ST_DECODING) return error(AVC_SEQ);
-    if (d->other_queue.size() + 2 > kOtherQueueRoom) return error(AVC_BUSY);
-    auto it = std::find_if(d->frames.begin(), d->frames.end(), [&](const auto& e) { return e.used && e.key == frame_id; });
-    if (it == d->frames.end()) return error(AVC_ARG);
+    if (d->destroyed) return lock_gone(*d);
+    if (d->state != ST_FLUSHING && d->state != ST_FLUSHED && d->state != ST_DECODING) return core.seq();
+    if (d->other_queue.size() + 2 > core.other_room) return core.busy();
+    auto it = std::find_if(d->frames.begin(), d->frames.begin() + core.frame_entries,
+        [&](const auto& e) { return e.used && e.key == frame_id; });
+    if (it == d->frames.begin() + core.frame_entries) return core.arg();
     Command c;
     c.kind = Command::Kind::Release;
     c.count = it->count;
@@ -1929,26 +2388,31 @@ s32 avcDecRlsFrame(PPUContext& ctx, u32 handle, u32 frame_id)
     c.skipped = it->skipped;
     d->seq++;
     d->other_queue.push_back(c);
-    for (u32 k = 0; k < it->count && k < 2; k++)
-        for (auto& s : d->side)
-            if (s.used && s.key == it->side[k]) {
-                s.used = false;
+    for (u32 k = 0; k < it->count && k < 2; k++) {
+        if (core.mvc) {
+            count_release(*d, it->side[k]);
+            continue;
+        }
+        for (u32 i = 0; i < core.side_entries; i++)
+            if (d->side[i].used && d->side[i].key == it->side[k]) {
+                d->side[i].used = false;
                 break;
             }
+    }
     it->used = false;
     wake(*d);
     return lv2::CELL_OK;
 }
 
-s32 avcDecFlush(PPUContext& ctx, u32 handle, u32 mode)
+s32 flush_call(PPUContext& ctx, const Core& core, u32 handle, u32 mode)
 {
-    if (!handle || mode != 0) return error(AVC_ARG);
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
+    if (!handle || mode != 0) return core.arg();
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, core, handle);
+    if (!d) return core.arg();
     std::lock_guard lk(d->m);
-    if (d->destroyed) return error(kLockGone);
-    if (d->state != ST_DECODING && d->state != ST_READY) return error(AVC_SEQ);
-    if (d->au_queue.size() >= kAuQueueRoom) return error(AVC_BUSY); // the queue full: Flush checks no room first
+    if (d->destroyed) return lock_gone(*d);
+    if (d->state != ST_DECODING && d->state != ST_READY) return core.seq();
+    if (d->au_queue.size() >= core.au_room) return core.busy(); // the queue full: Flush checks no room first
     Command c;
     c.kind = Command::Kind::Flush;
     d->seq++;
@@ -1958,21 +2422,155 @@ s32 avcDecFlush(PPUContext& ctx, u32 handle, u32 mode)
     return lv2::CELL_OK;
 }
 
+// ---- libavcdec
+
+s32 avcDecQueryMemory(PPUContext& ctx, u32 param, u32 attr) { return query_memory(ctx, kAvc, param, attr); }
+
+s32 avcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 param, u32 memdesc, u32 stack, u32 sdk,
+    u32 callback)
+{
+    u8* base = guest_base(ctx);
+    const u32 sp = static_cast<u32>(ctx.gpr[1]);
+    OpenArgs o;
+    o.handle_out = handle_out;
+    o.spurs = spurs;
+    o.taskset_out = taskset_out;
+    o.param = param;
+    o.memdesc = memdesc;
+    o.stack = stack;
+    o.sdk = sdk;
+    o.callback = callback;
+    // The arguments past eight, in the caller's parameter save area.
+    o.cb_arg = ps_read32(base, sp + 0x74);
+    o.nspus = ps_read8(base, sp + 0x7F);
+    o.prios = ps_read32(base, sp + 0x84);
+    o.spu_prio = static_cast<s32>(ps_read32(base, sp + 0x8C));
+    o.ppu_prio = static_cast<s32>(ps_read32(base, sp + 0x94));
+    return open_decoder(ctx, kAvc, o);
+}
+
+s32 avcDecClose(PPUContext& ctx, u32 handle) { return close_decoder(ctx, kAvc, handle); }
+
+s32 avcDecReset(PPUContext& ctx, u32 handle, u32 keep_sps, u32 flags) { return reset_call(ctx, kAvc, handle, keep_sps, flags); }
+
+s32 avcDecAccessUnit(PPUContext& ctx, u32 handle, u32 addr, u32 size, u32 cont, u32 cont_size, u64 dts, u64 pts,
+    u32 mode)
+{
+    u8* base = guest_base(ctx);
+    const u32 sp = static_cast<u32>(ctx.gpr[1]);
+    AuArgs a;
+    a.addr = addr;
+    a.size = size;
+    a.cont = cont;
+    a.cont_size = cont_size;
+    a.dts = dts;
+    a.pts = pts;
+    a.mode = mode;
+    a.side = ps_read32(base, sp + 0x74);
+    a.side_size = ps_read32(base, sp + 0x7C);
+    if (!handle || !addr || !size || (cont_size && !cont) || mode > 3 || a.side_size > 0x40 || (a.side_size && !a.side)) {
+        PS_LOG_ERROR(kChan, "avcDecAccessUnit: bad parameter");
+        return kAvc.arg();
+    }
+    return access_unit(ctx, kAvc, handle, a);
+}
+
+s32 avcDecRlsFrame(PPUContext& ctx, u32 handle, u32 frame_id) { return release_frame(ctx, kAvc, handle, frame_id); }
+
+s32 avcDecFlush(PPUContext& ctx, u32 handle, u32 mode) { return flush_call(ctx, kAvc, handle, mode); }
+
 // avcDecGetStatus(handle, status): [0] whether the access unit queue is full (Access Unit would be BUSY), [1] the
 // access units given and not yet done.
 s32 avcDecGetStatus(PPUContext& ctx, u32 handle, u32 status)
 {
-    if (!handle || !status || !writable(ctx, status, 8)) return error(AVC_ARG);
-    const std::shared_ptr<Decoder> d = decoder_of(ctx, handle);
-    if (!d) return error(AVC_ARG);
+    if (!handle || !status || !writable(ctx, status, 8)) return kAvc.arg();
+    const std::shared_ptr<Decoder> d = decoder_of(ctx, kAvc, handle);
+    if (!d) return kAvc.arg();
     std::lock_guard lk(d->m);
-    if (d->destroyed) return error(kLockGone);
-    if (d->state == ST_CLOSED) return error(AVC_SEQ);
+    if (d->destroyed) return lock_gone(*d);
+    if (d->state == ST_CLOSED) return kAvc.seq();
     u8* base = guest_base(ctx);
     ps_write32(base, status + 4, d->in_flight);
-    ps_write32(base, status, d->au_queue.size() + 2 > kAuQueueRoom ? 1 : 0);
+    ps_write32(base, status, d->au_queue.size() + 2 > kAvc.au_room ? 1 : 0);
     return lv2::CELL_OK;
 }
+
+// ---- libmvcdec
+
+s32 mvcDecQueryMemory(PPUContext& ctx, u32 param, u32 attr) { return query_memory(ctx, kMvc, param, attr); }
+
+// mvcDecOpen(&handle, spurs, &taskset, param, mem, stack, callback, arg, spus, priorities, spu priority, ppu priority):
+// libavcdec's without the SDK version.
+s32 mvcDecOpen(PPUContext& ctx, u32 handle_out, u32 spurs, u32 taskset_out, u32 param, u32 memdesc, u32 stack,
+    u32 callback, u32 cb_arg)
+{
+    u8* base = guest_base(ctx);
+    const u32 sp = static_cast<u32>(ctx.gpr[1]);
+    OpenArgs o;
+    o.handle_out = handle_out;
+    o.spurs = spurs;
+    o.taskset_out = taskset_out;
+    o.param = param;
+    o.memdesc = memdesc;
+    o.stack = stack;
+    o.callback = callback;
+    o.cb_arg = cb_arg;
+    o.nspus = ps_read8(base, sp + 0x77);
+    o.prios = ps_read32(base, sp + 0x7C);
+    o.spu_prio = static_cast<s32>(ps_read32(base, sp + 0x84));
+    o.ppu_prio = static_cast<s32>(ps_read32(base, sp + 0x8C));
+    return open_decoder(ctx, kMvc, o);
+}
+
+s32 mvcDecClose(PPUContext& ctx, u32 handle) { return close_decoder(ctx, kMvc, handle); }
+
+s32 mvcDecReset(PPUContext& ctx, u32 handle, u32 keep_sps, u32 flags) { return reset_call(ctx, kMvc, handle, keep_sps, flags); }
+
+// mvcDecAccessUnit(handle, pieces {base, size, its continuation, size, second view, size, its continuation, size}, dts,
+// pts, mode, side data, size).
+s32 mvcDecAccessUnit(PPUContext& ctx, u32 handle, u32 pieces, u64 dts, u64 pts, u32 mode, u32 side, u32 side_size)
+{
+    u8* base = guest_base(ctx);
+    AuArgs a;
+    if (pieces && writable(ctx, pieces, 32)) {
+        a.addr = ps_read32(base, pieces);
+        a.size = ps_read32(base, pieces + 4);
+        a.cont = ps_read32(base, pieces + 8);
+        a.cont_size = ps_read32(base, pieces + 12);
+        a.dep = ps_read32(base, pieces + 16);
+        a.dep_size = ps_read32(base, pieces + 20);
+        a.dep_cont = ps_read32(base, pieces + 24);
+        a.dep_cont_size = ps_read32(base, pieces + 28);
+    }
+    a.dts = dts;
+    a.pts = pts;
+    a.mode = mode;
+    a.side = side;
+    a.side_size = side_size;
+    if (!handle || !pieces || !a.addr || !a.size || (a.cont_size && !a.cont) || (a.dep_size && !a.dep) ||
+        (a.dep_size && a.dep_cont_size && !a.dep_cont) || mode > 3 || side_size > 0x40 || (side_size && !side)) {
+        PS_LOG_ERROR(kMvc.library, "mvcDecAccessUnit: bad parameter");
+        return kMvc.arg();
+    }
+    if (!a.dep_size) a.dep_cont_size = 0;
+    return access_unit(ctx, kMvc, handle, a);
+}
+
+s32 mvcDecRlsFrame(PPUContext& ctx, u32 handle, u32 frame_id) { return release_frame(ctx, kMvc, handle, frame_id); }
+
+s32 mvcDecFlush(PPUContext& ctx, u32 handle, u32 mode) { return flush_call(ctx, kMvc, handle, mode); }
+
+// The helper threads' entries (internal functions of pspocket's cores): the decoder's handle their argument.
+void helper_thread(PPUContext& ctx, u64 handle)
+{
+    lv2::PpuThread& t = thread_of(ctx);
+    if (const std::shared_ptr<Decoder> d = decoder_at(static_cast<u32>(handle))) run(ctx, *d);
+    else PS_LOG_ERROR(kChan, "the helper thread started for an unknown decoder {:#x}", handle);
+    lv2::_sys_ppu_thread_exit(t, 0);
+}
+
+void _pspocket_avcdec_thread(PPUContext& ctx, u64 handle) { helper_thread(ctx, handle); }
+void _pspocket_mvcdec_thread(PPUContext& ctx, u64 handle) { helper_thread(ctx, handle); }
 
 } // namespace
 
@@ -1987,7 +2585,21 @@ void register_avcdec(Registry& r)
         PS_HLE_FUNC(0xE1134B5D, avcDecRlsFrame),
         PS_HLE_FUNC(0x765DE1B4, avcDecFlush),
         PS_HLE_FUNC(0xD83259E8, avcDecGetStatus),
-        PS_HLE_INTERNAL(NID_helper_thread, _pspocket_avcdec_thread),
+        PS_HLE_INTERNAL(0x2D9EA30D, _pspocket_avcdec_thread),
+    });
+}
+
+void register_mvcdec(Registry& r)
+{
+    r.add("libmvcdec", {
+        PS_HLE_FUNC(0x6BE252E1, mvcDecQueryMemory),
+        PS_HLE_FUNC(0xC5C3B70A, mvcDecOpen),
+        PS_HLE_FUNC(0x739B99DF, mvcDecClose),
+        PS_HLE_FUNC(0x53F2DED8, mvcDecReset),
+        PS_HLE_FUNC(0xAC46F509, mvcDecAccessUnit),
+        PS_HLE_FUNC(0xEAB40886, mvcDecRlsFrame),
+        PS_HLE_FUNC(0xCB6494D5, mvcDecFlush),
+        PS_HLE_INTERNAL(0xC7AA1D3D, _pspocket_mvcdec_thread),
     });
 }
 
