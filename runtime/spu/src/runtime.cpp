@@ -15,6 +15,7 @@
 #include "pspocket/spu/fp.h"
 #include "pspocket/spu/interpreter.hpp"
 #include "pspocket/spu/registry.hpp"
+#include "pspocket/spu/replace.hpp"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -262,6 +263,9 @@ void ps_spu_register_program(ps_spu_program* program)
 {
     PS_CHECK(program && (program->code_start & 3) == 0 && (program->code_size & 3) == 0);
     PS_CHECK(program->code_start + program->code_size <= PS_SPU_LS_SIZE);
+    // A known build of middleware (D-965): the program derived from it, its listed functions native, goes first, so
+    // lookups by key find it.
+    if (ps_spu_program* derived = pspocket::spu::replace::derive(program)) ps_spu_register_program(derived);
     // The table is built outside the lock (SPU threads look programs up meanwhile, D-231) and published under it,
     // before the program can be found: whoever finds it through the lock sees it whole.
     bool built_already;
@@ -294,6 +298,7 @@ void ps_spu_register_program(ps_spu_program* program)
 
 void ps_spu_unregister_program(ps_spu_program* program)
 {
+    if (ps_spu_program* derived = pspocket::spu::replace::derived_of(program)) ps_spu_unregister_program(derived);
     std::lock_guard lock(g_registry_mutex);
     const auto it = std::remove(g_programs.begin(), g_programs.end(), program);
     if (it != g_programs.end()) {

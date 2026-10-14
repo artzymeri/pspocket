@@ -15330,3 +15330,49 @@ serial stages only.
   while it stays). It applies to the sound mixer's instance too, whose workloads are of one SPU. Unset: as before.
 - With PSPOCKET_SPU_AB=S it applies in the A half only, so one session measures it on and off every S seconds in the
   same scenes and heat (each SPURS time line names its half).
+## D-965 · 2026-10-14 · Native replacements of known SPU middleware builds: derived programs, the contract, capture and check
+
+The plan for a steady 30 fps on the phone (docs/improve.md) puts Sony's EDGE geometry, as GTA V's geometry job runs it,
+at 85 ms of CPU a frame in busy scenes, six of its functions 84% of the job. Plan section 6's middleware replacement,
+first part: the machinery, and the first function native (runtime/spu/replace/, pspocket/spu/replace.hpp).
+
+- A known build is data: a program key (ps_spu_hash64 of the image as lifted), its code range, and the functions listed
+  for replacement — entry, native implementation (or none yet), the registers their callers still read. No title
+  check: EDGE is linked by many games, each its own build and key.
+- When such a program is registered, ps_spu_register_program registers before it a derived program: a copy whose
+  listed entries go to a dispatcher, which runs the native implementation, or the lifted function when the native one
+  declines the inputs (it returns 0 having changed nothing) or is switched off. ps_spu_find_program returns the first
+  program of a key, so jobs take the derived one; unregistering the original takes it out too. Every path that adds
+  programs (built in, a game library, the session translator) goes through the registration.
+- The contract (agreed with the main session, after a first plan of every register exact): a native implementation
+  leaves every byte of local store, the pc, the stop and channel state, $0, $1 and the callee-saved $80-$127 exactly as
+  the lifted function does, and of $2-$79 the ones its callers still read after it (D-967 finds them; the return value
+  $3 where there is one). The other volatile registers are unspecified. Reproducing them would mean transcribing the
+  compiled loops instruction by instruction — the job's software-pipelined loops leave temporaries of loads past the end
+  of their arrays — which is derived code (CLAUDE.md rule 1) and gives up the native layout. A native implementation is
+  an implementation of what the function computes, each float operation the SPU's in the SPU's order (the lifted
+  code's own helpers, pspocket/spu/lifted.h, or NEON blocks checked against them), vectors laid out as the data is.
+- Switches: PSPOCKET_SPU_NATIVE=0 (no derived programs), =ab (native in half A of PSPOCKET_SPU_AB's period, D-950's
+  halves, so one walk's SPURS time lines compare both), PSPOCKET_SPU_NATIVE_ONLY=ADDR,... (some functions only),
+  PSPOCKET_SPU_NATIVE_SCRAMBLE=1 (after each call the registers outside the contract hold garbage: the check of D-967's
+  finding on the walk).
+- Capture: PSPOCKET_SPU_CAPTURE=KEY:ADDR,... records the state at entry and at exit (registers, channels, all of local
+  store, the lines that changed) of the lifted function, every PSPOCKET_SPU_CAPTURE_EVERY-th call, into inventory/
+  (game data). spu-native-check replays each capture through the lifted function (it must give the captured exit: the
+  replay is faithful) and through the native one (bit for bit on the contract; a decline must change nothing), and
+  --time N gives each the fastest of N runs a capture (the Mac is shared: the fastest run is the one not preempted).
+- PSPOCKET_SPU_TRACE_ENTRIES=KEY records every (entry, link register) pair the program's entries were entered with:
+  the targets of its calls through registers, for D-967.
+- First native function, 0x0ECF8 of GTA V's EDGE build (spu_dad457863220b1cc): the vertex-output callback of the
+  culling stage. Every batch of the walk takes its screen-space path (format byte not 3): positions times the
+  combined matrix, 1/w by the SPU's estimate and one Newton step, the viewport, integer coordinates packed with a w > 0
+  flag, outcodes against the scissor rectangle and depth range, 16 bytes a vertex. Natively: one vertex a lane
+  (vld4/vst4 over the big-endian buffers), two groups of four at a time, a zero matrix element's fma left out (an fma
+  with a zero factor is its addend), fcgt as integer keys. 400 captured calls of a walk (every 1000th, the whole
+  walk): 400 exact, none declined; the fastest run a call 3.0 µs lifted, 2.0 native (x1.48) on the shared Mac. The
+  lifted loop was already tight (about 290 host instructions for the job's 82); the SPU float model's zero and
+  saturation rules cost the same in either. A walk with it in half A (517,094 native calls): RSX failures 0, SPU code
+  interpreted 0.
+- Tests (tests/spu/test_spu_replace.cpp): the NEON blocks against the lifted helpers (frest and frsqest over every
+  index and exponent, fm, fma, fcgt keys over every float class); a synthetic program and build: derived, native,
+  declined, the original untouched, unregistered together.

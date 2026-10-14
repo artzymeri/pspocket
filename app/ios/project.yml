@@ -122,6 +122,12 @@ targets:
         group: Runtime
         includes: *compiled
         compilerFlags: [-ffp-contract=off, -fno-fast-math]
+      # Native replacements of SPU middleware (D-965): part of the SPU runtime, as in the host build.
+      - path: ../../runtime/spu/replace
+        name: spu-replace
+        group: Runtime
+        includes: *compiled
+        compilerFlags: [-ffp-contract=off, -fno-fast-math]
       - path: ../../runtime/lv2/src
         name: lv2
         group: Runtime

@@ -21,23 +21,62 @@ using pspocket::u64;
 // Tables: RPCS3 rpcs3/Emu/Cell/SPUThread.cpp (spu_frest_fraction_lut, spu_frest_exponent_lut,
 // spu_frsqest_fraction_lut, spu_frsqest_exponent_lut). The exponent tables are generated from their closed forms
 // below and checked against RPCS3's values in tests/spu.
-extern "C" const uint32_t ps_spu_frest_fraction_lut[32] = {
-    0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
-    0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
-    0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A,
+#define PS_FREST_FRACTIONS \
+    0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0, \
+    0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2, \
+    0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A, \
     0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07,
-};
 
-extern "C" const uint32_t ps_spu_frsqest_fraction_lut[64] = {
-    0x350160, 0x34E954, 0x2F993D, 0x2F993D, 0x2AA523, 0x2AA523, 0x26190D, 0x26190D,
-    0x21E4F9, 0x21E4F9, 0x1E00E9, 0x1E00E9, 0x1A5CD9, 0x1A5CD9, 0x16F8CB, 0x16F8CB,
-    0x13CCC0, 0x13CCC0, 0x10CCB3, 0x10CCB3, 0x0E00AA, 0x0E00AA, 0x0B58A1, 0x0B58A1,
-    0x08D498, 0x08D498, 0x067491, 0x067491, 0x043089, 0x043089, 0x020C83, 0x020C83,
-    0x7FFDF4, 0x7FD1DE, 0x7859C8, 0x783DBA, 0x71559C, 0x71559C, 0x6AE57C, 0x6AE57C,
-    0x64F561, 0x64F561, 0x5F7149, 0x5F7149, 0x5A4D33, 0x5A4D33, 0x55811F, 0x55811F,
-    0x51050F, 0x51050F, 0x4CC8FE, 0x4CC8FE, 0x48D0F0, 0x48D0F0, 0x4510E4, 0x4510E4,
+#define PS_FRSQEST_FRACTIONS \
+    0x350160, 0x34E954, 0x2F993D, 0x2F993D, 0x2AA523, 0x2AA523, 0x26190D, 0x26190D, \
+    0x21E4F9, 0x21E4F9, 0x1E00E9, 0x1E00E9, 0x1A5CD9, 0x1A5CD9, 0x16F8CB, 0x16F8CB, \
+    0x13CCC0, 0x13CCC0, 0x10CCB3, 0x10CCB3, 0x0E00AA, 0x0E00AA, 0x0B58A1, 0x0B58A1, \
+    0x08D498, 0x08D498, 0x067491, 0x067491, 0x043089, 0x043089, 0x020C83, 0x020C83, \
+    0x7FFDF4, 0x7FD1DE, 0x7859C8, 0x783DBA, 0x71559C, 0x71559C, 0x6AE57C, 0x6AE57C, \
+    0x64F561, 0x64F561, 0x5F7149, 0x5F7149, 0x5A4D33, 0x5A4D33, 0x55811F, 0x55811F, \
+    0x51050F, 0x51050F, 0x4CC8FE, 0x4CC8FE, 0x48D0F0, 0x48D0F0, 0x4510E4, 0x4510E4, \
     0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA,
+
+extern "C" const uint32_t ps_spu_frest_fraction_lut[32] = {PS_FREST_FRACTIONS};
+
+extern "C" const uint32_t ps_spu_frsqest_fraction_lut[64] = {PS_FRSQEST_FRACTIONS};
+
+// The two fraction tables by byte plane (byte k of entry i at [k][i]), for table lookups four lanes at a time in NEON
+// (the native replacements, runtime/spu/replace/neon.h, D-965).
+namespace {
+template <u32 N>
+struct Planes {
+    uint8_t p[3][N];
+    explicit constexpr Planes(const uint32_t (&t)[N]) : p()
+    {
+        for (u32 i = 0; i < N; i++)
+            for (u32 k = 0; k < 3; k++) p[k][i] = static_cast<uint8_t>(t[i] >> (8 * k));
+    }
 };
+constexpr uint32_t kFrestFractions[32] = {PS_FREST_FRACTIONS};
+constexpr uint32_t kFrsqestFractions[64] = {PS_FRSQEST_FRACTIONS};
+constexpr Planes<32> kFrestPlanes(kFrestFractions);
+constexpr Planes<64> kFrsqestPlanes(kFrsqestFractions);
+} // namespace
+
+#define PLANE(t, k, i) t.p[k][i]
+#define P8(t, k, b) PLANE(t, k, b), PLANE(t, k, b + 1), PLANE(t, k, b + 2), PLANE(t, k, b + 3), PLANE(t, k, b + 4), \
+    PLANE(t, k, b + 5), PLANE(t, k, b + 6), PLANE(t, k, b + 7)
+extern "C" const uint8_t ps_spu_frest_planes[3][32] = {
+    {P8(kFrestPlanes, 0, 0), P8(kFrestPlanes, 0, 8), P8(kFrestPlanes, 0, 16), P8(kFrestPlanes, 0, 24)},
+    {P8(kFrestPlanes, 1, 0), P8(kFrestPlanes, 1, 8), P8(kFrestPlanes, 1, 16), P8(kFrestPlanes, 1, 24)},
+    {P8(kFrestPlanes, 2, 0), P8(kFrestPlanes, 2, 8), P8(kFrestPlanes, 2, 16), P8(kFrestPlanes, 2, 24)},
+};
+#define P64(t, k) P8(t, k, 0), P8(t, k, 8), P8(t, k, 16), P8(t, k, 24), P8(t, k, 32), P8(t, k, 40), P8(t, k, 48), \
+    P8(t, k, 56)
+extern "C" const uint8_t ps_spu_frsqest_planes[3][64] = {
+    {P64(kFrsqestPlanes, 0)},
+    {P64(kFrsqestPlanes, 1)},
+    {P64(kFrsqestPlanes, 2)},
+};
+#undef P64
+#undef P8
+#undef PLANE
 
 namespace {
 
