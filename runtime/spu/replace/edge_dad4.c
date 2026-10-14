@@ -651,3 +651,135 @@ int ps_edge_dad4_080f8(SPUContext* ctx, uint8_t* ls)
     ctx->pc = (0x082E8u + ctx->reloc) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * Loop 0x0B850 of the decompression fragment 0x0B778 (to its exit at 0x0B9B0): four fixed-point vertex streams to
+ * floats. The fragment's code before the loop reads the attribute's format (component widths at most 23 bits; wider
+ * ones take another path) and sets up, constant through the loop: a byte pattern from two halfword patterns ($28, $27)
+ * by a shuffle control ($112), to which each stream adds its pointer's offset in its quadword; shift counts ($26); an
+ * exponent ($30) put in under a mask ($25); a bias ($29). For each block (counter $32 up to $56):
+ *   stream k's pointer = word 0 of $44, $43, $42, $45 + mpya(counter, $51, $50), advancing by word 0 of $35
+ *   output position    = word 0 of $31 (16 more each block) + $49, advancing by $41; word k of it, or of the scratch
+ *                        quadword $37 where it is past the limit $39, is where stream k's quadword goes
+ *   value              = fs(selb(rotm(shufb(lq(p), lq(p + 16), pattern(p & 15)), $26), $30, $25), $29)
+ * until word 0 of the output position is past the limit (that vertex's values are not stored). The loop is
+ * software-pipelined: each vertex's values are stored at the start of the next iteration, after the first one's zeros to
+ * the scratch quadword. The native loop stores each vertex's values after it reads them, in the same order, so local
+ * store sees the same reads and writes even where outputs and inputs overlap. Registers: spu-live, nothing it writes is
+ * read after the exit; it writes none.
+ * =================================================================================================================== */
+
+/* The shuffle for each of the 16 offsets of a stream's pointer in its quadword, as a table lookup on the two quadwords
+ * in local store order (the 32 bytes the job's shufb picks from) giving host words (lane i = guest word i); the special
+ * controls (10xxxxxx, 110xxxxx, 111xxxxx: 0x00, 0xFF, 0x80) out of the table's range and or'ed in. Made from the
+ * patterns' registers, kept while they are the same. */
+typedef struct {
+    ps_spu_vec key[3]; /* $27, $28, $112 */
+    int made;
+    uint8x16_t idx[16], orr[16];
+} decode_shuffles;
+
+static const decode_shuffles* decode_shuffles_for(const SPUContext* ctx)
+{
+    static _Thread_local decode_shuffles s;
+    const ps_spu_vec r27 = psl_ld(ctx, 27), r28 = psl_ld(ctx, 28), r112 = psl_ld(ctx, 112);
+    if (s.made && !memcmp(&s.key[0], &r27, 16) && !memcmp(&s.key[1], &r28, 16) && !memcmp(&s.key[2], &r112, 16))
+        return &s;
+    for (unsigned off = 0; off < 16; off++) {
+        const ps_spu_vec o = psl_splat8((uint8_t)off);
+        const psv_u8 pat = (psv_u8)psl_shufb(psl_ah(r28, o), psl_ah(r27, o), r112);
+        uint8_t idx[16], orr[16];
+        for (int h = 0; h < 16; h++) {
+            const int g = 4 * (h / 4) + 3 - h % 4; /* the guest byte host byte h of a host word holds */
+            const uint8_t c = pat[15 - g];          /* D-004: guest byte g is the register's host byte 15 - g */
+            idx[h] = (c & 0x80) ? 0xFF : (uint8_t)(c & 0x1F);
+            orr[h] = !(c & 0x80) ? 0x00 : (c & 0xE0) == 0xE0 ? 0x80 : (c & 0xE0) == 0xC0 ? 0xFF : 0x00;
+        }
+        s.idx[off] = vld1q_u8(idx);
+        s.orr[off] = vld1q_u8(orr);
+    }
+    s.key[0] = r27;
+    s.key[1] = r28;
+    s.key[2] = r112;
+    s.made = 1;
+    return &s;
+}
+
+typedef struct {
+    const decode_shuffles* sh;
+    int32x4_t shift;     /* -(rotm count) */
+    uint32x4_t mask, exponent;
+    float32x4_t bias;    /* clamped, as fs reads its second operand */
+} decode_0b850;
+
+static inline __attribute__((always_inline)) uint32x4_t decode_qw(const uint8_t* ls, const decode_0b850* d, uint32_t p)
+{
+    const uint8x16x2_t t = {{vld1q_u8(ls + (p & PS_SPU_QW_MASK)), vld1q_u8(ls + ((p + 16) & PS_SPU_QW_MASK))}};
+    const unsigned o = p & 15;
+    uint32x4_t v = vreinterpretq_u32_u8(vorrq_u8(vqtbl2q_u8(t, d->sh->idx[o]), d->sh->orr[o]));
+    v = vshlq_u32(v, d->shift); /* rotm: right by (0 - n) & 63, nothing left from 32 on (ushl by -32 or less) */
+    v = vbslq_u32(d->mask, d->exponent, v);
+    return vreinterpretq_u32_f32(vsubq_f32(vreinterpretq_f32_u32(v), d->bias));
+}
+
+int ps_edge_dad4_0b850(SPUContext* ctx, uint8_t* ls)
+{
+    /* the controls the code before the loop sets: word 0 into every word ($34), byte 3 into every byte ($33) */
+    for (int w = 0; w < 4; w++)
+        if (ctx->gpr[34].u32[w] != 0x00010203u || ctx->gpr[33].u32[w] != 0x03030303u) return 0;
+    const uint32_t blocks = pref(ctx, 56) - pref(ctx, 32);
+    if (blocks > 0x1000u) return 0;
+    const ps_spu_vec r49 = psl_ld(ctx, 49);
+    const int32_t step = (int32_t)pref(ctx, 41), limit = (int32_t)pref(ctx, 39);
+    const uint32_t first = pref(ctx, 31);
+    /* each block's loop ends (word 0 of the position passes the limit without wrapping), in a bounded number of
+     * iterations: else the lifted loop runs */
+    uint64_t work = 0;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const int32_t s0 = (int32_t)(first + 16u * b + w_of(r49, 0));
+        if (s0 > limit) continue;
+        if (step <= 0) return 0;
+        const int64_t n = ((int64_t)limit - s0) / step + 1;
+        if ((int64_t)s0 + n * step > INT32_MAX) return 0;
+        work += (uint64_t)n;
+        if (work > (1u << 20)) return 0;
+    }
+    /* the loop's constants, host words (lane i = guest word i) */
+    decode_0b850 d;
+    d.sh = decode_shuffles_for(ctx);
+    const uint32x4_t count = psn_rev4((uint32x4_t)psl_ld(ctx, 26));
+    d.shift = vnegq_s32(vreinterpretq_s32_u32(vandq_u32(vsubq_u32(vdupq_n_u32(0), count), vdupq_n_u32(63))));
+    d.mask = psn_rev4((uint32x4_t)psl_ld(ctx, 25));
+    d.exponent = psn_rev4((uint32x4_t)psl_ld(ctx, 30));
+    d.bias = vreinterpretq_f32_u32(psn_rev4((uint32x4_t)psl_clamp(psl_ld(ctx, 29))));
+    const uint32x4_t offsets = psn_rev4((uint32x4_t)r49), steps = psn_rev4((uint32x4_t)psl_ld(ctx, 41));
+    const int32x4_t limits = vreinterpretq_s32_u32(psn_rev4((uint32x4_t)psl_ld(ctx, 39)));
+    const uint32x4_t scratch = psn_rev4((uint32x4_t)psl_ld(ctx, 37));
+    const uint32_t stride = pref(ctx, 35), counter = pref(ctx, 32), scale = pref(ctx, 51), add = pref(ctx, 50);
+    const uint32_t stream[4] = {pref(ctx, 44), pref(ctx, 43), pref(ctx, 42), pref(ctx, 45)};
+    const uint32x4_t zero = vdupq_n_u32(0);
+    for (uint32_t b = 0; b < blocks; b++) {
+        st_words(ls, vgetq_lane_u32(scratch, 0), zero); /* the pipeline's first stores */
+        const uint32_t m = (uint32_t)((int32_t)(int16_t)(counter + b) * (int32_t)(int16_t)scale) + add; /* mpya */
+        uint32_t p0 = stream[0] + m, p1 = stream[1] + m, p2 = stream[2] + m, p3 = stream[3] + m;
+        uint32x4_t pos = vaddq_u32(vdupq_n_u32(first + 16u * b), offsets);
+        for (;;) {
+            const uint32x4_t past = vcgtq_s32(vreinterpretq_s32_u32(pos), limits);
+            if (vgetq_lane_u32(past, 0)) break;
+            const uint32x4_t at = vbslq_u32(past, scratch, pos);
+            const uint32x4_t v0 = decode_qw(ls, &d, p0), v1 = decode_qw(ls, &d, p1);
+            const uint32x4_t v2 = decode_qw(ls, &d, p2), v3 = decode_qw(ls, &d, p3);
+            st_words(ls, vgetq_lane_u32(at, 0), v0);
+            st_words(ls, vgetq_lane_u32(at, 1), v1);
+            st_words(ls, vgetq_lane_u32(at, 2), v2);
+            st_words(ls, vgetq_lane_u32(at, 3), v3);
+            p0 += stride;
+            p1 += stride;
+            p2 += stride;
+            p3 += stride;
+            pos = vaddq_u32(pos, steps);
+        }
+    }
+    ctx->pc = (0x0B9B0u + ctx->reloc) & PS_SPU_PC_MASK;
+    return 1;
+}

@@ -18,6 +18,7 @@ extern "C" {
 int ps_edge_dad4_0ecf8(SPUContext* ctx, uint8_t* ls);
 int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls);
 int ps_edge_dad4_080f8(SPUContext* ctx, uint8_t* ls); /* a loop of 0x07A38: head 0x080F8, exit 0x082E8 */
+int ps_edge_dad4_0b850(SPUContext* ctx, uint8_t* ls); /* a loop of 0x0B778: head 0x0B850, exit 0x0B9B0 */
 
 /* Sony's MP3 decoder module (flashMP3.pic), program 884ae88f68a9e778: decodeFrame (flashmp3.c). */
 int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls);

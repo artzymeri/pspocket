@@ -15445,6 +15445,13 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
 | 0x0ECF8 | vertex output: screen-space transform, outcodes | 400 of 400 | 2.85 µs | 1.93 µs | x1.47 |
 | 0x0F008 | culling stage (with the callback above) | 400 of 400 | 5.55 µs | 3.62 µs | x1.53 (its own part x2.1) |
 | loop 0x080F8 of 0x07A38 | four-bone skinning, two vertices an iteration | 398 of 400 (2 declined) | 2.54 µs | 0.95 µs | x2.68 |
+| loop 0x0B850 of 0x0B778 | fixed-point attributes to floats, four streams | 3000 of 3000 | 1.40 µs | 0.40 µs | x3.50 |
+
+A larger capture of the walk for each (every 300th to 1000th call, up to 3000, so the whole walk's scenes): 0x0ECF8
+2764 of 2764 exact, 0x0F008 2764 of 2764, loop 0x080F8 2988 of 3000 (12 declined to the lifted code: exact),
+loop 0x0B850 3000 of 3000 (its row above is that capture, the fastest of 5 runs). In the game (the walk with
+PSPOCKET_SPU_NATIVE=ab, 10 s halves, the dispatcher's host time a call, contention and all): 0x0ECF8 5.57 -> 3.66 µs,
+0x0F008 12.4 -> 7.0 µs (with its callback), loop 0x080F8 4.30 -> 1.95 µs.
 
 - 0x0F008, the culling stage: it calls the vertex-output callback through the table (native or lifted; a callback that
   stops before returning leaves the rest to the lifted code, which resumes at its return address), then culls four
@@ -15465,6 +15472,17 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
   through the rows). Its contract is the live set at the exit (spu-live: of what it writes, only the output pointer
   $86 is read again). It declines when an output it writes overlaps what it reads (the job reads a pair ahead; 2 of
   400 captured calls).
+- Loop 0x0B850 of the decompression fragment 0x0B778 (97% of the fragment's instructions; head and exit listed, both
+  reached by falling into them, D-966): four streams of fixed-point attributes (at most 23 bits a component; wider
+  ones take another path the fragment's own code chooses) to floats, a block of vertices at a time: each stream's 32
+  bytes around its pointer through a byte pattern the code before the loop makes (plus the pointer's offset in its
+  quadword), shifted, an exponent put in, a bias subtracted (fs). Natively the pattern is one table lookup on the two
+  quadwords as local store has them, made for the 16 offsets once (kept while the pattern registers are the same),
+  then ushl, bsl and the fsub fs is. The job's loop stores a vertex's values one iteration late (after zeros to a
+  scratch quadword); the native loop stores them right after their reads, which keeps local store's order of reads
+  and writes, so it is exact even where outputs overlap inputs. It declines when a block's loop would not end within
+  2^20 iterations (its step not positive, or the position wrapping). Nothing it writes is read after the exit
+  (spu-live), so its contract is local store and the pc.
 
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 
