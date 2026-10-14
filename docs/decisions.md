@@ -15029,9 +15029,10 @@ The other four with modules in the firmware stay firmware-first, each needing mo
 - E-AC-3 (libddpdec: getMemSize 0x93400, version 0x02080000 written into the attributes too, four handles, a 0x330-byte
   block): its StartSeq refuses (0x80612603) whatever the parameters; its open checks more of its arguments than the
   other cores' (an extended open's resources, by the look of it): what it needs from the front end is to find first.
-- WMA (libwmadec: 0x2FF80, 0x01010000, three handles, a 0x14-byte block echoing the format tag, channels, rate and
-  average bytes): it takes pspocket's reading of the parameters but refuses every frame of FFmpeg's WMA 2 (0x80612C80):
-  the units it expects (ASF packets, or other fields) are to find.
+- WMA (libwmadec: 0x2FF80, 0x01010000, three handles, a 0x14-byte block that is the parameters' first 20 bytes as
+  given): it refuses every frame of FFmpeg's WMA 2 (0x80612C80) whatever the parameters say (block size and encoder
+  options at each of words 4 to 8, or a big-endian WAVEFORMATEX): the units it expects are not FFmpeg's raw blocks
+  (ASF data packets, perhaps). Games do not decode WMA through cellAdec (the XMB's music player does).
 - DTS Express (libdtslbrdec: 0x6C720, 0x02080000, four handles, a 0x960-byte block): FFmpeg has no encoder for its
   streams to compare with.
 - MPEG-2 AAC, MP3 Surround, TrueHD and DTS have no module in the firmware.
