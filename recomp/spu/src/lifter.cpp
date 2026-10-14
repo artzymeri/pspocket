@@ -1171,8 +1171,8 @@ public:
         o += std::format("    ctx->pc = {};\n    {}(ctx, ls);\n", pc(target), it->second);
         // Not back here: store what the callee left alone, then return to the run loop.
         const std::string rest = stores(without(dirty, callee.touched));
-        o += rest.empty() ? std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) goto exit_now;\n", pc(ret))
-                          : std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) {{\n       {}\n        goto exit_now;\n    }}\n",
+        o += rest.empty() ? std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n", pc(ret))
+                          : std::format("    if (ctx->pc != {} || ctx->stop_reason) {{\n       {}\n        goto exit_now;\n    }}\n",
                                 pc(ret), rest);
         if (const std::string ld = loads(regs_.live_at(ret) & callee.written); !ld.empty()) o += "   " + ld + "\n";
         o += continue_at(ret);
@@ -1194,7 +1194,7 @@ private:
     std::string after_call(u32 ret) const
     {
         // Continue only if the callee returned to us; otherwise ctx is current and the run loop takes over.
-        return std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) goto exit_now;\n   {}\n", pc(ret), loads(regs_.live_at(ret))) +
+        return std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n   {}\n", pc(ret), loads(regs_.live_at(ret))) +
             continue_at(ret);
     }
     std::string continue_at(u32 ret) const
@@ -1391,7 +1391,7 @@ std::string emit_function(const LsImage& image, const Function& f, const std::st
     // Called (or resumed) at the entry: only what may be read before it is written (D-219), and what the joins of
     // paths into the entry need (D-960).
     if (const auto entry = regs.index(f.entry); mode != Mode::Twin && entry && f.labels.contains(f.entry))
-        o += std::format("    if (PSL_LIKELY(ctx->pc == {})) {{\n{}        goto L_{:05X};\n    }}\n", flow.pc(f.entry),
+        o += std::format("    if (ctx->pc == {}) {{\n{}        goto L_{:05X};\n    }}\n", flow.pc(f.entry),
             load_line(regs.entry_loads(), "       "), f.entry);
     std::set<u32> resume; // the labels of the run loop's switch
     if (mode == Mode::Fast) {

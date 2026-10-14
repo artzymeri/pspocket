@@ -40,10 +40,10 @@ extern "C" {
 #define PSL static inline __attribute__((always_inline))
 
 /* Branch weights (D-958): the ways out of lifted code (a runtime call that stops, an attention poll that finds a
- * request, a callee that does not come back to its call, a halt that holds) are almost never taken, and a function is
- * almost always entered at its entry. */
+ * request, a halt that holds) are almost never taken. A build may define it as (x) to compare without. */
+#ifndef PSL_UNLIKELY
 #define PSL_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define PSL_LIKELY(x) __builtin_expect(!!(x), 1)
+#endif
 
 /* ---- vector types (all 16 bytes; casts between them are free bit casts) ---- */
 typedef uint32_t ps_spu_vec __attribute__((vector_size(16), aligned(16)));

@@ -62,7 +62,7 @@ std::string function_text(const std::string& unit, u32 entry, const char* suffix
     return unit.substr(at, end - at);
 }
 
-// The fast entry: the loads between "if (PSL_LIKELY(ctx->pc == ...)) {" and its goto.
+// The fast entry: the loads between "if (ctx->pc == ...) {" and its goto.
 std::string entry_loads(const std::string& fn)
 {
     const size_t at = fn.find("ctx->pc == ");
