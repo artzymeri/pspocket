@@ -2,6 +2,7 @@
 # The iOS app compiles every source in src/ (D-014), so nothing here may be host-only or generated at configure time.
 add_library(pspocket_rsx STATIC
     src/context.cpp
+    src/index_scan.cpp
     src/io_map.cpp
     src/method_names.cpp
     src/methods.cpp
