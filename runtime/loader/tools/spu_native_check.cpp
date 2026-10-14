@@ -447,8 +447,8 @@ int main(int argc, char** argv)
         for (const auto& [key, n] : coverage) out << std::format("{:05x} {:05x} {}\n", key.first, key.second, n);
     }
     for (const auto& [key, t] : totals) {
-        std::printf("%016llx %05x: %llu captures; replay differs %llu; native: %llu exact, %llu differ, %llu declined (%llu of "
-                    "them changed something)",
+        std::printf("%016llx %05x: %llu captures; replay differs %llu; native: %llu exact, %llu differ, %llu declined to the "
+                    "lifted code (exact; %llu of them changed something first)",
             static_cast<unsigned long long>(key.first), key.second, static_cast<unsigned long long>(t.captures),
             static_cast<unsigned long long>(t.replay_bad), static_cast<unsigned long long>(t.native_ok),
             static_cast<unsigned long long>(t.native_bad), static_cast<unsigned long long>(t.declined),
