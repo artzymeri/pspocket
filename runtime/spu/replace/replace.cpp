@@ -194,6 +194,7 @@ struct Config {
     std::string capture_dir = "spu-capture";
     uint64_t capture_max = 500, capture_every = 1;
     bool scramble = false;   // PSPOCKET_SPU_NATIVE_SCRAMBLE: the unspecified registers garbage after each call
+    std::vector<uint32_t> scramble_only; // ... after these functions only (PSPOCKET_SPU_NATIVE_SCRAMBLE=ADDR,...)
     bool timed = false;      // PSPOCKET_SPU_NATIVE_TIME: every call timed
     uint64_t trace_hash = 0; // PSPOCKET_SPU_TRACE_ENTRIES: every entry of this program traced
     std::string trace_file;
@@ -237,6 +238,7 @@ const Config& config()
     c.only = parse_addrs(std::getenv("PSPOCKET_SPU_NATIVE_ONLY"));
     if (const char* v = std::getenv("PSPOCKET_SPU_NATIVE_SCRAMBLE"); v && std::strcmp(v, "0") != 0) {
         c.scramble = true;
+        if (std::strcmp(v, "1") != 0) c.scramble_only = parse_addrs(v);
         PS_LOG_INFO(kChan, "native SPU replacements: the registers outside their contract garbage after each call");
     }
     if (const char* v = std::getenv("PSPOCKET_SPU_NATIVE_TIME"); v && std::strcmp(v, "0") != 0) c.timed = true;
@@ -398,7 +400,13 @@ void dispatch(SPUContext* ctx, uint8_t* ls)
     if (c.timed) (native ? f->native_ns : f->lifted_ns).fetch_add(ps_host_now_ns() - t0, std::memory_order_relaxed);
     // The check of the contract (D-965): what callers may not read is garbage. After a native run, or a lifted one that
     // returned (not one that left for the run loop in the middle, to stop: its registers are all still needed).
-    if (c.scramble && (native || (ctx->stop_reason == PS_SPU_STOP_NONE && ctx->pc == ret))) scramble(ctx, f->exact);
+    // A function's lifted code that left for another listed address of the program has not returned, even where $0 (the
+    // return address taken at entry) holds that address: after an earlier call's garbage it can, by chance.
+    const bool returned = ctx->stop_reason == PS_SPU_STOP_NONE && ctx->pc == ret &&
+        (f->exit || !d->fn((ctx->pc - ctx->reloc) & PS_SPU_PC_MASK));
+    if (c.scramble && (native || returned) &&
+        (c.scramble_only.empty() || std::find(c.scramble_only.begin(), c.scramble_only.end(), addr) != c.scramble_only.end()))
+        scramble(ctx, f->exact);
 }
 
 // ---- capture ----

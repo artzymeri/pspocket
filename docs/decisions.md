@@ -15376,6 +15376,12 @@ first part: the machinery, and the first function native (runtime/spu/replace/, 
 - Tests (tests/spu/test_spu_replace.cpp): the NEON blocks against the lifted helpers (frest and frsqest over every
   index and exponent, fm, fma, fcgt keys over every float class); a synthetic program and build: derived, native,
   declined, the original untouched, unregistered together.
+- Fixed (2026-10-15): the scramble check took a lifted function as returned when its pc was the $0 it was entered
+  with. With loop regions listed, a function's lifted code leaves for another listed address, and $0, garbage after an
+  earlier native call (outside the regions' contracts: spu-live, nothing reads it there), matched that address by
+  chance about once a walk: all of $2-$79 went to garbage in the middle of 0x07A38 and the walk stopped. Leaving for a
+  listed address of the program is never a return now. PSPOCKET_SPU_NATIVE_SCRAMBLE=ADDR,... scrambles after those
+  functions only, which found it.
 
 ## D-966 · 2026-10-14 · The lifter calls a function listed for a native replacement through the program's table
 
@@ -15498,7 +15504,6 @@ PSPOCKET_SPU_NATIVE=ab, 10 s halves, the dispatcher's host time a call, contenti
   nothing in the game (A/B walk: 4.43 µs native, 4.44 µs lifted a call): half its time is the SPU float model's
   operations on every lane (frsqest, fi, the clamps), as many natively as in the lifted code, and which lanes matter
   depends on the table's shuffles. Not listed as native: the fragment stays lifted.
-
 
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 

@@ -21,6 +21,7 @@
 //   PSPOCKET_SPU_NATIVE_ONLY=ADDR[,ADDR...]  native for these functions only (hex, the program's own addresses).
 //   PSPOCKET_SPU_NATIVE_SCRAMBLE=1  after each call of a listed function (native, or lifted when it returned), the
 //                              registers outside its contract (below) hold garbage: the walk must not change.
+//                              =ADDR[,ADDR...]: after these functions only (to find the one whose contract is short).
 //   PSPOCKET_SPU_CAPTURE=HASH:ADDR[,ADDR...]  records the state at entry and at exit of the lifted function at each
 //                              ADDR of the program with key HASH (16 hex digits) into PSPOCKET_SPU_CAPTURE_DIR (default
 //                              "spu-capture"), at most PSPOCKET_SPU_CAPTURE_MAX per function (default 500), every
