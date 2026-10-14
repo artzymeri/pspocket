@@ -64,8 +64,56 @@ constexpr Function kEdgeDad4[] = {
     {0x0F008, ps_edge_dad4_0f008, regs({3})},
 };
 
+// Sony's MP3 decoder module, dev_flash/sys/external/flashMP3.pic from offset 0x100 (the build every MultiStream game
+// loads into its SPU decode jobs: GTA V's mixer at LS 0x17400), lifted relocatable at 0x17400. Its entry, decodeFrame,
+// is reached by the job's tail call through a register; its caller reads $3 (the PCM's address) after it (D-974).
+//
+// decodeFrame's arguments: $3 the frame, $4/$5 where it puts the bytes consumed and the PCM bytes a channel, $6 its
+// 22528-byte heap, $7/$8 the channels' hybrid overlap (576 floats), $9/$10 their filterbank history (544 floats), $11
+// the 512-byte reservoir, $12 the filterbank position. Where the native decoder may differ (flashmp3.c):
+// - equivalent: the PCM (16-bit, the heap + 2304 and + 6400: one step at most where a sum falls on the other side of
+//   an integer), the four float state buffers and the float scratch of the heap past the PCM (the granule's spectra,
+//   the hybrid filter's output and its last new block): within 1e-4 of each region's largest magnitude;
+// - dead: the padding of the module's variables (each has a quadword of its own; the bytes past its size, by the
+//   module's symbol table, belong to no variable, and the compiler's whole-quadword stores fill them with whatever its
+//   registers held); its rval (0x100A0), the last value a bit read assembled, which it only ever stores (101 stores,
+//   no load, its address never taken: none of its 9,437 instructions reads it); and the stack below the caller's
+//   stack pointer (the module's frames, free once it returns: the SPU ABI). The module's variables are reloaded with
+//   its image before calls anyway (the job DMAs the module in: the captured calls find the image's bytes there).
+void flashmp3_regions(const SPUContext& entry, const uint8_t*, std::vector<Region>& out)
+{
+    const auto pref = [&](int r) { return entry.gpr[r].u32[3] & PS_SPU_LS_MASK; };
+    const uint32_t mod = (0x17400u + entry.reloc) & PS_SPU_LS_MASK, heap = pref(6), sp = pref(1);
+    constexpr double kFloat = 1e-4, kPcm = 1;
+    out.push_back({Region::Kind::s16, heap + 2304, 4096, kPcm});
+    out.push_back({Region::Kind::s16, heap + 2304 + 4096, 4096, kPcm});
+    out.push_back({Region::Kind::f32, heap + 10624, 22144 - 10624, kFloat});
+    out.push_back({Region::Kind::f32, pref(7), 2304, kFloat});
+    out.push_back({Region::Kind::f32, pref(8), 2304, kFloat});
+    out.push_back({Region::Kind::f32, pref(9), 2176, kFloat});
+    out.push_back({Region::Kind::f32, pref(10), 2176, kFloat});
+    // The variables (image vaddr, size) of the module's .data and .bss, from 0x10000 to 0x103E0.
+    static constexpr std::pair<uint32_t, uint32_t> kVars[] = {{0x10000, 4}, {0x10010, 4}, {0x10020, 4}, {0x10030, 8},
+        {0x10040, 4}, {0x10050, 0x48}, {0x100A0, 4}, {0x100B0, 0x100}, {0x101B0, 0x48}, {0x10200, 4}, {0x10210, 1}, {0x10220, 0x10},
+        {0x10230, 0x48}, {0x10280, 4}, {0x10290, 4}, {0x102A0, 8}, {0x102B0, 0x10}, {0x102C0, 4}, {0x102D0, 4},
+        {0x102E0, 4}, {0x102F0, 4}, {0x10300, 0x10}, {0x10310, 4}, {0x10320, 4}, {0x10330, 4}, {0x10340, 0x44},
+        {0x10390, 4}, {0x103A0, 4}, {0x103B0, 8}, {0x103C0, 0x10}, {0x103D0, 4}};
+    for (const auto& [vaddr, size] : kVars) {
+        const uint32_t end = vaddr + size, quad_end = (end + 15) & ~15u;
+        if (end < quad_end) out.push_back({Region::Kind::dead, (mod + end - 0x80) & PS_SPU_LS_MASK, quad_end - end, 0});
+    }
+    out.push_back({Region::Kind::dead, (mod + 0x100A0 - 0x80) & PS_SPU_LS_MASK, 4, 0}); // rval
+    constexpr uint32_t kStack = 8192;
+    if (sp >= kStack) out.push_back({Region::Kind::dead, sp - kStack, kStack, 0});
+}
+
+constexpr Function kFlashMp3[] = {
+    {0x1E820, ps_flashmp3_884a_1e820, regs({3}), flashmp3_regions},
+};
+
 constexpr Build kBuilds[] = {
     {"EDGE geometry (spu_dad457863220b1cc)", 0xDAD457863220B1CCull, 0x04C00, 0xE900, kEdgeDad4},
+    {"Sony's MP3 decoder module (flashMP3.pic)", 0x884AE88F68A9E778ull, 0x17400, 0x10380, kFlashMp3},
 };
 
 // Builds added at run time (add_build): never removed, so a Build found stays valid.
@@ -314,10 +362,24 @@ void capture(SPUContext* ctx, uint8_t* ls, const Derived& d, DerivedFn& f, uint6
 {
     thread_local std::vector<uint8_t> before;
     before.assign(ls, ls + PS_SPU_LS_SIZE);
+    // The decrementer stands still through a captured call (as if the call took no time), so a function that reads it
+    // gives the same values when replayed (D-974: the MP3 module times itself); it runs on afterwards as before.
+    const ps_spu_channels ch = ctx->ch;
+    uint32_t dec = 0;
+    if (!ch.dec_frozen) {
+        ps_spu_rdch(ctx, ctx->pc, PS_SPU_RdDec, &dec);
+        ctx->ch.dec_value = dec;
+        ctx->ch.dec_frozen = 1;
+    }
     CaptureState in{}, out{};
     save_state(*ctx, in);
     f.lifted(ctx, ls);
     save_state(*ctx, out);
+    if (!ch.dec_frozen && ctx->ch.dec_frozen && ctx->ch.dec_value == dec) {
+        ctx->ch.dec_frozen = 0;
+        ctx->ch.dec_value = ch.dec_value;
+        ctx->ch.dec_start = ch.dec_start;
+    }
     const Config& c = config();
     if (f.captured.fetch_add(1, std::memory_order_relaxed) >= c.capture_max) return;
     CaptureHeader h{};
@@ -401,6 +463,16 @@ Registers exact_registers(uint64_t hash, uint32_t code_start, uint32_t code_size
                 r.bits[1] |= f.live.bits[1];
             }
     return r;
+}
+
+std::vector<Region> regions(uint64_t hash, uint32_t code_start, uint32_t code_size, uint32_t addr, const SPUContext& entry,
+    const uint8_t* ls_entry)
+{
+    std::vector<Region> out;
+    if (const Build* b = find_build(hash, code_start, code_size))
+        for (const Function& f : b->functions)
+            if (f.addr == addr && f.regions) f.regions(entry, ls_entry, out);
+    return out;
 }
 
 void set_mode(Mode mode)

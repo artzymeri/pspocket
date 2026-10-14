@@ -65,13 +65,30 @@ constexpr Registers abi_registers() { return {{0x3ull, 0xFFFFFFFFFFFF0000ull}}; 
 
 // The native implementation for the function at `addr` of the program with key `hash` (code start and size as the
 // program's), or nullptr.
+// Where a native implementation may leave local store other than bit for bit (D-974), worked out from the state at
+// entry: the bar for decoded audio is equivalent output, not the same bits (the host's float operations in another
+// order than the SPU's), and some bytes are never read again by anything (a variable the program only ever stores,
+// the stack below the caller's stack pointer). Everything outside these regions stays exact.
+struct Region {
+    enum class Kind : uint8_t {
+        dead, // not compared: shown never to be read (said why where the regions are listed)
+        f32,  // big-endian floats: the largest difference, against the region's largest magnitude, at most `tolerance`
+        s16,  // big-endian 16-bit samples: the largest difference at most `tolerance`
+    };
+    Kind kind;
+    uint32_t start, size; // local store, no wrap
+    double tolerance;
+};
+using RegionsFn = void (*)(const SPUContext& entry, const uint8_t* ls_entry, std::vector<Region>& out);
+
 // A listed function of a known build: its entry (the program's own address), its native implementation (nullptr:
-// listed only — calls into it go through the table, it can be captured — no native code yet) and the registers of
-// $2-$79 its callers may read after it.
+// listed only — calls into it go through the table, it can be captured — no native code yet), the registers of
+// $2-$79 its callers may read after it, and (none: all of local store exact) its regions.
 struct KnownFunction {
     uint32_t addr;
     Impl impl;
     Registers live;
+    RegionsFn regions = nullptr;
 };
 // Adds a known build beside the built-in table (tests; builds described elsewhere): kept for the process's life, used
 // by programs registered (and lifted) from then on.
@@ -81,6 +98,10 @@ Impl native(uint64_t hash, uint32_t code_start, uint32_t code_size, uint32_t add
 // The registers a native implementation of that function must leave exact: abi_registers() and those of $2-$79 its
 // callers may read after it.
 Registers exact_registers(uint64_t hash, uint32_t code_start, uint32_t code_size, uint32_t addr);
+// The regions of local store that function may leave equivalent or not at all (Region), for a call entered with `entry`
+// and `ls_entry`; empty: all of local store is exact.
+std::vector<Region> regions(uint64_t hash, uint32_t code_start, uint32_t code_size, uint32_t addr, const SPUContext& entry,
+    const uint8_t* ls_entry);
 
 enum class Mode { off, on, ab };
 // Overrides PSPOCKET_SPU_NATIVE (tools and tests; before the first registration).

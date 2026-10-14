@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "pspocket/core/be.h"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/game/host.hpp"
@@ -103,10 +105,23 @@ std::string hex128(const ps_spu_v128& v)
     return std::format("{:08x}{:08x}{:08x}{:08x}", v.u32[3], v.u32[2], v.u32[1], v.u32[0]);
 }
 
+bool g_ranges = false; // --ranges: every range of local store that differs
+
+// How far a run's local store is from the expected one in the regions a function may leave equivalent (D-974).
+struct Equivalence {
+    bool any = false;     // some region differs (within or past its tolerance)
+    bool outside = false; // past a tolerance
+    int s16 = 0;          // the largest 16-bit difference
+    double f32 = 0;       // the largest float difference against its region's largest magnitude
+    std::string where;
+};
+
 // What differs between the state a run left (ctx, ls) and the expected one in what must be exact (`exact`: the
-// registers; everything else always); empty when nothing does. *loose counts the other registers that differ.
+// registers; everything else always, but for `regions`, compared as they say: eq); empty when nothing does. *loose
+// counts the other registers that differ.
 std::string differences(const rp::CaptureState& want, const u8* ls_want, const SPUContext& ctx, const u8* ls,
-    const rp::Registers& exact = {{~0ull, ~0ull}}, u32* loose = nullptr)
+    const rp::Registers& exact = {{~0ull, ~0ull}}, u32* loose = nullptr, const std::vector<rp::Region>* regions = nullptr,
+    Equivalence* eq = nullptr)
 {
     rp::CaptureState got{};
     rp::save_state(ctx, got);
@@ -130,15 +145,70 @@ std::string differences(const rp::CaptureState& want, const u8* ls_want, const S
     ps_spu_channels a = want.ch, b = got.ch;
     a.res_version = b.res_version = 0;
     if (std::memcmp(&a, &b, sizeof a) != 0) d += " channels;";
+    static std::vector<u8> covered;
+    covered.assign(kLsSize, 0);
+    if (regions)
+        for (const rp::Region& r : *regions) {
+            if (r.start >= kLsSize || r.size > kLsSize - r.start) continue;
+            std::memset(covered.data() + r.start, 1, r.size);
+            if (r.kind == rp::Region::Kind::dead || std::memcmp(ls_want + r.start, ls + r.start, r.size) == 0) continue;
+            if (!eq) continue;
+            eq->any = true;
+            if (r.kind == rp::Region::Kind::s16) {
+                int worst = 0;
+                for (u32 i = 0; i + 2 <= r.size; i += 2) {
+                    const int x = static_cast<int16_t>(ps_ld16(ls_want + r.start + i)), y = static_cast<int16_t>(ps_ld16(ls + r.start + i));
+                    worst = std::max(worst, std::abs(x - y));
+                }
+                eq->s16 = std::max(eq->s16, worst);
+                if (worst > r.tolerance) {
+                    eq->outside = true;
+                    eq->where += std::format(" 16-bit at {:05x}+{:#x}: {} steps;", r.start, r.size, worst);
+                }
+            } else {
+                double peak = 0, worst = 0;
+                for (u32 i = 0; i + 4 <= r.size; i += 4) {
+                    const double x = static_cast<double>(ps_ldf32(ls_want + r.start + i)), y = static_cast<double>(ps_ldf32(ls + r.start + i));
+                    peak = std::max(peak, std::fabs(x));
+                    const double e = std::fabs(x - y);
+                    worst = std::isnan(e) ? 1e30 : std::max(worst, e);
+                }
+                const double rel = peak > 0 ? worst / peak : (worst > 0 ? 1e30 : 0);
+                eq->f32 = std::max(eq->f32, rel);
+                if (rel > r.tolerance) {
+                    eq->outside = true;
+                    eq->where += std::format(" floats at {:05x}+{:#x}: {:.3g} of their peak {:.3g};", r.start, r.size, rel, peak);
+                }
+            }
+        }
     u32 lines = 0, first = 0;
-    for (u32 i = 0; i < kLsSize; i += 16)
-        if (std::memcmp(ls_want + i, ls + i, 16) != 0 && lines++ == 0) first = i;
-    if (lines) d += std::format(" local store: {} lines differ, the first at {:05x};", lines, first);
+    std::string ranges;
+    u32 run_from = 0, run_to = 0;
+    for (u32 i = 0; i < kLsSize; i += 16) {
+        bool differs = false;
+        for (u32 j = i; j < i + 16 && !differs; j++) differs = !covered[j] && ls_want[j] != ls[j];
+        if (!differs) continue;
+        if (lines++ == 0) first = i;
+        if (lines > 1 && i == run_to) {
+            run_to = i + 16;
+            continue;
+        }
+        if (lines > 1) ranges += std::format(" {:05x}-{:05x}", run_from, run_to);
+        run_from = i;
+        run_to = i + 16;
+    }
+    if (lines) ranges += std::format(" {:05x}-{:05x}", run_from, run_to);
+    if (lines) d += std::format(" local store: {} lines differ, the first at {:05x}{};", lines, first,
+        g_ranges ? " (" + ranges.substr(1) + ")" : std::string());
+    if (eq && eq->outside) d += eq->where;
     return d;
 }
 
 struct Totals {
     u64 captures = 0, replay_bad = 0, native_ok = 0, native_bad = 0, declined = 0, decline_bad = 0;
+    u64 equivalent = 0; // of native_ok: equal outside the function's regions, within them equivalent (D-974)
+    int worst_s16 = 0;
+    double worst_f32 = 0;
     double lifted_ns = 0, native_ns = 0;
     u64 timed = 0, lifted_timed = 0, loose_regs = 0;
 };
@@ -153,6 +223,7 @@ int main(int argc, char** argv)
     u64 max = 0;
     bool quiet = false, verbose = false, bench = false, callees_native = true;
     std::string coverage_path;
+    std::string dump_dir; // --dump DIR: a capture whose native run differs: the local store at entry, wanted and got
     std::map<std::pair<u32, u32>, u64> coverage; // (function, address) -> instructions run
     u32 bench_runs = 1000;
     for (int i = 1; i < argc; i++) {
@@ -172,6 +243,8 @@ int main(int argc, char** argv)
         else if (a == "--callees") callees_native = value() != "lifted";
         else if (a == "--coverage") coverage_path = value();
         else if (a == "--bench") bench = true;
+        else if (a == "--ranges") g_ranges = true;
+        else if (a == "--dump") dump_dir = value();
         else if (a == "--bench-runs") bench_runs = static_cast<u32>(std::stoul(value()));
         else if (a.rfind("--", 0) == 0) {
             std::fprintf(stderr, "usage: spu-native-check CAPTURE... [--library FILE] [--time N] [--max N] [--quiet]\n");
@@ -302,12 +375,32 @@ int main(int argc, char** argv)
             continue;
         }
         const rp::Registers exact = rp::exact_registers(h.hash, h.code_start, h.code_size, h.addr);
+        SPUContext entry{};
+        rp::load_state(c.in, entry);
+        entry.reloc = h.reloc;
+        const std::vector<rp::Region> regions = rp::regions(h.hash, h.code_start, h.code_size, h.addr, entry, c.ls_in.data());
         u32 loose = 0;
-        const std::string d = differences(c.out, c.ls_out.data(), ctx, ls, exact, &loose);
+        Equivalence eq;
+        const std::string d = differences(c.out, c.ls_out.data(), ctx, ls, exact, &loose, &regions, &eq);
         t.loose_regs += loose;
+        t.worst_s16 = std::max(t.worst_s16, eq.s16);
+        t.worst_f32 = std::max(t.worst_f32, eq.f32);
+        if (eq.any && d.empty()) t.equivalent++;
         if (!d.empty()) {
             t.native_bad++;
             failures++;
+            if (!dump_dir.empty()) {
+                const std::string base = dump_dir + "/" + std::filesystem::path(c.path).stem().string();
+                std::ofstream(base + ".in", std::ios::binary).write(reinterpret_cast<const char*>(c.ls_in.data()), kLsSize);
+                std::ofstream(base + ".want", std::ios::binary).write(reinterpret_cast<const char*>(c.ls_out.data()), kLsSize);
+                std::ofstream(base + ".got", std::ios::binary).write(reinterpret_cast<const char*>(ls), kLsSize);
+                rp::CaptureState got{};
+                rp::save_state(ctx, got);
+                std::ofstream(base + ".regs", std::ios::binary)
+                    .write(reinterpret_cast<const char*>(&c.in), sizeof c.in)
+                    .write(reinterpret_cast<const char*>(&c.out), sizeof c.out)
+                    .write(reinterpret_cast<const char*>(&got), sizeof got);
+            }
             if (!quiet || t.native_bad <= 5) std::printf("DIFF %s:%s\n", c.path.c_str(), d.c_str());
             continue;
         }
@@ -360,6 +453,10 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(t.replay_bad), static_cast<unsigned long long>(t.native_ok),
             static_cast<unsigned long long>(t.native_bad), static_cast<unsigned long long>(t.declined),
             static_cast<unsigned long long>(t.decline_bad));
+        if (t.equivalent)
+            std::printf("; %llu of the exact equivalent in their regions (the largest 16-bit difference %d, float %.2g of "
+                        "its region's peak)",
+                static_cast<unsigned long long>(t.equivalent), t.worst_s16, t.worst_f32);
         if (t.native_ok + t.native_bad)
             std::printf("; volatile registers left otherwise: %.1f a call",
                 static_cast<double>(t.loose_regs) / static_cast<double>(t.native_ok + t.native_bad));

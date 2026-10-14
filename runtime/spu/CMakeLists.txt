@@ -13,7 +13,8 @@ add_library(pspocket_spu STATIC
     src/thread.cpp
     # Native replacements for known builds of SPU middleware (plan section 6, D-965).
     replace/replace.cpp
-    replace/edge_dad4.c)
+    replace/edge_dad4.c
+    replace/flashmp3.c)
 target_include_directories(pspocket_spu PUBLIC include)
 target_link_libraries(pspocket_spu PUBLIC pspocket::core)
 pspocket_set_warnings(pspocket_spu)

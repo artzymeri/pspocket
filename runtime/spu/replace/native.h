@@ -18,6 +18,9 @@ extern "C" {
 int ps_edge_dad4_0ecf8(SPUContext* ctx, uint8_t* ls);
 int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls);
 
+/* Sony's MP3 decoder module (flashMP3.pic), program 884ae88f68a9e778: decodeFrame (flashmp3.c). */
+int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls);
+
 #ifdef __cplusplus
 }
 #endif
