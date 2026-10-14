@@ -15436,6 +15436,7 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
 |---|---|---|---|---|---|
 | 0x0ECF8 | vertex output: screen-space transform, outcodes | 400 of 400 | 2.85 µs | 1.93 µs | x1.47 |
 | 0x0F008 | culling stage (with the callback above) | 400 of 400 | 5.55 µs | 3.62 µs | x1.53 (its own part x2.1) |
+| loop 0x080F8 of 0x07A38 | four-bone skinning, two vertices an iteration | 398 of 400 (2 declined) | 2.54 µs | 0.95 µs | x2.68 |
 
 - 0x0F008, the culling stage: it calls the vertex-output callback through the table (native or lifted; a callback that
   stops before returning leaves the rest to the lifted code, which resumes at its return address), then culls four
@@ -15449,6 +15450,14 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
   stores and vertex loads keep the job's order relative to the others (the output is written over the input), and a
   group's tests are four triangles a vector. The "no pixel" test is off in 77% of the captured calls: its six cflts are
   then left out (exact: its result is masked off).
+- Loop 0x080F8 of 0x07A38 (78% of that function's instructions; head and exit listed, D-966): four-bone matrix-palette
+  skinning of positions, the blended rows kept on the stack for the normals. Natively: the rows of the bones a call
+  names are read once into host order with their "not a zero" lanes, the 255 weights fm(cuflt(b), 1/255) made once per
+  thread, a zero weight's fma left out (its addend), the rest as the job does it (fm, then fma by bone, the position
+  through the rows). Its contract is the live set at the exit (spu-live: of what it writes, only the output pointer
+  $86 is read again). It declines when an output it writes overlaps what it reads (the job reads a pair ahead; 2 of
+  400 captured calls).
+
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 
 The plan for a steady 30 fps (docs/improve.md): on the iPhone 18 Pro Max the RSX thread (the FIFO reader and the Metal

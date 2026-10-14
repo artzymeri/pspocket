@@ -474,3 +474,180 @@ int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls)
     ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * Loop 0x080F8 of 0x07A38 (to its exit at 0x082E8): matrix-palette skinning with four bones a vertex, two vertices an
+ * iteration. For each vertex, its 8 bytes in the bone stream are (weight, bone) four times; a bone byte 0xFF at the
+ * first place stands for (weight 255, bone 0, then zeros). With the weights w_j = fm(cuflt(byte), 1/255) and the bones'
+ * three rows of 16 bytes (at the three row bases + 48 * bone):
+ *   R_r  = fma(w3, M3_r, fma(w2, M2_r, fma(w1, M1_r, fm(w0, M0_r))))     rows r = 0, 1, 2
+ *   R0'  = R0 with its last word 1.0, R1' and R2' with it 0: stored (48 bytes a vertex) for the normals that follow
+ *   p'   = fma(p.zxyw, R2', fma(p.yzxw, R1', fma(p, R0', (R0.w, R1.w, R2.w, 0))))  over the position, in place
+ * The loop is software-pipelined (the next pair's bones and positions read ahead): the native one reads each pair as
+ * the job does, from the bone stream at $49 - 16 and the positions at $48 - 32 on, and leaves what the code after the
+ * loop reads ($86, the output pointer, advanced; spu-live: nothing else it writes is read again).
+ * =================================================================================================================== */
+
+/* The registers the job sets before the loop and the loop only reads (shuffle controls, masks, 1/255, 1.0), checked. */
+static int skin_invariants_hold(const SPUContext* ctx)
+{
+    static const struct {
+        uint8_t r;
+        uint32_t w[4];
+    } k[] = {
+        {81, {0x00010203u, 0x00010203u, 0x00010203u, 0x00010203u}}, {93, {0x0C0D0E0Fu, 0x0C0D0E0Fu, 0x0C0D0E0Fu, 0x0C0D0E0Fu}},
+        {94, {0x08090A0Bu, 0x08090A0Bu, 0x08090A0Bu, 0x08090A0Bu}}, {95, {0x04050607u, 0x04050607u, 0x04050607u, 0x04050607u}},
+        {77, {0x80808000u, 0x80808002u, 0x80808004u, 0x80808006u}}, {102, {0x80808008u, 0x8080800Au, 0x8080800Cu, 0x8080800Eu}},
+        {36, {0x04050607u, 0x08090A0Bu, 0x00010203u, 0x0C0D0E0Fu}}, {82, {0x08090A0Bu, 0x00010203u, 0x04050607u, 0x0C0D0E0Fu}},
+        {70, {0x80808080u, 0x0C0D0E0Fu, 0x1C1D1E1Fu, 0x80808080u}}, {69, {0x1C1D1E1Fu, 0x04050607u, 0x08090A0Bu, 0x80808080u}},
+        {84, {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x00000000u}}, {97, {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}},
+        {91, {0x3B808080u, 0x3B808080u, 0x3B808080u, 0x3B808080u}}, {55, {0xFF000000u, 0x00000000u, 0xFF000000u, 0x00000000u}},
+        {54, {0x01010101u, 0x01010101u, 0x09090909u, 0x09090909u}},
+    };
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++)
+        for (int w = 0; w < 4; w++)
+            if (ctx->gpr[k[i].r].u32[3 - w] != k[i].w[w]) return 0;
+    return 1;
+}
+
+/* A quadword of local store as four host words (lane i = guest word i) and back. */
+static inline uint32x4_t ld_words(const uint8_t* ls, uint32_t addr)
+{
+    return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ls + (addr & PS_SPU_QW_MASK))));
+}
+static inline void st_words(uint8_t* ls, uint32_t addr, uint32x4_t v)
+{
+    vst1q_u8(ls + (addr & PS_SPU_QW_MASK), vrev32q_u8(vreinterpretq_u8_u32(v)));
+}
+
+/* The palette as the loop uses it: each row of each bone named (host words) and its lanes that are not zeros (an fma
+ * with a zero factor is its addend); the weights by byte (fm(cuflt(b), 1/255), as the job computes them). */
+typedef struct {
+    uint32x4_t row[3][256], nz[3][256];
+    uint32_t weight[256];
+} skin_palette;
+
+/* One vertex: its four (weight, bone) bytes, its position at `pos` (transformed in place), its three rows to `mat`. */
+static inline __attribute__((always_inline)) void skin_vertex(uint8_t* ls, const skin_palette* pal, const uint8_t q[8],
+    uint32_t mat, uint32_t pos)
+{
+    uint32x4_t r[3];
+    {
+        const unsigned b = q[1];
+        if (q[0]) {
+            const float32x4_t w = vreinterpretq_f32_u32(vdupq_n_u32(pal->weight[q[0]]));
+            for (int k = 0; k < 3; k++)
+                r[k] = vandq_u32(vreinterpretq_u32_f32(vmulq_f32(w, vreinterpretq_f32_u32(pal->row[k][b]))), pal->nz[k][b]);
+        } else {
+            r[0] = r[1] = r[2] = vdupq_n_u32(0); /* fm by a zero weight */
+        }
+    }
+    for (int j = 1; j < 4; j++) {
+        if (!q[2 * j]) continue; /* fma by a zero weight: its addend */
+        const unsigned b = q[2 * j + 1];
+        const float32x4_t w = vreinterpretq_f32_u32(vdupq_n_u32(pal->weight[q[2 * j]]));
+        for (int k = 0; k < 3; k++) {
+            const float32x4_t f = vfmaq_f32(vreinterpretq_f32_u32(r[k]), w, vreinterpretq_f32_u32(pal->row[k][b]));
+            r[k] = vbslq_u32(pal->nz[k][b], vreinterpretq_u32_f32(f), r[k]);
+        }
+    }
+    const uint32x4_t r0 = vsetq_lane_u32(0x3F800000u, r[0], 3), r1 = vsetq_lane_u32(0, r[1], 3), r2 = vsetq_lane_u32(0, r[2], 3);
+    st_words(ls, mat, r0);
+    st_words(ls, mat + 16, r1);
+    st_words(ls, mat + 32, r2);
+    uint32x4_t t = vdupq_n_u32(0);
+    t = vcopyq_laneq_u32(t, 0, r[0], 3);
+    t = vcopyq_laneq_u32(t, 1, r[1], 3);
+    t = vcopyq_laneq_u32(t, 2, r[2], 3);
+    const uint32x4_t p = ld_words(ls, pos);
+    const uint8x16_t yzxw = {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15};
+    const uint8x16_t zxyw = {8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15};
+    const uint32x4_t py = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(p), yzxw));
+    const uint32x4_t pz = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(p), zxyw));
+    uint32x4_t o = psn_fma(p, r0, t);
+    o = psn_fma(py, r1, o);
+    o = psn_fma(pz, r2, o);
+    st_words(ls, pos, o);
+}
+
+int ps_edge_dad4_080f8(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t count = pref(ctx, 46);
+    if (count == 0 || (count & 1) || count > 0x10000u) return 0;
+    if (!skin_invariants_hold(ctx)) return 0;
+    const uint32_t base[3] = {pref(ctx, 38), pref(ctx, 37), pref(ctx, 35)}; /* the rows' bases */
+    uint32_t bones = pref(ctx, 49) - 16, positions = pref(ctx, 48) - 32, mat = pref(ctx, 47);
+    const uint32_t out = pref(ctx, 86);
+    if ((out & PS_SPU_QW_MASK) != (positions & PS_SPU_QW_MASK)) return 0; /* the job transforms in place */
+    /* The job reads a pair's bones and positions before it writes the pair before: here each vertex reads and writes
+     * in turn, the same only while the matrices written, the positions and the bone rows read do not overlap. */
+    const uint32_t m0 = mat & PS_SPU_QW_MASK, p0 = positions & PS_SPU_QW_MASK, b0 = bones & PS_SPU_QW_MASK;
+    const uint32_t mlen = 48u * count, plen = 16u * count, blen = 8u * count + 16;
+    if (!in_ls(m0, mlen) || !in_ls(p0, plen) || !in_ls(b0, blen)) return 0;
+    /* the largest bone named (a vertex whose first bone is 0xFF names bone 0 only), sixteen bytes at a time */
+    unsigned top;
+    {
+        const uint8x16_t odd = vreinterpretq_u8_u16(vdupq_n_u16(0xFF00u)); /* bytes 1, 3, 5, ... in memory order */
+        const uint8x16_t first = {1, 1, 1, 1, 1, 1, 1, 1, 9, 9, 9, 9, 9, 9, 9, 9};
+        uint8x16_t m = vdupq_n_u8(0);
+        for (uint32_t i = 0; i < count / 2; i++) {
+            const uint8x16_t q = vld1q_u8(ls + ((bones + 16 * i) & PS_SPU_QW_MASK));
+            const uint8x16_t one = vceqq_u8(vqtbl1q_u8(q, first), vdupq_n_u8(0xFF));
+            m = vmaxq_u8(m, vbicq_u8(vandq_u8(q, odd), one));
+        }
+        top = vmaxvq_u8(m);
+    }
+#define OVERLAP(a, alen, b, blen) ((a) < (b) + (blen) && (b) < (a) + (alen))
+    if (OVERLAP(m0, mlen, p0, plen) || OVERLAP(m0, mlen, b0, blen) || OVERLAP(p0, plen, b0, blen)) return 0;
+    const uint32_t lo = base[0] < base[2] ? base[0] : base[2], hi = (base[0] > base[2] ? base[0] : base[2]) + (top + 1) * 48u;
+    if ((lo & ~PS_SPU_LS_MASK) || hi > PS_SPU_LS_SIZE) return 0;
+    if (OVERLAP(m0, mlen, lo, hi - lo) || OVERLAP(p0, plen, lo, hi - lo)) {
+        /* the palette's span reaches an output: the rows of the bones named must not */
+        uint64_t used[4] = {0, 0, 0, 0};
+        for (uint32_t i = 0; i < count; i++) {
+            const uint8_t* v = ls + ((bones + 8 * i) & PS_SPU_LS_MASK);
+            for (int j = 0; j < 4; j++) {
+                const unsigned b = v[1] == 0xFF ? 0u : v[2 * j + 1];
+                used[b >> 6] |= 1ull << (b & 63);
+            }
+        }
+        for (unsigned b = 0; b <= top; b++) {
+            if (!((used[b >> 6] >> (b & 63)) & 1)) continue;
+            for (int k = 0; k < 3; k++) {
+                const uint32_t row = (base[k] + 48u * b) & PS_SPU_QW_MASK;
+                if (OVERLAP(m0, mlen, row, 16u) || OVERLAP(p0, plen, row, 16u)) return 0;
+            }
+        }
+    }
+#undef OVERLAP
+    /* The rows of the bones named, the weights by byte. */
+    static _Thread_local skin_palette pal;
+    for (unsigned b = 0; b <= top; b++)
+        for (int k = 0; k < 3; k++) {
+            pal.row[k][b] = ld_words(ls, base[k] + 48u * b);
+            pal.nz[k][b] = psn_nz(pal.row[k][b]);
+        }
+    static _Thread_local int weights_made;
+    if (!weights_made) { /* the same for every call (the SPU FP environment) */
+        for (unsigned v = 1; v < 256; v++) /* weight 0 is never used: its fma is left out */
+            pal.weight[v] = psl_fm(psl_splat32(ps_spu_u32f((float)v)), psl_splat32(0x3B808080u))[3];
+        weights_made = 1;
+    }
+    for (uint32_t pair = 0; pair < count / 2; pair++) {
+        uint8_t q[16];
+        memcpy(q, ls + (bones & PS_SPU_QW_MASK), 16);
+        for (int h = 0; h < 2; h++)
+            if (q[8 * h + 1] == 0xFF) { /* one bone: weight 255 for bone 0 */
+                q[8 * h] = 0xFF;
+                memset(q + 8 * h + 1, 0, 7);
+            }
+        skin_vertex(ls, &pal, q, mat, positions);
+        skin_vertex(ls, &pal, q + 8, mat + 48, positions + 16);
+        bones += 16;
+        positions += 32;
+        mat += 96;
+    }
+    psl_st(ctx, 86, psl_a(psl_ld(ctx, 86), psl_splat32(32u * (count / 2))));
+    ctx->pc = (0x082E8u + ctx->reloc) & PS_SPU_PC_MASK;
+    return 1;
+}

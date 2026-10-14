@@ -56,6 +56,13 @@ constexpr Registers kFragmentState = regs({4, 35, 37, 39, 41, 42, 43, 44, 45, 46
     61, 65, 66, 67, 72, 76});
 constexpr Function kEdgeDad4[] = {
     {0x07A38, nullptr, {}},
+    // its skinning loop (78% of its instructions): head and exit; after the exit the job reads these
+    {0x080F8, ps_edge_dad4_080f8,
+        regs({1, 36, 39, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 81, 82, 84, 85, 86, 87, 88, 89, 90,
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,
+            115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 127}),
+        nullptr, 0x082E8},
+    {0x082E8, nullptr, {}},
     {0x0A098, nullptr, {}},
     {0x0AC10, nullptr, kFragmentState},
     {0x0AC20, nullptr, kFragmentState},
@@ -246,6 +253,7 @@ const Config& config()
 
 struct DerivedFn {
     uint32_t addr = 0;
+    uint32_t exit = 0; // a loop's exit (0: a function, returning to its link)
     Impl impl = nullptr;
     Registers exact{};
     ps_spu_fn lifted = nullptr;
@@ -362,7 +370,7 @@ void dispatch(SPUContext* ctx, uint8_t* ls)
         return;
     }
     const Config& c = config();
-    const uint32_t ret = ctx->gpr[0].u32[3] & PS_SPU_PC_MASK;
+    const uint32_t ret = f->exit ? (f->exit + ctx->reloc) & PS_SPU_PC_MASK : ctx->gpr[0].u32[3] & PS_SPU_PC_MASK;
     bool native = false;
     const uint64_t t0 = c.timed ? ps_host_now_ns() : 0;
     if (f->impl && f->enabled && native_now(c)) {
@@ -483,6 +491,7 @@ Registers exact_registers(uint64_t hash, uint32_t code_start, uint32_t code_size
     if (const Build* b = find_build(hash, code_start, code_size))
         for (const Function& f : b->functions)
             if (f.addr == addr) {
+                if (f.exit) r = Registers{};
                 r.bits[0] |= f.live.bits[0];
                 r.bits[1] |= f.live.bits[1];
             }
@@ -539,7 +548,8 @@ ps_spu_program* derive(const ps_spu_program* program)
         auto f = std::make_unique<DerivedFn>();
         f->addr = lf.addr;
         f->impl = lf.impl;
-        f->exact = abi_registers();
+        f->exact = lf.exit ? Registers{} : abi_registers();
+        f->exit = lf.exit;
         f->exact.bits[0] |= lf.live.bits[0];
         f->exact.bits[1] |= lf.live.bits[1];
         f->lifted = it->fn;

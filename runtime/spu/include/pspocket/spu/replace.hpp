@@ -83,14 +83,17 @@ struct Region {
 };
 using RegionsFn = void (*)(const SPUContext& entry, const uint8_t* ls_entry, std::vector<Region>& out);
 
-// A listed function of a known build: its entry (the program's own address), its native implementation (nullptr:
-// listed only — calls into it go through the table, it can be captured — no native code yet), the registers of
-// $2-$79 its callers may read after it, and (none: all of local store exact) its regions.
+// A listed address of a known build (the program's own): a function's entry, or a loop's head (D-966). Its native
+// implementation (nullptr: listed only — the lifter makes it a boundary, it can be captured — no native code yet). For
+// a function, the registers of $2-$79 its callers may read after it returns (with $0, $1, $80-$127: the exact set); for
+// a loop, `exit` is where it leaves (the loop's exit, listed as well) and `live` every register read from there on: the
+// exact set, all of it. Its regions (none: all of local store exact).
 struct KnownFunction {
     uint32_t addr;
     Impl impl;
     Registers live;
     RegionsFn regions = nullptr;
+    uint32_t exit = 0;
 };
 // Adds a known build beside the built-in table (tests; builds described elsewhere): kept for the process's life, used
 // by programs registered (and lifted) from then on.
