@@ -129,8 +129,9 @@ static const band_info g_bandInfo[9] = {
      {6,6,6,6,6,6,8,10,12,14,16,20,24,28,32,38,46,52,60,68,58,54},
      {0,4*3,8*3,12*3,18*3,24*3,32*3,42*3,56*3,74*3,100*3,132*3,174*3,192*3},
      {4,4,4,6,6,8,10,14,18,26,32,42,18}},
-    {{0,6,12,18,24,30,36,44,54,66,80,96,114,136,162,194,232,278,332,394,464,540,576},
-     {6,6,6,6,6,6,8,10,12,14,16,18,22,26,32,38,46,54,62,70,76,36},
+    /* 24 kHz: the module's band 18 starts at 330 (mpg123's table), not the standard's 332 */
+    {{0,6,12,18,24,30,36,44,54,66,80,96,114,136,162,194,232,278,330,394,464,540,576},
+     {6,6,6,6,6,6,8,10,12,14,16,18,22,26,32,38,46,52,64,70,76,36},
      {0,4*3,8*3,12*3,18*3,26*3,36*3,48*3,62*3,80*3,104*3,136*3,180*3,192*3},
      {4,4,4,6,8,10,12,14,18,24,32,44,12}},
     {{0,6,12,18,24,30,36,44,54,66,80,96,116,140,168,200,238,284,336,396,464,522,576},
@@ -249,7 +250,7 @@ static void init_tables(void)
         const band_info* bi = &g_bandInfo[j];
         int *mp, cb, lwin;
         const short* bdf;
-        const int switch_idx = (j < 3) ? 8 : 6;
+        const int switch_idx = 8; /* the module's mixed blocks have 8 long bands at every rate (mpglib: 6 for MPEG-2) */
         mp = g_map[j][0] = g_mapbuf0[j];
         bdf = bi->longDiff;
         for (i = 0, cb = 0; cb < switch_idx; cb++, i += *bdf++) {
@@ -370,6 +371,7 @@ typedef struct {
     unsigned part2_3_length, big_values, scalefac_compress, block_type, mixed_block_flag, table_select[3];
     int pow2gain, full_gain[3]; /* indices into g_gainpow2 */
     unsigned maxband[3], maxbandl, maxb, region1start, region2start, preflag, scalefac_scale, count1table_select;
+    uint32_t stale_word9; /* see antialias */
 } gr_info;
 
 typedef struct {
@@ -390,8 +392,13 @@ typedef struct {
     mp3_frame fr;
     side_info si;
     int ssize;
-    int scalefacs[2][39];
+    /* decodePacket's two arrays of scale factors, on its stack: the bands its maps read past those a granule's scale
+     * factors fill (mixed and short blocks of MPEG-2: up to 39 read, 36 written) hold what the stack held there */
+    int scalefacs[2][44];
+    /* the two channels' spectra one after the other, as in the module's heap, and room past them: the module's mixed
+     * blocks at the MPEG-2 rates run 18 lines past a channel's 576 (into the next channel's, or past both) */
     float hybridIn[2][SBLIMIT][SSLIMIT];
+    float hybridIn_past[64];
     float hybridOut[2][SSLIMIT][SBLIMIT];
     float block[2][SBLIMIT * SSLIMIT];      /* oldBlock[ch] */
     float newblock[SBLIMIT * SSLIMIT];      /* III_hybrid's temporary block (the last one stays in the heap) */
@@ -459,14 +466,12 @@ static void get_side_info(mp3_state* d, int stereo, int ms_stereo, int sfreq)
                 g->table_select[2] = 0;
                 for (int i = 0; i < 3; i++) g->full_gain[i] = g->pow2gain + (int)(getbits(d, 3) << 3);
                 if (g->block_type == 0) d->bad = 1; /* forbidden */
-                if (!lsf) {
-                    g->region1start = 36 >> 1;
-                } else if (g->block_type == 2) {
-                    g->region1start = g->mixed_block_flag ? 48 >> 1 : 36 >> 1;
-                } else {
-                    g->region1start = 54 >> 1;
-                }
-                if (lsf && sfreq == 8) g->region1start *= 2;
+                /* The module's region 1 (mpglib: 36, 48 mixed, 54 other lines for MPEG-2 and 2.5, twice at 8 kHz): 36
+                 * lines for MPEG-1 and MPEG-2's short and mixed blocks, 54 for MPEG-2's others; MPEG-2.5's start at
+                 * long band 6 for short blocks, band 8 for mixed and the others. */
+                if (!lsf) g->region1start = 36 >> 1;
+                else if (!d->fr.mpeg25) g->region1start = g->block_type == 2 ? 36 >> 1 : 54 >> 1;
+                else g->region1start = (unsigned)g_bandInfo[sfreq].longIdx[g->block_type == 2 && !g->mixed_block_flag ? 6 : 8] >> 1;
                 g->region2start = 576 >> 1;
             } else {
                 for (int i = 0; i < 3; i++) g->table_select[i] = getbits(d, 5);
@@ -549,7 +554,9 @@ static int get_scale_factors_2(mp3_state* d, int* scf, gr_info* g, int i_stereo)
         n++;
         if (g->mixed_block_flag) n++;
     }
-    const unsigned char* pnt = g_stab[n][(slen >> 12) & 0x7];
+    /* The module steps into its table by the partition's index in bytes, not in rows of four (mpglib: stab[n][p]): its
+     * partitions past the first overlap the rows (bytes p to p + 3 of the block type's six rows). */
+    const unsigned char* pnt = &g_stab[n][0][0] + ((slen >> 12) & 0x7);
     for (int i = 0; i < 4; i++) {
         const int num = (int)(slen & 0x7);
         slen >>= 3;
@@ -560,12 +567,22 @@ static int get_scale_factors_2(mp3_state* d, int* scf, gr_info* g, int i_stereo)
             for (int j = 0; j < (int)pnt[i]; j++) *scf++ = 0;
         }
     }
-    n = (n << 1) + 1;
-    for (int i = 0; i < n; i++) *scf++ = 0;
+    for (int i = 0; i < 3; i++) *scf++ = 0; /* the module's three zeros (mpglib: 1, 3 or 5 by the block type) */
     return numbits;
 }
 
 /* ---- Huffman decoding and dequantisation (mpglib III_dequantize_sample) ---- */
+
+/* A gain (mpglib get_gain): an index past the table (scale factors the stack held, or a granule's own) reads whatever
+ * follows the module's table: not modelled, declined. */
+static inline float gain(mp3_state* d, int idx)
+{
+    if (idx < 0 || idx >= (int)(sizeof g_gainpow2 / sizeof g_gainpow2[0])) {
+        d->bad = 1;
+        return 0.0f;
+    }
+    return g_gainpow2[idx];
+}
 
 static inline int huff_pair(mp3_state* d, const int16_t* val, int* part2remain)
 {
@@ -598,7 +615,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
     float* xrpnt = (float*)xr;
     int l[3], l3;
     int part2remain = (int)g->part2_3_length - part2bits;
-    float* const xr_end = &xr[SBLIMIT - 1][SSLIMIT - 1];
+    float* const xr_end = &d->hybridIn_past[63]; /* see mp3_state */
 
     memset(xr, 0, sizeof(float) * SBLIMIT * SSLIMIT);
     {
@@ -655,10 +672,10 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
                     lwin = *m++;
                     cb = *m++;
                     if (lwin == 3) {
-                        v = g_gainpow2[g->pow2gain + ((*scf++) << shift)];
+                        v = gain(d, (int)((unsigned)g->pow2gain + ((unsigned)(*scf++) << shift)));
                         step = 1;
                     } else {
-                        v = g_gainpow2[g->full_gain[lwin] + ((*scf++) << shift)];
+                        v = gain(d, (int)((unsigned)g->full_gain[lwin] + ((unsigned)(*scf++) << shift)));
                         step = 3;
                     }
                 }
@@ -696,10 +713,10 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
                         lwin = *m++;
                         cb = *m++;
                         if (lwin == 3) {
-                            v = g_gainpow2[g->pow2gain + ((*scf++) << shift)];
+                            v = gain(d, (int)((unsigned)g->pow2gain + ((unsigned)(*scf++) << shift)));
                             step = 1;
                         } else {
-                            v = g_gainpow2[g->full_gain[lwin] + ((*scf++) << shift)];
+                            v = gain(d, (int)((unsigned)g->full_gain[lwin] + ((unsigned)(*scf++) << shift)));
                             step = 3;
                         }
                     }
@@ -752,7 +769,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
             for (; lp; lp--, mc--) {
                 if (!mc) {
                     mc = *m++;
-                    v = g_gainpow2[g->pow2gain + (((*scf++) + (*pretab++)) << shift)];
+                    v = gain(d, (int)((unsigned)g->pow2gain + ((unsigned)((*scf++) + (*pretab++)) << shift)));
                     cb = *m++;
                     if (cb == 21) v = 0.0f; /* the module's band 21 (no scale factor of its own) is silent */
                 }
@@ -783,7 +800,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
                     if (!mc) {
                         mc = *m++;
                         cb = *m++;
-                        v = g_gainpow2[g->pow2gain + (((*scf++) + (*pretab++)) << shift)];
+                        v = gain(d, (int)((unsigned)g->pow2gain + ((unsigned)((*scf++) + (*pretab++)) << shift)));
                         if (cb == 21) v = 0.0f;
                     }
                     mc--;
@@ -820,7 +837,9 @@ static void antialias(float xr[SBLIMIT][SSLIMIT], const gr_info* g)
 {
     int sblim;
     if (g->block_type == 2) {
-        if (!g->mixed_block_flag) return;
+        /* The module tests a word of its granule information that nothing writes (the tenth: after the mixed block
+         * flag) where mpglib tests the mixed block flag: what decodePacket's stack held there decides. */
+        if (!g->stale_word9) return;
         sblim = 1;
     } else {
         sblim = (int)g->maxb - 1;
@@ -1304,15 +1323,7 @@ static void decode_packet(mp3_state* d)
         d->bad = 1;
         return;
     }
-    get_side_info(d, stereo, ms_stereo, sfreq);
-    if (d->bad) return;
-    /* set_pointer: the reservoir before the main data (mpglib's set_pointer over the module's backup) */
-    {
-        const unsigned backstep = d->si.main_data_begin;
-        d->wp = 512 + (uint32_t)d->ssize - backstep;
-        /* the bytes come from the backup the caller kept: bs[0..512) holds it already (see decode_frame) */
-        d->bi = 0;
-    }
+    /* the side information was read and set_pointer done (decode_frame) */
     for (int gr = 0; gr < (fr->lsf ? 1 : 2); gr++) {
         {
             gr_info* g = &d->si.ch[0].gr[gr];
@@ -1470,6 +1481,11 @@ static void commit(SPUContext* ctx, uint8_t* ls, const mp3_state* d, uint32_t mo
     uint32_t start_dec = 0;
     ps_spu_rdch(ctx, (mod + 0x7448) & PS_SPU_PC_MASK, PS_SPU_RdDec, &start_dec);
 
+    /* the link register where the SPU ABI keeps it, in the caller's frame (stqd $lr,16($sp)) */
+    {
+        uint8_t* q = ls + ((pref(ctx, 1) + 16) & PS_SPU_QW_MASK);
+        for (int w = 0; w < 4; w++) ps_st32(q + 4 * w, ctx->gpr[0].u32[3 - w]);
+    }
     memset(ls + heap, 0, HEAP_SIZE);
     ps_st32(ls + p_pcm, 0);
     ps_st32(ls + p_consumed, 0);
@@ -1499,7 +1515,7 @@ static void commit(SPUContext* ctx, uint8_t* ls, const mp3_state* d, uint32_t mo
             if (d->fr.stereo == 2) ps_st16(ls + heap + HEAP_PCM + PCM_CH1 + 2 * i, (uint16_t)d->pcm[1][i]);
         }
         /* the granule's spectra (as the hybrid filter left them), its output, and the last new block */
-        for (int ch = 0; ch < 2; ch++) {
+        for (int ch = 0; ch < d->fr.stereo; ch++) {
             st_floats(ls + heap + HEAP_HYBRID_IN + 2304 * (uint32_t)ch, &d->hybridIn[ch][0][0], SBLIMIT * SSLIMIT);
             st_floats(ls + heap + HEAP_HYBRID_OUT + 2304 * (uint32_t)ch, &d->hybridOut[ch][0][0], SBLIMIT * SSLIMIT);
         }
@@ -1590,19 +1606,33 @@ int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls)
         d->wp = 512;
         d->bi = 0;
         if (d->fr.error_protection) getbits(d, 16);
-        /* Read the side information first to know main_data_begin, then place the reservoir as set_pointer does. The
-         * side information is read again by decode_packet from the same bits (no state changes in between). */
+        /* decodePacket's III_get_side_info, then set_pointer: the reservoir's last main_data_begin bytes (the caller's
+         * backup) go right before the main data, over the side information, and the reading starts there */
         {
-            const uint32_t wp0 = d->wp, bi0 = d->bi, rval0 = d->rval;
-            const uint8_t rval_uc0 = d->rval_uc;
-            int ms_stereo = d->fr.mode == 1 ? d->fr.mode_ext & 0x2 : 0;
+            const int ms_stereo = d->fr.mode == 1 ? d->fr.mode_ext & 0x2 : 0;
             get_side_info(d, d->fr.stereo, ms_stereo, d->fr.sampling_frequency);
+            if (d->bad) return 0;
             const unsigned backstep = d->si.main_data_begin;
-            d->wp = wp0;
-            d->bi = bi0;
-            d->rval = rval0;
-            d->rval_uc = rval_uc0;
-            if (backstep) memcpy(d->bs + 512 + d->ssize - backstep, ls + backup + 512 - backstep, backstep);
+            d->wp = 512 + (uint32_t)d->ssize - backstep;
+            d->bi = 0;
+            if (backstep) memcpy(d->bs + d->wp, ls + backup + 512 - backstep, backstep);
+        }
+        /* the word of each granule's information the module's antialias reads unwritten (decodePacket's side
+         * information at 416 in its frame: 8 bytes, then 132 a granule, 264 a channel) */
+        {
+            const uint32_t sp = pref(ctx, 1) & LS_MASK;
+            for (int ch = 0; ch < 2; ch++)
+                for (int gr = 0; gr < 2; gr++)
+                    d->si.ch[ch].gr[gr].stale_word9 =
+                        ps_ld32(ls + ((sp - 208 - 1312 + 424 + 264 * (uint32_t)ch + 132 * (uint32_t)gr + 36) & LS_MASK));
+        }
+        /* decodePacket's scale factor arrays as its stack holds them (the frames of decodeFrame, 208 bytes, and
+         * decodePacket, 1312, below the caller's stack pointer; the arrays at 64 and 240 in the latter) */
+        {
+            const uint32_t sp = pref(ctx, 1) & LS_MASK;
+            for (int ch = 0; ch < 2; ch++)
+                for (int i = 0; i < 44; i++)
+                    d->scalefacs[ch][i] = (int)ps_ld32(ls + ((sp - 208 - 1312 + (ch ? 240 : 64) + 4 * (uint32_t)i) & LS_MASK));
         }
         /* the state the module keeps in the caller's buffers */
         for (int ch = 0; ch < 2; ch++) {

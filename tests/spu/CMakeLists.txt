@@ -10,6 +10,14 @@ target_include_directories(test_spu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJEC
 # The building blocks are C over pspocket/spu/lifted.h, as the native replacements: no contraction, no fast-math (fp.h).
 set_source_files_properties(replace_blocks.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
 
+# ---- Sony's MP3 decoder module natively (D-974): synthetic streams; FFmpeg's decoder as a reference where the build has
+# it; the module itself from the user's firmware where PSPOCKET_TEST_DEV_FLASH names it
+pspocket_add_test(test_spu_mp3 SOURCES test_flashmp3.cpp LIBS pspocket::spu)
+target_include_directories(test_spu_mp3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/runtime/spu/replace)
+if(TARGET pspocket::ffmpeg)
+    target_link_libraries(test_spu_mp3 PRIVATE pspocket::ffmpeg)
+endif()
+
 # ---- differential fuzz: interpreter vs lifted code, every supported instruction (CLAUDE.md rule 3)
 set(PSPOCKET_SPU_FUZZ_CASES 256 CACHE STRING "Differential fuzz cases per SPU instruction (at least 200)")
 set(PSPOCKET_SPU_FUZZ_TUS 16 CACHE STRING "Translation units the lifted SPU fuzz cases are split into")
