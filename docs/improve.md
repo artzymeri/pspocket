@@ -482,6 +482,19 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **State:** fixed (D-225): 0 stops in 11 loaded walks where 3 in 10 stopped before. Confirm on the iPhone (run 100's
   stop came after 110 s there).
 
+## Stability: a taskset's SPU tasks left waiting when it is released
+
+- **Seen (2026-10-14, agent e's libsjvtd comparison, D-920 part 8):** Sony's libsjvtd on pspocket's native SPURS: a
+  ReleaseInstance after the instance was initialised again following a stream leaves 5 of the core's 6 SPU tasks
+  waiting; a new instance in the same memory then overwrites their saved contexts, and a waiting task woken later
+  runs from garbage (lr 0xa5a5a5a5) and crashes. Games are not affected while pspocket's own libsjvtd serves them (it
+  has no SPU tasks); a game or Sony module that ends a taskset with tasks still waiting would be.
+- **Try:** what a PS3's SPURS does with a taskset's waiting tasks when it is shut down and joined
+  (cellSpursShutdownTaskset, cellSpursJoinTaskset: RPCS3 cellSpurs.cpp), and whether pspocket's leaves them
+  schedulable; a test with a task blocked on an event flag across the taskset's shutdown, and the same memory reused
+  for a new taskset.
+- **State:** open.
+
 ## Stability: data races (ThreadSanitizer, D-585)
 
 - **Done:** `scripts/tsan.sh` builds build/tsan and runs every threaded test under ThreadSanitizer, a line per group.
