@@ -198,3 +198,55 @@ void ps_test_oracle_2828_0a920(SPUContext* ctx, uint8_t* ls)
     }
     ctx->pc = psl_u32p(psl_ld(ctx, 0)) & PS_SPU_PC_MASK;
 }
+
+/* 0x06048: eight combs and four all-passes on four lanes, frame by frame (the records' fields read and written as the
+ * job does, each frame). */
+void ps_test_oracle_2828_06048(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t cx = psl_u32p(psl_ld(ctx, 3)), n = psl_u32p(psl_ld(ctx, 6));
+    const uint32_t in = psl_u32p(psl_ld(ctx, 4)), out = psl_u32p(psl_ld(ctx, 5));
+    const ps_spu_vec gain = psl_lq(ls, 0x18E30 + ctx->reloc), damp = psl_lq(ls, cx + 0x10), fb = psl_lq(ls, cx + 0x20);
+    const ps_spu_vec undamp = psl_fs(psl_splat32(0x3F800000u), damp);
+    for (uint32_t i = 0; i < n; i++) {
+        const ps_spu_vec inp = psl_fm(psl_lq(ls, in + 16 * i), gain);
+        ps_spu_vec acc = psl_splat32(0);
+        for (uint32_t k = 0; k < 8; k++) {
+            const uint32_t r = cx + 48 + 48 * k, pos = word_at(ls, r + 16), slot = word_at(ls, r + 12) + 16 * pos;
+            const ps_spu_vec b = psl_lq(ls, slot);
+            const ps_spu_vec f = psl_fma(psl_lq(ls, r + 0x20), damp, psl_fm(b, undamp));
+            acc = psl_fa(acc, b);
+            psl_stq(ls, r + 0x20, f);
+            psl_stq(ls, slot, psl_fma(f, fb, inp));
+            put_at(ls, r + 16, pos + 1);
+        }
+        ps_spu_vec v = acc;
+        for (uint32_t k = 0; k < 4; k++) {
+            const uint32_t r = cx + 432 + 24 * k, pos = word_at(ls, r + 16), slot = word_at(ls, r + 12) + 16 * pos;
+            const ps_spu_vec b = psl_lq(ls, slot);
+            psl_stq(ls, slot, psl_fma(b, psl_splat32(0x3F000000u), v));
+            v = psl_fma(v, psl_splat32(0xBF800000u), b);
+            put_at(ls, r + 16, pos + 1);
+        }
+        psl_stq(ls, out + 16 * i, psl_fm(v, psl_splat32(0x40400000u)));
+    }
+    ctx->pc = psl_u32p(psl_ld(ctx, 0)) & PS_SPU_PC_MASK;
+}
+
+/* 0x08748: a delay line with feedback, frame by frame. */
+void ps_test_oracle_2828_08748(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t rel = ctx->reloc, cx = psl_u32p(psl_ld(ctx, 3)), frames = psl_u32p(psl_ld(ctx, 6)) >> 1;
+    const uint32_t in = psl_u32p(psl_ld(ctx, 4)), out = psl_u32p(psl_ld(ctx, 5)), r = cx + 0x20;
+    for (uint32_t f = 0; f < frames; f++) {
+        const ps_spu_vec x0 = psl_lq(ls, in + 32 * f), x1 = psl_lq(ls, in + 32 * f + 16);
+        const ps_spu_vec g = psl_lq(ls, r), fb = psl_lq(ls, cx + 0x10);
+        line l = {r + 28, r + 36, r + 40, r + 20, 0};
+        ps_spu_vec dl, dh;
+        line_read(ls, rel, &l, &dl, &dh);
+        const ps_spu_vec eh = psl_fm(dh, g), el = psl_fm(dl, g);
+        line_write(ls, rel, &l, psl_fma(el, fb, x0), psl_fma(eh, fb, x1));
+        psl_stq(ls, out + 32 * f, el);
+        psl_stq(ls, out + 32 * f + 16, eh);
+    }
+    ctx->pc = psl_u32p(psl_ld(ctx, 0)) & PS_SPU_PC_MASK;
+}

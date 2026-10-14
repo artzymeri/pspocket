@@ -19,6 +19,8 @@ extern "C" {
 void ps_test_oracle_012b_062c8(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_012b_05b20(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_2828_0a920(SPUContext* ctx, uint8_t* ls);
+void ps_test_oracle_2828_06048(SPUContext* ctx, uint8_t* ls);
+void ps_test_oracle_2828_08748(SPUContext* ctx, uint8_t* ls);
 }
 
 namespace {
@@ -244,4 +246,83 @@ TEST_CASE("GTA V audio: the submix job's reverb (0x0A920) is the job's, bit for 
     Tally d;
     for (int k = 0; k < 4; k++) check(reverb_case(r, Mix::audio, 4, 0, false, true), ps_gta5_2828_0a920, ps_test_oracle_2828_0a920, {}, d);
     CHECK(d.declined == 4);
+}
+
+namespace {
+
+// A Freeverb-style case (0x06048): the context at 0x10000, twelve lines of up to 64 frames' slots from 0x30000 (their
+// positions anywhere a run of the call's frames fits), frames from 0x20000 to 0x22000 or in place.
+Case freeverb_case(Rng& r, Mix mix, uint32_t frames, uint32_t reloc, bool in_place, bool slot_in_context)
+{
+    Case c;
+    for (size_t i = 0; i < c.ls.size(); i += 4) ps_st32(c.ls.data() + i, r.next());
+    const uint32_t cx = 0x10000, in = 0x20000, out = in_place ? in : 0x22000;
+    const auto coef = [&] {
+        const uint32_t v = pick(r, mix);
+        return mix == Mix::specials ? v : (v & 0x807FFFFFu) | ((0x7Fu - 1u - r.next() % 12u) << 23);
+    };
+    for (uint32_t at = cx; at < cx + 528; at += 4) ps_st32(c.ls.data() + at, coef());
+    put_quad(c.ls.data(), 0x18E30 + reloc, coef(), coef(), coef(), coef());
+    for (uint32_t k = 0; k < 12; k++) {
+        const uint32_t rec = k < 8 ? cx + 48 + 48 * k : cx + 432 + 24 * (k - 8);
+        ps_st32(c.ls.data() + rec + 12, 0x30000 + 0x1000 * k);
+        ps_st32(c.ls.data() + rec + 16, r.next() % 64);
+    }
+    if (slot_in_context) {
+        ps_st32(c.ls.data() + cx + 48 + 12, cx - 0x40);
+        ps_st32(c.ls.data() + cx + 48 + 16, 0);
+    }
+    for (uint32_t i = 0; i < 4 * frames; i++) ps_st32(c.ls.data() + in + 4 * i, pick(r, mix));
+    for (int reg = 0; reg < 128; reg++) set_reg(c.ctx, reg, r.next(), r.next(), r.next(), r.next());
+    set_reg(c.ctx, 3, cx, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 4, in, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 5, out, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 6, frames, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 0, 0x08CA0, 0, 0, 0);
+    c.ctx.reloc = reloc;
+    c.ctx.pc = 0x06048 + reloc;
+    return c;
+}
+
+} // namespace
+
+TEST_CASE("GTA V audio: the submix job's comb and all-pass reverb (0x06048) is the job's, bit for bit (D-981)", "[games]")
+{
+    Rng r;
+    Tally t;
+    for (const Mix mix : {Mix::audio, Mix::zeros, Mix::specials, Mix::silence})
+        for (const uint32_t frames : {0u, 1u, 3u, 64u})
+            for (const uint32_t reloc : {0u, 0x400u})
+                for (const bool in_place : {false, true})
+                    check(freeverb_case(r, mix, frames, reloc, in_place, false), ps_gta5_2828_06048, ps_test_oracle_2828_06048, {}, t);
+    CHECK(t.ran == 4 * 4 * 2 * 2);
+    Tally d;
+    for (int k = 0; k < 4; k++) check(freeverb_case(r, Mix::audio, 8, 0, false, true), ps_gta5_2828_06048, ps_test_oracle_2828_06048, {}, d);
+    CHECK(d.declined == 4);
+}
+
+TEST_CASE("GTA V audio: the submix job's delay (0x08748) is the job's, bit for bit (D-981)", "[games]")
+{
+    // The reverb's cases serve: the delay's record is a bank line's, at ctx + 32, over the reverb's coefficients.
+    Rng r;
+    Tally t, d;
+    for (const Mix mix : {Mix::audio, Mix::zeros, Mix::specials, Mix::silence})
+        for (const uint32_t frames : {0u, 1u, 2u, 32u})
+            for (const uint32_t reloc : {0u, 0x400u})
+                for (const bool in_place : {false, true}) {
+                    Case c = reverb_case(r, mix, frames, reloc, in_place, false);
+                    const uint32_t len = 1 + r.next() % 64;
+                    ps_st32(c.ls.data() + 0x10000 + 0x20 + 28, 0x2C000);
+                    ps_st32(c.ls.data() + 0x10000 + 0x20 + 36, r.next() % 8 == 0 ? 0u - 1u : r.next() % len);
+                    ps_st32(c.ls.data() + 0x10000 + 0x20 + 40, len);
+                    check(c, ps_gta5_2828_08748, ps_test_oracle_2828_08748, {}, t);
+                }
+    CHECK(t.ran == 4 * 4 * 2 * 2);
+    for (int k = 0; k < 2; k++) {
+        Case c = reverb_case(r, Mix::audio, 4, 0, false, false);
+        ps_st32(c.ls.data() + 0x10000 + 0x20 + 28, 0x10000);
+        ps_st32(c.ls.data() + 0x10000 + 0x20 + 36, 0);
+        check(c, ps_gta5_2828_08748, ps_test_oracle_2828_08748, {}, d);
+    }
+    CHECK(d.declined == 2);
 }

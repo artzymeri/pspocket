@@ -263,3 +263,130 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
     ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * 0x06048: the submix's other reverb, Freeverb's structure on four lanes: $6 frames (quadwords) from $4 to $5, the
+ * context at $3 (damping at +16, feedback at +32), the input gain the quadword at 0x18E30 of the job's image. Per frame:
+ *   in = fm(x, gain); eight combs (records at ctx + 48 + 48 k: the line's base at +12, its position at +16, the filter's
+ *   store at +32): b = slot; f = fma(store, damp, fm(b, fs(1, damp))); the slot gets fma(f, feedback, in); the sum of
+ *   the eight b (fa from b0 + 0, in order). Four all-passes in series on the sum (records at ctx + 432 + 24 k): b =
+ *   slot; the slot gets fma(b, 0.5, v); v = fma(v, -1, b). The frame's output fm(v, 3). Positions step by one a frame
+ *   (no wrap here: the caller's). Nothing in registers is read after it (spu-live at its four call sites). Declined: the
+ *   lines' slots over the call (each a run of quadwords) inside the context, the input or the output, or wrapping past
+ *   local store's end; the input or output inside the context; a context off a quadword boundary.
+ * =================================================================================================================== */
+
+#define FV_CTX 528u
+
+int ps_gta5_2828_06048(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t n = pref(ctx, 6);
+    if (n == 0) {
+        ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
+        return 1;
+    }
+    const uint32_t cx = pref(ctx, 3), in = pref(ctx, 4), out = pref(ctx, 5);
+    if ((cx & 15) || cx >= PS_SPU_LS_SIZE || FV_CTX > PS_SPU_LS_SIZE - cx || n > 4096) return 0;
+    if ((in & 15) || (out & 15) || in >= PS_SPU_LS_SIZE || out >= PS_SPU_LS_SIZE || 16 * n > PS_SPU_LS_SIZE - in ||
+        16 * n > PS_SPU_LS_SIZE - out || overlaps(in, 16 * n, cx, FV_CTX) || overlaps(out, 16 * n, cx, FV_CTX))
+        return 0;
+    uint32_t rec[12], pos[12], slot0[12];
+    for (uint32_t k = 0; k < 12; k++) {
+        rec[k] = k < 8 ? cx + 48 + 48 * k : cx + 432 + 24 * (k - 8);
+        pos[k] = ldw(ls, rec[k] + 16);
+        const uint32_t start = ldw(ls, rec[k] + 12) + 16u * pos[k];
+        slot0[k] = start & PS_SPU_QW_MASK;
+        if (16 * n > PS_SPU_LS_SIZE - slot0[k] || overlaps(slot0[k], 16 * n, cx, FV_CTX) ||
+            overlaps(slot0[k], 16 * n, in, 16 * n) || overlaps(slot0[k], 16 * n, out, 16 * n))
+            return 0;
+    }
+
+    const uint32x4_t gain = (uint32x4_t)ldq(ls, 0x18E30 + ctx->reloc), damp = (uint32x4_t)ldq(ls, cx + 0x10);
+    const uint32x4_t fb = (uint32x4_t)ldq(ls, cx + 0x20);
+    const uint32x4_t one = vdupq_n_u32(0x3F800000u), zero = vdupq_n_u32(0);
+    const uint32x4_t half = vdupq_n_u32(0x3F000000u), minus1 = vdupq_n_u32(0xBF800000u), three = vdupq_n_u32(0x40400000u);
+    const uint32x4_t undamp = (uint32x4_t)psl_fs((ps_spu_vec)one, (ps_spu_vec)damp);
+    const uint32x4_t nz_gain = psn_nz(gain), nz_damp = psn_nz(damp), nz_fb = psn_nz(fb), nz_undamp = psn_nz(undamp);
+    uint32x4_t store[8];
+    for (uint32_t k = 0; k < 8; k++) store[k] = (uint32x4_t)ldq(ls, rec[k] + 0x20);
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32x4_t x = (uint32x4_t)ldq(ls, in + 16 * i);
+        const uint32x4_t inp = psn_fm_n(x, gain, vandq_u32(psn_nz(x), nz_gain));
+        uint32x4_t acc = zero;
+        for (uint32_t k = 0; k < 8; k++) {
+            const uint32_t s = slot0[k] + 16 * i;
+            const uint32x4_t b = (uint32x4_t)ldq(ls, s);
+            const uint32x4_t t = psn_fm_n(b, undamp, vandq_u32(psn_nz(b), nz_undamp));
+            acc = vreinterpretq_u32_f32(vaddq_f32(vreinterpretq_f32_u32(k ? acc : b), vreinterpretq_f32_u32(k ? b : zero)));
+            store[k] = psn_fma_n(store[k], damp, t, vandq_u32(psn_nz(store[k]), nz_damp));
+            stq(ls, s, (ps_spu_vec)psn_fma_n(store[k], fb, inp, vandq_u32(psn_nz(store[k]), nz_fb)));
+        }
+        uint32x4_t v = acc;
+        for (uint32_t k = 8; k < 12; k++) {
+            const uint32_t s = slot0[k] + 16 * i;
+            const uint32x4_t b = (uint32x4_t)ldq(ls, s);
+            const uint32x4_t nzb = psn_nz(b), nzv = psn_nz(v);
+            stq(ls, s, (ps_spu_vec)psn_fma_n(b, half, v, nzb));
+            v = psn_fma_n(v, minus1, b, nzv);
+        }
+        stq(ls, out + 16 * i, (ps_spu_vec)psn_fm_n(v, three, psn_nz(v)));
+    }
+    for (uint32_t k = 0; k < 12; k++) {
+        if (k < 8) stq(ls, rec[k] + 0x20, (ps_spu_vec)store[k]);
+        stw(ls, rec[k] + 16, pos[k] + n);
+    }
+    ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
+    return 1;
+}
+
+/* ===================================================================================================================
+ * 0x08748: the submix's delay (an echo), N = $6 / 2 frames of two quadwords from $4 to $5, the context at $3
+ * (feedback at +16; the line's record at +32 as a bank line's of 0x0A920: gain, counter, base, position, length). Per
+ * frame: the slot's halves d (csflt 140), e = fm(d, gain); the slot gets the halves fma(e, feedback, x) (cflts 158,
+ * clamped to int16); the position steps (pos + 1 % len, the counter + 1); the frame's output e. Nothing in registers is
+ * read after it (spu-live at its four call sites). Declined: as 0x0A920 (the record's fields at ctx + 16 to 80).
+ * =================================================================================================================== */
+
+int ps_gta5_2828_08748(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t rel = ctx->reloc, frames = pref(ctx, 6) >> 1;
+    if (frames == 0) {
+        ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
+        return 1;
+    }
+    const uint32_t cx = pref(ctx, 3), in = pref(ctx, 4), out = pref(ctx, 5);
+    const uint32_t lo_ctx = cx + 0x10, n_ctx = 0x40;
+    if ((cx & 15) || cx >= PS_SPU_LS_SIZE || 0x50 > PS_SPU_LS_SIZE - cx || frames > 4096) return 0;
+    if ((in & 15) || (out & 15) || in >= PS_SPU_LS_SIZE || out >= PS_SPU_LS_SIZE || 32 * frames > PS_SPU_LS_SIZE - in ||
+        32 * frames > PS_SPU_LS_SIZE - out || overlaps(in, 32 * frames, lo_ctx, n_ctx) || overlaps(out, 32 * frames, lo_ctx, n_ctx))
+        return 0;
+    if (!constants_hold(ls, rel, k_2828_reverb, 3)) return 0;
+    const uint32_t r = cx + 0x20, base = ldw(ls, r + 28), len = ldw(ls, r + 40);
+    if (len == 0) return 0;
+    uint32_t pos = ldw(ls, r + 36);
+    for (uint32_t f = 0; f < frames; f++) {
+        const uint32_t slot = (base + 16u * pos) & PS_SPU_QW_MASK;
+        if (overlaps(slot, 16, lo_ctx, n_ctx) || overlaps(slot, 16, in, 32 * frames) || overlaps(slot, 16, out, 32 * frames))
+            return 0;
+        for (int k = 0; k < 3; k++)
+            if (overlaps(slot, 16, (k_2828_reverb[k].addr + rel) & PS_SPU_QW_MASK, 16)) return 0;
+        pos = srem(pos + 1u, len);
+    }
+    const ps_spu_vec fb = ldq(ls, cx + 0x10), g = ldq(ls, r);
+    pos = ldw(ls, r + 36);
+    for (uint32_t f = 0; f < frames; f++) {
+        const ps_spu_vec x0 = ldq(ls, in + 32 * f), x1 = ldq(ls, in + 32 * f + 16);
+        const uint32_t slot = (base + 16u * pos) & PS_SPU_QW_MASK;
+        ps_spu_vec dl, dh;
+        unpack(ls, slot, &dl, &dh);
+        const ps_spu_vec eh = psl_fm(dh, g), el = psl_fm(dl, g);
+        pack(ls, slot, psl_fma(el, fb, x0), psl_fma(eh, fb, x1));
+        pos = srem(pos + 1u, len);
+        stq(ls, out + 32 * f, el);
+        stq(ls, out + 32 * f + 16, eh);
+    }
+    stw(ls, r + 36, pos);
+    stw(ls, r + 20, ldw(ls, r + 20) + frames);
+    ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
+    return 1;
+}

@@ -15855,3 +15855,20 @@ divisions that wrap the positions under 8%.
   0-16 frames, relocated, in place or not, negative positions; a slot inside the context declined. A walk with
   PSPOCKET_SPU_NATIVE_SCRAMBLE=1 (the registers outside the contracts garbage after each call): 94,484 native calls of
   it, 926,000 of D-979's two, nothing declined, no RSX failure.
+
+## D-981 · 2026-10-14 · The submix job's comb reverb (0x06048) and delay (0x08748) native, exact
+
+Two more of the submix job's (spu_28281614459ce75e) effects, each called about 190,000 times a walk (four submixes):
+
+- 0x06048: a reverb of Freeverb's structure on four lanes: the input times a gain (a quadword of the job's image), eight
+  comb filters with damping (a one-pole store per comb) over float delay lines, their outputs summed in order, four
+  all-passes in series (0.5 and -1), the output times 3. Natively the combs' stores stay in registers over the call and
+  the fm and fma zero tests of the constant operands are made once (neon.h's psn_fm_n and psn_fma_n, which take the
+  operands' "not a zero" masks); the positions step by one a frame with no wrap (the caller wraps them), so each line's
+  slots over a call are one run of quadwords, checked once against the context, the input and the output. 200 captured
+  calls exact; 2.06 us lifted, 0.94 us native (x2.2).
+- 0x08748: an echo, one delay line of int16 pairs (the record as 0x0A920's bank lines) with feedback: the slot's halves
+  times the gain are the output, and with the input times the feedback written back. 200 captured calls exact; 656 ns
+  lifted, 245 ns native (x2.7).
+- Tests (tests/games): oracles in the job's order (records read and written each frame) against both over the four
+  mixes, frame counts, relocation, in place or not; slots inside the context declined.
