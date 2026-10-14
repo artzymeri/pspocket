@@ -10,6 +10,7 @@
 #include "pspocket/platform/game.h"
 
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <os/proc.h>
 #include <signal.h>
 
@@ -43,6 +44,7 @@
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
 #include "pspocket/hle/audio.hpp"
+#include "pspocket/hle/display.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/report.hpp"
@@ -78,6 +80,27 @@ extern const uint32_t game_ppu_image_word_count;
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
 #endif
 
+// The screen's refreshes for the game's vblanks (D-971): a display link at 60 Hz reports each one, in steady_clock
+// time.
+@interface PSPocketDisplayClock : NSObject
+- (void)refresh:(CADisplayLink*)link;
+@end
+
+@implementation PSPocketDisplayClock
+- (void)refresh:(CADisplayLink*)link
+{
+    using std::chrono::duration;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point now = Clock::now();
+    // The link's times are CACurrentMediaTime's (mach absolute time); steady_clock counts the time asleep too, so the
+    // refresh is placed by how long ago it was.
+    const double ago = CACurrentMediaTime() - link.timestamp;
+    const double period = link.targetTimestamp - link.timestamp;
+    pspocket::hle::display_vsync(now - std::chrono::duration_cast<Clock::duration>(duration<double>(ago)),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration<double>(period)));
+}
+@end
+
 namespace {
 
 constexpr std::string_view kChan = "game";
@@ -104,6 +127,16 @@ struct Session {
     u64 rate_flips = 0;
     u64 rate_underruns = 0; // the speaker's, at the last line
     u64 rate_ppu_interpreted = 0, rate_spu_interpreted = 0; // instructions, at the last line (D-228)
+    // TASK_POWER_INFO_V2's counters at the last line (D-970): CPU and performance-core time (mach time units), energy
+    // (nJ), moves between the kinds of cores.
+    u64 rate_cpu = 0, rate_ptime = 0, rate_energy = 0, rate_switches = 0;
+    // Presenting (RSX thread only, D-971): the flips' pace (a moving average of the time between them), whether frames
+    // are held for 1/30 s at least, and the time spent waiting for a drawable since the last line.
+    std::chrono::steady_clock::time_point last_present;
+    double flip_ms = 0;
+    bool pace_30 = false;
+    bool pacing = true; // PSPOCKET_NO_PACING: off
+    u64 drawable_wait_ns = 0, held_frames = 0;
     // The disc's title ID, which keeps each game's shader cache and coverage apart (D-118), and whether the build's
     // translated PPU code is this game's: the shaders recorded on the Mac for it come with it.
     std::string title_id;
@@ -122,6 +155,28 @@ struct Session {
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
+
+// iOS's heat levels (NSProcessInfoThermalState): from "serious" the system slows the chips down.
+constexpr const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
+const char* thermal_name()
+{
+    return kThermal[std::min<usize>(static_cast<usize>([[NSProcessInfo processInfo] thermalState]), 3)];
+}
+
+struct PowerCounters {
+    u64 cpu = 0, ptime = 0, energy = 0, switches = 0;
+};
+
+// The process's CPU time, the part of it on the performance cores, its energy and its moves between the kinds of cores
+// (TASK_POWER_INFO_V2, D-970).
+std::optional<PowerCounters> power_counters()
+{
+    task_power_info_v2_data_t p{};
+    mach_msg_type_number_t n = TASK_POWER_INFO_V2_COUNT;
+    if (task_info(mach_task_self(), TASK_POWER_INFO_V2, reinterpret_cast<task_info_t>(&p), &n) != KERN_SUCCESS) return {};
+    return PowerCounters{p.cpu_energy.total_user + p.cpu_energy.total_system, p.task_ptime, p.task_energy,
+        p.task_pset_switches};
+}
 
 Session* g_session = nullptr; // one game per process, never destroyed
 
@@ -361,6 +416,11 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = NO;
         layer.drawableSize = CGSizeMake(1152, 640);
+        // Metal's performance HUD (Info.plist MetalHUDEnabled) only when asked: PSPOCKET_HUD (Documents/pspocket-env.txt)
+        // shows it and logs a "metal-HUD" line a second (present intervals, frame misses; D-970).
+        if (@available(iOS 16.0, *)) {
+            layer.developerHUDProperties = std::getenv("PSPOCKET_HUD") ? @{@"mode" : @"default", @"logging" : @"default"} : @{};
+        }
         s->layer = layer;
     }
     s->tracker = std::make_unique<rsx::WriteTracker>(*s->memory);
@@ -393,9 +453,6 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             if (now - raw->rate_since >= kRateInterval) {
                 const double dt = std::chrono::duration<double>(now - raw->rate_since).count();
                 const u64 underruns = raw->audio ? raw->audio->stats().underruns : 0;
-                // iOS's heat level: from "serious" the system slows the chips down.
-                static constexpr const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
-                const auto thermal = static_cast<usize>([[NSProcessInfo processInfo] thermalState]);
                 // The memory iOS counts against the app, and what is left before it stops the app (it does so without
                 // a crash report: a game that vanished at 17:06 left only "Received memory warning" in the log).
                 task_vm_info_data_t vm{};
@@ -405,9 +462,26 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                 PS_LOG_INFO(kChan, "{:.1f} fps ({} frames in {:.1f} s; {} since the boot); the speaker ran dry {} times; "
                                    "heat {}; memory {:.2f} GB, {:.2f} GB left",
                     static_cast<double>(flips - raw->rate_flips) / dt, flips - raw->rate_flips, dt, flips,
-                    underruns - raw->rate_underruns, kThermal[std::min<usize>(thermal, 3)], footprint / 1e9,
+                    underruns - raw->rate_underruns, thermal_name(), footprint / 1e9,
                     static_cast<double>(os_proc_available_memory()) / 1e9);
                 PS_LOG_INFO(kChan, "threads: {}", thread_cpu_report(dt)); // which thread holds a slow stretch back
+                // How much of the work iOS gives the two performance cores, and the power behind the heat (D-970).
+                // Low Power Mode slows the CPUs and caps the display at 60 Hz.
+                if (const auto p = power_counters()) {
+                    mach_timebase_info_data_t tb{};
+                    mach_timebase_info(&tb);
+                    const u64 cpu = p->cpu - raw->rate_cpu, ptime = p->ptime - raw->rate_ptime;
+                    PS_LOG_INFO(kChan, "power: CPU {:.1f} s, {:.0f}% of it on the performance cores, {:.1f} W, "
+                                       "{} moves between the kinds of cores{}",
+                        static_cast<double>(cpu) * tb.numer / tb.denom / 1e9,
+                        cpu ? 100.0 * static_cast<double>(ptime) / static_cast<double>(cpu) : 0.0,
+                        static_cast<double>(p->energy - raw->rate_energy) / 1e9 / dt, p->switches - raw->rate_switches,
+                        [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? "; Low Power Mode on" : "");
+                    raw->rate_cpu = p->cpu;
+                    raw->rate_ptime = p->ptime;
+                    raw->rate_energy = p->energy;
+                    raw->rate_switches = p->switches;
+                }
                 // Code the translation did not cover, run by the interpreters (D-207, D-228): the goal is none.
                 const u64 ppu = interpreted_total(&ps_ppu_interp_sites), spu = interpreted_total(&ps_spu_interp_sites);
                 if (ppu != raw->rate_ppu_interpreted || spu != raw->rate_spu_interpreted) {
@@ -434,6 +508,11 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                 if (os_proc_available_memory() < (1536ull << 20)) {
                     if (rsx::metal::MetalBackend* b = raw->backend.load(std::memory_order_acquire)) b->trim_memory();
                 }
+                PS_LOG_INFO(kChan, "present: a flip every {:.1f} ms, {} frames held 1/30 s, {:.1f} ms waiting for "
+                                   "drawables", raw->flip_ms, raw->held_frames,
+                    static_cast<double>(raw->drawable_wait_ns) / 1e6);
+                raw->held_frames = 0;
+                raw->drawable_wait_ns = 0;
                 raw->rate_underruns = underruns;
                 raw->rate_since = now;
                 raw->rate_flips = flips;
@@ -442,12 +521,28 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             if (!layer) return;
             id<MTLTexture> src = (__bridge id<MTLTexture>)f.texture;
             id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)f.command_buffer;
+            // The flips' pace (D-971): a game that flips every second vblank (30 fps) has each frame shown for 1/30 s
+            // at least, so one the GPU finishes a little late is not shown a refresh late while the next is on time
+            // (a 3-1 cadence of refreshes, a judder). Switched with some hysteresis; a 60 fps game is never held.
+            if (raw->last_present.time_since_epoch().count()) {
+                const double ms = std::chrono::duration<double, std::milli>(now - raw->last_present).count();
+                if (ms < 200) raw->flip_ms = raw->flip_ms > 0 ? raw->flip_ms * 0.95 + ms * 0.05 : ms;
+            }
+            raw->last_present = now;
+            raw->pace_30 = raw->pacing && (raw->pace_30 ? raw->flip_ms > 24 : raw->flip_ms > 30);
             id<CAMetalDrawable> drawable = [layer nextDrawable];
+            raw->drawable_wait_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - now).count());
             if (!drawable || drawable.texture.width != src.width || drawable.texture.height != src.height) return;
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             [blit copyFromTexture:src toTexture:drawable.texture];
             [blit endEncoding];
-            [cb presentDrawable:drawable];
+            if (raw->pace_30) {
+                [cb presentDrawable:drawable afterMinimumDuration:1.0 / 30];
+                raw->held_frames++;
+            } else {
+                [cb presentDrawable:drawable];
+            }
         };
         auto backend = std::make_unique<rsx::metal::MetalBackend>(*raw->memory, *raw->tracker, std::move(mc));
         if (!backend->valid()) return nullptr;
@@ -619,6 +714,49 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     u32 main_id = 0;
     s->start = std::chrono::steady_clock::now();
     s->rate_since = s->start;
+    if (const auto p = power_counters()) {
+        s->rate_cpu = p->cpu;
+        s->rate_ptime = p->ptime;
+        s->rate_energy = p->energy;
+        s->rate_switches = p->switches;
+    }
+    {
+        // The kinds of cores (D-970): hw.perflevel0 the performance cores, hw.perflevel1 the efficiency cores.
+        int perf = 0, eff = 0;
+        size_t size = sizeof(int);
+        sysctlbyname("hw.perflevel0.logicalcpu", &perf, &size, nullptr, 0);
+        size = sizeof(int);
+        sysctlbyname("hw.perflevel1.logicalcpu", &eff, &size, nullptr, 0);
+        PS_LOG_INFO(kChan, "cores: {} performance, {} efficiency; heat {}; Low Power Mode {}", perf, eff, thermal_name(),
+            [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? "on" : "off");
+    }
+    // The game's vblanks on the screen's refreshes (D-971): a 60 Hz display link on the main thread reports them
+    // (PSPOCKET_NO_DISPLAY_CLOCK: the free-running 59.94 Hz timer, as before). PSPOCKET_NO_PACING: frames not held.
+    s->pacing = !std::getenv("PSPOCKET_NO_PACING");
+    if (!std::getenv("PSPOCKET_NO_DISPLAY_CLOCK")) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PSPocketDisplayClock* clock = [PSPocketDisplayClock new];
+            CADisplayLink* link = [CADisplayLink displayLinkWithTarget:clock selector:@selector(refresh:)];
+            link.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
+            [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        });
+    }
+    PS_LOG_INFO(kChan, "vblanks on {}; frames {}", std::getenv("PSPOCKET_NO_DISPLAY_CLOCK") ? "a 59.94 Hz timer" :
+        "the screen's refreshes", s->pacing ? "held 1/30 s at 30 fps" : "not held");
+    // Each change of the heat level and of Low Power Mode when it happens (D-970): the 5-s lines show only the level.
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                                                      object:nil
+                                                       queue:nil
+                                                  usingBlock:^(NSNotification*) {
+                                                      PS_LOG_INFO(kChan, "heat now {}", thermal_name());
+                                                  }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSProcessInfoPowerStateDidChangeNotification
+                                                      object:nil
+                                                       queue:nil
+                                                  usingBlock:^(NSNotification*) {
+                                                      PS_LOG_INFO(kChan, "Low Power Mode now {}",
+                                                          [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? "on" : "off");
+                                                  }];
     s->running = true;
     g_session = s.release();
     // iOS's memory warning: the backend frees what it can make again at its next flip (D-148; run 089: nine warnings

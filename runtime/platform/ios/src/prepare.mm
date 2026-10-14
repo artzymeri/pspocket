@@ -470,8 +470,10 @@ std::shared_ptr<prepare::SessionTranslator> start_session_translator(const std::
     // Programs that would compile for longer wait for the next launch's preparation (the game would run hot meanwhile).
     // Assassin's Creed's slowest took 5.4 s on the M4 (run 219).
     o.max_program_seconds = 60;
-    // Not after a memory warning (for the rest of the session), not with under 2 GB left, not hot, not in Low Power
-    // Mode, not while the app is in the background.
+    // Not after a memory warning (for the rest of the session), not with under 2 GB left, not at "critical" heat, not in
+    // Low Power Mode, not while the app is in the background. At "serious" it runs (D-970): run 327 was serious from
+    // start to end, the programs met in play stayed in the interpreter all session (844 million SPU instructions), and
+    // the interpreter's load kept the phone hot; one utility-QoS core compiling ends that.
     static std::atomic<bool> warned{false}, active{true};
     NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
     [center addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil
@@ -482,7 +484,7 @@ std::shared_ptr<prepare::SessionTranslator> start_session_translator(const std::
                     usingBlock:^(NSNotification*) { active = true; }];
     o.may_compile = [] {
         NSProcessInfo* info = [NSProcessInfo processInfo];
-        return !warned && active && !info.lowPowerModeEnabled && info.thermalState < NSProcessInfoThermalStateSerious &&
+        return !warned && active && !info.lowPowerModeEnabled && info.thermalState < NSProcessInfoThermalStateCritical &&
             os_proc_available_memory() > (2048ull << 20);
     };
     o.load = [&memory](const std::string& path, std::string* error) {
