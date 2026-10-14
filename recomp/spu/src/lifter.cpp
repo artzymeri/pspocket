@@ -1481,11 +1481,24 @@ std::string lift_step_function(std::string_view symbol, u32 insn, u32 pc, u8 xfl
     return o;
 }
 
-LiftResult lift(const LsImage& image, const Program& program, const LiftOptions& options)
+LiftResult lift(const LsImage& image, const Program& analyzed, const LiftOptions& options)
 {
     LiftResult result;
     result.hash = image.hash();
     const u32 tus = std::max<u32>(1, options.tu_count);
+
+    // Addresses listed for a native replacement (pspocket/spu/replace.hpp, D-965, D-966) are boundaries: a call into
+    // one, a forward jump or fall-through into one leaves for the run loop, which goes on through the program's table,
+    // where the program the runtime derives from this one takes it over.
+    LiftOptions bounded = options;
+    if (options.replace_boundaries)
+        for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
+    // A boundary inside a function's code is a label of it, so the table has an entry there: a listed function the
+    // analyzer now folds into its caller (one that began after brsl $rt, .+4, which no longer calls, D-963) is one.
+    Program program = analyzed;
+    for (Function& f : program.functions)
+        for (const u32 b : bounded.boundaries)
+            if (std::binary_search(f.insns.begin(), f.insns.end(), b)) f.labels.insert(b);
 
     std::map<u32, std::string> symbols;
     for (const Function& f : program.functions)
@@ -1496,12 +1509,6 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
         options.name, options.name);
     h += "#include \"pspocket/spu/runtime.h\"\n";
     h += "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
-    // Addresses listed for a native replacement (pspocket/spu/replace.hpp, D-965, D-966) are boundaries: a call into
-    // one, a forward jump or fall-through into one leaves for the run loop, which goes on through the program's table,
-    // where the program the runtime derives from this one takes it over.
-    LiftOptions bounded = options;
-    if (options.replace_boundaries)
-        for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
     std::map<u32, std::string> callable = symbols;
     std::erase_if(callable, [&](const auto& s) { return bounded.boundaries.contains(s.first); });
     // A boundary inside a function is a label of it, an entry the run loop goes on at: a loop head or exit reached by

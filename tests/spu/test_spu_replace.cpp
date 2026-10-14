@@ -161,6 +161,35 @@ TEST_CASE("SPU replace: the lifter calls a listed function through the program's
     CHECK(listed.find(std::format("ctx->pc = 0x{:05X}u;", f_addr)) != std::string::npos);
 }
 
+TEST_CASE("SPU replace: a listed function after brsl $rt, .+4 has a table entry (D-963)", "[spu]")
+{
+    // entry: brsl $3, .+4 (no call since D-963: the code takes its own address); f: $4 = $3 + 1; return. f was a
+    // function of its own before, and is listed: it must stay an entry of the program (a boundary is a label).
+    as::Assembler a(0x7000);
+    a.emit(as::brsl(3, 4));
+    const auto f = a.here();
+    a.emit(as::ai(4, 3, 1));
+    a.emit(as::bi(0));
+    const std::vector<u8> code = a.finish();
+    auto image = pspocket::recomp::spu::load_raw_image(code, 0x7000, {0x7000});
+    REQUIRE(image);
+    const u32 f_addr = a.address(f);
+    const auto program = pspocket::recomp::spu::analyze(*image, AnalyzerOptions{});
+    REQUIRE(program.functions.size() == 1); // f is no function of its own
+    LiftOptions options;
+    options.name = "replace_getpc_test";
+    const auto reg = [&] {
+        const auto lifted = pspocket::recomp::spu::lift(*image, program, options);
+        for (const auto& file : lifted.files)
+            if (file.name == "replace_getpc_test_reg.c") return file.content;
+        return std::string();
+    };
+    const std::string entry = std::format("{{0x{:05X}u, ", f_addr);
+    CHECK(reg().find(entry) == std::string::npos); // not listed: only the entry
+    rp::add_build("replace getpc test", image->hash(), 0x7000, image->code_size(), {{f_addr, nullptr, {}}});
+    CHECK(reg().find(entry) != std::string::npos); // listed: an entry the derived program can take over
+}
+
 TEST_CASE("SPU replace: the lifter leaves at a loop boundary entered forward, loops locally on its back edge", "[spu]")
 {
     // $3 = 0; $4 = 10; head: $3 += 1; $4 -= 1; brnz $4, head; exit: return.
