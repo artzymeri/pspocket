@@ -8,8 +8,9 @@
 // offered here the same way: each table is a variable of its library, laid out when first linked with descriptors of
 // internal functions of cellAdec that run the core's code (AdecCore) with the arguments, notifications and answers of
 // the ABI. A core opened through a table notifies the functions open was given, as guest calls (CoreNotifier);
-// pspocket's own front end opens its cores directly and is notified directly. The cores on FFmpeg are not compared with
-// Sony's yet: their libraries are firmware-first (D-563), so a module importing one gets Sony's where the system
+// pspocket's own front end opens its cores directly and is notified directly. MP3, the MPEG audio layers, MPEG-4 AAC,
+// AC-3 and ATRAC3 agree with Sony's cores (D-944) and are pspocket's for every game; the other cores on FFmpeg are not
+// compared yet: their libraries are firmware-first (D-563), so a module importing one gets Sony's where the system
 // software has it, and pspocket's where it does not.
 // Reference: RPCS3 rpcs3/Emu/Cell/Modules/cellAdec.cpp (g_cell_adec_core_ops_lpcm and _CellAdecCoreOp*_lpcm; each core
 // module's REG_VNID table and REG_FUNC _SceAdecCorrectPtsValue_*), cellAdec.h (CellAdecCoreOps, CellAdecCoreOp*,
@@ -362,12 +363,12 @@ void register_adec_tables(Registry& r)
     r.add("cellWMAdec", {PS_HLE_FUNC(0x46E6C806, _SceAdecCorrectPtsValue_wma)});
     r.add("cellWMAPROdec", {PS_HLE_FUNC(0x8D45F21A, _SceAdecCorrectPtsValue_WmaPro)});
     r.add("cellWMALSLdec", {PS_HLE_FUNC(0xF2F9C183, _SceAdecCorrectPtsValue_WmaLsl)});
-    // The cores on FFmpeg are not compared with Sony's yet (D-577 to D-579, D-621, D-622): Sony's module serves first
-    // (D-563).
-    for (const std::string_view library : {"cellMP3dec", "cellMPL1dec", "cellM2BCdec", "cellM4AacDec",
-             "cellM4AacDec2ch", "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec", "cellDDPdec", "cellM2AACdec",
-             "cellMP3Sdec", "cellAtrac3multidec", "cellTRHDdec", "cellDTSdec", "cellDTSHDdec", "cellDTSHDCOREdec",
-             "cellDTSLBRdec", "cellWMAdec", "cellWMAPROdec", "cellWMALSLdec"})
+    // MP3, MPEG audio layers I and II, MPEG-4 AAC (its three cores), AC-3 and ATRAC3 are compared with Sony's cores and
+    // agree (D-944): games get pspocket's. The others' cores are not compared yet (D-621, D-622): Sony's module serves
+    // first (D-563).
+    for (const std::string_view library : {"cellDDPdec", "cellM2AACdec", "cellMP3Sdec", "cellAtrac3multidec",
+             "cellTRHDdec", "cellDTSdec", "cellDTSHDdec", "cellDTSHDCOREdec", "cellDTSLBRdec", "cellWMAdec",
+             "cellWMAPROdec", "cellWMALSLdec"})
         r.firmware_first(library);
 #endif
 }

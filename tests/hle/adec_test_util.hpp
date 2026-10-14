@@ -231,6 +231,12 @@ struct FirmwareCores {
     FirmwareCores(Fixture& f, GuestThread& t, const std::string& dev_flash) : lle(dev_flash)
     {
         REQUIRE(lle.index());
+        // Sony's core modules whether games get them or pspocket's (D-944: the compared cores are no longer
+        // firmware-first): the comparisons' other side.
+        for (const char* library : {"cellMP3dec", "cellMPL1dec", "cellM2BCdec", "cellM4AacDec", "cellM4AacDec2ch",
+                 "cellM4AacDec2chmod", "cell_libac3dec", "cellAtrac3dec", "cellDDPdec", "cellAtrac3multidec",
+                 "cellDTSLBRdec", "cellWMAdec"})
+            lle.force(library);
         lle.link_host_imports({{"cellAdec", {}, {}}}, *f.hle);
         for (const hle::ModuleEntry& start : lle.take_starts()) hle::run_module_entry(t.ctx, start, 0, 0);
     }

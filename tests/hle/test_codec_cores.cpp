@@ -46,12 +46,10 @@ TEST_CASE("Codec cores: versions and characteristics as RPCS3 has them, firmware
     CHECK(g.call("avcDecQueryCharacteristics", 0) == r3_of_code(0x80615201));
     CHECK(g.call("mvcDecQueryCharacteristics", kNotGuest) == r3_of_code(0x80615901));
 
-    // The cores whose decoding calls are not pspocket's own yet; libsmvd4's, libsmvd2's and libsvc1d's are (D-920),
-    // libavcdec's (D-933).
-    for (const char* library : {"libmvcdec", "libsjvtd"}) {
-        INFO(library);
-        CHECK(hle::registry().is_firmware_first(library));
-    }
+    // The core whose decoding calls are not pspocket's own yet; libsmvd4's, libsmvd2's, libsvc1d's and libsjvtd's are
+    // (D-920), libavcdec's (D-933).
+    CHECK(hle::registry().is_firmware_first("libmvcdec"));
+    CHECK_FALSE(hle::registry().is_firmware_first("libsjvtd"));
     CHECK_FALSE(hle::registry().is_firmware_first("libsmvd4"));
     CHECK_FALSE(hle::registry().is_firmware_first("libsmvd2"));
     CHECK_FALSE(hle::registry().is_firmware_first("libsvc1d"));

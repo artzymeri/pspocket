@@ -363,7 +363,7 @@ TEST_CASE("cellAdec: a firmware core (MPEG layer I) through pspocket's front end
     {
         BigFixture f;
         GuestThread t(f, 0, "ppu");
-        FirmwareLibrary sony(f, t, *flash, "cellAdec");
+        FirmwareLibrary sony(f, t, *flash, "cellAdec", true, {"cellMPL1dec"}); // Sony's core too (D-944)
         theirs = core_run(f.base(),
             [&](const char*, u32 nid, std::initializer_list<u64> args) { return sony.call(t, nid, args); }, kMpegL1,
             {3, 0, 0}, aus);

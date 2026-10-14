@@ -1296,7 +1296,7 @@ TEST_CASE("cellAdec: AC-3's core reads a unit too short for its header's raw byt
     REQUIRE(spec);
     REQUIRE(spec->output_bytes <= 0x100000);
     std::vector<u8> param = ac3_param({.word = 1, .mode = 2, .lfe = 0, .compression = 2, .channels = 2, .stereo = 0,
-        .dualmono = 0, .karaoke = 3, .cut = 1, .boost = 1, .scale = 1, .pointers = {0, -1, 1, -1, -1, -1}});
+        .dualmono = 0, .karaoke = 3, .cut = 1, .boost = 1, .scale = 1, .pointers = {0, 2, 1, 3, 4, 5}});
     param.resize(std::max<usize>(param.size(), spec->param_size), 0);
     REQUIRE(spec->check(param.data()) == lv2::CELL_OK);
     const std::unique_ptr<hle::adec::ffcore::Codec> codec = spec->make();
@@ -1308,9 +1308,7 @@ TEST_CASE("cellAdec: AC-3's core reads a unit too short for its header's raw byt
     const hle::adec::ffcore::Decoded d = codec->decode(b, kEnd - 8, 8, kOut, kBsi);
     CHECK(d.error != 0); // the frame is not all there
     CHECK(d.size == 0);
-    CHECK(ps_read32(b, kBsi + 0x28) == 0x40436100u); // the raw bytes from 5 on: the three there are, then zeros
-    CHECK(ps_read32(b, kBsi + 0x2C) == 0u);
-    CHECK(ps_read8(b, kBsi + 0x3B) == 8); // bsid
+    for (u32 at = 0; at < spec->bsi_size; at++) CHECK(ps_read8(b, kBsi + at) == 0); // libac3dec's blank block (D-944)
 }
 
 TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every channel routed, the information (D-579)",
@@ -1341,17 +1339,21 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every chan
         CHECK(o.size == 1536 * 6 * 4);
         CHECK(o.pcm == expected_pcm(ref[k], false)); // 3/2 with the LFE: no downmix, FFmpeg's samples in WAV's order
         CHECK(o.pts_lower == 0x1000 + 2880 * k);
-        CHECK(be32(o.bsi, 0x04) == 0x01000000);
+        // libac3dec's block (D-944).
+        CHECK(be32(o.bsi, 0x00) == 0x00001001);
+        CHECK(be32(o.bsi, 0x04) == 0x04990000);
         CHECK(be32(o.bsi, 0x0C) == k + 1);          // totalCallNum
-        CHECK(be32(o.bsi, 0x10) == 448);            // kbit/s
+        CHECK(be32(o.bsi, 0x10) == 448000);         // bit/s
         CHECK(be32(o.bsi, 0x14) == o.size);         // pcmSize
-        CHECK(be32(o.bsi, 0x18) == 8 * 1792);       // esSizeBit
+        CHECK(be32(o.bsi, 0x18) == 0);              // esSizeBit: 0, as libac3dec's
         CHECK(be32(o.bsi, 0x1C) == 0);
-        CHECK(o.bsi[0x21] == 1);                    // validity
+        CHECK(o.bsi[0x20] == (k == 0));             // the frame's size changed (from none)
+        CHECK(o.bsi[0x21] == 0);                    // validity
         CHECK(o.bsi[0x22] == 6);                    // channels with the LFE
-        CHECK(o.bsi[0x23] == 0);                    // 48 kHz
-        CHECK(o.bsi[0x24] == 1);                    // float
+        CHECK(o.bsi[0x23] == 3);                    // 48 kHz: MPEG-4's index
+        CHECK(o.bsi[0x24] == 0xFF);                 // float
         CHECK(o.bsi[0x25] == 6);
+        CHECK(o.bsi[0x34] == 2);                    // karaokeMode: no karaoke stream
         CHECK(o.bsi[0x32] == 7);                    // acmod 3/2
         CHECK(o.bsi[0x33] == 1);                    // LFE
         CHECK(o.bsi[0x3B] == feed.aus[k][5] >> 3);  // bsid
@@ -1379,7 +1381,7 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, 5.1 that FFmpeg's encoder wrote: every chan
                 worst = std::max(worst, static_cast<double>(std::abs(got[i] - 0.5f * want[i])));
         }
     }
-    CHECK(worst < 1.0 / 32768 + 1e-9); // the 16-bit floor
+    CHECK(worst < 0.5 / 32768 + 1e-9); // 16-bit samples rounded to nearest (libac3dec's)
 }
 
 TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; stereo out wide; refusals (D-579)",
@@ -1401,7 +1403,7 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
     const float clev = std::array{0.70710678f, 0.59460356f, 0.5f, 0.59460356f}[cmix];
     const float slev = std::array{0.70710678f, 0.5f, 0.0f, 0.5f}[smix];
     const float k3 = 0.70710678f;
-    // A downmix of the full output (WAV's order: L, R, C, LFE, Ls, Rs), each row over its sum when that passes 1.
+    // A downmix of the full output (WAV's order: L, R, C, LFE, Ls, Rs), not normalised (libac3dec's, D-944).
     using Row = std::array<float, 6>;
     const auto check_downmix = [&](const Ac3Param& p, const std::vector<Row>& rows, u8 dmix_type) {
         const CoreRun run = run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param(p), feed);
@@ -1409,11 +1411,9 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
         double worst = 0;
         for (u32 k = 0; k < run.outs.size(); k++) {
             CHECK(run.outs[k].size == 1536 * rows.size() * 4);
-            CHECK(run.outs[k].bsi[0x43] == dmix_type);
+            CHECK(run.outs[k].bsi[0x43] == (k == 0 ? 0 : dmix_type)); // the 2/0 kind the frame before set up
             for (u32 o = 0; o < rows.size(); o++) {
-                float sum = 0;
-                for (const float c : rows[o]) sum += std::abs(c);
-                const float norm = std::max(sum, 1.0f);
+                const float norm = 1.0f;
                 const auto got = channel_of(run.outs[k].pcm, static_cast<u32>(rows.size()), o, false);
                 for (usize i = 0; i < got.size(); i++) {
                     double want = 0;
@@ -1428,23 +1428,24 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
         }
         CHECK(worst < 1e-5);
     };
-    const std::array<s32, 6> lr = {0, -1, 1, -1, -1, -1};
+    // L and R in slots 0 and 1, the other pointers past the two slots (libac3dec takes pointers 0 to 5 only).
+    const std::array<s32, 6> lr = {0, 2, 1, 3, 4, 5};
     // 2/0 Lo/Ro: L + clev C + slev Ls; Lt/Rt: L + 0.7071 C - 0.7071 (Ls + Rs), R + 0.7071 C + 0.7071 (Ls + Rs).
     check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 2, .pointers = lr},
         {Row{1, 0, clev, 0, slev, 0}, Row{0, 1, clev, 0, 0, slev}}, 2);
     check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 1, .pointers = lr},
         {Row{1, 0, k3, 0, -k3, -k3}, Row{0, 1, k3, 0, k3, k3}}, 1);
-    // Auto: the stream names no preferred mode, so Lo/Ro.
+    // Auto: Lt/Rt, as libac3dec's (the stream names no preferred mode).
     check_downmix({.mode = 2, .lfe = 0, .channels = 2, .stereo = 0, .pointers = lr},
-        {Row{1, 0, clev, 0, slev, 0}, Row{0, 1, clev, 0, 0, slev}}, 2);
-    // 1/0: the Lo/Ro pair's sum at 0.7071, to the one slot the centre points at.
-    check_downmix({.mode = 1, .lfe = 0, .channels = 1, .pointers = {-1, 0, -1, -1, -1, -1}},
-        {Row{k3, k3, 2 * k3 * clev, 0, k3 * slev, k3 * slev}}, 2);
-    // 3/0 with the LFE: the surrounds into the fronts; 2/1: the centre into the fronts, the surrounds to one.
-    check_downmix({.mode = 3, .lfe = 1, .channels = 4, .pointers = {0, 2, 1, -1, -1, 3}},
-        {Row{1, 0, 0, 0, slev, 0}, Row{0, 1, 0, 0, 0, slev}, Row{0, 0, 1, 0, 0, 0}, Row{0, 0, 0, 1, 0, 0}}, 2);
-    check_downmix({.mode = 4, .lfe = 0, .channels = 3, .pointers = {0, -1, 1, 2, -1, -1}},
-        {Row{1, 0, clev, 0, 0, 0}, Row{0, 1, clev, 0, 0, 0}, Row{0, 0, 0, 0, k3, k3}}, 2);
+        {Row{1, 0, k3, 0, -k3, -k3}, Row{0, 1, k3, 0, k3, k3}}, 1);
+    // 1/0: half of L, R, the centre at clev and the surrounds at slev, to the one slot the centre points at.
+    check_downmix({.mode = 1, .lfe = 0, .channels = 1, .pointers = {1, 0, 2, 3, 4, 5}},
+        {Row{0.5f, 0.5f, 0.5f * clev, 0, 0.5f * slev, 0.5f * slev}}, 0);
+    // 3/0 with the LFE: the surrounds into the fronts; 2/1: the centre into the fronts, the surrounds to one at half.
+    check_downmix({.mode = 3, .lfe = 1, .channels = 4, .pointers = {0, 2, 1, 4, 5, 3}},
+        {Row{1, 0, 0, 0, slev, 0}, Row{0, 1, 0, 0, 0, slev}, Row{0, 0, 1, 0, 0, 0}, Row{0, 0, 0, 1, 0, 0}}, 0);
+    check_downmix({.mode = 4, .lfe = 0, .channels = 3, .pointers = {0, 3, 1, 2, 4, 5}},
+        {Row{1, 0, clev, 0, 0, 0}, Row{0, 1, clev, 0, 0, 0}, Row{0, 0, 0, 0, 0.5f, 0.5f}}, 0);
     // A stereo stream into 3/2 with the LFE: L and R, the other slots silent.
     const std::vector<s16> two = sines(48000, 24000, {700, 1300}, {0.4, 0.4});
     const Encoded stereo = ffmpeg_encode("ac3", 48000, 2, 192000, two);
@@ -1484,13 +1485,16 @@ TEST_CASE("cellAdec: AC-3 on FFmpeg, downmixed: Lo/Ro, Lt/Rt, mono, 3/0, 2/1; st
     CHECK(refused.outs[5].bsi[0x42] == 1); // crcErrorFlag
     CHECK(refused.outs[6].bsi[0x42] == 0);
     CHECK(refused.outs[6].size == 1536 * 6 * 4);
-    // StartSeq's checks: a word size, an output mode, a channel count, a pointer past the slots, two at one slot, a
-    // scale factor past 1.
-    for (const Ac3Param& p : {Ac3Param{.word = 2}, Ac3Param{.mode = 0}, Ac3Param{.mode = 8}, Ac3Param{.channels = 0},
-             Ac3Param{.channels = 7}, Ac3Param{.channels = 5}, Ac3Param{.pointers = {0, 0, 1, 2, 3, 4}},
-             Ac3Param{.scale = 1.5f}})
+    // StartSeq's checks, libac3dec's (D-944): enums past their values, more than six slots, a pointer outside 0 to 5
+    // (libadec's ARG); not the output mode, slots fewer than the pointers, two pointers alike or the scale factors.
+    for (const Ac3Param& p : {Ac3Param{.word = 2}, Ac3Param{.lfe = 2}, Ac3Param{.compression = 4}, Ac3Param{.channels = 7},
+             Ac3Param{.stereo = 3}, Ac3Param{.dualmono = 4}, Ac3Param{.karaoke = 4},
+             Ac3Param{.pointers = {0, 2, 1, 4, 5, 6}}, Ac3Param{.pointers = {0, -1, 1, 4, 5, 3}}})
         CHECK(run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param(p), Feed{}).lines[2] ==
-            "cellAdecStartSeq -> 0x80612502");
+            "cellAdecStartSeq -> 0x80610003");
+    for (const Ac3Param& p : {Ac3Param{.mode = 0}, Ac3Param{.mode = 8}, Ac3Param{.channels = 0}, Ac3Param{.channels = 5},
+             Ac3Param{.pointers = {0, 0, 1, 2, 3, 4}}, Ac3Param{.scale = 1.5f}, Ac3Param{.scale = -1}, Ac3Param{.cut = 2}})
+        CHECK(run_core(f.base(), hle_calls(f, t), kTypeAc3, ac3_param(p), Feed{}).lines[2] == "cellAdecStartSeq -> 0x0");
 }
 
 #endif
@@ -1941,7 +1945,7 @@ TEST_CASE("cellAdec: the cores' own PTS functions (D-591)", "[hle][adec]")
 // PSPOCKET_TEST_DEV_FLASH (the gate sets it on the Mac) or the test passes without comparing. No game data. For a
 // look: PSPOCKET_TEST_DUMP=1 prints the first items' information blocks whole and some PCM, PSPOCKET_TEST_SHIFT=1 each
 // item's PCM against pspocket's one before, PSPOCKET_TEST_LAG=<channels> the lag that best lines the two up.
-TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][adec][firmware][.compare-adec]")
+TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[.][hle][adec][firmware][compare][adec-cores]")
 {
 #if !PSPOCKET_HAVE_FFMPEG
     SKIP("no FFmpeg in this build: pspocket has no cores on FFmpeg to compare");
@@ -2196,9 +2200,11 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
         const Encoded enc = ffmpeg_encode("ac3", 48000, 2, 192000, input);
         REQUIRE(enc.packets.size() >= 5);
         Feed feed;
+        // From FFmpeg's second frame: its encoder's first (the sound's onset after its priming silence) is one
+        // libac3dec refuses (D-944), as it refuses any frame of the encoder's where a sound starts after silence.
         feed.bsi_size = 0x50;
         feed.step = 2880;
-        feed.aus.assign(enc.packets.begin(), enc.packets.begin() + 5);
+        feed.aus.assign(enc.packets.begin() + 1, enc.packets.begin() + 6);
         feed.missing = {2};
         cases.push_back({"AC-3", kTypeAc3, ac3_param({}), feed, true});
         Ac3Param sixteen;
@@ -2222,21 +2228,29 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
         params("no slots", [](Ac3Param& a) { a.channels = 0; });
         params("mode 0", [](Ac3Param& a) { a.mode = 0; });
         params("mode 1", [](Ac3Param& a) { a.mode = 1; });
-        params("mode 8", [](Ac3Param& a) { a.mode = 8; });
         params("the same pointer twice", [](Ac3Param& a) { a.pointers = {0, 0, 1, 4, 5, 3}; });
         params("scale 2", [](Ac3Param& a) { a.scale = 2; });
         params("scale -1", [](Ac3Param& a) { a.scale = -1; });
         params("no LFE out", [](Ac3Param& a) { a.lfe = 0; });
+        const std::vector<s16> loud_input = sines(48000, 24000, {1000, 2500}, {0.95, 0.9});
+        const Encoded e_loud = ffmpeg_encode("ac3", 48000, 2, 192000, loud_input);
+        Feed loud = feed;
+        loud.aus.assign(e_loud.packets.begin() + 1, e_loud.packets.begin() + 6);
+        Ac3Param louder;
+        louder.scale = 1.9f;
+        cases.push_back({"AC-3, loud, scale 1.9", kTypeAc3, ac3_param(louder), loud, true});
+        louder.word = 0;
+        cases.push_back({"AC-3, loud, scale 1.9, 16-bit", kTypeAc3, ac3_param(louder), loud, false});
         const Encoded e44 = ffmpeg_encode("ac3", 44100, 2, 128000, input);
         Feed f44 = feed;
-        f44.aus.assign(e44.packets.begin(), e44.packets.begin() + 5);
+        f44.aus.assign(e44.packets.begin() + 1, e44.packets.begin() + 6);
         f44.step = 3135;
         cases.push_back({"AC-3, 44.1 kHz", kTypeAc3, ac3_param({}), f44, true});
         std::vector<s16> mono;
         for (usize k = 0; k < input.size(); k += 2) mono.push_back(input[k]);
         const Encoded e32 = ffmpeg_encode("ac3", 32000, 1, 96000, mono);
         Feed f32 = feed;
-        f32.aus.assign(e32.packets.begin(), e32.packets.begin() + 5);
+        f32.aus.assign(e32.packets.begin() + 1, e32.packets.begin() + 6);
         f32.step = 4320;
         cases.push_back({"AC-3, mono at 32 kHz", kTypeAc3, ac3_param({}), f32, true});
         const std::vector<s16> six = sines(48000, 24000, {300, 500, 700, 900, 1100, 60}, {0.3, 0.3, 0.3, 0.3, 0.3, 0.3});
@@ -2245,7 +2259,7 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
             av_channel_layout_from_mask(&av->ch_layout, AV_CH_LAYOUT_5POINT1_BACK);
         });
         Feed f51 = feed;
-        f51.aus.assign(e51.packets.begin(), e51.packets.begin() + 5);
+        f51.aus.assign(e51.packets.begin() + 1, e51.packets.begin() + 6);
         cases.push_back({"AC-3, 5.1", kTypeAc3, ac3_param({}), f51, true});
     }
     for (const Case& c : cases) {
@@ -2261,6 +2275,14 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[hle][a
                 BigFixture f;
                 GuestThread t(f, 0, "ppu");
                 FirmwareCores cores(f, t, *flash);
+                // Sony's core module linked for cellAdec, not pspocket's (the compared cores serve games, D-944).
+                static constexpr std::pair<u32, std::pair<const char*, u32>> kSonyCores[] = {
+                    {kTypeMp3, {"cellMP3dec", 0x84276A23}}, {kTypeMpegL1, {"cellMPL1dec", 0xBBC70551}},
+                    {kTypeMpegL2, {"cellM2BCdec", 0x300AFE4D}}, {kTypeM4Aac, {"cellM4AacDec", 0xAB61278D}},
+                    {kTypeM4Aac2ch, {"cellM4AacDec2ch", 0xE996C664}}, {kTypeM4Aac2chMod, {"cellM4AacDec2chmod", 0xDBD26836}},
+                    {kTypeAc3, {"cell_libac3dec", 0xC58BB170}}, {kTypeAtrac3, {"cellAtrac3dec", 0x60487D65}}};
+                for (const auto& [type, core] : kSonyCores)
+                    if (type == c.type) REQUIRE(f.hle->imported(core.first, core.second) != 0);
                 theirs = run_core(f.base(), hle_calls(f, t), c.type, c.param, c.feed);
             }
             std::vector<std::string> differ;

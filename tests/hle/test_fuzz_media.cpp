@@ -528,7 +528,8 @@ std::vector<u8> be_words(std::initializer_list<u32> words)
     return v;
 }
 
-// CellAdecParamAc3 for two channels out: 16-bit, 2/0, no LFE, full DRC and scale, slots 0 and 1.
+// CellAdecParamAc3 for two channels out: 16-bit, 2/0, no LFE, full DRC and scale, L and R in slots 0 and 1 (the other
+// pointers past the two slots: libac3dec takes pointers 0 to 5 only, D-944).
 std::vector<u8> ac3_stereo_param()
 {
     std::vector<u8> v(0x30, 0);
@@ -538,7 +539,7 @@ std::vector<u8> ac3_stereo_param()
     for (const usize at : {usize{4}, usize{8}, usize{0x14}}) ps_st32(v.data() + at, 0x3F800000); // 1.0f
     v[0xC] = 2;
     v[0xD] = 2;
-    const s32 pointers[6] = {0, 1, -1, -1, -1, -1};
+    const s32 pointers[6] = {0, 2, 1, 3, 4, 5};
     for (u32 k = 0; k < 6; k++) ps_st32(v.data() + 0x18 + 4 * k, static_cast<u32>(pointers[k]));
     return v;
 }
@@ -566,7 +567,7 @@ TEST_CASE("fuzz: the audio cores' frame parsing in front of FFmpeg over damaged 
     std::vector<std::vector<u8>> l2 = {mpeg_silence(0xFFFD8404, 384)};
     for (auto& p : encoded("mp2", 48000, 2, 192000)) l2.push_back(std::move(p));
     l2.resize(std::min<usize>(l2.size(), 3));
-    targets.push_back({6, "adec mpeg layer 2", be_words({3, 0, 0}), l2});
+    targets.push_back({6, "adec mpeg layer 2", be_words({0, 0, 0}), l2}); // channelNumber 0: the stream's (D-944)
     // AAC LC from FFmpeg's encoder: ADTS frames, and its raw blocks (configuration 2: rate index 3, LC).
     std::vector<std::vector<u8>> aac = encoded("aac", 48000, 2, 128000);
     if (aac.size() > 3) {

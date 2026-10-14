@@ -13593,6 +13593,90 @@ own half with Sony's values, firmware-free); "The VC-1 core under Sony's libvdec
 with the simple and main profiles through mode 3); test_vdec_cores_compare.cpp's FFmpeg checks of the writer's streams.
 pspocket's own libvdec still answers mode 3 with a fatal error and does not decode the simple and main profiles: next.
 
+## D-920 · 2026-10-13 · libsjvtd, the JVT (H.264) core, pspocket's own (part 8)
+
+libsjvtd's eighteen decoding functions (sjvtdGetMemorySize, GetMemorySize2, CreateInstance2, ReleaseInstance,
+Initialize, DecodePicture, FlushPicture, Discontinue, CancelDecode, SetDecodeMode, GetNumPicture, GetPicture,
+ReleasePicture, GetSideInfoPic, GetAuxData, GetSideInfoSeq, GetExistenceFlag, SetAuxData) are pspocket's own
+(runtime/hle/src/vdec_sjvtd.cpp, on part 5's vdec_score.hpp), with its version query (D-575) the whole library: no
+longer firmware-first. Compared with Sony's module called directly (tests/hle/test_vdec_sjvtd_compare.cpp: 0 of 9,436
+observations differ, every byte of every frame buffer the same) and driven by Sony's libvdec (test_vdec_codecs_compare.cpp's
+new JVT family, Sony's libvdec over pspocket's core and over Sony's: 0 of 1,093 differ).
+
+**The samples are FFmpeg's H.264 decoder's** (H.264's reconstruction is exact by the standard), read through
+vdec_h264.hpp's syntax readers (D-933) and written into Sony's frame buffers: 16-sample strips, Cb and Cr in each strip's
+halves, 32 lines of edge above and below the luma (16 the chroma) that the program never writes, and one strip each side
+that repeats the first and last columns of a reference picture's lines. The parameters' first flag (libvdec's
+!disableDeblockingFilter) 0: neither the edge strips nor the loop filter (FFmpeg's skip_loop_filter); the strips are
+compared, the filter is not (the tests' I_PCM and skipped macroblocks are never filtered).
+
+**What the program does, read in the module and checked against it** (the details are vdec_sjvtd.cpp's):
+- The memory: frame buffers (frames + 2, each with its motion data), a table a macroblock column and one a macroblock,
+  0x31D00 more, and the areas before them (0x95A50, 0x100 a macroblock row, 0x24A80 for the first flag set and for the
+  second's default); without the caller's taskset (GetMemorySize, GetMemorySize2's parameters with none) room for one
+  of its own too, a CellSpursTaskset2 (0x2900). Levels 0 to 16 (0 and 11 to 15: 1920x1088; 1 and 16: 176x144; 2 to 5:
+  352x288; 6: 352x576; 7, 8: 720x576; 9: 1280x720; 10: 1280x1024); types 4 (the level's largest picture and the
+  defaults: libvdec's without the codec specific information) to 6; frames 1 to 16 (16 by default), frame buffers one
+  more, the lowest free taken.
+- The decoded picture buffer: its size set at a sequence's first picture after Initialize (the VUI's
+  max_dec_frame_buffering when given and not 0, else the level's MaxDpbMbs over the frame's macroblocks; at most 16 and
+  the frame count); a new sequence parameter set at an IDR picture without Initialize keeps it. The instance's first
+  sequence's size is what its frame buffers hold: a later sequence that needs more stops the decoder (0x80615881, then
+  0x80615880 from DecodePicture, Initialize, FlushPicture, Discontinue, CancelDecode, SetDecodeMode, SetAuxData,
+  GetSideInfoSeq; ReleaseInstance releases and answers 0x80615880; the queries answer as before). Output by C.4.5.3's
+  bumping, or by the HRD's times (C.4.5.2) once a picture timing message with its delays came since Initialize: removal
+  times from the last buffering period's (C.1.2), a picture without a timing message output when decoded. Reference
+  marking by the sliding window or the memory management operations (operation 5 outputs every picture before it and
+  starts the order counts and frame numbers again).
+- Access units: no NAL unit, a warning (0x8); parameter sets alone, no picture and no error; a delimiter alone, or
+  slices whose parameter sets the decoder does not have (Initialize forgets them), no picture (0x20; the sequence
+  structure then has none); a picture larger than the instance's, refused as busy (0x80615821, nothing used) after the
+  pictures before its IDR picture are output. The existence flag (the instance's second word, not set at creation): 0x1
+  a sequence parameter set, 0x2 a picture parameter set, 0x10 an access unit delimiter, 0x100 a buffering period
+  message, 0x200 a picture timing message. FlushPicture's mark (GetNumPicture's 0x80615822) stays until a picture.
+- GetPicture's nine words: the luma's first sample, Cb's, Cr's (Cb + 8), the structure word, width, height, the strips'
+  lines and chroma lines, the frame buffer. The structure word 0x40000004 with 0x10 two fields shown, 0x1000 the bottom
+  first, 0x4000 a field repeated, 0x800 a field pair, 0x400 a field alone (a bottom field's addresses a line down):
+  from pic_struct (a frame's 1 and 2 taken as 0 and 7), else a frame's fields' order counts.
+- GetSideInfoPic's blocks (0x188 bytes, two for a field pair): the cropping in samples, a status (0x1 a reference
+  missing, 0x80 passed over), whether the picture is a random access point (an IDR picture, or the one a recovery
+  point message names), the slice type code (1, 2, 4: B over P over I), the slices' NAL units' bits, IDR flags (the
+  first picture after CancelDecode's too), the picture type, the order count, pic_struct and the bottom field flag; the
+  decode mode at +0x168. GetAuxData: SetAuxData's 16 bytes of each field's access unit.
+- GetSideInfoSeq's structure (0x7E0 bytes): the sequence parameter set as the program reads it, its VUI's HRD (each
+  CPB's bit rate, cbr_flag and size). The VUI's fields are the record's (kept when a set has no VUI, written from then
+  on); delta_pic_order_always_zero_flag is kept across sets of other types; the cropping when on, the timing when fixed.
+- SetDecodeMode takes 0 and 0xFF (else SEQ): 0xFF passes the non-reference pictures over (0x80615828, given out
+  undecoded, their frame buffers as they were). CancelDecode drops every picture; the P and B pictures after it warn
+  (GetPicture 0x8061581b) until an IDR picture. Discontinue keeps everything. ReleasePicture with none: 0;
+  GetSideInfoPic and GetAuxData with none write a count of 2 and answer EMPTY.
+- Sony's libvdec (read in the module, traced): type 6 with the codec specific information's size, its deblocking flag
+  as the first flag (inverted), the second -1, the frame count from numberOfDecodedFrameBuffer; type 4 without it.
+
+**Not reproduced** (each left out of the comparisons where Sony's program does it, with the reason in the tests):
+- What a sequence parameter set leaves out (the VUI's fields past a flag of 0) in a new instance: Sony's SPU task keeps
+  what its local store held, an earlier instance's task's or anything; pspocket's are 0 there, then the instance's own.
+  Likewise GetSideInfoSeq before an instance's first picture (Sony's: an earlier instance's).
+- Field pictures given out alone (picture timing messages on fields): Sony's answers warnings that change with what
+  its memory held before; the second side information block of a lone field is a stale copy. pspocket gives each field
+  alone with its structure word; not compared.
+- The parameters' second flag 1 (libvdec gives -1): Sony's refuses every access unit (0x80615842) and gives its frame
+  buffers out with warnings anyway; pspocket refuses them and gives none.
+- libvdec's information block of a sequence without a VUI: its video signal, colour and timing bytes come from the
+  structure's words the core leaves unwritten, on libvdec's stack, so from what Sony's core's own calls left there:
+  notes in the libvdec comparison.
+- Streams of CABAC (the tests' are CAVLC): the side information's bits are the NAL units' there too, unverified.
+- Found on the way: in pspocket's SPURS, Sony's ReleaseInstance leaves five of the core's six tasks waiting when the
+  instance was initialized again after a stream, and a new instance in the same memory overwrites their saved contexts
+  (the comparison gives each instance its memory). pspocket's core has no SPU tasks.
+
+Tests: h264_streams.hpp's streams (I_PCM, P_Skip and B_Skip pictures; field pairs; VUIs of every field and HRD
+parameters of more CPBs; buffering period, picture timing, recovery point and closed caption messages; slices of
+different types; memory management operations 1 to 6); "The JVT core (libsjvtd) against Sony's" (the call-for-call comparison, `[.]`), "The JVT core
+(libsjvtd): pspocket's own, answering as Sony's did (D-920)" (its own half with Sony's values, firmware-free) and "The
+JVT core under Sony's libvdec: pspocket's against Sony's" (`[.]`, with the codec specific information's flags and
+counts and DecodeAu's modes). libmvcdec stays firmware-first (D-933).
+
 ## D-921 · 2026-10-12 · sceNp's last 24: the product category getters as libsysutil_np, its requests to the NP service
 
 sceNp's 24 functions answered as RPCS3's stubs (D-182) are pspocket's own (runtime/hle/src/sceNp.cpp), so the whole
@@ -14836,6 +14920,44 @@ refused (up to 12 16-bit steps: libat3dec's state after its partial decode of th
 Compared: 45 cases of MP3, layers I and II, ATRAC3 and AAC agree, each in every answer, callback, item, information
 byte and PCM sample (floats within their last bits, 16-bit within one step). Still differing (part 3): AC-3.
 
+## D-944 · 2026-10-13 · The audio cores against Sony's (part 3: AC-3; the compared cores no longer firmware-first)
+
+libac3dec's behaviour, from the comparison and probes of its output by parameter (adec_ac3.cpp):
+
+- StartSeq refuses only word size, LFE, compression, stereo, dual mono and karaoke modes past their enums, more than
+  six slots, and a channel pointer outside 0 to 5, with libadec's ARG (0x80610003). It does not check the output mode,
+  the scale factors or two pointers alike; -1 is no pointer (it is refused): a channel is left out by pointing past
+  numberOfChannels.
+- Routing: each channel of the output mode (L, C, R, Ls, Rs, then the LFE when outLfeOn), whether or not the stream
+  has it, goes to its pointer's slot in that order, a later one taking a slot an earlier one has; channels outside the
+  output mode write nothing; slots past numberOfChannels are not out (0 slots: no PCM).
+- Downmixes, nothing normalised: Lt/Rt L + 0.7071 C - 0.7071 (Ls + Rs), R + 0.7071 C + 0.7071 (Ls + Rs); Lo/Ro L + clev C
+  + slev Ls; 3/0 the surrounds into the fronts at slev; 2/1 and 3/1 the centre into the fronts at clev (2/1) and the
+  surround as half of each; 1/0 half of L, R, the centre at clev and the surrounds at slev; a mono stream into 2/0 both
+  sides at 0.7071; stereoMode auto is Lt/Rt (Lo/Ro only where annex D's dmixmod prefers it); the 1+1 output mode is
+  the 2/0 one.
+- pcmScaleFactor from -2 up to 2, anything else silence; floats held below 1, 16-bit rounded to nearest
+  (Rounding::HeldNearest: 85 dB against Sony's either way the precision allows, 82 dB floored).
+- CellAdecBsiAc3 is 0x50 bytes (so getMemSize's total grows by 12 bytes a PCM handle): codecType word 0x1001,
+  versionInfo 0x04990000, totalCallNum every call, the bit rate in bit/s, esSizeBit and validity 0, the rate as
+  MPEG-4's sampling frequency index (48 kHz 3, 44.1 kHz 4, 32 kHz 5), outputQuantization 0xFF float and 3 16-bit,
+  karaokeMode 2 for a stream that is no karaoke one, bsi() from bsid as 24-bit words cut at its end (A/52's bsi()
+  parsed to addbsi), execDmixType 1 Lt/Rt or 2 Lo/Ro for a 2/0 output whatever the stream, reported for the frame after
+  the one that set it up (0 on a sequence's first frame), and the flag at +0x20 when the frame's size or that kind is
+  not the frame before's (44.1 kHz's padded frames set it). A refused unit's block is left blank.
+
+Not reproduced (documented tolerance): libac3dec refuses (AC3_FRAME) the frame of FFmpeg's encoder where a sound starts
+after digital silence (its priming frame and any such onset; a sound that starts quiet is decoded), its CRCs good: some
+check of its own FFmpeg's decoder does not make, not found; the next frame's first block shows its partial decode. A
+professional encoder's frames are not expected to trip it, so pspocket decodes them, and the comparison's streams start
+past it. Output modes past 7 (not in CellAdecAc3OutputMode): libac3dec gives eight slots for mode 8; pspocket takes it
+as 3/2. AC-3's PCM differs from libac3dec's by up to two 16-bit steps (its decoder's precision, 85 to 105 dB).
+
+With this, the 67 cases of the comparison agree, and test_hle "[compare][adec-cores]" (hidden: three minutes) holds
+them. MP3, the MPEG audio layers, MPEG-4 AAC and its two 2-channel cores, AC-3 and ATRAC3 are no longer firmware-first
+(adec_tables.cpp): every game gets pspocket's cores for them, with or without the firmware. Still Sony's first, not
+compared: E-AC-3 (libddpdec), MPEG-2 AAC, MP3 Surround, ATRAC3 multichannel (libat3multidec), TrueHD, DTS (libdtslbrdec)
+and WMA (libwmadec); the firmware has modules for E-AC-3, ATRAC3 multichannel, DTS Express and WMA to compare with.
 
 ## D-945 · 2026-10-14 · Fewer render passes for a tile GPU (part 1: clears that wait, stores the next pass makes dead)
 
