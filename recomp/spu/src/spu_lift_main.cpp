@@ -3,11 +3,12 @@
 //   spu-lift --elf prog.elf --out DIR [options]
 //   spu-lift --image code.bin --base 0x0 --entry 0x0 [--entry ...] --out DIR [options]
 //   options: [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]
-//            [--no-constant-entries] [--relocatable] [--discover] [--strict] [--quiet]
+//            [--no-constant-entries] [--relocatable] [--discover] [--whole] [--strict] [--quiet]
 //
 // --relocatable lifts position independent code (job binaries, the modules programs load: D-081) to run at any LS
 // address: the base is only where the image is analysed. --discover also lifts code only registers reach (D-155), as
-// the game and system preparations do.
+// the game and system preparations do. --whole makes each function one C function entered at any label, as before
+// D-961 (no twins).
 // Prints a summary (functions, instructions, labels, the program key) and every unsupported instruction reached by
 // control flow (left to the interpreter at runtime). --strict turns those into a failing exit code.
 
@@ -33,7 +34,7 @@ void usage()
     std::fprintf(stderr,
         "usage: spu-lift (--elf FILE | --image FILE --base ADDR --entry ADDR [--entry ADDR]...) --out DIR\n"
         "                [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]\n"
-        "                [--no-constant-entries] [--relocatable] [--discover] [--strict] [--quiet]\n");
+        "                [--no-constant-entries] [--relocatable] [--discover] [--whole] [--strict] [--quiet]\n");
 }
 
 bool read_file(const std::string& path, std::vector<u8>& out)
@@ -115,6 +116,7 @@ int main(int argc, char** argv)
             analyzer.constant_entries = false;
         }
         else if (arg == "--discover") analyzer.discover = true;
+        else if (arg == "--whole") options.twins = false;
         else if (arg == "--strict") strict = true;
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--help" || arg == "-h") {
@@ -164,6 +166,9 @@ int main(int argc, char** argv)
             lifted.stats.functions, lifted.stats.instructions, lifted.stats.labels, lifted.stats.unsupported,
             out_dir.c_str(), lifted.files.size());
     }
+    if (lifted.stats.forced_loads)
+        std::printf("spu-lift: %zu functions load every live register at their entry (lazy loads fell back, D-960)\n",
+            lifted.stats.forced_loads);
     for (const Diagnostic& d : program.unsupported)
         std::printf("unsupported: %05x: %08x  %s\n", d.addr, d.word, d.message.c_str());
     return strict && !program.unsupported.empty() ? 1 : 0;

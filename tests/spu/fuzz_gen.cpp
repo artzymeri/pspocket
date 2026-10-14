@@ -93,6 +93,7 @@ public:
             break;
         }
         case Fmt::RI16_BR:
+            if (op == Op::BRSL && rng_.chance(25)) f.imm = 1; // brsl $rt, .+4: the code takes its own address (D-963)
             if (rng_.chance(50)) pref(f.rt, rng_.chance(50) ? 0 : static_cast<u32>(rng_.next()));
             if ((op == Op::BRHZ || op == Op::BRHNZ) && rng_.chance(50)) pref(f.rt, static_cast<u32>(rng_.next()) & 0xFFFF0000u);
             break;
@@ -208,6 +209,9 @@ private:
                 pref(f.ra, static_cast<u32>(imm + static_cast<s32>(rng_.below(3)) - 1));
             }
             break;
+        case Op::SHUFB:
+            if (rng_.chance(40)) f.rb = f.ra; // one table register (D-963)
+            break;
         case Op::CBD:
         case Op::CHD:
         case Op::CWD:
@@ -291,7 +295,7 @@ private:
 // registers around calls (D-127): kept across a call that doesn't touch them, read and written by the callee, written
 // two calls deep, and kept across a call that leaves the program and comes back through the run loop. And registers a
 // callee writes on one path only or before it reads them (D-219). And stops in callees, one the runtime answers and one
-// that leaves (D-247).
+// that leaves (D-247), whose resumes run in the functions' twins (D-961). And the code taking its own address (D-963).
 struct SyntheticProgram {
     std::vector<u8> bytes; // at PS_SPU_FUZZ_PROGRAM_BASE
     u32 entry = 0;
@@ -408,6 +412,9 @@ SyntheticProgram synthetic_program()
     m.brsl(0, stop_mid); // stops 0x12 (answered) and 0x13 (leaves; the run loop resumes after it)
     m.emit(as::a(48, 47, 46)); // 0x4747 + 0x47
     m.emit(as::a(51, 50, 49)); // 0x5050 + 0x4A
+    // The code takes its own address (D-963): brsl $53, .+4 is no call; r54 = r53 + 16.
+    m.emit(as::brsl(53, 4));
+    m.emit(as::ai(54, 53, 16));
     m.emit(as::stop(0x11));
     return {m.finish(), entry, {func2, target}};
 }

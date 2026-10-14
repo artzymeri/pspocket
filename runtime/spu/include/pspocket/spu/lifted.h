@@ -39,6 +39,12 @@ extern "C" {
 
 #define PSL static inline __attribute__((always_inline))
 
+/* Branch weights (D-958): the ways out of lifted code (a runtime call that stops, an attention poll that finds a
+ * request, a callee that does not come back to its call, a halt that holds) are almost never taken, and a function is
+ * almost always entered at its entry. */
+#define PSL_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define PSL_LIKELY(x) __builtin_expect(!!(x), 1)
+
 /* ---- vector types (all 16 bytes; casts between them are free bit casts) ---- */
 typedef uint32_t ps_spu_vec __attribute__((vector_size(16), aligned(16)));
 typedef uint8_t psv_u8 __attribute__((vector_size(16)));
@@ -62,10 +68,20 @@ PSL ps_spu_vec psl_ld(const SPUContext* ctx, unsigned r)
 }
 PSL void psl_st(SPUContext* ctx, unsigned r, ps_spu_vec v) { memcpy(&ctx->gpr[r], &v, 16); }
 
+/* A quadword's bytes reversed (D-004), on every local store access. As a shuffle the compiler makes it rev64 and ext,
+ * two permutes; one table lookup does it, but the compiler turns a lookup with a constant index back into the two, so
+ * the index goes through an empty asm it cannot see into (kept in a register through loops). Apple clang built one of
+ * GTA V's programs wrong with the table lookup (D-253): only other compilers, the phone's among them, take it (D-964). */
 PSL ps_spu_vec psl_rev(ps_spu_vec v)
 {
+#if defined(__aarch64__) && !defined(__apple_build_version__)
+    uint8x16_t index = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+    __asm__("" : "+w"(index));
+    return (ps_spu_vec)vqtbl1q_u8((uint8x16_t)v, index);
+#else
     const psv_u8 b = (psv_u8)v;
     return (ps_spu_vec)__builtin_shufflevector(b, b, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+#endif
 }
 PSL ps_spu_vec psl_lq(const uint8_t* ls, uint32_t addr)
 {
@@ -267,6 +283,20 @@ PSL ps_spu_vec psl_shufb(ps_spu_vec a, ps_spu_vec b, ps_spu_vec c)
 #endif
 }
 
+/* shufb with ra == rb (D-963): both halves of the table are the same register, so one TBL over it does (a third of
+ * GTA V's shufb sites; the two-register table needs its registers consecutive, often a move each) */
+PSL ps_spu_vec psl_shufb1(ps_spu_vec a, ps_spu_vec c)
+{
+#if defined(__aarch64__)
+    const uint8x16_t cc = (uint8x16_t)c;
+    const uint8x16_t picked = vqtbl1q_u8((uint8x16_t)a, vbicq_u8(vdupq_n_u8(0x0F), cc));
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    return (ps_spu_vec)vqtbx1q_u8(picked, special, vshrq_n_u8(veorq_u8(cc, vdupq_n_u8(0x80)), 3));
+#else
+    return psl_shufb(a, a, c);
+#endif
+}
+
 /* cbd/chd/cwd/cdd and x forms: identity mask over rb bytes with an insertion slot for `size` bytes at addr */
 PSL ps_spu_vec psl_cmask(uint32_t addr, uint32_t size)
 {
@@ -278,6 +308,51 @@ PSL ps_spu_vec psl_cmask(uint32_t addr, uint32_t size)
     const psv_u8 ins = g + (uint8_t)(first - t);
     return (ps_spu_vec)((ins & in) | ((g + 0x10) & ~in));
 }
+
+/* The same as a table (D-963), [size index: 1, 2, 4, 8 bytes][addr & 15]: psl_cmask(addr, 1 << s) */
+static const ps_spu_vec psl_cmask_table[4][16] __attribute__((unused)) = {
+    {
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x03111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10031213u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10110313u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10111203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x03151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14031617u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14150317u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151603u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x03191A1Bu, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x18031A1Bu, 0x14151617u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x1819031Bu, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A03u, 0x14151617u, 0x10111213u},
+        {0x031D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x1C031E1Fu, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+        {0x1C1D031Fu, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x1C1D1E03u, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+    },
+    {
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x02031213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x02031213u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10110203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x10110203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x02031617u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x02031617u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14150203u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14150203u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x02031A1Bu, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x02031A1Bu, 0x14151617u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x18190203u, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x18190203u, 0x14151617u, 0x10111213u},
+        {0x02031E1Fu, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x02031E1Fu, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+        {0x1C1D0203u, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x1C1D0203u, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+    },
+    {
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x00010203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x14151617u, 0x00010203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x00010203u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x00010203u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x00010203u, 0x10111213u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x00010203u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x00010203u, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x00010203u, 0x14151617u, 0x10111213u},
+        {0x1C1D1E1Fu, 0x00010203u, 0x14151617u, 0x10111213u}, {0x1C1D1E1Fu, 0x00010203u, 0x14151617u, 0x10111213u},
+        {0x00010203u, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x00010203u, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+        {0x00010203u, 0x18191A1Bu, 0x14151617u, 0x10111213u}, {0x00010203u, 0x18191A1Bu, 0x14151617u, 0x10111213u},
+    },
+    {
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u},
+        {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u}, {0x1C1D1E1Fu, 0x18191A1Bu, 0x04050607u, 0x00010203u},
+        {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u}, {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u},
+        {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u}, {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u},
+        {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u}, {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u},
+        {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u}, {0x04050607u, 0x00010203u, 0x14151617u, 0x10111213u},
+    },
+};
+PSL ps_spu_vec psl_cmask_t(uint32_t addr, unsigned s) { return psl_cmask_table[s][addr & 0xFu]; }
 
 /* ---- element shifts and rotates: count vectors (register forms) ---- */
 
@@ -521,6 +596,20 @@ PSL ps_spu_vec psl_cuflt(ps_spu_vec x, unsigned i8, int accurate)
     }
     return r;
 }
+#if defined(__aarch64__)
+/* csflt/cuflt in the approximate model with a scale of 2^-n, n = 155 - i8 from 1 to 32 (psl_csflt0/psl_cuflt0: 0), in
+ * NEON (D-963): SCVTF/UCVTF with n fraction bits round x / 2^n once, toward zero as FPCR says, which is what the
+ * double-precision path's one rounding of the exact quotient gives; no result is denormal. n must be a constant. */
+#define PSL_CSFLT_N(x, n) ((ps_spu_vec)vcvtq_n_f32_s32((int32x4_t)(x), (n)))
+#define PSL_CUFLT_N(x, n) ((ps_spu_vec)vcvtq_n_f32_u32((uint32x4_t)(x), (n)))
+PSL ps_spu_vec psl_csflt0(ps_spu_vec x) { return (ps_spu_vec)vcvtq_f32_s32((int32x4_t)x); }
+PSL ps_spu_vec psl_cuflt0(ps_spu_vec x) { return (ps_spu_vec)vcvtq_f32_u32((uint32x4_t)x); }
+#else
+#define PSL_CSFLT_N(x, n) psl_csflt((x), 155u - (n), 0)
+#define PSL_CUFLT_N(x, n) psl_cuflt((x), 155u - (n), 0)
+PSL ps_spu_vec psl_csflt0(ps_spu_vec x) { return psl_csflt(x, 155u, 0); }
+PSL ps_spu_vec psl_cuflt0(ps_spu_vec x) { return psl_cuflt(x, 155u, 0); }
+#endif
 #if defined(__aarch64__)
 /* cflts/cfltu in NEON (D-215) when the scale 2^(173 - i8) is a normal float: x times it is exact or past the integer
  * range, and FCVTZS/FCVTZU truncate and saturate as the SPU does. The SPU's own float range: exponent 0 is zero, and

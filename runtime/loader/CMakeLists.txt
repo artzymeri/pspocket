@@ -54,6 +54,13 @@ elseif(PSPOCKET_GAME_SPU)
     if(NOT pspocket_game_spu_sources)
         message(FATAL_ERROR "PSPOCKET_GAME_SPU=${PSPOCKET_GAME_SPU} holds no lifted programs")
     endif()
+    # The cold twins of the translated functions (spu-lift's N_resume_*.c, D-961) at -O1: half the compile time, and
+    # they run only when the run loop resumes a function after a label.
+    set(pspocket_game_spu_twins ${pspocket_game_spu_sources})
+    list(FILTER pspocket_game_spu_twins INCLUDE REGEX "_resume_[0-9]+\\.c$")
+    if(pspocket_game_spu_twins)
+        set_source_files_properties(${pspocket_game_spu_twins} PROPERTIES COMPILE_OPTIONS -O1)
+    endif()
     add_library(pspocket_game_spu STATIC ${pspocket_game_spu_sources})
     target_link_libraries(pspocket_game_spu PRIVATE pspocket::spu)
     pspocket_set_warnings(pspocket_game_spu)

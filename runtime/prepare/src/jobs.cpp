@@ -71,6 +71,12 @@ codegen::BuildJob job_for(const fs::path& source, bool spu, const std::string& h
     if (!headers.empty()) j.defines = {headers};
     j.extra_args = spu ? spu_args : ppu_args;
     j.cost = e.seconds;
+    // The cold twins of translated SPU functions (spu-lift's N_resume_*.c, D-961) at -O1: they run only when the run
+    // loop resumes a function after a label, and compile in half the time (GTA V's EDGE job's: 7.6 s for 16.0 at -O2).
+    if (kind == codegen::FileKind::SpuCode && name.find("_resume_") != std::string::npos) {
+        j.extra_args.push_back("-O1");
+        j.cost *= 0.5;
+    }
     j.memory_mb = e.memory_mb;
     j.group = static_cast<int>(kind);
     return j;

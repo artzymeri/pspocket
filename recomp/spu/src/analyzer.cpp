@@ -6,6 +6,7 @@
 #include <deque>
 #include <format>
 
+#include "pspocket/spu/context.h"
 #include "pspocket/spu/disasm.hpp"
 
 namespace pspocket::recomp::spu {
@@ -258,7 +259,7 @@ private:
             const u32 fl = inst.flags();
             const u32 next = a + 4;
             // Instructions that may stop and be resumed (blocking channels, halts, exceptions) restart in place.
-            if (use.runtime) f.labels.insert(a);
+            if (use.runtime && restarts_in_place(inst)) f.labels.insert(a);
 
             switch (inst.op) {
             case Op::STOP:
@@ -270,7 +271,7 @@ private:
             default: break;
             }
 
-            if (fl & OPF_BRANCH) {
+            if ((fl & OPF_BRANCH) && !get_pc(inst, a)) {
                 if (inst.info().fmt == Fmt::RI16_BR && (fl & OPF_ABS) && options_.relocatable) {
                     if (fl & OPF_CALL) f.labels.insert(next); // brasl: returns here through the run loop
                     else return;                               // bra
@@ -308,6 +309,30 @@ private:
 };
 
 } // namespace
+
+bool inline_channel_write(const Inst& inst)
+{
+    if (inst.op != Op::WRCH) return false;
+    switch (inst.channel()) {
+    case PS_SPU_WrSRR0:
+    case PS_MFC_LSA:
+    case PS_MFC_EAH:
+    case PS_MFC_EAL:
+    case PS_MFC_Size:
+    case PS_MFC_TagID: return true;
+    default: return false;
+    }
+}
+
+bool get_pc(const Inst& inst, u32 pc) { return inst.op == Op::BRSL && branch_target(inst, pc) == ((pc + 4) & PS_SPU_PC_MASK); }
+
+bool restarts_in_place(const Inst& inst)
+{
+    if (inst.op == Op::RCHCNT) return false;
+    if (inst.op == Op::WRCH)
+        return !inline_channel_write(inst) && inst.channel() != PS_MFC_WrTagMask && inst.channel() != PS_MFC_WrTagUpdate;
+    return true;
+}
 
 const Function* Program::find(u32 entry) const
 {

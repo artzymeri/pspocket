@@ -386,6 +386,9 @@ TEST_CASE("program-level fuzz: a lifted program agrees with the interpreter wher
         // Stops in callees (D-247).
         CHECK(gw(lifted.gpr[48], 0) == 0x4747 + 0x47);
         CHECK(gw(lifted.gpr[51], 0) == 0x5050 + 0x4A);
+        // brsl $53, .+4 (D-963).
+        CHECK(gw(lifted.gpr[53], 0) == ((gw(lifted.gpr[53], 0) & 0x3FFFCu)));
+        CHECK(gw(lifted.gpr[54], 0) == gw(lifted.gpr[53], 0) + 16);
         // Lifted code ran throughout: the misses are the stub, outside the program, called twice.
         CHECK(lifted.program == program);
         CHECK(ps_spu_miss_count() - misses == 2);

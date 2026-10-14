@@ -68,4 +68,19 @@ struct Program {
 
 Program analyze(const LsImage& image, const AnalyzerOptions& options = {});
 
+// A channel write the lifter makes a plain store of ctx (D-959): SPU_WrSRR0 and the MFC's command parameters (MFC_LSA,
+// MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID), which ps_spu_wrch only stores. No runtime call, no way out.
+bool inline_channel_write(const ::pspocket::spu::Inst& inst);
+
+// brsl $rt, .+4: the code takes its own address (position independent code): rt is written and the code falls
+// through, no call (D-963).
+bool get_pc(const ::pspocket::spu::Inst& inst, u32 pc);
+
+// Whether the code for a supported instruction that calls the runtime (RegUse::runtime) may leave for the run loop and
+// be resumed at the instruction itself, which then starts a block (a label): a channel that may block (the run loop
+// takes a stop request while it waits and executes it again), a halt, an interrupt taken at an indirect branch, a stop.
+// The inline channel writes never leave, and MFC_WrTagMask, MFC_WrTagUpdate and rchcnt never block: they leave only
+// on an SPU exception, which ends the thread (D-959).
+bool restarts_in_place(const ::pspocket::spu::Inst& inst);
+
 } // namespace pspocket::recomp::spu

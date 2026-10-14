@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 
+#include "pspocket/core/log.hpp"
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/decoder.hpp"
 #include "pspocket/spu/disasm.hpp"
@@ -97,7 +98,7 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     const auto imm8 = [&](const char* fn, u32 v) { set(std::format("{}({}, psl_splat8(0x{:X}))", fn, R(ra), v & 0xFF)); };
     const auto interrupts = [&]() -> std::string {
         if (!inst.e() && !inst.d()) return {};
-        return std::format("    if (ps_spu_set_interrupts(ctx, {})) goto exit_spill;\n", inst.e() ? 1 : 0);
+        return std::format("    if (PSL_UNLIKELY(ps_spu_set_interrupts(ctx, {}))) goto exit_spill;\n", inst.e() ? 1 : 0);
     };
     const u32 si10 = static_cast<u32>(inst.si10());
     const u32 i7 = inst.i7();
@@ -117,21 +118,34 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
         const u32 code = inst.op == Op::STOP ? inst.stop_signal() : 0x3FFF;
         if (spill_around_stop) {
             o += flow.spill_for_stop();
-            o += std::format("    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_now;\n", flow.pc(a), code);
+            o += std::format("    if (PSL_UNLIKELY(ps_spu_stop(ctx, {}, 0x{:X}u))) goto exit_now;\n", flow.pc(a), code);
             o += flow.reload_after_stop();
         } else {
-            o += std::format("    if (ps_spu_stop(ctx, {}, 0x{:X}u)) goto exit_spill;\n", flow.pc(a), code);
+            o += std::format("    if (PSL_UNLIKELY(ps_spu_stop(ctx, {}, 0x{:X}u))) goto exit_spill;\n", flow.pc(a), code);
         }
         return true;
     }
     case Op::MFSPR: set("psl_splat32(0u)"); return true;
     case Op::RDCH:
     case Op::RCHCNT:
-        o += std::format("    {{\n        uint32_t v;\n        if ({}(ctx, {}, {}u, &v)) goto exit_spill;\n        {} = psl_pref(v);\n    }}\n",
+        o += std::format("    {{\n        uint32_t v;\n        if (PSL_UNLIKELY({}(ctx, {}, {}u, &v))) goto exit_spill;\n        {} = psl_pref(v);\n    }}\n",
             inst.op == Op::RDCH ? "ps_spu_rdch" : "ps_spu_rchcnt", flow.pc(a), inst.channel(), R(rt));
         return true;
     case Op::WRCH:
-        o += std::format("    if (ps_spu_wrch(ctx, {}, {}u, {})) goto exit_spill;\n", flow.pc(a), inst.channel(), P(rt));
+        // What ps_spu_wrch does for these (runtime/spu/src/channels.cpp), inline (D-959): a DMA's parameters are five
+        // channel writes, each was a call, a way out and a block start.
+        switch (inst.channel()) {
+        case PS_SPU_WrSRR0: o += std::format("    ctx->srr0 = {} & 0x3FFFCu;\n", P(rt)); return true;
+        case PS_MFC_LSA: o += std::format("    ctx->ch.mfc_lsa = {};\n", P(rt)); return true;
+        case PS_MFC_EAH: o += std::format("    ctx->ch.mfc_eah = {};\n", P(rt)); return true;
+        case PS_MFC_EAL: o += std::format("    ctx->ch.mfc_eal = {};\n", P(rt)); return true;
+        case PS_MFC_Size:
+            o += std::format("    {{\n        const uint32_t v = {};\n        ctx->ch.mfc_size = v < 0xFFFFu ? v : 0xFFFFu;\n    }}\n", P(rt));
+            return true;
+        case PS_MFC_TagID: o += std::format("    ctx->ch.mfc_tag = {} & 0x1Fu;\n", P(rt)); return true;
+        default: break;
+        }
+        o += std::format("    if (PSL_UNLIKELY(ps_spu_wrch(ctx, {}, {}u, {}))) goto exit_spill;\n", flow.pc(a), inst.channel(), P(rt));
         return true;
 
     // ---- halts ----
@@ -150,7 +164,7 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
         case Op::HGTI: cond = std::format("(int32_t){} > {}", P(ra), inst.si10()); break;
         default: cond = std::format("{} > {}", P(ra), hex32(si10)); break;
         }
-        o += std::format("    if ({}) {{\n        ps_spu_halt(ctx, {});\n        goto exit_spill;\n    }}\n", cond, flow.pc(a));
+        o += std::format("    if (PSL_UNLIKELY({})) {{\n        ps_spu_halt(ctx, {});\n        goto exit_spill;\n    }}\n", cond, flow.pc(a));
         return true;
     }
 
@@ -182,6 +196,7 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     }
     case Op::BRSL:
         set(std::format("psl_pref({})", flow.pc(ret)));
+        if (get_pc(inst, a)) return true; // brsl $rt, .+4: the code takes its own address (D-963)
         o += flow.call(branch_target(inst, a), ret);
         return false;
     case Op::BRASL:
@@ -207,7 +222,7 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::BISLED:
         o += std::format("    {{\n        const uint32_t target = {} & 0x3FFFCu;\n", P(ra));
         o += std::format("        {} = psl_pref({});\n", R(rt), flow.pc(ret));
-        o += "        if (ps_spu_events_pending(ctx)) {\n            ctx->pc = target;\n";
+        o += "        if (PSL_UNLIKELY(ps_spu_events_pending(ctx))) {\n            ctx->pc = target;\n";
         o += interrupts();
         o += flow.jump_dynamic();
         o += "        }\n    }\n";
@@ -303,7 +318,13 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::XORBI: imm8("psl_xor", inst.i10()); return true;
     case Op::ORX: un("psl_orx"); return true;
     case Op::SELB: quad("psl_selb"); return true;
-    case Op::SHUFB: quad("psl_shufb"); return true;
+    case Op::SHUFB:
+        if (ra == rb) { // one table register (D-963)
+            o += std::format("    {} = psl_shufb1({}, {});\n", R(rt4), R(ra), R(rc));
+            return true;
+        }
+        quad("psl_shufb");
+        return true;
 
     // ---- compares ----
     case Op::CEQ: bin("psl_ceq"); return true;
@@ -357,20 +378,21 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::SHLQBYBI: set(std::format("psl_shlqby({}, ({} >> 3) & 0x1Fu)", R(ra), P(rb))); return true;
     case Op::ROTQBYBI: set(std::format("psl_rotqby({}, ({} >> 3) & 0xFu)", R(ra), P(rb))); return true;
     case Op::ROTQMBYBI: set(std::format("psl_rotqmby({}, (0u - ({} >> 3)) & 0x1Fu)", R(ra), P(rb))); return true;
+    // The insertion masks from a table (D-963): the size index 0 to 3 for 1, 2, 4 and 8 bytes.
     case Op::CBD:
     case Op::CHD:
     case Op::CWD:
     case Op::CDD: {
-        const u32 size = inst.op == Op::CBD ? 1 : inst.op == Op::CHD ? 2 : inst.op == Op::CWD ? 4 : 8;
-        set(std::format("psl_cmask({} + {}, {}u)", P(ra), hex32(static_cast<u32>(inst.si7())), size));
+        const u32 s = inst.op == Op::CBD ? 0 : inst.op == Op::CHD ? 1 : inst.op == Op::CWD ? 2 : 3;
+        set(std::format("psl_cmask_t({} + {}, {}u)", P(ra), hex32(static_cast<u32>(inst.si7())), s));
         return true;
     }
     case Op::CBX:
     case Op::CHX:
     case Op::CWX:
     case Op::CDX: {
-        const u32 size = inst.op == Op::CBX ? 1 : inst.op == Op::CHX ? 2 : inst.op == Op::CWX ? 4 : 8;
-        set(std::format("psl_cmask({} + {}, {}u)", P(ra), P(rb), size));
+        const u32 s = inst.op == Op::CBX ? 0 : inst.op == Op::CHX ? 1 : inst.op == Op::CWX ? 2 : 3;
+        set(std::format("psl_cmask_t({} + {}, {}u)", P(ra), P(rb), s));
         return true;
     }
 
@@ -388,8 +410,17 @@ bool lower(std::string& o, const Inst& inst, u32 a, const Flow& flow, u8 xfloat,
     case Op::FREST: un("psl_frest"); return true;
     case Op::FRSQEST: un("psl_frsqest"); return true;
     case Op::FI: bin("psl_fi"); return true;
-    case Op::CSFLT: set(std::format("psl_csflt({}, {}u, {})", R(ra), inst.i8(), acc ? 1 : 0)); return true;
-    case Op::CUFLT: set(std::format("psl_cuflt({}, {}u, {})", R(ra), inst.i8(), acc ? 1 : 0)); return true;
+    case Op::CSFLT:
+    case Op::CUFLT: {
+        const char* name = inst.op == Op::CSFLT ? "csflt" : "cuflt";
+        // A scale of 2^-n, n from 0 to 32, in the approximate model: SCVTF/UCVTF with n fraction bits (D-963).
+        if (const u32 n = 155 - inst.i8(); !acc && inst.i8() <= 155 && n <= 32)
+            set(n ? std::format("PSL_{}_N({}, {})", inst.op == Op::CSFLT ? "CSFLT" : "CUFLT", R(ra), n)
+                  : std::format("psl_{}0({})", name, R(ra)));
+        else
+            set(std::format("psl_{}({}, {}u, {})", name, R(ra), inst.i8(), acc ? 1 : 0));
+        return true;
+    }
     case Op::CFLTS: set(std::format("psl_cflts({}, {}u)", R(ra), inst.i8())); return true;
     case Op::CFLTU: set(std::format("psl_cfltu({}, {}u)", R(ra), inst.i8())); return true;
     case Op::FSCRRD: o += std::format("    memcpy(&{}, &ctx->fpscr, 16);\n", R(rt)); return true;
@@ -458,6 +489,9 @@ std::string reg_decls(const RegSet& used)
 struct CallSummary {
     RegSet touched; // registers the callee and its callees may read or write through ctx
     RegSet written; // registers they may write
+    // The callee or a function it calls may leave for the run loop and come back through it (a stop, a call through a
+    // register or out of the program): the caller is then resumed after its call (D-961).
+    bool leaves = false;
 };
 
 RegSet all_regs()
@@ -481,7 +515,17 @@ RegSet without(const RegSet& a, const RegSet& b)
     return r;
 }
 
-std::map<u32, CallSummary> call_summaries(const LsImage& image, const Program& program)
+// Whether the call at a (brsl, brasl) leaves for the run loop and comes back through it: out of the program (an
+// absolute call in relocatable code, a target that is not lifted) or into a function that may (D-961).
+bool call_leaves(const Inst& inst, u32 a, const std::map<u32, CallSummary>& sums, const LiftOptions& options)
+{
+    if (inst.op == Op::BRASL && options.relocatable) return true;
+    if (options.boundaries.contains(branch_target(inst, a))) return true; // through the program's table (D-966)
+    const auto it = sums.find(branch_target(inst, a));
+    return it == sums.end() || it->second.leaves;
+}
+
+std::map<u32, CallSummary> call_summaries(const LsImage& image, const Program& program, const LiftOptions& options)
 {
     std::map<u32, CallSummary> sums;
     for (const Function& f : program.functions) {
@@ -489,12 +533,19 @@ std::map<u32, CallSummary> call_summaries(const LsImage& image, const Program& p
         for (u32 a : f.insns) {
             const Op op = decode(image.word(a)).op;
             if (op == Op::STOP || op == Op::STOPD || op == Op::BISL) {
-                s = {all_regs(), all_regs()};
+                s = {all_regs(), all_regs(), true};
                 break;
             }
         }
         sums.emplace(f.entry, s);
     }
+    for (const Function& f : program.functions) // calls and jumps out of the program
+        for (u32 a : f.insns) {
+            const Inst inst = decode(image.word(a));
+            if (((inst.op == Op::BRSL && !get_pc(inst, a)) || inst.op == Op::BRASL) && call_leaves(inst, a, sums, options))
+                sums.at(f.entry).leaves = true;
+            if (inst.op == Op::BRA && options.relocatable) sums.at(f.entry).leaves = true;
+        }
     for (bool changed = true; changed;) { // the callees' sets, to a fixpoint (calls may recurse)
         changed = false;
         for (const Function& f : program.functions) {
@@ -505,8 +556,9 @@ std::map<u32, CallSummary> call_summaries(const LsImage& image, const Program& p
                 if (it == sums.end()) continue; // not lifted: the call leaves for the run loop
                 s.touched |= it->second.touched;
                 s.written |= it->second.written;
+                s.leaves |= it->second.leaves;
             }
-            changed |= !(s.touched == before.touched && s.written == before.written);
+            changed |= !(s.touched == before.touched && s.written == before.written && s.leaves == before.leaves);
         }
     }
     return sums;
@@ -526,6 +578,12 @@ std::string loads(const RegSet& regs)
     for (u32 r = 0; r < 128; r++)
         if (regs.test(r)) o += std::format(" r{} = psl_ld(ctx, {});", r, r);
     return o;
+}
+
+// loads() as a statement line of its own, or nothing.
+std::string load_line(const RegSet& regs, std::string_view indent = "   ")
+{
+    return regs.empty() ? std::string() : std::format("{}{}\n", indent, loads(regs));
 }
 
 // ---- step mode ----
@@ -563,6 +621,12 @@ struct RegSetLess {
     bool operator()(const RegSet& a, const RegSet& b) const { return a.bits < b.bits; }
 };
 
+// How a function's C is entered (D-961). Whole: one C function entered at any label (a switch on ctx->pc), the run
+// loop's resume points inside its loops make them irreducible to the C compiler. Fast: entered at its entry and at
+// the few labels fast_entries() picks; it holds the code reachable from those. Twin: the cold copy the run loop
+// resumes every other label in, which leaves for the run loop at a backward branch to one of those labels.
+enum class Mode { Whole, Fast, Twin };
+
 class RegFlow {
 public:
     struct Node {
@@ -579,9 +643,12 @@ public:
         std::vector<usize> targets; // local branch targets (indexes)
     };
 
+    // entries: the labels besides its entry the fast function is entered at (fast_entries()). Without analyze only the
+    // instructions' flow is made (successors()).
     RegFlow(const LsImage& image, const Function& f, const std::map<u32, std::string>& symbols,
-        const std::map<u32, CallSummary>& sums, const LiftOptions& options)
-        : f_(f)
+        const std::map<u32, CallSummary>& sums, const LiftOptions& options, Mode mode = Mode::Whole,
+        const std::set<u32>& entries = {}, bool analyze = true)
+        : f_(f), mode_(mode), fast_entries_(entries)
     {
         for (usize i = 0; i < f.insns.size(); i++) index_.emplace(f.insns[i], i);
         nodes_.resize(f.insns.size());
@@ -594,10 +661,44 @@ public:
             }
         }
         for (u32 l : f.dynamic) dynamic_.push_back(index_.at(l));
+        if (!analyze) return;
         dirty_.resize(nodes_.size());
         live_.resize(nodes_.size());
+        reach();
         forward();
         backward();
+        lazy_loads();
+    }
+
+    usize size() const { return nodes_.size(); }
+    // Calls visit(successor, through an indirect jump) for each way instruction u goes on in this C function.
+    template <class Visit>
+    void successors(usize u, const Visit& visit) const
+    {
+        const Node& n = nodes_[u];
+        for (usize t : n.targets) visit(t, false);
+        if (n.dispatch)
+            for (usize l : dynamic_) visit(l, true);
+        if (n.falls)
+            if (const auto j = next(u)) visit(*j, false);
+        if (n.call || n.call_dynamic)
+            if (const auto j = ret_index(n)) visit(*j, false);
+    }
+
+    // Whether label is one the fast function is entered at besides its entry.
+    bool fast_entry(u32 label) const { return fast_entries_.contains(label); }
+    // Whether the instruction is part of this C function (Fast and Twin hold what their entries reach).
+    bool reachable(usize i) const { return reachable_[i]; }
+    // The labels the run loop enters this C function at: every label (Whole), the fast entries but the entry (Fast:
+    // they load their live registers, D-961), every label but the entry and those (Twin).
+    bool resume_root(u32 label) const
+    {
+        switch (mode_) {
+        case Mode::Whole: return f_.labels.contains(label);
+        case Mode::Fast: return fast_entries_.contains(label) && label != f_.entry;
+        case Mode::Twin: return f_.labels.contains(label) && label != f_.entry && !fast_entries_.contains(label);
+        }
+        return false;
     }
 
     const Node& node(usize i) const { return nodes_[i]; }
@@ -631,6 +732,16 @@ public:
         return it == index_.end() ? std::nullopt : std::optional<usize>(it->second);
     }
 
+    // Lazy loads (D-960): the registers loaded when the function is called at its entry, on the edge from instruction
+    // `from` to its successor `to` (a fall-through, a branch, a call's return), and before an indirect jump that may go
+    // on at the function's dynamic labels.
+    const RegSet& entry_loads() const { return entry_loads_; }
+    RegSet edge_loads(usize from, usize to) const { return without(live_[to] & uni_[to], vout_[from]); }
+    RegSet dispatch_loads(usize from) const { return without(dynamic_need_, vout_[from]); }
+    // Whether the function's entry loads had to take registers the lazy placement left unloaded somewhere (none is
+    // known: a safety net, counted in LiftStats::forced_loads).
+    bool forced() const { return forced_; }
+
 private:
     Node node(const LsImage& image, u32 a, const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums,
         const LiftOptions& options) const
@@ -647,8 +758,11 @@ private:
                 n.exit_post = true;
                 return;
             }
+            if (target <= a) {
+                n.exit_post = true; // the attention poll
+                if (mode_ == Mode::Twin && fast_entries_.contains(target)) return; // the twin leaves (D-961)
+            }
             n.targets.push_back(index_.at(target));
-            if (target <= a) n.exit_post = true; // the attention poll
         };
         const auto call = [&](u32 target) {
             n.ret = ret;
@@ -667,9 +781,12 @@ private:
         switch (inst.op) {
         case Op::STOP:
         case Op::STOPD: n.stop = n.falls = true; return n;
+        case Op::WRCH:
+            if (inline_channel_write(inst)) break; // a plain store (D-959)
+            n.exit_pre = n.falls = true;
+            return n;
         case Op::RDCH:
         case Op::RCHCNT:
-        case Op::WRCH:
         case Op::HEQ:
         case Op::HGT:
         case Op::HLGT:
@@ -688,7 +805,10 @@ private:
             jump(branch_target(inst, a));
             n.falls = true;
             return n;
-        case Op::BRSL: call(branch_target(inst, a)); return n;
+        case Op::BRSL:
+            if (get_pc(inst, a)) break; // falls through (D-963)
+            call(branch_target(inst, a));
+            return n;
         case Op::BRASL:
             if (options.relocatable) n.exit_post = true;
             else call(branch_target(inst, a));
@@ -726,6 +846,28 @@ private:
         return index(n.ret);
     }
 
+    void reach()
+    {
+        reachable_.assign(nodes_.size(), mode_ == Mode::Whole);
+        if (mode_ == Mode::Whole) return;
+        std::vector<usize> work;
+        const auto root = [&](usize i, bool) {
+            if (!reachable_[i]) {
+                reachable_[i] = true;
+                work.push_back(i);
+            }
+        };
+        if (mode_ == Mode::Fast)
+            if (const auto e = index(f_.entry); e && f_.labels.contains(f_.entry)) root(*e, false);
+        for (u32 l : f_.labels)
+            if (resume_root(l)) root(index_.at(l), false);
+        while (!work.empty()) {
+            const usize u = work.back();
+            work.pop_back();
+            successors(u, root);
+        }
+    }
+
     void forward()
     {
         for (bool changed = true; changed;) {
@@ -739,6 +881,7 @@ private:
                 }
             };
             for (usize i = 0; i < nodes_.size(); i++) {
+                if (!reachable_[i]) continue;
                 const Node& n = nodes_[i];
                 const RegSet def = dirty_def(i);
                 for (usize t : n.targets) flow_to(t, def);
@@ -790,12 +933,161 @@ private:
         }
     }
 
+    // ---- lazy loads (D-960)
+    //
+    // The live set above counts every store of dirty registers as a read, so a register written on one path only had
+    // to be loaded at the entry for the stores of the paths that skip its write (60% of GTA V's entry loads were never
+    // read before they were written). Now the entry loads only the registers read before they are written ("real"
+    // liveness, where a store does not count), and a register is loaded where a path whose local does not hold it
+    // joins one whose local does, when the join needs it (live there): usually a cold edge, or the edge into a loop.
+    // A forward must-analysis gives, before each instruction, the registers whose locals hold ctx's value on every
+    // path ("valid"); an edge loads what its target needs (live) and some other edge into it has valid. Started from
+    // everything valid, it settles on the edges into loops rather than inside them. Then every read and every store
+    // of dirty registers is checked against it; a register that fails is loaded at the entry (none known).
+
+    struct Pred {
+        usize from;
+        bool dispatch; // an indirect jump into the dynamic labels
+    };
+
+    void real_backward()
+    {
+        rl_.assign(nodes_.size(), {});
+        for (bool changed = true; changed;) {
+            changed = false;
+            RegSet dynamic_rl;
+            for (usize l : dynamic_) dynamic_rl |= rl_[l];
+            for (usize k = nodes_.size(); k-- > 0;) {
+                const Node& n = nodes_[k];
+                RegSet after;
+                for (usize t : n.targets) after |= rl_[t];
+                if (n.dispatch) after |= dynamic_rl;
+                if (n.falls && !n.stop)
+                    if (const auto j = next(k)) after |= rl_[*j];
+                if (n.call)
+                    if (const auto j = ret_index(n)) after |= without(rl_[*j], n.sum->written);
+                RegSet in = n.read;
+                in |= without(after, n.write);
+                if (!(in == rl_[k])) {
+                    rl_[k] = in;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    RegSet transfer(usize v, const RegSet& vin) const
+    {
+        const Node& n = nodes_[v];
+        if (n.stop) return live_at(f_.insns[v] + 4); // reloaded after it
+        if (n.call_dynamic) return live_at(n.ret);
+        RegSet o = vin;
+        o |= n.write;
+        if (n.call) {
+            o = without(o, n.sum->written);
+            o |= live_at(n.ret) & n.sum->written;
+        }
+        return o;
+    }
+
+    void valid_forward(const RegSet& entry_set, const std::vector<std::vector<Pred>>& preds)
+    {
+        const usize count = nodes_.size();
+        const RegSet all = all_regs();
+        vin_.assign(count, all);
+        vout_.assign(count, all);
+        uni_.assign(count, all);
+        const auto e = entry_edge();
+        for (bool changed = true; changed;) {
+            changed = false;
+            dynamic_need_ = {};
+            for (usize l : dynamic_)
+                if (reachable_[l]) dynamic_need_ |= live_[l] & uni_[l];
+            for (usize v = 0; v < count; v++) {
+                if (!reachable_[v]) continue;
+                // A resume root of Whole or Twin is entered with every register it uses loaded (PSL_RELOAD): that
+                // edge takes nothing from the intersection. A Fast entry is entered with its live registers.
+                RegSet inter = all, uni;
+                if (e && *e == v) inter = uni = entry_set;
+                if (mode_ == Mode::Fast && resume_root(f_.insns[v])) inter = inter & live_[v];
+                for (const Pred& p : preds[v]) {
+                    RegSet vo = vout_[p.from];
+                    if (p.dispatch) vo |= dynamic_need_;
+                    inter = inter & vo;
+                    uni |= vo;
+                }
+                RegSet vin = inter;
+                vin |= live_[v] & uni;
+                const RegSet vout = transfer(v, vin);
+                if (!(vin == vin_[v]) || !(vout == vout_[v]) || !(uni == uni_[v])) {
+                    vin_[v] = vin;
+                    vout_[v] = vout;
+                    uni_[v] = uni;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // The entry when the function is called there (not in the twin).
+    std::optional<usize> entry_edge() const
+    {
+        if (mode_ == Mode::Twin || !f_.labels.contains(f_.entry)) return std::nullopt;
+        return index(f_.entry);
+    }
+
+    // The registers a read or a store of dirty registers finds not valid.
+    RegSet unmet() const
+    {
+        RegSet missing;
+        const auto need = [&](const RegSet& want, const RegSet& have) { missing |= without(want, have); };
+        for (usize i = 0; i < nodes_.size(); i++) {
+            if (!reachable_[i]) continue;
+            const Node& n = nodes_[i];
+            RegSet pre = n.read;
+            if (n.exit_pre || n.stop) pre |= dirty_[i];
+            need(pre, vin_[i]);
+            RegSet def_valid = vin_[i];
+            def_valid |= n.write;
+            if (n.exit_post || n.dispatch || n.call || n.call_dynamic) need(dirty_def(i), def_valid);
+            if (n.falls && !next(i)) need(dirty_after(i), vout_[i]);
+            if ((n.call || n.call_dynamic) && !ret_index(n)) need(dirty_after(i), vout_[i]);
+        }
+        return missing;
+    }
+
+    void lazy_loads()
+    {
+        real_backward();
+        std::vector<std::vector<Pred>> preds(nodes_.size());
+        for (usize u = 0; u < nodes_.size(); u++)
+            if (reachable_[u]) successors(u, [&](usize v, bool dispatch) { preds[v].push_back({u, dispatch}); });
+        const auto e = entry_edge();
+        RegSet entry_set = e ? rl_[*e] : RegSet{};
+        valid_forward(entry_set, preds);
+        if (const RegSet missing = unmet(); !missing.empty()) {
+            forced_ = true;
+            PS_CHECK(e.has_value());
+            entry_set = live_[*e]; // as before D-960
+            valid_forward(entry_set, preds);
+            PS_CHECK(unmet().empty());
+        }
+        entry_loads_ = entry_set;
+        if (e) entry_loads_ |= live_[*e] & uni_[*e];
+    }
+
     const Function& f_;
     const std::set<u32>* boundaries_ = nullptr;
+    Mode mode_;
+    std::set<u32> fast_entries_;
     std::map<u32, usize> index_;
     std::vector<Node> nodes_;
     std::vector<usize> dynamic_;
+    std::vector<bool> reachable_;
     std::vector<RegSet> dirty_, live_;
+    std::vector<RegSet> rl_, vin_, vout_, uni_; // lazy loads: real liveness, valid sets, the join's union of valid sets
+    RegSet entry_loads_, dynamic_need_;
+    bool forced_ = false;
 };
 
 // ---- full mode ----
@@ -815,8 +1107,9 @@ public:
         if (f.dynamic.empty()) return exit(dirty);
         return std::format("dispatch_{}", dispatches_.emplace(dirty, dispatches_.size()).first->second);
     }
-    // The dispatch switches, then the exits.
-    std::string emit(const Function& f, bool relocatable)
+    // The run loop's switch over the labels it resumes this C function at (none: no switch), the dispatch switches,
+    // then the exits.
+    std::string emit(const Function& f, bool relocatable, const std::set<u32>& resume)
     {
         const std::string sw = relocatable ? "    switch ((ctx->pc - rel) & 0x3FFFFu) {\n" : "    switch (ctx->pc) {\n";
         const auto cases = [](const std::set<u32>& labels) {
@@ -824,7 +1117,7 @@ public:
             for (u32 l : labels) c += std::format("    case 0x{:05X}u: goto L_{:05X};\n", l, l);
             return c;
         };
-        std::string o = "dispatch:\n" + sw + cases(f.labels) + "    default: goto exit_now;\n    }\n";
+        std::string o = resume.empty() ? std::string() : "dispatch:\n" + sw + cases(resume) + "    default: goto exit_now;\n    }\n";
         const std::string dynamic = cases(f.dynamic);
         for (const auto& [dirty, n] : std::map<RegSet, usize, RegSetLess>(dispatches_))
             o += std::format("dispatch_{}:\n{}{}    default: goto {};\n    }}\n", n, sw, dynamic, exit(dirty));
@@ -839,8 +1132,8 @@ private:
 class FunctionFlow final : public Flow {
 public:
     FunctionFlow(const Function& f, const std::map<u32, std::string>& symbols, const RegFlow& regs, Exits& exits,
-        bool relocatable)
-        : Flow(relocatable), f_(f), symbols_(symbols), regs_(regs), exits_(&exits)
+        bool relocatable, bool twin)
+        : Flow(relocatable), f_(f), symbols_(symbols), regs_(regs), exits_(&exits), twin_(twin)
     {
     }
 
@@ -849,14 +1142,21 @@ public:
 
     std::string jump(u32 target, u32 from) const override
     {
-        if (!f_.labels.contains(target) || regs_.leaves(target, from)) return leave(target);
+        // The twin leaves at a backward branch to a fast entry: the run loop enters the fast function there (D-961).
+        if (!f_.labels.contains(target) || regs_.leaves(target, from) || (twin_ && target <= from && regs_.fast_entry(target)))
+            return leave(target);
+        const std::string go = load_line(regs_.edge_loads(i_, *regs_.index(target))) + std::format("    goto L_{:05X};\n", target);
         if (target <= from)
-            return std::format("    if (__atomic_load_n(&ctx->attention, __ATOMIC_RELAXED)) {{\n        ctx->pc = {};\n"
-                               "        goto exit_spill;\n    }}\n    goto L_{:05X};\n",
-                pc(target), target);
-        return std::format("    goto L_{:05X};\n", target);
+            return std::format("    if (PSL_UNLIKELY(__atomic_load_n(&ctx->attention, __ATOMIC_RELAXED))) {{\n        ctx->pc = {};\n"
+                               "        goto exit_spill;\n    }}\n{}",
+                pc(target), go);
+        return go;
     }
-    std::string jump_dynamic() const override { return std::format("    goto {};\n", exits_->dispatch(f_, regs_.dirty_def(i_))); }
+    std::string jump_dynamic() const override
+    {
+        const std::string go = std::format("    goto {};\n", exits_->dispatch(f_, regs_.dirty_def(i_)));
+        return f_.dynamic.empty() ? go : load_line(regs_.dispatch_loads(i_)) + go;
+    }
     std::string call(u32 target, u32 ret) const override
     {
         const auto it = symbols_.find(target);
@@ -871,8 +1171,8 @@ public:
         o += std::format("    ctx->pc = {};\n    {}(ctx, ls);\n", pc(target), it->second);
         // Not back here: store what the callee left alone, then return to the run loop.
         const std::string rest = stores(without(dirty, callee.touched));
-        o += rest.empty() ? std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n", pc(ret))
-                          : std::format("    if (ctx->pc != {} || ctx->stop_reason) {{\n       {}\n        goto exit_now;\n    }}\n",
+        o += rest.empty() ? std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) goto exit_now;\n", pc(ret))
+                          : std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) {{\n       {}\n        goto exit_now;\n    }}\n",
                                 pc(ret), rest);
         if (const std::string ld = loads(regs_.live_at(ret) & callee.written); !ld.empty()) o += "   " + ld + "\n";
         o += continue_at(ret);
@@ -880,7 +1180,7 @@ public:
     }
     std::string call_dynamic(u32 ret) const override
     {
-        return std::format("    {{\n        const ps_spu_fn fn = ps_spu_lookup(ctx, ctx->pc);\n        if (!fn) goto exit_spill;\n"
+        return std::format("    {{\n        const ps_spu_fn fn = ps_spu_lookup(ctx, ctx->pc);\n        if (PSL_UNLIKELY(!fn)) goto exit_spill;\n"
                            "       {}\n        fn(ctx, ls);\n    }}\n{}",
             stores(regs_.dirty_def(i_)), after_call(ret));
     }
@@ -894,19 +1194,21 @@ private:
     std::string after_call(u32 ret) const
     {
         // Continue only if the callee returned to us; otherwise ctx is current and the run loop takes over.
-        return std::format("    if (ctx->pc != {} || ctx->stop_reason) goto exit_now;\n   {}\n", pc(ret), loads(regs_.live_at(ret))) +
+        return std::format("    if (PSL_UNLIKELY(ctx->pc != {} || ctx->stop_reason)) goto exit_now;\n   {}\n", pc(ret), loads(regs_.live_at(ret))) +
             continue_at(ret);
     }
     std::string continue_at(u32 ret) const
     {
-        return f_.labels.contains(ret) ? std::format("    goto L_{:05X};\n", ret)
-                                       : std::format("    goto {};\n", exits_->exit(regs_.dirty_after(i_)));
+        return f_.labels.contains(ret)
+            ? load_line(regs_.edge_loads(i_, *regs_.index(ret))) + std::format("    goto L_{:05X};\n", ret)
+            : std::format("    goto {};\n", exits_->exit(regs_.dirty_after(i_)));
     }
 
     const Function& f_;
     const std::map<u32, std::string>& symbols_;
     const RegFlow& regs_;
     Exits* exits_;
+    bool twin_;
     usize i_ = 0;
 };
 
@@ -916,23 +1218,201 @@ std::string replace_all(std::string s, std::string_view from, std::string_view t
     return s;
 }
 
-std::string lift_function(const LsImage& image, const Function& f, const std::string& symbol,
-    const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums, const LiftOptions& options)
+// The labels the fast function is entered at besides its entry (D-961). The run loop resumes a function after a label
+// when it left there and came back: after a call that may leave for the run loop (out of the program, as the jobs'
+// calls of the SPURS kernel, or into a function that may), a stop, a call through a register, at a label reached
+// through a register, at a boundary (D-966). A fast function entered there in the middle of a loop would make the
+// loop irreducible to the C compiler, which then optimizes it no better than the one function entered at every label
+// did; so such a label is an entry only when it adds no second way into any cycle of the fast function's flow
+// (strongly connected components: a call that always leaves has no way on to its return, which often breaks the loop
+// around it), else the header of the outermost loop (by addresses) around it is, if that adds none, else the twin
+// keeps it. The twin leaves at a backward branch to an entry, so it runs the rest of one round of such a loop.
+std::set<u32> fast_entries(const LsImage& image, const Function& f, const std::map<u32, std::string>& symbols,
+    const std::map<u32, CallSummary>& sums, const LiftOptions& options)
 {
-    const RegFlow regs(image, f, symbols, sums, options);
+    std::vector<std::pair<u32, u32>> loops; // (header, back edge)
+    std::set<u32> resumed(f.dynamic.begin(), f.dynamic.end());
+    for (u32 a : f.insns) {
+        const Inst inst = decode(image.word(a));
+        const u32 next = (a + 4) & PS_SPU_PC_MASK;
+        switch (inst.op) {
+        case Op::BRA:
+            if (options.relocatable) break;
+            [[fallthrough]];
+        case Op::BR:
+        case Op::BRZ:
+        case Op::BRNZ:
+        case Op::BRHZ:
+        case Op::BRHNZ:
+            if (const u32 t = branch_target(inst, a); t <= a && f.labels.contains(t)) loops.emplace_back(t, a);
+            break;
+        case Op::BRSL:
+        case Op::BRASL:
+            if (!get_pc(inst, a) && call_leaves(inst, a, sums, options)) resumed.insert(next);
+            break;
+        case Op::STOP:
+        case Op::STOPD:
+        case Op::BISL: resumed.insert(next); break;
+        default: break;
+        }
+    }
+    // A boundary (D-966) is reached only through the program's table.
+    resumed.insert(options.boundaries.begin(), options.boundaries.end());
+    std::erase_if(resumed, [&](u32 l) { return l == f.entry || !f.labels.contains(l); });
+    if (resumed.empty()) return {};
+
+    const RegFlow g(image, f, symbols, sums, options, Mode::Fast, {}, false);
+    const usize n = g.size();
+    std::vector<std::vector<usize>> succ(n), pred(n);
+    for (usize u = 0; u < n; u++)
+        g.successors(u, [&](usize v, bool) {
+            succ[u].push_back(v);
+            pred[v].push_back(u);
+        });
+    // The second and further ways into the cycles of what the roots reach.
+    const auto extra_entries = [&](const std::vector<bool>& root) {
+        std::vector<bool> seen(n, false);
+        std::vector<usize> work;
+        for (usize i = 0; i < n; i++)
+            if (root[i]) {
+                seen[i] = true;
+                work.push_back(i);
+            }
+        while (!work.empty()) {
+            const usize u = work.back();
+            work.pop_back();
+            for (usize v : succ[u])
+                if (!seen[v]) {
+                    seen[v] = true;
+                    work.push_back(v);
+                }
+        }
+        // Tarjan's strongly connected components, iteratively.
+        std::vector<usize> order(n, ~usize{0}), low(n, 0), comp(n, ~usize{0}), stack;
+        std::vector<bool> on(n, false);
+        usize counter = 0, comps = 0;
+        std::vector<std::pair<usize, usize>> call; // (node, next successor)
+        for (usize s0 = 0; s0 < n; s0++) {
+            if (!seen[s0] || order[s0] != ~usize{0}) continue;
+            call.push_back({s0, 0});
+            order[s0] = low[s0] = counter++;
+            stack.push_back(s0);
+            on[s0] = true;
+            while (!call.empty()) {
+                auto& [u, k] = call.back();
+                if (k < succ[u].size()) {
+                    const usize v = succ[u][k++];
+                    if (order[v] == ~usize{0}) {
+                        order[v] = low[v] = counter++;
+                        stack.push_back(v);
+                        on[v] = true;
+                        call.push_back({v, 0});
+                    } else if (on[v]) {
+                        low[u] = std::min(low[u], order[v]);
+                    }
+                    continue;
+                }
+                const usize done = u;
+                call.pop_back();
+                if (!call.empty()) low[call.back().first] = std::min(low[call.back().first], low[done]);
+                if (low[done] == order[done]) {
+                    for (usize w = ~usize{0}; w != done;) {
+                        w = stack.back();
+                        stack.pop_back();
+                        on[w] = false;
+                        comp[w] = comps;
+                    }
+                    comps++;
+                }
+            }
+        }
+        std::vector<usize> members(comps, 0), entries(comps, 0);
+        std::vector<bool> cyclic(comps, false);
+        for (usize v = 0; v < n; v++)
+            if (seen[v]) {
+                members[comp[v]]++;
+                for (usize w : succ[v])
+                    if (w == v) cyclic[comp[v]] = true;
+            }
+        for (usize v = 0; v < n; v++) {
+            if (!seen[v]) continue;
+            bool entry = root[v];
+            for (usize u : pred[v])
+                if (seen[u] && comp[u] != comp[v]) entry = true;
+            if (entry) entries[comp[v]]++;
+        }
+        usize extra = 0;
+        for (usize c = 0; c < comps; c++)
+            if ((members[c] > 1 || cyclic[c]) && entries[c] > 1) extra += entries[c] - 1;
+        return extra;
+    };
+    std::vector<bool> root(n, false);
+    if (const auto e = g.index(f.entry)) root[*e] = true;
+    const usize base = extra_entries(root);
+    std::set<u32> out;
+    const auto try_add = [&](u32 label) {
+        const usize i = *g.index(label);
+        if (root[i]) return true;
+        root[i] = true;
+        if (extra_entries(root) <= base) {
+            out.insert(label);
+            return true;
+        }
+        root[i] = false;
+        return false;
+    };
+    for (u32 r : resumed) {
+        if (try_add(r)) continue;
+        std::optional<std::pair<u32, u32>> outer;
+        for (const auto& l : loops)
+            if (l.first <= r && r <= l.second && (!outer || l.first < outer->first || (l.first == outer->first && l.second > outer->second)))
+                outer = l;
+        if (outer && outer->first != f.entry) try_add(outer->first);
+    }
+    return out;
+}
+
+// One C function for f in the given mode (Whole, Fast or Twin). `twin` names the twin a fast function hands every
+// other label to ("": none).
+std::string emit_function(const LsImage& image, const Function& f, const std::string& symbol, const std::string& twin,
+    const std::map<u32, std::string>& symbols, const std::map<u32, CallSummary>& sums, const LiftOptions& options,
+    Mode mode, const std::set<u32>& entries, LiftStats& stats)
+{
+    const RegFlow regs(image, f, symbols, sums, options, mode, entries);
+    if (regs.forced()) stats.forced_loads++;
     Exits exits;
-    FunctionFlow flow(f, symbols, regs, exits, options.relocatable);
+    FunctionFlow flow(f, symbols, regs, exits, options.relocatable, mode == Mode::Twin);
     std::string o;
-    o += reg_macros(f.used, f.written);
-    o += std::format("void {}(SPUContext* ctx, uint8_t* ls)\n{{\n", symbol);
+    if (mode != Mode::Fast) o += reg_macros(f.used, f.written);
+    // The twin is cold: resumed by the run loop, it runs to the next loop back edge or the function's end.
+    o += std::format("{}void {}(SPUContext* ctx, uint8_t* ls)\n{{\n", mode == Mode::Twin ? "__attribute__((cold)) " : "", symbol);
     o += reg_decls(f.used);
     if (options.relocatable) o += "    const uint32_t rel = ctx->reloc;\n";
-    // Called (or resumed) at the entry: only what may be read before it is written. Anywhere else: everything.
-    if (const auto entry = regs.index(f.entry); entry && f.labels.contains(f.entry))
-        o += std::format("    if (ctx->pc == {}) {{\n   {}\n        goto L_{:05X};\n    }}\n", flow.pc(f.entry),
-            loads(regs.live_in(*entry)), f.entry);
-    o += "    PSL_RELOAD();\n    goto dispatch;\n";
+    // Called (or resumed) at the entry: only what may be read before it is written (D-219), and what the joins of
+    // paths into the entry need (D-960).
+    if (const auto entry = regs.index(f.entry); mode != Mode::Twin && entry && f.labels.contains(f.entry))
+        o += std::format("    if (PSL_LIKELY(ctx->pc == {})) {{\n{}        goto L_{:05X};\n    }}\n", flow.pc(f.entry),
+            load_line(regs.entry_loads(), "       "), f.entry);
+    std::set<u32> resume; // the labels of the run loop's switch
+    if (mode == Mode::Fast) {
+        // A fast entry the run loop resumes (fast_entries()): its live registers. Anywhere else: the twin.
+        std::string cases;
+        for (u32 h : entries)
+            if (regs.resume_root(h))
+                cases += std::format("    case 0x{:05X}u:\n{}        goto L_{:05X};\n", h,
+                    load_line(regs.live_in(*regs.index(h)), "       "), h);
+        if (!cases.empty())
+            o += std::format("    switch ({}) {{\n{}    default: break;\n    }}\n",
+                options.relocatable ? "(ctx->pc - rel) & 0x3FFFFu" : "ctx->pc", cases);
+        if (!twin.empty()) o += std::format("    {}(ctx, ls);\n", twin);
+        o += "    return;\n";
+    } else {
+        for (u32 l : f.labels)
+            if (regs.resume_root(l)) resume.insert(l);
+        o += "    PSL_RELOAD();\n    goto dispatch;\n";
+    }
     for (usize i = 0; i < f.insns.size(); i++) {
+        if (!regs.reachable(i)) continue;
         const u32 a = f.insns[i];
         const u32 word = image.word(a);
         if (f.labels.contains(a)) o += std::format("L_{:05X}:\n", a);
@@ -948,14 +1428,18 @@ std::string lift_function(const LsImage& image, const Function& f, const std::st
         o += code;
         if (falls) {
             const bool next_emitted = i + 1 < f.insns.size() && f.insns[i + 1] == a + 4;
-            if (!next_emitted || regs.leaves((a + 4) & PS_SPU_PC_MASK, a))
+            if (next_emitted && !regs.leaves((a + 4) & PS_SPU_PC_MASK, a)) o += load_line(regs.edge_loads(i, i + 1));
+            else
                 o += std::format("    ctx->pc = {};\n    goto {};\n", flow.pc((a + 4) & PS_SPU_PC_MASK), exits.exit(regs.dirty_after(i)));
         }
     }
-    o += exits.emit(f, options.relocatable);
-    o += "}\n#undef PSL_SPILL\n#undef PSL_RELOAD\n\n";
-    return o;
+    o += exits.emit(f, options.relocatable, resume);
+    o += "}\n";
+    if (mode != Mode::Fast) o += "#undef PSL_SPILL\n#undef PSL_RELOAD\n";
+    return o + "\n";
 }
+
+std::string twin_symbol(const std::string& symbol) { return symbol + "_resume"; }
 
 bool write_text(const std::string& path, const std::string& content)
 {
@@ -1012,16 +1496,6 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
         options.name, options.name);
     h += "#include \"pspocket/spu/runtime.h\"\n";
     h += "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
-    for (const auto& [entry, sym] : symbols) h += std::format("void {}(SPUContext* ctx, uint8_t* ls);\n", sym);
-    h += std::format("extern ps_spu_program {}_program;\nvoid {}_register(void);\n", options.name, options.name);
-    h += "#ifdef __cplusplus\n}\n#endif\n#endif\n";
-    result.files.push_back({options.name + ".h", h});
-
-    // Function units
-    std::vector<std::string> units(tus,
-        std::format("/* Generated by spu-lift ({}). Do not edit. */\n#include \"pspocket/spu/lifted.h\"\n#include \"{}.h\"\n\n",
-            image.name, options.name));
-    const std::map<u32, CallSummary> sums = call_summaries(image, program);
     // Addresses listed for a native replacement (pspocket/spu/replace.hpp, D-965, D-966) are boundaries: a call into
     // one, a forward jump or fall-through into one leaves for the run loop, which goes on through the program's table,
     // where the program the runtime derives from this one takes it over.
@@ -1040,20 +1514,62 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
                 if (std::binary_search(f.insns.begin(), f.insns.end(), a)) f.labels.insert(a);
         lifted = &labelled;
     }
+    const std::map<u32, CallSummary> sums = call_summaries(image, *lifted, bounded);
+    // Each function's fast entries besides its entry (D-961), and whether it has a twin: any label but its entry and
+    // those.
+    std::map<u32, std::set<u32>> entries_of;
+    std::set<u32> twins;
+    for (const Function& f : lifted->functions) {
+        if (!options.twins) continue;
+        entries_of[f.entry] = fast_entries(image, f, callable, sums, bounded);
+        for (u32 l : f.labels)
+            if (l != f.entry && !entries_of[f.entry].contains(l)) twins.insert(f.entry);
+    }
+    for (const auto& [entry, sym] : symbols) {
+        h += std::format("void {}(SPUContext* ctx, uint8_t* ls);\n", sym);
+        if (twins.contains(entry)) h += std::format("void {}(SPUContext* ctx, uint8_t* ls);\n", twin_symbol(sym));
+    }
+    h += std::format("extern ps_spu_program {}_program;\nvoid {}_register(void);\n", options.name, options.name);
+    h += "#ifdef __cplusplus\n}\n#endif\n#endif\n";
+    result.files.push_back({options.name + ".h", h});
+
+    // Function units
+    std::vector<std::string> units(tus,
+        std::format("/* Generated by spu-lift ({}). Do not edit. */\n#include \"pspocket/spu/lifted.h\"\n#include \"{}.h\"\n\n",
+            image.name, options.name));
+    // The twins in units of their own, which builds compile at -O1 (D-961): in half the time.
+    std::vector<std::string> twin_units(units);
     usize index = 0;
     for (const Function& f : lifted->functions) {
-        units[index++ % tus] += lift_function(image, f, symbols[f.entry], callable, sums, bounded);
+        std::string& unit = units[index % tus];
+        std::string& twin_unit = twin_units[index++ % tus];
+        const std::string& sym = symbols[f.entry];
+        if (!options.twins) {
+            unit += emit_function(image, f, sym, "", callable, sums, bounded, Mode::Whole, {}, result.stats);
+        } else {
+            const bool twin = twins.contains(f.entry);
+            unit += emit_function(image, f, sym, twin ? twin_symbol(sym) : "", callable, sums, bounded, Mode::Fast,
+                entries_of[f.entry], result.stats);
+            if (twin)
+                twin_unit += emit_function(image, f, twin_symbol(sym), "", callable, sums, bounded, Mode::Twin,
+                    entries_of[f.entry], result.stats);
+        }
         result.stats.instructions += f.insns.size();
         result.stats.labels += f.labels.size();
     }
     for (u32 i = 0; i < tus; i++) result.files.push_back({std::format("{}_{}.c", options.name, i), units[i]});
+    if (options.twins)
+        for (u32 i = 0; i < tus; i++) result.files.push_back({std::format("{}_resume_{}.c", options.name, i), twin_units[i]});
 
-    // Program descriptor: every label is an entry (the function whose entry it is wins)
+    // Program descriptor: every label is an entry (the function whose entry it is wins): the fast function at its
+    // entry and fast entries, the twin anywhere else (D-961).
     std::map<u32, std::string> entries;
     for (const Function& f : lifted->functions)
         for (u32 l : f.labels) {
-            auto [it, inserted] = entries.emplace(l, symbols[f.entry]);
-            if (!inserted && l == f.entry) it->second = symbols[f.entry];
+            const bool fast = l == f.entry || !twins.contains(f.entry) || entries_of[f.entry].contains(l);
+            const std::string sym = fast ? symbols[f.entry] : twin_symbol(symbols[f.entry]);
+            auto [it, inserted] = entries.emplace(l, sym);
+            if (!inserted && l == f.entry) it->second = sym;
         }
     std::string r = std::format("/* Generated by spu-lift ({}). Do not edit. */\n#include \"{}.h\"\n\n", image.name, options.name);
     r += std::format("static const ps_spu_entry {}_entries[] = {{\n", options.name);

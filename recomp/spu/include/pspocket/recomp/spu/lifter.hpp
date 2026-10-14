@@ -2,19 +2,21 @@
 
 // SPU lifter: analysed functions -> C11 translation units.
 //
-// One C function per SPU function, void spu_<hash>_<start>_<entry>(SPUContext* ctx, uint8_t* ls), entered at any of its
-// block starts (a switch on ctx->pc). Registers it uses live in ps_spu_vec locals; local branches are gotos (loop
-// back edges poll ctx->attention); direct calls into lifted functions are C calls that continue only when the
-// callee returned to the expected address (anything else returns to the run loop); indirect branches switch over
-// the labels such branches may reach (Function::dynamic) and otherwise return to the run loop, which dispatches
-// through the program table or falls back to the interpreter (logging the address). Called at its entry, a function
-// loads only the registers it may read before writing them; every way out stores only those it may have written
-// (D-219).
+// Two C functions per SPU function (D-961): void spu_<hash>_<start>_<entry>(SPUContext* ctx, uint8_t* ls), entered at
+// the function's entry (and the few labels the run loop resumes it at that keep its loops reducible), and its cold
+// twin spu_<hash>_<start>_<entry>_resume, which the run loop enters at any other block start (a switch on ctx->pc). Registers it uses live in ps_spu_vec locals; local branches are gotos (loop back
+// edges poll ctx->attention); direct calls into lifted functions are C calls that continue only when the callee
+// returned to the expected address (anything else returns to the run loop); indirect branches switch over the labels
+// such branches may reach (Function::dynamic) and otherwise return to the run loop, which dispatches through the
+// program table or falls back to the interpreter (logging the address). Called at its entry, a function loads only the registers it may read before writing them,
+// and a path that skips a write loads that register where it joins one that did (D-960); every way out stores only
+// those it may have written (D-219).
 //
 // Output of lift() for options.name = N:
-//   N.h          prototypes, N_program, N_register()
-//   N_0.c ...    the lifted functions (options.tu_count units)
-//   N_reg.c      the program descriptor (key, code range, entries) and N_register()
+//   N.h            prototypes, N_program, N_register()
+//   N_0.c ...      the lifted functions (options.tu_count units)
+//   N_resume_0.c   their twins (with options.twins; builds compile them at -O1)
+//   N_reg.c        the program descriptor (key, code range, entries) and N_register()
 
 #include <set>
 #include <string>
@@ -39,6 +41,9 @@ struct LiftOptions {
     // fall-through into one leaves for the run loop (a back edge to one stays a local jump). lift() adds those
     // pspocket::spu::replace lists for the program: native replacements of functions and of loops.
     std::set<u32> boundaries;
+    // Each function as a fast C function entered at its entry (and a few labels), and a cold twin the run loop resumes
+    // its other labels in (D-961). Off (spu-lift --whole): one C function entered anywhere (a switch over every label).
+    bool twins = true;
 };
 
 struct OutputFile {
@@ -51,6 +56,7 @@ struct LiftStats {
     usize instructions = 0;
     usize labels = 0;
     usize unsupported = 0; // left to the interpreter
+    usize forced_loads = 0; // functions whose lazy loads (D-960) fell back to loading every live register at the entry
 };
 
 struct LiftResult {
