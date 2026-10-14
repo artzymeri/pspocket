@@ -89,6 +89,27 @@ unsigned ps_test_replace_arith(uint32_t rounds)
     return bad;
 }
 
+/* shufb on vectors in local-store word order against psl_shufb on the registers' order (D-004), every control byte
+ * value in turn; and fs's clamp. */
+unsigned ps_test_replace_shufb(uint32_t rounds)
+{
+    unsigned bad = 0;
+    for (uint32_t i = 0; i < rounds; i++) {
+        const ps_spu_vec a = vec(4 * i), b = vec(4 * i + 5);
+        ps_spu_vec c;
+        for (int l = 0; l < 4; l++) {
+            const uint32_t base = (16u * i + 4u * (uint32_t)l) & 0xFFu; /* every byte value over 16 rounds */
+            c[l] = (base * 0x01010101u + 0x00010203u) ^ (next32() & 0x01000100u);
+        }
+        const ps_spu_vec want = psl_shufb(a, b, c);
+        const uint32x4_t aw = psn_rev4((uint32x4_t)a), bw = psn_rev4((uint32x4_t)b), cw = psn_rev4((uint32x4_t)c);
+        bad += differ(psn_rev4(psn_shufb_w(aw, bw, cw)), want);
+        bad += differ(psn_rev4(psn_shufb_k(aw, bw, psn_shufb_key(cw))), want);
+        bad += differ(psn_clamp((uint32x4_t)a), psl_clamp(a));
+    }
+    return bad;
+}
+
 /* Four quadwords of local store as big-endian words, de-interleaved, and back: as psl_lq reads them. */
 unsigned ps_test_replace_ld4(void)
 {

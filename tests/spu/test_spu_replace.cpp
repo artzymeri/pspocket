@@ -24,6 +24,7 @@ unsigned ps_test_replace_frest(void);
 unsigned ps_test_replace_frsqest(void);
 unsigned ps_test_replace_arith(uint32_t rounds);
 unsigned ps_test_replace_ld4(void);
+unsigned ps_test_replace_shufb(uint32_t rounds);
 }
 
 using namespace pspocket;
@@ -42,6 +43,7 @@ TEST_CASE("SPU replace: NEON building blocks give what the lifted code's helpers
     CHECK(ps_test_replace_frsqest() == 0);
     CHECK(ps_test_replace_arith(20000) == 0);
     CHECK(ps_test_replace_ld4() == 0);
+    CHECK(ps_test_replace_shufb(4096) == 0);
 }
 
 namespace {

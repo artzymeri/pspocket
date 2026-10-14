@@ -47,21 +47,33 @@ PSN uint32x4_t psn_frest(uint32x4_t x)
 
 /* frsqest (psl_frsqest): the fraction from RPCS3's 64-entry table by bits 18-23, the exponent by its closed form
  * (exponent 0 -> 0x7F800000, else (190 - (e + 1) / 2) << 23), no sign. Three lookups, one a plane (TBL, then TBX). */
-PSN uint32x4_t psn_frsqest(uint32x4_t x)
+typedef struct {
+    uint8x16x4_t p[3];
+} psn_frsqest_tables;
+/* The planes in registers: a loop loads them once (stores to local store may alias the tables for the compiler). */
+PSN psn_frsqest_tables psn_frsqest_load(void)
 {
-    const uint8x16x4_t p0 = vld1q_u8_x4(&ps_spu_frsqest_planes[0][0]);
-    const uint8x16x4_t p1 = vld1q_u8_x4(&ps_spu_frsqest_planes[1][0]);
-    const uint8x16x4_t p2 = vld1q_u8_x4(&ps_spu_frsqest_planes[2][0]);
+    psn_frsqest_tables t;
+    for (int k = 0; k < 3; k++) t.p[k] = vld1q_u8_x4(&ps_spu_frsqest_planes[k][0]);
+    return t;
+}
+PSN uint32x4_t psn_frsqest_t(uint32x4_t x, const psn_frsqest_tables* t)
+{
     const uint32x4_t idx = vandq_u32(vshrq_n_u32(x, 18), vdupq_n_u32(0x3F));
     /* byte k of a lane: idx + 64 k; byte 3 always out of range */
     const uint8x16_t i = vreinterpretq_u8_u32(vaddq_u32(vmulq_u32(idx, vdupq_n_u32(0x01010101u)), vdupq_n_u32(0xC0804000u)));
-    uint8x16_t r = vqtbl4q_u8(p0, i);
-    r = vqtbx4q_u8(r, p1, vsubq_u8(i, vdupq_n_u8(64)));
-    r = vqtbx4q_u8(r, p2, vsubq_u8(i, vdupq_n_u8(128)));
+    uint8x16_t r = vqtbl4q_u8(t->p[0], i);
+    r = vqtbx4q_u8(r, t->p[1], vsubq_u8(i, vdupq_n_u8(64)));
+    r = vqtbx4q_u8(r, t->p[2], vsubq_u8(i, vdupq_n_u8(128)));
     const uint32x4_t e = vandq_u32(vshrq_n_u32(x, 23), vdupq_n_u32(0xFF));
     const uint32x4_t half = vshrq_n_u32(vaddq_u32(e, vdupq_n_u32(1)), 1);
     const uint32x4_t expo = vbslq_u32(vceqzq_u32(e), vdupq_n_u32(0x7F800000u), vshlq_n_u32(vsubq_u32(vdupq_n_u32(190), half), 23));
     return vorrq_u32(vreinterpretq_u32_u8(r), expo);
+}
+PSN uint32x4_t psn_frsqest(uint32x4_t x)
+{
+    const psn_frsqest_tables t = psn_frsqest_load();
+    return psn_frsqest_t(x, &t);
 }
 
 /* Zero class (psl_zero_class): all ones where the exponent is 0 (zero or denormal: the SPU's zeros); psn_nz is its
@@ -113,6 +125,47 @@ PSN uint32x4_t psn_rev4(uint32x4_t v)
 {
     const uint32x4_t r = vrev64q_u32(v);
     return vextq_u32(r, r, 2);
+}
+
+/* shufb (psl_shufb) on vectors in local-store word order (guest word i in lane i, each word's bytes in host order):
+ * guest byte g of such a vector is its byte g ^ 3, so a control byte c picks byte (c & 31) ^ 3 of {a, b}; the special
+ * controls (10xxxxxx, 110xxxxx, 111xxxxx: 0x00, 0xFF, 0x80) as psl_shufb makes them. */
+PSN uint32x4_t psn_shufb_w(uint32x4_t a, uint32x4_t b, uint32x4_t c)
+{
+    const uint8x16_t cc = vreinterpretq_u8_u32(c);
+    const uint8x16x2_t t = {{vreinterpretq_u8_u32(a), vreinterpretq_u8_u32(b)}};
+    const uint8x16_t picked = vqtbl2q_u8(t, veorq_u8(vandq_u8(cc, vdupq_n_u8(0x1F)), vdupq_n_u8(3)));
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    return vreinterpretq_u32_u8(vqtbx1q_u8(picked, special, vshrq_n_u8(veorq_u8(cc, vdupq_n_u8(0x80)), 3)));
+}
+
+/* A control known ahead (psn_shufb_w's), as a lookup and the special bytes or'ed in: psn_shufb_k(a, b, k) is
+ * psn_shufb_w(a, b, c) for k = psn_shufb_key(c). */
+typedef struct {
+    uint8x16_t idx, orr;
+} psn_shufb_key_t;
+PSN psn_shufb_key_t psn_shufb_key(uint32x4_t c)
+{
+    const uint8x16_t cc = vreinterpretq_u8_u32(c);
+    const uint8x16_t sel = vcltq_u8(cc, vdupq_n_u8(0x80)); /* a byte picked */
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    psn_shufb_key_t k;
+    k.idx = vorrq_u8(veorq_u8(vandq_u8(cc, vdupq_n_u8(0x1F)), vdupq_n_u8(3)), vmvnq_u8(sel)); /* 0xFF: out of range */
+    k.orr = vbicq_u8(vqtbl1q_u8(special, vshrq_n_u8(veorq_u8(cc, vdupq_n_u8(0x80)), 3)), sel);
+    return k;
+}
+PSN uint32x4_t psn_shufb_k(uint32x4_t a, uint32x4_t b, psn_shufb_key_t k)
+{
+    const uint8x16x2_t t = {{vreinterpretq_u8_u32(a), vreinterpretq_u8_u32(b)}};
+    return vreinterpretq_u32_u8(vorrq_u8(vqtbl2q_u8(t, k.idx), k.orr));
+}
+
+/* What fs and the like read of a float operand (psl_clamp): exponent 255 (a large number on the SPU) to the largest
+ * finite float of its sign. */
+PSN uint32x4_t psn_clamp(uint32x4_t x)
+{
+    const uint32x4_t e255 = vceqq_u32(vandq_u32(x, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0x7F800000u));
+    return vbslq_u32(e255, vorrq_u32(vandq_u32(x, vdupq_n_u32(0x80000000u)), vdupq_n_u32(0x7F7FFFFFu)), x);
 }
 
 #undef PSN
