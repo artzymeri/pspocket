@@ -2516,6 +2516,7 @@ void MetalBackend::Impl::trim()
     const u64 texture_mb = texture_bytes() >> 20, surface_mb = surface_bytes() >> 20;
     evict_unused(60);
     trim_texture_pool(true);
+    surface_texture_pool.clear();
     for (auto& s : surfaces) {
         if (!draw_targets.contains(s.get()) && !(pass_open && pass.contains(s.get()))) s->feedback = {};
     }
@@ -2651,7 +2652,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {:.1f} textures decoded "
                            "({:.1f} over a target drawn to again, {:.1f} written); {} programs and {} pipelines "
                            "made ({:.1f} ms, {:.2f} draws waiting for one, {:.2f} drawn by the interpreter); "
-                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB); "
+                           "{} textures cached ({:.0f} MB in guest memory), {} surfaces ({:.0f} MB; {:.2f} made a frame, {:.2f} "
+                           "of them with a removed one's texture); "
                            "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures ({:.2f} "
                            "copies into pooled textures), {:.2f} surface reloads; {:.2f} ms waiting for the GPU; GPU "
                            "memory {:.0f} MB, {} deferred",
@@ -2664,7 +2666,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.draws_interpreted, w.textures, w.texture_mb,
-            w.surfaces, w.surface_mb,
+            w.surfaces, w.surface_mb, per_frame(m.stats.surfaces_created, m.report_surfaces_made),
+            per_frame(m.stats.surface_textures_reused, m.report_surfaces_reused),
             w.feedback_copies, w.depth_bounds_draws, w.corner_textures,
             per_frame(m.stats.pooled_textures_taken, m.report_pooled), w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
             w.deferred_queue);
@@ -2729,6 +2732,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_corners = m.stats.corner_textures;
         m.report_pooled = m.stats.pooled_textures_taken;
         m.report_reloads = m.stats.surface_reloads;
+        m.report_surfaces_made = m.stats.surfaces_created;
+        m.report_surfaces_reused = m.stats.surface_textures_reused;
         m.report_gpu_wait_ns = m.stats.gpu_wait_ns;
         m.report_flips = 0;
         m.report_gpu_ns = gpu;

@@ -15560,3 +15560,21 @@ At the iPhone's 12.2 us a draw that would be some 10.2 us, 28 ms a frame of 2,70
 fps. Left: Metal's encoder creation (7.5% of the thread, one a pass) and its draw state (about 14%), the vertex and
 index copies (7.5%), a target GTA V makes again every frame (make_surface 2.6%, the report's "grow 1.0"), the vertex
 programs it writes anew (decoding them 1.3%), the FIFO (about 10%).
+
+## D-984 · 2026-10-14 · A removed render target's texture for the next one of its format and size
+
+The RSX thread's second round (after D-953 to D-957, -16.3% a draw). A log of each target made and removed at one address
+(PSPOCKET_RSX_WATCH_SURFACE=ADDR, kept as a diagnostic) found GTA V's 640x360 A8B8G8R8 target at 0xcd260000 and a
+320x180 F_W16Z16Y16X16 one over the same memory replacing each other every frame from flip ~1450, and over the whole
+walk 12 to 15 targets made a frame: a new Metal texture each (newTextureWithDescriptor), the old one released.
+
+- remove_surface keeps the surface's texture in a pool (at most 24, the oldest dropped; trim() empties it), and
+  make_surface takes one of the same pixel format, width and height from it before allocating. What it holds is not
+  used: the new surface starts as one nobody wrote (cleared at its pass's start, or loaded from guest memory). The GPU
+  work recorded with the old surface runs first (one queue; Metal tracks the texture between command buffers).
+- The per-frame report gives the targets made a frame and how many took a pooled texture; the first 20 targets grown
+  over smaller ones (D-120) are logged with their sizes (GTA V grows 0xcd260000 from 640x256 to 640x360 each frame
+  from flip ~2850).
+- Measured (GTA V's walk, PSPOCKET_RSX_CPU_AB=10:32, the pool alone switched every 10 frames, ten windows): the RSX
+  thread's CPU a draw -2.1 to -9.6%, -5.1% on average; with the pool on every target made took a pooled texture. With
+  D-953 to D-957: about -21% a draw.

@@ -67,8 +67,28 @@ Surface* MetalBackend::Impl::find_surface(u32 address, bool depth) const
     return best;
 }
 
+// PSPOCKET_RSX_WATCH_SURFACE=ADDR: every surface made or removed whose memory holds ADDR is logged (a diagnostic).
+static u32 watched_surface_address()
+{
+    static const u32 a = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_WATCH_SURFACE");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    return a;
+}
+
+static bool watched_surface(const Surface& s)
+{
+    const u32 a = watched_surface_address();
+    return a && a >= s.address && a < s.address + s.bytes();
+}
+
 void MetalBackend::Impl::remove_surface(Surface* s)
 {
+    if (watched_surface(*s)) {
+        PS_LOG_INFO(kChan, "watched surface {:#010x} {}x{} fmt {} pitch {:#x}{} removed (flip {})", s->address, s->width,
+            s->height, s->gcm_format, s->pitch, s->depth ? " depth" : "", stats.flips);
+    }
     if (pass_open && pass.contains(s)) end_pass_for(kEndSurfaceGone);
     if (closing.encoder && closing.targets.contains(s)) finish_closing(false); // D-945: it stores what it drew
     // A child leaves what it wrote in its parent; children of a parent that goes stand alone (D-122).
@@ -88,6 +108,12 @@ void MetalBackend::Impl::remove_surface(Surface* s)
     if (const auto at = surfaces_at.find(s->address); at != surfaces_at.end()) { // D-953
         std::erase(at->second, s);
         if (at->second.empty()) surfaces_at.erase(at);
+    }
+    // Its texture waits for the next surface of its format and size (D-984). The GPU work recorded with it runs
+    // first: the queue keeps the order, and Metal tracks the texture's use between command buffers.
+    if (s->texture) {
+        surface_texture_pool.push_back(s->texture);
+        if (surface_texture_pool.size() > kSurfacePoolMax) surface_texture_pool.pop_front();
     }
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }
@@ -200,10 +226,25 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     bool swizzled, MTLPixelFormat pf)
 {
     Impl& impl = *this;
-    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:width height:height mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    d.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> tex = [impl.device newTextureWithDescriptor:d];
+    // A removed surface's texture of this format and size, when one waits (what it holds is not used: the new surface
+    // starts as one nobody wrote, cleared or loaded from guest memory), else a new one.
+    id<MTLTexture> tex = nil;
+    for (auto it = impl.surface_texture_pool.begin(); impl.fast(kFastSurfacePool) && it != impl.surface_texture_pool.end();
+         ++it) {
+        if ((*it).pixelFormat == pf && (*it).width == width && (*it).height == height) {
+            tex = *it;
+            impl.surface_texture_pool.erase(it);
+            impl.stats.surface_textures_reused++;
+            break;
+        }
+    }
+    if (!tex) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:width height:height
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        d.storageMode = MTLStorageModePrivate;
+        tex = [impl.device newTextureWithDescriptor:d];
+    }
     if (!tex) return nullptr;
     tex.label = [NSString stringWithFormat:@"rsx surface %08x %ux%u", address, width, height];
     auto s = std::make_unique<Surface>();
@@ -221,6 +262,10 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     s->last_frame = impl.stats.flips;
     impl.stats.surfaces_created++;
     impl.note_guest(*s);
+    if (watched_surface(*s)) {
+        PS_LOG_INFO(kChan, "watched surface {:#010x} {}x{} fmt {} pitch {:#x}{} made (flip {})", s->address, s->width,
+            s->height, s->gcm_format, s->pitch, s->depth ? " depth" : "", impl.stats.flips);
+    }
     impl.surfaces_at[address].push_back(s.get()); // D-953
     impl.surfaces.push_back(std::move(s));
     return impl.surfaces.back().get();
@@ -306,7 +351,11 @@ void MetalBackend::Impl::grow_surface(Surface& outer, Surface& inner)
     outer.gpu_newer = inner.gpu_newer || outer.gpu_newer;
     outer.generation++;
     surface_written(outer);
-    stats.surfaces_grown++;
+    if (stats.surfaces_grown++ < 20) {
+        PS_LOG_INFO(kChan, "target {:#010x} fmt {} grown from {}x{} to {}x{} (pitch {:#x}, flip {}): a new texture, the smaller "
+            "one's pixels copied", outer.address, outer.gcm_format, inner.width, inner.height, outer.width, outer.height,
+            outer.pitch, stats.flips);
+    }
 }
 
 Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth_float)

@@ -489,7 +489,8 @@ struct MetalBackend::Impl {
         kFastLookups = 1,   // surfaces by address, pipelines by hash, one take a draw, the fragment program's list (D-953)
         kFastSetters = 4,   // encoder state set only when it changes (D-954)
         kFastScratch = 8,   // the draw's lists kept from draw to draw (D-956)
-        kFastIndexScan = 16 // the index scan in NEON (D-957)
+        kFastIndexScan = 16, // the index scan in NEON (D-957)
+        kFastSurfacePool = 32 // a removed surface's texture for the next of its format and size (D-984)
     };
     u32 ab_items = ~0u;
     bool fast(u32 item = ~0u) const { return !ab_cpu || !(ab_items & item) || ab_half() == 1; }
@@ -659,6 +660,12 @@ struct MetalBackend::Impl {
 
     // Caches
     std::vector<std::unique_ptr<Surface>> surfaces;
+    // Textures of surfaces removed, for the next surface of the same format and size (D-984): GTA V's 640x360
+    // target and the 320x180 F16 one over the same memory replace each other every frame, a new texture each time.
+    // At most kSurfacePoolMax, oldest dropped first; emptied by trim().
+    static constexpr usize kSurfacePoolMax = 24;
+    std::deque<id<MTLTexture>> surface_texture_pool;
+    u64 report_surfaces_made = 0, report_surfaces_reused = 0; // at the last report
     // The surfaces at each guest address, in the order they were made (D-953): a surface's address is set when it is
     // made (make_surface) and it leaves only through remove_surface. The lookups by address read these instead of
     // scanning every surface (some 150 in GTA V, up to four scans for each texture a draw binds); they meet them in
