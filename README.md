@@ -14,7 +14,7 @@ signs and loads it, and plays it flawlessly. Driving title: GTA V (BLES01807); s
 
 ![engine](docs/progress/badge-0.svg) ![system libraries](docs/progress/badge-1.svg) ![kernel calls](docs/progress/badge-2.svg) ![PPU instructions](docs/progress/badge-3.svg) ![SPU instructions](docs/progress/badge-4.svg) ![games flawless](docs/progress/badge-5.svg)
 
-_2026-10-14._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: every RSX state games set is now used (fog, two-sided lighting, clip planes, depth bounds, point sprites and more, D-256 to D-267). Nothing is Flawless yet: the iPhone is too slow in heavy scenes.
+_2026-10-14._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: on the iPhone 18 Pro Max (run 327) GTA V's heavy scenes went from 4-12 fps to 15-28 (D-947), its shadows and blending are right (D-948, D-949) and its fight scene no longer goes black (D-951). Nothing is Flawless yet: the iPhone is too slow in heavy scenes, and a plan for a steady 30 fps is in docs/improve.md.
 
 ![The engine, part by part](docs/progress/engine.svg)
 
