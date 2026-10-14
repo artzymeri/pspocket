@@ -98,6 +98,9 @@ pspocket_add_component(tools/ps3inspect)
 # Process loader and boot host (need both the runtime and recomp/common)
 pspocket_add_component(runtime/loader)
 
+# Native code of games' own SPU jobs (games/<title>/spu, D-979), linked into the tools above.
+pspocket_add_component(games)
+
 if(PSPOCKET_BUILD_TESTS)
     enable_testing()
     pspocket_add_component(tests)

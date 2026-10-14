@@ -128,6 +128,13 @@ targets:
         group: Runtime
         includes: *compiled
         compilerFlags: [-ffp-contract=off, -fno-fast-math]
+      # ... and those of games' own SPU jobs (games/<title>/spu, D-979): each table registers its builds when the
+      # library loads (the app force-loads it), as games/CMakeLists.txt links them into the host tools.
+      - path: ../../games
+        name: games-spu
+        group: Runtime
+        includes: ["*/spu/*.c", "*/spu/*.cpp"]
+        compilerFlags: [-ffp-contract=off, -fno-fast-math, '-I$(PSPOCKET_ROOT)/runtime/spu/replace']
       - path: ../../runtime/lv2/src
         name: lv2
         group: Runtime

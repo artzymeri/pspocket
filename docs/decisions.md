@@ -15781,3 +15781,50 @@ At about 650 MP3 frames a second the decoding takes 13 ms of SPU time a second i
 calls a second while streaming, 4 ms instead of 15-20 (zlibInflater's lines: 0.03 s per 5 s in half A against 0.08 in
 half B, run ab3). The window averages move with the scene (other runs: -10% and -1% for the mixer), the per-call times
 do not.
+## D-979 · 2026-10-14 · Native code for a game's own SPU jobs in games/<title>/spu; GTA V's synthesizer biquads native
+
+The plan for a steady 30 fps on the phone (docs/improve.md) puts GTA V's sound mixer (SPURS 0x10016000 "Secondary",
+one SPU) at a whole phone core at full sound pace. A Time Profiler window of the walk (30 s, leaf samples mapped to SPU
+addresses through the lifted C's line table): MP3 (884ae88f) 24% of Secondary, the submix job (28281614) 22%, the
+synthesizer jobs (012bf135, 54e79c9f; RAGE's modular synth, the vehicles) 16% and 14%, a decode job (bb12970d) 15%.
+These jobs are Rockstar's, not middleware other games link: their replacements belong in games/gta5 (CLAUDE.md rule 6).
+
+- The hook, as data the game's directory provides: games/<title>/spu/ holds a table (builds.cpp: program key, code
+  range, listed functions, natives, live registers) that registers its builds with pspocket::spu::replace::add_build()
+  when the program loads, and the native code. No title in the runtime: a build is found by its program key, as EDGE's.
+  games/CMakeLists.txt builds them as an OBJECT library linked straight into every tool that registers or lifts SPU
+  programs (pspocket-boot, spu-lift, spu-live, spu-check, spu-native-check, pspocket-prepare): objects are always linked,
+  so the registrations run (an archive member nobody references would be dropped). The app compiles the same sources
+  into its runtime library, which it force-loads (app/ios/project.yml). add_build() before main is safe: the table of
+  added builds is constant-initialised.
+- Finding the time: interpreter coverage needs captures, and the jobs' top functions DMA; instead xctrace's leaf PCs
+  through atos to the lifted C's lines (each follows its SPU instruction's comment). Captures of the candidates
+  (spu-native-check --time) then give each function's cost a call, and the walk's call counts its total: 012bf135's
+  0x05B20 1.4 s a walk (510,000 calls, 2.7 us), 0x062C8 0.8 s (394,000, 2.0 us), the submix job's 0x0A920 1.6 s (95,000
+  calls, 16.9 us), 0x06048 0.4 s; many others are under 1 us a call, where the way through the run loop a listed
+  function takes (the caller's exit and reload, the dispatcher) would eat what native code saves.
+- 0x062C8, the synthesizer's biquad: one section in transposed direct form II over 256 floats in place (y = fma(b0, x,
+  s0); s0 = s1 + fms(b1, x, fm(a1, y)); s1 = fms(b2, x, fm(a2, y))), the state in words 0 and 1 of its quadword. Native:
+  one sample at a time, each operation the SPU's in the job's order (fm's and fma's zero factor, fms's clamp), so exact;
+  the zero tests become branches the host predicts, and a loop without them (checked at the end, redone exactly when a
+  zero met) measured no faster. Callers read $6 after it (spu-live: the synthesizer's program interpreter can store it
+  as a module's result): the job leaves the cwd control of the last sample's address there, and so does the native code.
+- 0x05B20, two such sections in series: here $6 is the first section's last y, which the job computes on whole
+  quadwords, so its other three words are computations of their own (each coefficient register's word k, the state's
+  words rotated, the sample's quadword rotated to the sample, outputs already written included). The samples' lane runs
+  on its own, scalar, and the four lanes beside it in NEON, fast (an fma with a zero factor as fma(-0, 1, s0), valid as
+  no s0 is a denormal: the state is checked, a denormal in it declines; fm's zero test of y checked at the end, the four
+  lanes redone exactly when one was a zero). Coupling the samples' lane to the four (one vector) put the store-to-input
+  path on the recurrence: 1,707 ns a call instead of 1,204.
+- Checked: 150 captured calls of each over a walk (every 97th), all exact; the fastest of 7 runs a call: 0x062C8 2,040 to
+  832 ns (x2.45), 0x05B20 2,700 to 1,200 ns (x2.46). Tests (tests/games): an oracle from the lifted code's helpers on
+  whole quadwords (tests/games/gta5_audio_oracle.c) against the natives over synthetic buffers at every word alignment,
+  counts 0 to 256, relocated, four mixes (audio, zeros, specials: denormals and exponent 255, silence): exact, the only
+  declines a state with a denormal. A walk with them in half A of 10 s halves: 404,000 native calls, nothing declined, no
+  RSX failure; the Mac was at a load of 30 and Secondary's 5 s windows moved more than the expected 4% (A/B 1.08), so
+  the saving stands on the per-call times: about 1.2 s of the walk's lifted 2.2 s in these two.
+- Not changed, for the main session: the translator hash (runtime/game) covers the lifters' sources, not the tables of
+  listed functions, so a prepared game library from before a table change keeps direct calls into newly listed
+  functions (correct, but without the native code) until prepared again; and the dispatcher reads its switches through
+  config(), which takes a mutex on every call of a listed function (EDGE's 1.4 million native calls a walk, from up to
+  five SPU threads).
