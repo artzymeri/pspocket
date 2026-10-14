@@ -15828,3 +15828,30 @@ These jobs are Rockstar's, not middleware other games link: their replacements b
   functions (correct, but without the native code) until prepared again; and the dispatcher reads its switches through
   config(), which takes a mutex on every call of a listed function (EDGE's 1.4 million native calls a walk, from up to
   five SPU threads).
+
+## D-980 · 2026-10-14 · GTA V's submix reverb (0x0A920 of spu_28281614459ce75e) native, exact, x2.9
+
+The single costliest function of the mixer's jobs: 1.6 s of a walk (95,000 calls, 16.9 us lifted). RAGE's reverb on
+the submix: per frame of two quadwords (four lanes each, "lo" and "hi"), four all-pass sections in series over int16
+delay lines, three banks of six delay lines tapped, mixed and fed back (each bank fed the input with the other banks'
+taps), and two of the banks' taps each through a filter run four times on the lo tap and four on the hi tap; the
+output a chain of fma over bank 1's taps and the filters' states (games/gta5/spu/rage_submix.c says it in full).
+Interpreter coverage over 40 captured calls: 52,000 instructions a call, 75% in the banks' section, the software
+divisions that wrap the positions under 8%.
+
+- Natively, every operation through the lifted code's own helpers (psl_fma, psl_fm, psl_fs, psl_fa, psl_cflts) on
+  quadwords in guest order (the helpers are lane-wise), in the job's order; csflt 140 of an int16 as NEON's fixed-point
+  convert (exact: an int16 times 2^-15); the job's division (magnitudes, shift and subtract, the dividend's sign on the
+  remainder) as an unsigned remainder. The twelve filters of a frame are independent: they run side by side (the job
+  runs them one after another, each a chain of 24 dependent fma), and the outputs' fma chains take their results in
+  the job's order. The delay lines are read and written in the job's order.
+- Declined, before anything is written: any slot a line will use in any of the call's frames (positions simulated
+  ahead) inside the context, the input, the output or the job's shuffle controls, a length 0 (the job halts there), the
+  input or output inside the context, a context off a quadword boundary. Nothing in registers is read after it
+  (spu-live at its four call sites).
+- Checked: 200 captured calls of a walk (every 331st), all exact; 17.9 us lifted, 6.1 us native a call (x2.94). Tests:
+  an oracle in the job's order on whole quadwords in register layout (the slot's halves through shufb with the job's
+  controls, xshw, csflt; the division as the job's shift-and-subtract loop) against the native code: four mixes,
+  0-16 frames, relocated, in place or not, negative positions; a slot inside the context declined. A walk with
+  PSPOCKET_SPU_NATIVE_SCRAMBLE=1 (the registers outside the contracts garbage after each call): 94,484 native calls of
+  it, 926,000 of D-979's two, nothing declined, no RSX failure.

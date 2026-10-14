@@ -18,6 +18,7 @@
 extern "C" {
 void ps_test_oracle_012b_062c8(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_012b_05b20(SPUContext* ctx, uint8_t* ls);
+void ps_test_oracle_2828_0a920(SPUContext* ctx, uint8_t* ls);
 }
 
 namespace {
@@ -180,4 +181,67 @@ TEST_CASE("GTA V audio: the synthesizer's two biquad sections (0x05B20) are the 
     CHECK(t.ran > 300);
     // Declined: only a state with a denormal in it (the specials' and silence's).
     CHECK(t.declined < t.ran / 4);
+}
+
+namespace {
+
+// A reverb case (0x0A920): the context at 0x10000 (coefficients, filter states, line records), 22 delay lines of up to
+// 64 slots from 0x30000 (positions sometimes negative: the slot below the base, the remainder negative), the frames'
+// input at 0x20000 and output at 0x22000 (or in place).
+Case reverb_case(Rng& r, Mix mix, uint32_t frames, uint32_t reloc, bool in_place, bool slot_in_context)
+{
+    Case c;
+    for (size_t i = 0; i < c.ls.size(); i += 4) ps_st32(c.ls.data() + i, r.next());
+    put_quad(c.ls.data(), 0x189F0 + reloc, 0x00000001u, 0x00000203u, 0x00000405u, 0x00000607u);
+    put_quad(c.ls.data(), 0x18A00 + reloc, 0x00000809u, 0x00000A0Bu, 0x00000C0Du, 0x00000E0Fu);
+    put_quad(c.ls.data(), 0x18A10 + reloc, 0x02030607u, 0x0A0B0E0Fu, 0x12131617u, 0x1A1B1E1Fu);
+    const uint32_t cx = 0x10000, in = 0x20000, out = in_place ? in : 0x22000;
+    // Gains and coefficients a stable reverb might have (|x| < 1), in the case's mix.
+    const auto coef = [&] {
+        const uint32_t v = pick(r, mix);
+        return mix == Mix::specials ? v : (v & 0x807FFFFFu) | ((0x7Fu - 1u - r.next() % 12u) << 23);
+    };
+    for (uint32_t at = cx; at < cx + 0xA40; at += 4) ps_st32(c.ls.data() + at, coef());
+    const auto line = [&](uint32_t n, uint32_t base_at, uint32_t pos_at, uint32_t len_at) {
+        const uint32_t len = 1 + r.next() % 64;
+        const uint32_t pos = r.next() % 8 == 0 ? 0u - (1 + r.next() % 3) : r.next() % len;
+        ps_st32(c.ls.data() + base_at, 0x30000 + 0x800 * n + 0x40);
+        ps_st32(c.ls.data() + pos_at, pos);
+        ps_st32(c.ls.data() + len_at, len);
+    };
+    for (uint32_t k = 0; k < 4; k++) line(k, cx + 2368 + 64 * k + 44, cx + 2368 + 64 * k + 52, cx + 2368 + 64 * k + 56);
+    for (uint32_t i = 0; i < 6; i++)
+        for (uint32_t t = 0; t < 3; t++) {
+            const uint32_t rec = cx + 1504 + 288 * t + 48 * i;
+            line(4 + 3 * i + t, rec + 28, rec + 36, rec + 40);
+        }
+    if (slot_in_context) ps_st32(c.ls.data() + cx + 1504 + 48 * 2 + 28, cx + 0x100);
+    for (uint32_t i = 0; i < 8 * frames; i++) ps_st32(c.ls.data() + in + 4 * i, pick(r, mix));
+    for (int reg = 0; reg < 128; reg++) set_reg(c.ctx, reg, r.next(), r.next(), r.next(), r.next());
+    set_reg(c.ctx, 3, cx, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 4, in, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 5, out, r.next(), r.next(), r.next());
+    set_reg(c.ctx, 6, 2 * frames + (r.next() & 1), r.next(), r.next(), r.next());
+    set_reg(c.ctx, 0, 0x0C180, 0, 0, 0);
+    c.ctx.reloc = reloc;
+    c.ctx.pc = 0x0A920 + reloc;
+    return c;
+}
+
+} // namespace
+
+TEST_CASE("GTA V audio: the submix job's reverb (0x0A920) is the job's, bit for bit (D-980)", "[games]")
+{
+    Rng r;
+    Tally t;
+    for (const Mix mix : {Mix::audio, Mix::zeros, Mix::specials, Mix::silence})
+        for (const uint32_t frames : {0u, 1u, 2u, 16u})
+            for (const uint32_t reloc : {0u, 0x400u})
+                for (const bool in_place : {false, true}) check(reverb_case(r, mix, frames, reloc, in_place, false),
+                    ps_gta5_2828_0a920, ps_test_oracle_2828_0a920, {}, t);
+    CHECK(t.ran == 4 * 4 * 2 * 2);
+    // A line whose slot is inside the context: declined (unless there are no frames).
+    Tally d;
+    for (int k = 0; k < 4; k++) check(reverb_case(r, Mix::audio, 4, 0, false, true), ps_gta5_2828_0a920, ps_test_oracle_2828_0a920, {}, d);
+    CHECK(d.declined == 4);
 }

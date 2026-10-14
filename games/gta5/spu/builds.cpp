@@ -30,6 +30,11 @@ const bool registered = [] {
             {0x05B20, ps_gta5_012b_05b20, regs({6})},
             {0x062C8, ps_gta5_012b_062c8, regs({6})},
         });
+    // The mixer's submix job ("Submixes", "BiquadFilter", "BufferConversion", "R360OutputBuffer").
+    rp::add_build("RAGE audio submixes (spu_28281614459ce75e)", 0x28281614459CE75Eull, 0x04C00, 0x14730,
+        {
+            {0x0A920, ps_gta5_2828_0a920, {}},
+        });
     return true;
 }();
 

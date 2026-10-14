@@ -18,6 +18,9 @@ extern "C" {
 int ps_gta5_012b_05b20(SPUContext* ctx, uint8_t* ls); /* two biquad sections in series */
 int ps_gta5_012b_062c8(SPUContext* ctx, uint8_t* ls); /* biquad */
 
+/* The mixer's submix job, spu_28281614459ce75e (rage_submix.c). */
+int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls); /* reverb */
+
 #ifdef __cplusplus
 }
 #endif
