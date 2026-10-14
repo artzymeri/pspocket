@@ -15505,6 +15505,31 @@ PSPOCKET_SPU_NATIVE=ab, 10 s halves, the dispatcher's host time a call, contenti
   operations on every lane (frsqest, fi, the clamps), as many natively as in the lifted code, and which lanes matter
   depends on the table's shuffles. Not listed as native: the fragment stays lifted.
 
+## D-969 · 2026-10-15 · GTA V's EDGE job with its native pieces: the walks, the contract's check, what is left
+
+The native pieces of D-968 together (0x0ECF8, 0x0F008, and the regions 0x07EF4, 0x080F8, 0x084AC of 0x07A38 and
+0x0B850 of 0x0B778), measured in one session on the gate's 128 s walk (the Mac shared with other agents' builds):
+
+| Walk | EDGE/GFX SPU time (SPURS lines, 5 s windows summed) | flips | RSX failures | SPU code interpreted |
+|---|---|---|---|---|
+| natives off (PSPOCKET_SPU_NATIVE=0, run off2) | 68.5 s | 3719 | 0 | 0 |
+| natives on (run nat2) | 50.5 s (-26%) | 3727 | 0 | 0 |
+| natives on, contract scrambled (PSPOCKET_SPU_NATIVE_SCRAMBLE=1, run scr4) | | 3568 | 0 | 0 |
+
+Each piece in the game, the A/B walk (PSPOCKET_SPU_NATIVE=ab, 10 s halves, run ab3; host time a call, contention and
+all): 0x0ECF8 4.28 -> 2.90 µs (x1.47); 0x0F008 9.38 -> 5.67 µs with its callback (x1.65); loop 0x080F8 3.38 -> 1.64 µs
+(x2.06); 0x07EF4 0.90 -> 0.73 µs (x1.24); 0x084AC 0.63 -> 0.38 µs (x1.65); loop 0x0B850 1.79 -> 0.79 µs (x2.28). Every
+piece was checked on 2600 to 3000 entries captured over the whole walk (D-968): all exact, or declined to the lifted
+code (12 of 3000 for 0x080F8). The gate (scripts/gate.sh game) passes with all of them on: 29.8 fps median, 2 frame
+jumps, no dark frame. All 150 of GTA V's SPU programs lifted again with the table: the 149 not in it byte for byte as
+before, the EDGE job differing at its listed addresses only.
+
+What is left of the job's time: about 9 s a walk in listed code still lifted (0x0A098, the index decompression, 4.0 s:
+bit fields, population counts and data-dependent shuffles through the job's tables, integer work the lifted code
+already does at about one host instruction an SPU one; 0x0AC10, 3.5 s, tried, D-968), and some 24 s outside the listed
+functions (the job's own loop, its DMA and the fragments' dispatch). A native 0x0A098 is the next piece by size, then a
+profile of the unlisted part.
+
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 
 The plan for a steady 30 fps (docs/improve.md): on the iPhone 18 Pro Max the RSX thread (the FIFO reader and the Metal
