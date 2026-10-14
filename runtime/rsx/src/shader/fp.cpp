@@ -175,16 +175,24 @@ std::optional<FragmentProgram> decode_fragment_program(const u8* data, u32 max_l
 
 bool scan_fragment_program(const u8* data, u32 max_length, FpScan& out)
 {
+    // Only what tells the program's end and its constants, as decode_fp_instruction finds them: the end bit, the
+    // opcode (a flow control instruction has no constant) and the three sources' register types (D-953: the full
+    // decode of every instruction was most of a draw's program lookup in GTA V, which writes programs over each other).
     out.constant_offsets.clear();
     u64 h = 0x66726167ull; // as decode_fragment_program
     u32 offset = 0;
     while (offset + 16 <= max_length) {
-        const FpInstruction in = decode_fp_instruction(data, offset);
-        if (in.has_constant && offset + 32 > max_length) break;
-        h = hash_words(in.words.data(), 4, h);
-        offset += in.has_constant ? 32 : 16;
-        if (in.has_constant) out.constant_offsets.push_back(in.constant_offset);
-        if (in.end) {
+        u32 words[4];
+        for (u32 i = 0; i < 4; i++) words[i] = load_fp_word(data, offset + i * 4);
+        const u32 op = bits(words[0], 24, 6) | (bits(words[2], 31, 1) << 6);
+        const auto constant = [](u32 s) { return static_cast<FpRegType>(bits(s, 0, 2)) == FpRegType::Constant; };
+        const bool has_constant =
+            !fp_op_is_flow_control(op) && (constant(words[1]) || constant(words[2]) || constant(words[3]));
+        if (has_constant && offset + 32 > max_length) break;
+        h = hash_words(words, 4, h);
+        if (has_constant) out.constant_offsets.push_back(offset + 16);
+        offset += has_constant ? 32 : 16;
+        if (bits(words[0], 0, 1)) {
             out.ucode_length = offset;
             out.hash = h ^ (u64{offset} << 32);
             return true;

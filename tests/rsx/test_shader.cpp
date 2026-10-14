@@ -5,6 +5,7 @@
 #include <catch_amalgamated.hpp>
 
 #include <format>
+#include <random>
 
 #include "pspocket/rsx/shader/ir.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
@@ -946,4 +947,28 @@ TEST_CASE("the translation's fingerprint is stable and covers what the translato
     CHECK(a == b);
     CHECK(a != 0);
     CHECK(a != (0xcbf29ce484222325ull ^ kTranslationVersion)); // the programs and the prologue went into it
+}
+
+// The program scan (D-953) reads only the bits that tell a program's end and its constants: over random microcode it
+// finds what the full decode finds (length, hash, constant positions), and nothing where the decode finds no end.
+TEST_CASE("fp: the program scan agrees with the full decode (D-953)")
+{
+    std::mt19937 rng(953);
+    shader::FpScan scan;
+    for (u32 round = 0; round < 3000; round++) {
+        const u32 instructions = 1 + rng() % 24;
+        std::vector<u8> bytes((instructions * 2 + 2) * 16);
+        for (auto& b : bytes) b = static_cast<u8>(rng());
+        // Mostly no end bit, so the program runs on; the end bit (bit 0 of the first word, its halves exchanged in
+        // memory: byte 1) set at random.
+        for (u32 at = 0; at < bytes.size(); at += 16) bytes[at + 1] &= (rng() % 8 == 0) ? 0xff : 0xfe;
+        const u32 max_length = static_cast<u32>(bytes.size()) - (rng() % 3) * 16;
+        const auto fp = shader::decode_fragment_program(bytes.data(), max_length);
+        const bool found = shader::scan_fragment_program(bytes.data(), max_length, scan);
+        REQUIRE(found == fp.has_value());
+        if (!fp) continue;
+        CHECK(scan.ucode_length == fp->ucode_length);
+        CHECK(scan.hash == fp->hash);
+        CHECK(scan.constant_offsets == fp->constant_offsets);
+    }
 }
