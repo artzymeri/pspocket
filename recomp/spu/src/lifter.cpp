@@ -1500,7 +1500,8 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     // one, a forward jump or fall-through into one leaves for the run loop, which goes on through the program's table,
     // where the program the runtime derives from this one takes it over.
     LiftOptions bounded = options;
-    for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
+    if (options.replace_boundaries)
+        for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
     std::map<u32, std::string> callable = symbols;
     std::erase_if(callable, [&](const auto& s) { return bounded.boundaries.contains(s.first); });
     // A boundary inside a function is a label of it, an entry the run loop goes on at: a loop head or exit reached by

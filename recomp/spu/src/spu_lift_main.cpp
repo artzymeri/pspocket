@@ -3,12 +3,14 @@
 //   spu-lift --elf prog.elf --out DIR [options]
 //   spu-lift --image code.bin --base 0x0 --entry 0x0 [--entry ...] --out DIR [options]
 //   options: [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]
-//            [--no-constant-entries] [--relocatable] [--discover] [--whole] [--strict] [--quiet]
+//            [--no-constant-entries] [--relocatable] [--discover] [--whole] [--no-replace-boundaries] [--strict]
+//            [--quiet]
 //
 // --relocatable lifts position independent code (job binaries, the modules programs load: D-081) to run at any LS
 // address: the base is only where the image is analysed. --discover also lifts code only registers reach (D-155), as
 // the game and system preparations do. --whole makes each function one C function entered at any label, as before
-// D-961 (no twins).
+// D-961 (no twins). --no-replace-boundaries lifts the functions listed for native replacement (D-966) as any other, to
+// compare translations with the replacements off (D-962).
 // Prints a summary (functions, instructions, labels, the program key) and every unsupported instruction reached by
 // control flow (left to the interpreter at runtime). --strict turns those into a failing exit code.
 
@@ -34,7 +36,8 @@ void usage()
     std::fprintf(stderr,
         "usage: spu-lift (--elf FILE | --image FILE --base ADDR --entry ADDR [--entry ADDR]...) --out DIR\n"
         "                [--seed ADDR]... [--name NAME] [--tu N] [--xfloat approximate|accurate] [--no-comments]\n"
-        "                [--no-constant-entries] [--relocatable] [--discover] [--whole] [--strict] [--quiet]\n");
+        "                [--no-constant-entries] [--relocatable] [--discover] [--whole] [--no-replace-boundaries]\n"
+        "                [--strict] [--quiet]\n");
 }
 
 bool read_file(const std::string& path, std::vector<u8>& out)
@@ -117,6 +120,7 @@ int main(int argc, char** argv)
         }
         else if (arg == "--discover") analyzer.discover = true;
         else if (arg == "--whole") options.twins = false;
+        else if (arg == "--no-replace-boundaries") options.replace_boundaries = false;
         else if (arg == "--strict") strict = true;
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--help" || arg == "-h") {

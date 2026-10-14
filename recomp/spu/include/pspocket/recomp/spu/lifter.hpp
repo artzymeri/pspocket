@@ -41,6 +41,9 @@ struct LiftOptions {
     // fall-through into one leaves for the run loop (a back edge to one stays a local jump). lift() adds those
     // pspocket::spu::replace lists for the program: native replacements of functions and of loops.
     std::set<u32> boundaries;
+    // lift() adds the replace lists' addresses to the boundaries (spu-lift --no-replace-boundaries: not, to compare
+    // translations with the native replacements off, D-962).
+    bool replace_boundaries = true;
     // Each function as a fast C function entered at its entry (and a few labels), and a cold twin the run loop resumes
     // its other labels in (D-961). Off (spu-lift --whole): one C function entered anywhere (a switch over every label).
     bool twins = true;
