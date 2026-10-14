@@ -15225,3 +15225,103 @@ a fault over a whole shot passes them.
 - Measured: the walk from frame 2880, every 4th frame saved: no frame with 30% of its pixels black outside the top-left
   corner (234 frames), where each walk with the fault had whole shots of them (frames 2700 to 2976, 3082 to 3176, 3222
   to 3238 in one).
+
+## D-952 · 2026-10-14 · The iOS runtime built for the A12 and later (LSE atomics); the app a game (Game Mode)
+
+Two findings of the research on a steady 30 fps (docs/improve.md), both from build settings:
+
+- **LSE atomics.** libPSPocketRuntime.a held no LSE atomic instruction and 5,444 load- and store-exclusive ones: for an
+  arm64 iOS target clang builds for ARMv8.0 (apple-a7) unless told, where the Mac's builds get ARMv8.5 (apple-m1).
+  Every atomic on the hot paths (the reservations, ps_res_acquire and ps_res_notify_write; the SPURS lines; the FIFO's
+  get and put) was a retry loop. The runtime target now has -mcpu=apple-a12: iOS 17's oldest devices have an A12
+  (ARMv8.3, LSE). The Mac's numbers cannot show it; the phone's SPU and RSX threads' CPU in the same scenes will.
+- **Game Mode.** The app declared public.app-category.developer-tools, so iOS never gave it Game Mode (CPU and GPU
+  priority, background work held back, and Adaptive Power leaves such games alone). It is now public.app-category.games
+  with LSSupportsGameMode (iOS 18.6 and later) and GCSupportsGameMode (iOS 18.0 to 18.5) in Info.plist; iOS shows a
+  "Game Mode" banner when it applies, and the user can turn it off from Control Center.
+
+## D-970 · 2026-10-14 · The phone's power and heat in the log; in-session translation at "serious" heat; the Metal HUD
+
+From the research on a steady 30 fps (docs/improve.md): what iOS gives the game cannot be judged from fps and the heat
+level alone.
+
+- **Power** (game.mm, every 5 s): "power: CPU N s, P% of it on the performance cores, W watts, M moves between the kinds
+  of cores", from TASK_POWER_INFO_V2 (total_user + total_system and task_ptime are in mach time units: on the Mac 10.85
+  million of them were rusage's 0.452 s at 125/3 ns each; task_energy in nJ), and "Low Power Mode on" when it is.
+- **Heat:** each change of the thermal state and of Low Power Mode is logged when it happens (NSProcessInfo's
+  notifications), and the session's first line names the cores (hw.perflevel0/1.logicalcpu), the heat and Low Power
+  Mode.
+- **In-session SPU translation (D-236) now runs at "serious" heat**, stopping only at "critical": run 327 was serious from
+  start to end, the programs met in play stayed in the interpreter all session (844 million SPU instructions), and the
+  interpreter's load kept the phone hot. It already runs on one core at utility QoS.
+- **Metal's performance HUD:** MetalHUDEnabled in Info.plist, hidden on the game's layer unless PSPOCKET_HUD is set
+  (Documents/pspocket-env.txt): then it shows and logs a "metal-HUD" line a second (present intervals, frame misses)
+  through developerHUDProperties (mode and logging "default", Apple tech talk 110339).
+
+## D-971 · 2026-10-14 · The game's vblanks on the screen's refreshes; frames held 1/30 s at 30 fps
+
+The GCM interrupt thread counted vblanks on a free-running 1/59.94 s timer (RPCS3's period). Against a 60 Hz screen
+(16.667 ms) it drifts 16 us a vblank, so a game flipping at every second vblank had a frame held a refresh longer about
+every 8 to 17 s (60 or 120 Hz refreshes): a hitch even at full speed. And the RSX thread presented each frame as it
+came, so one the GPU finished a little late showed a refresh late while the next was on time.
+
+- hle::display_vsync(at, period) takes the screen's refreshes from the platform; the interrupt thread's next vblank is
+  the refresh nearest its nominal time (hle::next_vblank), never within half a period of the previous one, and the
+  59.94 Hz timer while no refresh was reported in 100 ms (pspocket-boot on the Mac, a stopped display link).
+- iOS: a CADisplayLink at 60 Hz on the main run loop reports each refresh (its CACurrentMediaTime times placed in
+  steady_clock time by how long ago they were). PSPOCKET_NO_DISPLAY_CLOCK: the timer as before.
+- Present: a moving average of the time between flips; above 30 ms (below 24 ms to leave) each frame is presented with
+  presentDrawable:afterMinimumDuration: 1/30 s, a 60 fps game never. PSPOCKET_NO_PACING: off. The 5-s "present" line
+  gives the flips' pace, the frames held and the time the RSX thread waited for drawables (to decide whether the
+  drawable needs to come off the RSX thread).
+- Test (tests/hle/test_gcm_sys.cpp, "D-971"): no reports, the nominal time; a 60 Hz screen, 600 vblanks one refresh
+  apart each and on the grid; a 120 Hz screen, every second refresh; a late vblank's next is the refresh after; reports
+  over 100 ms old unused.
+
+## D-972 · 2026-10-14 · The SPU runtime's overheads around the translated code (channels, SPURS selection, the tracker)
+
+The research on a steady 30 fps (docs/improve.md; Mac profiles 204 and 206 of GTA V's walk) put about a quarter of the
+SPU threads' busy time outside the translated code. The parts done here, each safe without a re-lift:
+
+- **Channels.** ps_spu_wrch and ps_spu_rdch saved 10 and 12 registers before their switch, also for the channels that
+  take no lock (a DMA's parameters: lifted code makes six wrch calls a DMA). The locked channels are now out of line
+  (wrch_locked, rdch_locked) and the errors cold: wrch's fast path saves only fp and lr, rdch's six registers (its
+  decrementer read). The tag mask and tag update writes, the tag and atomic status reads and their counts take no lock
+  any more: mfc_command already updates that state without it, on the SPU's own thread, and no other thread reads it.
+- **SPURS selection** (select1, select2): "changed" was set whenever a workload was picked, so a worker picking its own
+  workload again (GTA V's job chains, over and over) stored the line anyway: a new version, every parked worker woken
+  (a bucket mutex and notify_all) and others' read-modify-writes failed. Now only bytes that change count (the
+  workload's signal bit when set, the workload flag when not already 0xFFFFFFFF, the contention). The kernel context
+  takes the line the selection ended with instead of reading it again (a DMB and two 128-byte reads a dispatch).
+- **The module tracker:** lifted_outside tests 32 code words at a time (any_bit; 200,000 random cases against the word
+  by word test, no difference); save_module_runs finds each stretch with run_end's NEON scan. A copy over lines of a
+  module that hold none of its program's code (its data, D-085) leaves the module identified for the lines it still
+  holds, instead of hashing, comparing and scanning it again at its next run (run 142: about 700,000 identifications a
+  walk); a copy over any of its code still drops it.
+- Small: ps_res_store_line copies the caller's 256 bytes before taking the line's lock; GETLLAR tests whether the old
+  reservation was lost before taking the context lock (the event alone needs it); the job chain's clock and its pauses
+  use ps_host_now_ns and ps_host_sleep_ns.
+- Not done (measured too small or too risky for now): DMA lists in one pass, a granule bitmap for PUT notifications,
+  inline small copies (memmove is mostly the bytes).
+- Tests: tests/spu, test_reservation, test_lv2 and test_hle's SPURS and SPU program cases pass; "a module with data
+  copied over its tail" now also checks that data over its tail does not identify it again (fails before the change).
+- Measured on the Mac (GTA V's prologue walk, 128 s; the Mac loaded by three agents' builds, load 30 to 50, so the
+  builds alternated: before, after, before, after, then after, before): frames drawn in the 128 s 3,278 / 3,149 / 2,506
+  before, 3,681 / 3,653 / 3,451 after (+12 to +38%). Before, the busy half of the walk fell to 7 to 24 fps (10 to 16 in
+  the last pair); after, it held 22 to 30. CPU of the main SPURS instance's threads per frame hardly moved (42 to 47 ms
+  either way): the time went to waiting (the wake-ups and failed read-modify-writes of the stores that changed nothing),
+  which a loaded machine, like the phone's six busy cores, pays most.
+
+## D-973 · 2026-10-14 · PSPOCKET_SPU_QOS_SERIAL: a workload of one SPU at a time on a QoS class of its own
+
+GTA V's GraphicsMain runs on one SPU at a time (maximum contention 1): about 30 ms of each 33 ms frame on one thread
+(run 327's budget), the frame's critical path, wherever iOS puts that thread. D-950 found every worker at interactive no
+better (the two performance cores full either way); the research's suggestion is to give the performance cores to the
+serial stages only.
+
+- The selection notes whether the workload it picked has a maximum contention of 1 (Selection::serial). With
+  PSPOCKET_SPU_QOS_SERIAL=interactive (or initiated, default, utility), a worker running such a workload switches its
+  thread to that class, and back to its own when it runs another (one pthread_set_qos_class_self_np a change, none
+  while it stays). It applies to the sound mixer's instance too, whose workloads are of one SPU. Unset: as before.
+- With PSPOCKET_SPU_AB=S it applies in the A half only, so one session measures it on and off every S seconds in the
+  same scenes and heat (each SPURS time line names its half).

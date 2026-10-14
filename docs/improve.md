@@ -41,7 +41,12 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
 - **Not levers:** real-time threads for SPU workers (XNU demotes them after a second without blocking), thread affinity
   (not on iOS), fewer SPU threads (the game's priorities pin workloads, D-950), every worker at interactive (D-950),
   -O3 or another -mcpu for the lifted code (under 1% static).
-- **State:** open; item 1 first.
+- **State (2026-10-14 evening):** the user asked to build all of it. Done: D-952 (LSE atomics, Game Mode), D-970 (power and
+  heat in the log, in-session translation at "serious", the HUD switch), D-971 (vblanks on the screen's refreshes,
+  frames held 1/30 s), D-972 (the SPU runtime's channels, SPURS selection and tracker: the Mac walk +12 to +38% frames
+  under load), D-973 (QoS for serial workloads, to measure on the phone). In progress in agents' clones: the RSX
+  thread's per-draw costs (inventory/agents/f1), the SPU translator (f2), native EDGE (f3). Next: native MP3 and zlib,
+  the mixer's DSP on vDSP.
 
 ## SPU and SPURS: the biggest cost in play
 
