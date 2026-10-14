@@ -1217,7 +1217,18 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     const bool clear_depth = (mask & clear::kDepth) && t.depth;
     const bool clear_stencil = (mask & clear::kStencil) && t.depth && z24;
 
-    // Keep the open pass if it already has these surfaces (clearing mid-pass), else switch.
+    // What the clear covers: the scissor within its own area, its surface clip within its surfaces (as a pass of its own
+    // would have it, open_pass).
+    u32 area_width = 0, area_height = 0;
+    bool area_partial = false;
+    target_area(t, area_width, area_height, area_partial);
+    u32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    region(area_width, area_height, x0, y0, x1, y1);
+
+    // Keep the open pass if it already has these surfaces and its area holds the clear's region (clearing mid-pass),
+    // else switch. A pass over a smaller target with the same depth buffer has less of it: GTA V draws a 320x128 target
+    // with its 1280x720 depth buffer, then clears that depth buffer alone; done in that pass, the clear reached its
+    // 320x128 corner, and the scene was drawn against old depth everywhere else (run 327's fight, D-951).
     bool here = false;
     if (pass_open) {
         bool subset = true;
@@ -1225,7 +1236,7 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
             subset &= i < pass.color_count && pass.color[i] == t.color[i];
         }
         if (t.depth && t.depth != pass.depth) subset = false;
-        here = subset && !newer_in_guest(t);
+        here = subset && !newer_in_guest(t) && x1 <= pass_width && y1 <= pass_height;
     }
     if (!here && merging() && !newer_in_guest(t) && (t.color_count || t.depth)) {
         // D-945: a clear of targets the pass drawing does not have waits, and the pass goes on (the clear runs before
@@ -1286,8 +1297,6 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     if (!here) open_pass(t);
     if (!pass_open) return;
 
-    u32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    region(pass_width, pass_height, x0, y0, x1, y1);
     if (x1 <= x0 || y1 <= y0) return;
     const bool full = x0 == 0 && y0 == 0 && x1 == pass_width && y1 == pass_height;
     if (tracing) {
@@ -1522,7 +1531,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         for (u32 i = 0; i < targets.color_count; i++) {
             if (!draw_blend.enabled_for(targets.rsx_index[i])) continue;
             const MTLPixelFormat pf = targets.color[i]->pixel_format;
-            const bool unorm = pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatBGRA8Unorm;
+            const bool unorm = pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatBGRA8Unorm ||
+                               pf == MTLPixelFormatR8Unorm || pf == MTLPixelFormatRG8Unorm; // B8, G8B8 too
             if (!unorm && pf != MTLPixelFormatRGBA16Float && pf != MTLPixelFormatRGBA32Float) continue;
             fo.blend_in_shader = static_cast<u8>(fo.blend_in_shader | (1u << i));
             if (unorm) fo.blend_unorm = static_cast<u8>(fo.blend_unorm | (1u << i));

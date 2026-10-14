@@ -608,8 +608,15 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
     for (u32 i = 0; i < p.color_count; i++) blends |= p.blend_on[i] != 0;
     MTLBlendOperation op = MTLBlendOperationAdd;
     if (blends && (!blend_operation(p.equation_rgb, op) || !blend_operation(p.equation_a, op))) {
-        unsupported(std::format("blend equation {:#x}/{:#x} (signed) is not implemented", blend.equation_rgb,
-            blend.equation_a));
+        // A signed equation Metal draws as add: the shader interpreter's draw while the program compiles, or a
+        // target the shader does not blend (D-948), named so the two can be told apart.
+        std::string formats;
+        for (u32 i = 0; i < p.color_count; i++)
+            if (p.blend_on[i]) formats += std::format("{}{}", formats.empty() ? "" : ", ", p.color_formats[i]);
+        const bool interpreter = fp.key.starts_with("interp:");
+        unsupported(std::format("blend equation {:#x}/{:#x} (signed) drawn as add ({}, MTLPixelFormat {})",
+            blend.equation_rgb, blend.equation_a, interpreter ? "the shader interpreter's draw" : "the target's format",
+            formats));
     }
     if (blend.logic_op_enable) unsupported("logic ops are not implemented (Metal has none)");
     MTLRenderPipelineDescriptor* d = pipeline_descriptor(p, vp.function, fp.function);

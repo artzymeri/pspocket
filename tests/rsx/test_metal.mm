@@ -3919,6 +3919,31 @@ TEST_CASE("metal e2e: the signed blend equations are done in the shader (D-948)"
         INFO(px[0] << " " << px[1] << " " << px[2] << " " << px[3]);
         CHECK(near(px, {0xff, 0x90, 0x70, 0x80}));
     }
+    SECTION("ADD_SIGNED on a B8 target (GTA V's, run 327)")
+    {
+        // The B8 target keeps the shader's blue: 0x00 (0) added to the clear's 0x80. Blue 0xf0 here instead: -16.
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0x0000f000, 0x0000f000, 0x0000f000}); // b 0xf0 (-16)
+        auto b = e.at(0);
+        setup_surface_as(b, kSurfaceB, SurfaceColorFormat::B8, kW);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x80808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+        b.method(m::NV4097_SET_BLEND_EQUATION, 0xf006f006);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().shader_blend_draws == 1);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH));
+        const int v = *e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceB + 48 * kW + 32);
+        INFO(v);
+        CHECK(std::abs(v - 0x70) <= 1);
+    }
     SECTION("REVERSE_ADD_SIGNED: the source plus the signed target")
     {
         // The target's 0x80 is -128 as a signed byte and its 0xff -1: the source minus 128/255 (alpha minus 1/255),
@@ -5994,6 +6019,70 @@ TEST_CASE("metal e2e: a clear of the first targets of a pass with more leaves th
             CHECK(guest_pixel(*e, kSurfaceB, 32, 48) == (drawn ? kGreen : kBlack));
             CHECK(guest_pixel(*e, kSurfaceB, 2, 2) == kBlack);
         }
+    }
+}
+
+TEST_CASE("metal e2e: a depth buffer cleared alone after a pass over a smaller target with it is cleared whole (D-951)")
+{
+    // GTA V's fight (run 327): a 320x128 target drawn with the 1280x720 depth buffer, a clear of another target that
+    // waits while that pass goes on (D-945), then a clear of the depth buffer alone under the full surface clip. Done
+    // in the open pass, the clear reached the pass's corner only, and the scene drawn next failed the depth test
+    // everywhere else: the screen black but its top-left corner.
+    REQUIRE_METAL();
+    struct Result {
+        Px in, top;
+        u16 z_far = 0, z_corner = 0;
+    };
+    const auto run = [](bool merging) {
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red, window z 0.75
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        // A black, the depth buffer at 0.25 all over: the triangle fails against it.
+        setup_surface(b, kSurfaceOffset);
+        set_z16(b, kDepthZ);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x4000u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        // A 16x16 target drawn with it, depth-tested: a pass over the depth buffer's top-left corner.
+        setup_surface_sized(b, kSurfaceC, 16, 16, kW * 4);
+        set_z16(b, kDepthZ);
+        depth_test_less(b);
+        draw_triangle(b);
+        // Another target cleared whole: it waits, and the pass goes on (D-945).
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        // The depth buffer alone, all of it, to 1.0.
+        setup_surface(b, kSurfaceOffset);
+        set_z16(b, kDepthZ);
+        b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::None));
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffffu);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth);
+        // The scene: the triangle into A against it, drawn everywhere it covers.
+        b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::A));
+        draw_triangle(b);
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepthZ, kW * kH * 2));
+        Result r;
+        r.in = guest_pixel(*e, kSurfaceOffset, 32, 48);
+        r.top = guest_pixel(*e, kSurfaceOffset, 31, 15); // the triangle's tip, just right of the 16x16 corner
+        r.z_far = guest_depth16(*e, kDepthZ, 60, 4); // outside the triangle and the corner
+        r.z_corner = guest_depth16(*e, kDepthZ, 2, 2);
+        return r;
+    };
+    for (const bool merging : {true, false}) {
+        INFO((merging ? "merging" : "not merging"));
+        const Result r = run(merging);
+        CHECK(r.in == kRed); // fails before the fix with merging: the depth there still 0.25
+        CHECK(r.top == kRed);
+        CHECK(r.z_far == 0xffff);
+        CHECK(r.z_corner == 0xffff);
     }
 }
 
