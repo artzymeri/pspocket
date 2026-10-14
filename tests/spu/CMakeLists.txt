@@ -18,6 +18,11 @@ if(TARGET pspocket::ffmpeg)
     target_link_libraries(test_spu_mp3 PRIVATE pspocket::ffmpeg)
 endif()
 
+# ---- zlib 1.2.3's inflate natively (D-975): raw deflate streams the host's zlib makes
+find_package(ZLIB REQUIRED)
+pspocket_add_test(test_spu_zlib SOURCES test_zinflate.cpp LIBS pspocket::spu ZLIB::ZLIB)
+target_include_directories(test_spu_zlib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/runtime/spu/replace)
+
 # ---- differential fuzz: interpreter vs lifted code, every supported instruction (CLAUDE.md rule 3)
 set(PSPOCKET_SPU_FUZZ_CASES 256 CACHE STRING "Differential fuzz cases per SPU instruction (at least 200)")
 set(PSPOCKET_SPU_FUZZ_TUS 16 CACHE STRING "Translation units the lifted SPU fuzz cases are split into")

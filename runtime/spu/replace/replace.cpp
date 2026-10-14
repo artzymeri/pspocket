@@ -111,9 +111,29 @@ constexpr Function kFlashMp3[] = {
     {0x1E820, ps_flashmp3_884a_1e820, regs({3}), flashmp3_regions},
 };
 
+// zlib 1.2.3's inflate as RAGE links it into GTA V's "inflateServer" SPURS task (spu_3ffe1d50f8a58e15: the strings
+// "1.2.3" and zlib's messages; its main loop DMAs a request's input in, calls inflate and DMAs the output out),
+// lifted at 0x3000. inflate(strm, flush) at 0x05190 returns its result in $3 (D-975).
+// Not reproduced (dead): the stack below the caller's stack pointer (the frames of inflate, inflate_fast and the
+// task's copy routine, free once it returns: the SPU ABI), and the copy routine's scratch quadword at 0x9720 (the
+// routine 0x03110 that zmemcpy calls writes it before it reads it: 400 captured calls replayed with it scrambled at
+// entry leave everything else as they did).
+void inflate3ffe_regions(const SPUContext& entry, const uint8_t*, std::vector<Region>& out)
+{
+    const uint32_t sp = entry.gpr[1].u32[3] & PS_SPU_LS_MASK;
+    out.push_back({Region::Kind::dead, 0x9720, 16, 0});
+    constexpr uint32_t kStack = 8192;
+    if (sp >= kStack) out.push_back({Region::Kind::dead, sp - kStack, kStack, 0});
+}
+
+constexpr Function kInflate3ffe[] = {
+    {0x05190, ps_zlib_3ffe_05190, regs({3}), inflate3ffe_regions},
+};
+
 constexpr Build kBuilds[] = {
     {"EDGE geometry (spu_dad457863220b1cc)", 0xDAD457863220B1CCull, 0x04C00, 0xE900, kEdgeDad4},
     {"Sony's MP3 decoder module (flashMP3.pic)", 0x884AE88F68A9E778ull, 0x17400, 0x10380, kFlashMp3},
+    {"zlib 1.2.3 inflate (spu_3ffe1d50f8a58e15)", 0x3FFE1D50F8A58E15ull, 0x03000, 0x6690, kInflate3ffe},
 };
 
 // Builds added at run time (add_build): never removed, so a Build found stays valid.

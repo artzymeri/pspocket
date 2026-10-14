@@ -21,6 +21,9 @@ int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls);
 /* Sony's MP3 decoder module (flashMP3.pic), program 884ae88f68a9e778: decodeFrame (flashmp3.c). */
 int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls);
 
+/* zlib 1.2.3's inflate in GTA V's inflateServer task, program 3ffe1d50f8a58e15 (zinflate.c). */
+int ps_zlib_3ffe_05190(SPUContext* ctx, uint8_t* ls);
+
 #ifdef __cplusplus
 }
 #endif
