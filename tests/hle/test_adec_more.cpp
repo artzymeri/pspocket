@@ -86,7 +86,8 @@ TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and ma
     for (const NewCore& c : kNewCores) {
         INFO(c.library);
         CHECK((reg.find_variable(c.library, c.table_nid) != nullptr) == ffmpeg);
-        CHECK(reg.is_firmware_first(c.library) == ffmpeg);
+        // ATRAC3 multichannel is compared with Sony's and pspocket's for every game (D-944); the others firmware-first.
+        CHECK(reg.is_firmware_first(c.library) == (ffmpeg && std::string_view(c.library) != "cellAtrac3multidec"));
         if (c.pts) {
             CHECK(c.pts_nid == recomp::nid_of(c.pts));
             CHECK((reg.find(c.library, c.pts_nid) != nullptr) == ffmpeg);
@@ -133,7 +134,7 @@ TEST_CASE("cellAdec: the cores of D-621 and D-622, their modules' exports and ma
         CHECK(query(type) == 0);
         CHECK(ps_read32(b, kAttr) > 0x200);
         CHECK(ps_read32(b, kAttr + 4) == 0x492000);
-        CHECK(ps_read32(b, kAttr + 8) == 0x01000000);
+        CHECK(ps_read32(b, kAttr + 8) == (type == 31 ? 0x00010000u : 0x01000000u)); // libat3multidec's (D-944)
     }
 }
 
@@ -1335,7 +1336,7 @@ TEST_CASE("cellAdec: ATRAC3 multichannel on FFmpeg, tracks of channel units buil
     const std::array<u32, 4> lines = {100, 60, 140, 30};
     const std::array<s32, 4> tracks = {2, 0, -1, 3};
     Feed feed;
-    feed.bsi_size = 0x10;
+    feed.bsi_size = 0xC;
     feed.step = 3840;
     std::vector<std::vector<std::vector<u8>>> per_track(4);
     for (u32 k = 0; k < 12; k++) {
@@ -1353,12 +1354,19 @@ TEST_CASE("cellAdec: ATRAC3 multichannel on FFmpeg, tracks of channel units buil
     REQUIRE(run.outs.size() == 12);
     CHECK(flow_ok(run, 12, {}));
     CHECK(pts_ok(run, feed)); // the front end's step for ATRAC3 multichannel (type 39): 3840
+    // As libat3multidec (D-944): the first frame out empty, FFmpeg's sound with its sign turned over, the block's
+    // nbytes a channel's.
+    const auto negated = [](Unit unit) {
+        for (auto& ch : unit)
+            for (float& x : ch) x = -x;
+        return unit;
+    };
     const std::vector<Unit> ref = atrac3_tracks(per_track);
     for (u32 k = 0; k < 12; k++) {
         INFO("access unit " << k);
-        CHECK(run.outs[k].size == 1024 * 4 * 4);
-        CHECK(run.outs[k].pcm == pcm_of(ref[k]));
-        CHECK(run.outs[k].bsi == be32s({4, 0, 768, 4}));
+        CHECK(run.outs[k].size == (k == 0 ? 0u : 1024 * 4 * 4));
+        if (k) CHECK(run.outs[k].pcm == pcm_of(negated(ref[k])));
+        CHECK(run.outs[k].bsi == be32s({4, 0, 192}));
     }
     CHECK(energy_near(joined(run, 4, 0), 44100, 140.5 * 44100 / 2048, 150) > 0.8);
     CHECK(energy_near(joined(run, 4, 3), 44100, 30.5 * 44100 / 2048, 150) > 0.8);
@@ -1367,7 +1375,7 @@ TEST_CASE("cellAdec: ATRAC3 multichannel on FFmpeg, tracks of channel units buil
     // Eight tracks of a two-channel stream, its channels repeated: the unit given with the stream frame's 384 bytes,
     // its eight blocks read past them; 16-bit PCM.
     Feed eight;
-    eight.bsi_size = 0x10;
+    eight.bsi_size = 0xC;
     eight.step = 3840;
     eight.au_size = 384;
     std::vector<std::vector<std::vector<u8>>> per8(8);
@@ -1386,9 +1394,9 @@ TEST_CASE("cellAdec: ATRAC3 multichannel on FFmpeg, tracks of channel units buil
     CHECK(flow_ok(r8, 6, {}));
     const std::vector<Unit> ref8 = atrac3_tracks(per8);
     for (u32 k = 0; k < 6; k++) {
-        CHECK(r8.outs[k].size == 1024 * 8 * 2);
-        CHECK(r8.outs[k].pcm == pcm_of(ref8[k], true));
-        CHECK(r8.outs[k].bsi == be32s({8, 0, 384, 2}));
+        CHECK(r8.outs[k].size == (k == 0 ? 0u : 1024 * 8 * 2));
+        if (k) CHECK(r8.outs[k].pcm == pcm_of(negated(ref8[k]), true));
+        CHECK(r8.outs[k].bsi == be32s({8, 0, 192}));
     }
     // Refused by StartSeq: 9 tracks, joint stereo, frames of 100 bytes a channel, a word size, a stream of 9 channels.
     for (const auto& refused : {be32s({9, 0, 768, 0x84, 4}), be32s({2, 1, 384, 0x84, 2}), be32s({4, 0, 400, 0x84, 4}),
@@ -1402,7 +1410,7 @@ TEST_CASE("cellAdec: ATRAC3 multichannel on FFmpeg, tracks of channel units buil
     for (auto& au : two.aus) au.resize(2 * 192);
     const CoreRun r0 = run_core(f.base(), hle_calls(f, t), kTypeAtrac3Multi, be32s({2, 0, 384, 0x84, 0}), two);
     REQUIRE(r0.outs.size() == 3);
-    CHECK(r0.outs[0].bsi == be32s({2, 0, 384, 2}));
+    CHECK(r0.outs[0].bsi == be32s({2, 0, 192}));
 }
 
 TEST_CASE("cellAtracMulti plays a four-channel ATRAC3 file through pspocket's ATRAC3 multichannel core where no "

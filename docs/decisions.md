@@ -15016,3 +15016,23 @@ the depth buffer alone, then all four G-buffer targets with depth drawn) stored 
   .iso is here), and neither iPhone is connected to copy it back (scripts/ios.sh pull-iso). With it back:
   `PSPOCKET_GPU_AB=30 scripts/gate.sh game` gives both halves' passes, MB and GPU time from one walk, and the gate's
   frame checks the rendering.
+
+## D-944 · 2026-10-14 · The audio cores against Sony's (part 4: ATRAC3 multichannel; what the other four need)
+
+ATRAC3 multichannel (adec_atrac3.cpp) against libat3multidec: Sony's answers (getMemSize 0x42400, version 0x00010000,
+three PCM handles, a 0xC-byte block: nch, isJoint and a channel's bytes of a frame), and libat3dec's ways (part 2):
+the sound with FFmpeg's sign turned over, a sequence's first frame and the first after a refused unit out empty. It
+agrees (68 cases in all now) and is no longer firmware-first. The comparison's harness forces Sony's core modules
+(FirmwareCores) and checks the one linked is Sony's, since games get pspocket's.
+
+The other four with modules in the firmware stay firmware-first, each needing more than a comparison:
+- E-AC-3 (libddpdec: getMemSize 0x93400, version 0x02080000 written into the attributes too, four handles, a 0x330-byte
+  block): its StartSeq refuses (0x80612603) whatever the parameters; its open checks more of its arguments than the
+  other cores' (an extended open's resources, by the look of it): what it needs from the front end is to find first.
+- WMA (libwmadec: 0x2FF80, 0x01010000, three handles, a 0x14-byte block echoing the format tag, channels, rate and
+  average bytes): it takes pspocket's reading of the parameters but refuses every frame of FFmpeg's WMA 2 (0x80612C80):
+  the units it expects (ASF packets, or other fields) are to find.
+- DTS Express (libdtslbrdec: 0x6C720, 0x02080000, four handles, a 0x960-byte block): FFmpeg has no encoder for its
+  streams to compare with.
+- MPEG-2 AAC, MP3 Surround, TrueHD and DTS have no module in the firmware.
+

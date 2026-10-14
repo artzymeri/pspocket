@@ -158,7 +158,7 @@ private:
 namespace mprm {
 constexpr u32 nch = 0x0, is_joint = 0x4, nbytes = 0x8, bw_pcm = 0xC, channels = 0x10, size = 0x14;
 }
-constexpr u32 kMultiInfoSize = 0x10, kMaxTracks = 8;
+constexpr u32 kMultiInfoSize = 0xC, kMaxTracks = 8; // libat3multidec's block: nch, isJoint, a channel's bytes
 
 class Atrac3Multi final : public Codec {
 public:
@@ -173,6 +173,7 @@ public:
         format_ = format_of(ps_ld32(param + mprm::bw_pcm));
         for (u32 t = 0; t < nch_ && configured_; t++)
             configured_ = open_atrac3(tracks_[t], "ATRAC3 multichannel", 1, false, block_);
+        held_ = false;
         return configured_ ? lv2::CELL_OK : error(CELL_ADEC_ERROR_ARG);
     }
 
@@ -185,10 +186,10 @@ public:
         d.pts_type = CORRECT_PTS_ATRAC3MULTI;
         ps_write32(base, bsi + mprm::nch, nch_);
         ps_write32(base, bsi + mprm::is_joint, 0);
-        ps_write32(base, bsi + mprm::nbytes, nbytes_);
-        ps_write32(base, bsi + 0xC, channels_);
+        ps_write32(base, bsi + mprm::nbytes, block_); // a channel's bytes, as libat3multidec's (D-944)
         const auto fail = [&] {
             d.error = error(CELL_ADEC_ERROR_FATAL);
+            held_ = false;
             return d;
         };
         if (!configured_) {
@@ -208,14 +209,19 @@ public:
             }
             pcm.ch[t] = std::move(one.ch[0]);
         }
-        d.size = write_pcm(base, out, pcm, straight(nch_), format_);
+        // As libat3dec (D-944): the sequence's first frame, and the first after a refused unit, comes out empty, and the
+        // sound has FFmpeg's sign turned over.
+        const bool first = !held_;
+        held_ = true;
+        if (first) return d;
+        d.size = write_pcm(base, out, pcm, straight(nch_), format_, -1.0f);
         return d;
     }
 
 private:
     std::array<FfDecoder, kMaxTracks> tracks_;
     u32 nch_ = 0, nbytes_ = 0, channels_ = 0, block_ = 0;
-    bool configured_ = false;
+    bool configured_ = false, held_ = false;
     Format format_ = Format::F32;
 };
 
@@ -256,9 +262,10 @@ s32 check_multi(const u8* p)
 const Spec kAtrac3 = {CELL_ADEC_TYPE_ATRAC3, "ATRAC3", prm::size, kInfoSize, 1024 * 2 * 4, 0x01020000,
     CELL_ADEC_ERROR_AT3_BUSY, check, [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3>()); }, 0x3cb80, 3, false};
 // ATRAC3 multichannel (D-621): eight tracks of 1024 samples, 32 bits each at most; libadec's error codes.
+// libat3multidec's answers (D-944): its version, getMemSize 0x42400, three PCM handles, a 0xC-byte block.
 const Spec kAtrac3Multi = {CELL_ADEC_TYPE_ATRAC3MULTI, "ATRAC3 multichannel", mprm::size, kMultiInfoSize,
-    1024 * kMaxTracks * 4, 0x01000000, CELL_ADEC_ERROR_BUSY, check_multi,
-    [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3Multi>()); }};
+    1024 * kMaxTracks * 4, 0x00010000, CELL_ADEC_ERROR_BUSY, check_multi,
+    [] { return std::unique_ptr<Codec>(std::make_unique<Atrac3Multi>()); }, 0x42400, 3, false};
 
 } // namespace pspocket::hle::adec::ffcore
 

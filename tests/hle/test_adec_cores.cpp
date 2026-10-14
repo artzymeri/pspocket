@@ -2262,6 +2262,22 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[.][hle
         f51.aus.assign(e51.packets.begin() + 1, e51.packets.begin() + 6);
         cases.push_back({"AC-3, 5.1", kTypeAc3, ac3_param({}), f51, true});
     }
+    // ATRAC3 multichannel (D-944 part 4: libatrac3multi's parameters, four tracks of one channel each).
+    {
+        Feed feed;
+        feed.bsi_size = 0x10;
+        feed.step = 3840;
+        for (u32 k = 0; k < 5; k++) {
+            std::vector<u8> au;
+            for (const u32 line : {100u, 60u, 140u, 30u}) {
+                const std::vector<u8> unit = atrac3_frame(1, {line, 0});
+                au.insert(au.end(), unit.begin(), unit.end());
+            }
+            feed.aus.push_back(au);
+        }
+        feed.bsi_size = 0xC;
+        cases.push_back({"ATRAC3 multichannel", 31, be32s({4, 0, 768, 0x84, 4}), feed, true});
+    }
     for (const Case& c : cases) {
         DYNAMIC_SECTION(c.name)
         {
@@ -2280,7 +2296,8 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[.][hle
                     {kTypeMp3, {"cellMP3dec", 0x84276A23}}, {kTypeMpegL1, {"cellMPL1dec", 0xBBC70551}},
                     {kTypeMpegL2, {"cellM2BCdec", 0x300AFE4D}}, {kTypeM4Aac, {"cellM4AacDec", 0xAB61278D}},
                     {kTypeM4Aac2ch, {"cellM4AacDec2ch", 0xE996C664}}, {kTypeM4Aac2chMod, {"cellM4AacDec2chmod", 0xDBD26836}},
-                    {kTypeAc3, {"cell_libac3dec", 0xC58BB170}}, {kTypeAtrac3, {"cellAtrac3dec", 0x60487D65}}};
+                    {kTypeAc3, {"cell_libac3dec", 0xC58BB170}}, {kTypeAtrac3, {"cellAtrac3dec", 0x60487D65}},
+                    {31, {"cellAtrac3multidec", 0xC20C6BD7}}};
                 for (const auto& [type, core] : kSonyCores)
                     if (type == c.type) REQUIRE(f.hle->imported(core.first, core.second) != 0);
                 theirs = run_core(f.base(), hle_calls(f, t), c.type, c.param, c.feed);

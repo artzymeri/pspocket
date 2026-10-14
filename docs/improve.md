@@ -380,9 +380,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   except a set start bit (Sony's codes per syntax error are not known). MP3, MPEG audio layers I and II, MPEG-4 AAC,
   AC-3 and ATRAC3 are pspocket's own cores on FFmpeg (adec_ffmpeg.cpp and a file each), compared with Sony's (D-944:
   test_adec_cores.cpp, test_hle "[compare][adec-cores]" with PSPOCKET_TEST_DEV_FLASH; PSPOCKET_TEST_DUMP, _SHIFT and
-  _LAG print more): all 67 cases agree, and they are no longer firmware-first. **Next:** compare E-AC-3 (libddpdec),
-  ATRAC3 multichannel (libat3multidec), DTS Express (libdtslbrdec) and WMA (libwmadec) the same way, then drop their
-  firmware-first rule; MPEG-2 AAC, MP3 Surround, TrueHD and DTS have no module in the firmware to compare with. The
+  _LAG print more): all 68 cases agree (ATRAC3 multichannel too), and they are no longer firmware-first. **Next:**
+  E-AC-3 (libddpdec refuses StartSeq whatever the parameters: find what its open needs), WMA (libwmadec refuses FFmpeg's
+  WMA 2 frames: find the units it takes) and DTS Express (no encoder for test streams), D-944 part 4; MPEG-2 AAC, MP3
+  Surround, TrueHD and DTS have no module in the firmware to compare with. The
   AC-3 onset frame libac3dec refuses (D-944 part 3), if a game's stream ever shows one. A game's stream can be given
   to a probe locally (as SND0.AT3 in run 105).
 - **cellPngDec (D-199):** decodes the whole image into a host buffer, then copies rows (and converts colour to gray)
