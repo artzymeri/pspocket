@@ -12,6 +12,14 @@
 	<false/>
 	<key>UIRequiresFullScreen</key>
 	<true/>
+	<!-- Game Mode while a game runs full screen (D-952; the games category in project.yml): GCSupportsGameMode for iOS 18.0 to 18.5. -->
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsGameMode</key>
+	<true/>
+	<!-- Metal's performance HUD, hidden unless PSPOCKET_HUD asks for it (game.mm, D-970). -->
+	<key>MetalHUDEnabled</key>
+	<true/>
 	<!-- One window: the Metal tab drives a single renderer and layer. -->
 	<key>UIApplicationSceneManifest</key>
 	<dict>

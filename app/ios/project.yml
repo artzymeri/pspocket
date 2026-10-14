@@ -225,6 +225,10 @@ targets:
       base:
         PRODUCT_NAME: PSPocketRuntime
         SKIP_INSTALL: YES
+        # The A12 (iOS 17's oldest) and later: ARMv8.3 with LSE atomics. Without it clang builds for ARMv8.0, and every
+        # atomic (the reservations, the SPURS lines, the FIFO's get and put) is a load-exclusive/store-exclusive loop
+        # (5,444 of them in the library, D-952). Release's OTHER_CFLAGS below repeats it.
+        OTHER_CFLAGS: [$(inherited), -mcpu=apple-a12]
         # The Metal backend and the game session are Objective-C++ with ARC (as -fobjc-arc in CMake).
         CLANG_ENABLE_OBJC_ARC: YES
         # Resolve includes like the CMake build does: no header maps, explicit search paths only.
@@ -299,7 +303,7 @@ targets:
         Release:
           # Same as the host build (CMake RelWithDebInfo): -O2 and NDEBUG.
           GCC_OPTIMIZATION_LEVEL: "2"
-          OTHER_CFLAGS: [$(inherited), -DNDEBUG]
+          OTHER_CFLAGS: [$(inherited), -DNDEBUG, -mcpu=apple-a12]
 
   # SwiftUI app: the game library (D-142: the disc images in Documents/Games or added from Files) and the running
   # game, with the self-test probes and a Metal output/pacing preview behind Settings.
@@ -343,7 +347,9 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_FILE: PSPocket/Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: PSPocket
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # A game (D-952): iOS's Game Mode (CPU and GPU priority, less background work; Adaptive Power leaves its games
+        # alone) needs the games category and LSSupportsGameMode (Info.plist).
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.games
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         CODE_SIGN_ENTITLEMENTS: PSPocket/PSPocket.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
