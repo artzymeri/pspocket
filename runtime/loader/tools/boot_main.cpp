@@ -149,6 +149,7 @@
 #include "pspocket/rsx/rsx.hpp"
 #include "pspocket/spu/disasm.hpp"
 #include "pspocket/spu/registry.hpp"
+#include "pspocket/spu/replace.hpp"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -1556,6 +1557,13 @@ int main(int argc, char** argv)
     if (game_modules)
         std::printf("the game's modules: %zu translated in its modules library, %zu loaded and run translated\n",
             game_modules->modules(), game_modules->modules_translated());
+    // The native replacements of SPU middleware (D-965): calls of each listed function, by how they ran.
+    for (const spu::replace::FunctionStats& f : spu::replace::stats()) {
+        std::printf("SPU native %s 0x%05x: %llu native, %llu declined, %llu lifted, %llu captured\n", f.build.c_str(),
+            f.addr, static_cast<unsigned long long>(f.native), static_cast<unsigned long long>(f.declined),
+            static_cast<unsigned long long>(f.lifted), static_cast<unsigned long long>(f.captured));
+    }
+    spu::replace::write_trace();
     if (const u64 adopted = spu::pending_homes_adopted())
         std::printf("SPU contexts switched to a program registered while they ran: %llu\n",
             static_cast<unsigned long long>(adopted));

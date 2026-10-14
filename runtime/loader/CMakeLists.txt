@@ -73,6 +73,33 @@ if(APPLE)
     target_link_options(spu-check PRIVATE -Wl,-no_warn_duplicate_libraries) # the static libraries pspocket::game brings again
 endif()
 pspocket_set_warnings(spu-check)
+# spu-native-check CAPTURE...: native replacements of SPU middleware functions against the lifted ones, on states
+# captured from the game (D-965, PSPOCKET_SPU_CAPTURE).
+add_executable(spu-native-check tools/spu_native_check.cpp)
+target_link_libraries(spu-native-check PRIVATE pspocket::game pspocket::spu pspocket::core)
+if(PSPOCKET_GAME_SPU)
+    target_link_libraries(spu-native-check PRIVATE pspocket_game_spu)
+    target_compile_definitions(spu-native-check PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
+endif()
+if(APPLE)
+    target_link_options(spu-native-check PRIVATE -Wl,-no_warn_duplicate_libraries)
+endif()
+pspocket_set_warnings(spu-native-check)
+
+# Programs lifted again alone (a lifter change that touches a few programs, D-965), compiled into pspocket-boot,
+# spu-check and spu-native-check ahead of the game's other lifted programs: each overrides the copy in
+# PSPOCKET_GAME_SPU_LIB, whose members for it the linker then leaves out (the same symbols are already defined).
+set(PSPOCKET_GAME_SPU_EXTRA "" CACHE PATH "Lifted SPU programs (spu-lift output) linked ahead of the game's library")
+if(PSPOCKET_GAME_SPU_EXTRA AND PSPOCKET_GAME_SPU)
+    file(GLOB_RECURSE pspocket_game_spu_extra_sources CONFIGURE_DEPENDS ${PSPOCKET_GAME_SPU_EXTRA}/*.c)
+    add_library(pspocket_game_spu_extra OBJECT ${pspocket_game_spu_extra_sources})
+    target_link_libraries(pspocket_game_spu_extra PRIVATE pspocket::spu)
+    pspocket_set_warnings(pspocket_game_spu_extra)
+    pspocket_set_generated_warnings(pspocket_game_spu_extra)
+    foreach(t pspocket-boot spu-check spu-native-check)
+        target_link_libraries(${t} PRIVATE pspocket_game_spu_extra)
+    endforeach()
+endif()
 
 # The game's PPU code translated ahead of time (D-092): ppu-lift over the executable's loaded segments
 # (--name game_ppu --prefix game_ppu_), from the user's own game, outside the repository (CLAUDE.md rule 1);
