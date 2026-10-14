@@ -152,6 +152,7 @@ struct Config {
     std::string capture_dir = "spu-capture";
     uint64_t capture_max = 500, capture_every = 1;
     bool scramble = false;   // PSPOCKET_SPU_NATIVE_SCRAMBLE: the unspecified registers garbage after each call
+    bool timed = false;      // PSPOCKET_SPU_NATIVE_TIME: every call timed
     uint64_t trace_hash = 0; // PSPOCKET_SPU_TRACE_ENTRIES: every entry of this program traced
     std::string trace_file;
 };
@@ -196,6 +197,7 @@ const Config& config()
         c.scramble = true;
         PS_LOG_INFO(kChan, "native SPU replacements: the registers outside their contract garbage after each call");
     }
+    if (const char* v = std::getenv("PSPOCKET_SPU_NATIVE_TIME"); v && std::strcmp(v, "0") != 0) c.timed = true;
     if (const char* v = std::getenv("PSPOCKET_SPU_CAPTURE")) {
         char* end = nullptr;
         c.capture_hash = std::strtoull(v, &end, 16);
@@ -229,7 +231,7 @@ struct DerivedFn {
     ps_spu_fn lifted = nullptr;
     bool enabled = true;
     bool capture = false;
-    std::atomic<uint64_t> native{0}, declined{0}, lifted_calls{0}, calls{0}, captured{0};
+    std::atomic<uint64_t> native{0}, declined{0}, lifted_calls{0}, calls{0}, captured{0}, native_ns{0}, lifted_ns{0};
 };
 
 struct Derived {
@@ -342,6 +344,7 @@ void dispatch(SPUContext* ctx, uint8_t* ls)
     const Config& c = config();
     const uint32_t ret = ctx->gpr[0].u32[3] & PS_SPU_PC_MASK;
     bool native = false;
+    const uint64_t t0 = c.timed ? ps_host_now_ns() : 0;
     if (f->impl && f->enabled && native_now(c)) {
         native = f->impl(ctx, ls) != 0;
         (native ? f->native : f->declined).fetch_add(1, std::memory_order_relaxed);
@@ -349,6 +352,7 @@ void dispatch(SPUContext* ctx, uint8_t* ls)
         f->lifted_calls.fetch_add(1, std::memory_order_relaxed);
     }
     if (!native) f->lifted(ctx, ls);
+    if (c.timed) (native ? f->native_ns : f->lifted_ns).fetch_add(ps_host_now_ns() - t0, std::memory_order_relaxed);
     // The check of the contract (D-965): what callers may not read is garbage. After a native run, or a lifted one that
     // returned (not one that left for the run loop in the middle, to stop: its registers are all still needed).
     if (c.scramble && (native || (ctx->stop_reason == PS_SPU_STOP_NONE && ctx->pc == ret))) scramble(ctx, f->exact);
@@ -565,7 +569,7 @@ std::vector<FunctionStats> stats()
     for (const auto& d : g_derived)
         for (const auto& f : d->fns)
             out.push_back({d->build->name, f->addr, f->native.load(), f->declined.load(), f->lifted_calls.load(),
-                f->captured.load()});
+                f->captured.load(), f->native_ns.load(), f->lifted_ns.load()});
     return out;
 }
 

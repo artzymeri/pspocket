@@ -1559,9 +1559,15 @@ int main(int argc, char** argv)
             game_modules->modules(), game_modules->modules_translated());
     // The native replacements of SPU middleware (D-965): calls of each listed function, by how they ran.
     for (const spu::replace::FunctionStats& f : spu::replace::stats()) {
-        std::printf("SPU native %s 0x%05x: %llu native, %llu declined, %llu lifted, %llu captured\n", f.build.c_str(),
+        std::printf("SPU native %s 0x%05x: %llu native, %llu declined, %llu lifted, %llu captured", f.build.c_str(),
             f.addr, static_cast<unsigned long long>(f.native), static_cast<unsigned long long>(f.declined),
             static_cast<unsigned long long>(f.lifted), static_cast<unsigned long long>(f.captured));
+        if (f.native_ns || f.lifted_ns) // PSPOCKET_SPU_NATIVE_TIME (D-974)
+            std::printf("; %.2f s native (%.1f us a call), %.2f s lifted or declined (%.1f us a call)",
+                static_cast<double>(f.native_ns) / 1e9, f.native ? static_cast<double>(f.native_ns) / 1e3 / static_cast<double>(f.native) : 0.0,
+                static_cast<double>(f.lifted_ns) / 1e9,
+                f.lifted + f.declined ? static_cast<double>(f.lifted_ns) / 1e3 / static_cast<double>(f.lifted + f.declined) : 0.0);
+        std::printf("\n");
     }
     spu::replace::write_trace();
     if (const u64 adopted = spu::pending_homes_adopted())

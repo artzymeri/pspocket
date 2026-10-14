@@ -38,6 +38,10 @@
 #include <pthread.h>
 #include <string.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "mp3_huffman.h"
 #include "pspocket/core/be.h"
 #include "pspocket/spu/fp.h"
@@ -345,9 +349,11 @@ static void init_tables(void)
 }
 
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
+static void build_huffman(void);
 
 static void init_tables_default_fp(void)
 {
+    build_huffman();
 #if defined(__aarch64__)
     /* The caller may be in the SPU FP environment (round toward zero): libm wants the default. */
     const uint64_t fpcr = ps_spu_fpcr_read();
@@ -385,9 +391,7 @@ typedef struct {
     /* the bitstream buffer, as the module's (bsspace: 512 bytes of reservoir, then the frame), and room past it for
      * reads that run off its end (a decline) */
     uint8_t bs[BS_SIZE + 8192];
-    uint32_t wp, bi; /* mpglib's wordpointer (into bs) and bitindex */
-    uint32_t rval;   /* the module's rval and rval_uc after its last read */
-    uint8_t rval_uc;
+    uint32_t pos; /* the bit read next: mpglib's wordpointer (into bs) pos >> 3, its bitindex pos & 7 */
     int bad; /* something the native code does not do as the module does: decline */
     mp3_frame fr;
     side_info si;
@@ -410,29 +414,83 @@ typedef struct {
 
 static _Thread_local mp3_state t_state;
 
-/* ---- bits (mpglib common.c getbits, getbits_fast, get1bit; the module keeps the last value in rval/rval_uc) ---- */
+/* ---- bits (mpglib common.c getbits, getbits_fast, get1bit: MSB first; 0 bits read nothing) ---- */
+
+static inline uint32_t peek32(const mp3_state* d)
+{
+    const uint8_t* p = d->bs + (d->pos >> 3);
+    const uint32_t v = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+    return v << (d->pos & 7);
+}
 
 static inline uint32_t getbits(mp3_state* d, int n)
 {
-    const uint8_t* p = d->bs + d->wp;
-    uint32_t rval = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
-    rval = (rval << d->bi) & 0xFFFFFFu;
-    d->bi += (uint32_t)n;
-    rval >>= 24 - n;
-    d->wp += d->bi >> 3;
-    d->bi &= 7;
-    d->rval = rval;
-    return rval;
+    if (n <= 0) return 0;
+    const uint32_t v = peek32(d) >> (32 - n);
+    d->pos += (uint32_t)n;
+    return v;
 }
 
 static inline uint32_t get1bit(mp3_state* d)
 {
-    const uint8_t v = (uint8_t)(d->bs[d->wp] << d->bi);
-    d->bi++;
-    d->wp += d->bi >> 3;
-    d->bi &= 7;
-    d->rval_uc = v;
-    return v >> 7;
+    const uint32_t v = (d->bs[d->pos >> 3] >> (7 - (d->pos & 7))) & 1;
+    d->pos++;
+    return v;
+}
+
+/* The Huffman trees by their first 8 bits (built from mp3_huffman.h): a leaf within them and its length, or the node
+ * the walk goes on from after all 8. */
+typedef struct {
+    int16_t value; /* leaf value, or node index */
+    uint8_t len;
+    uint8_t leaf;
+} huff_entry;
+enum { HUFF_TREES = 18 };
+static const int16_t* g_trees[HUFF_TREES];
+static huff_entry g_huff[HUFF_TREES][256];
+static uint8_t g_tree_of_table[32], g_tree_of_count1[2];
+
+static void build_huffman(void)
+{
+    int n = 0;
+    for (int t = 0; t < 32 + 2; t++) {
+        const int16_t* tree = t < 32 ? mp3_ht[t].tree : mp3_htc[t - 32];
+        int k = 0;
+        while (k < n && g_trees[k] != tree) k++;
+        if (k == n) {
+            g_trees[n++] = tree;
+            for (int p = 0; p < 256; p++) {
+                int at = 0, bits = 0;
+                while (tree[at] < 0 && bits < 8) {
+                    const int bit = (p >> (7 - bits)) & 1;
+                    at = bit ? at + 1 - tree[at] : at + 1;
+                    bits++;
+                }
+                huff_entry* e = &g_huff[k][p];
+                e->leaf = tree[at] >= 0;
+                e->value = (int16_t)(e->leaf ? tree[at] : at);
+                e->len = (uint8_t)bits;
+            }
+        }
+        if (t < 32) g_tree_of_table[t] = (uint8_t)k;
+        else g_tree_of_count1[t - 32] = (uint8_t)k;
+    }
+}
+
+/* A big-value pair: mpglib's walk (part2remain less a bit a node). */
+static inline int huff_pair(mp3_state* d, int tree, int* part2remain)
+{
+    const huff_entry e = g_huff[tree][peek32(d) >> 24];
+    d->pos += e.len;
+    *part2remain -= e.len;
+    if (e.leaf) return e.value;
+    const int16_t* t = g_trees[tree];
+    int at = e.value, y;
+    while ((y = t[at]) < 0) {
+        at = get1bit(d) ? at + 1 - y : at + 1;
+        (*part2remain)--;
+    }
+    return y;
 }
 
 /* ---- side information (the module's III_get_side_info: mpglib's III_get_side_info_1 and _2) ---- */
@@ -584,16 +642,6 @@ static inline float gain(mp3_state* d, int idx)
     return g_gainpow2[idx];
 }
 
-static inline int huff_pair(mp3_state* d, const int16_t* val, int* part2remain)
-{
-    int y;
-    while ((y = *val++) < 0) {
-        if (get1bit(d)) val -= y;
-        (*part2remain)--;
-    }
-    return y;
-}
-
 static inline float lin_value(mp3_state* d, int x, unsigned linbits, float v, int* part2remain)
 {
     if (x == 15) {
@@ -661,6 +709,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
         for (int i = 0; i < 2; i++) {
             int lp = l[i];
             const mp3_huffman_table* h = &mp3_ht[g->table_select[i]];
+            const int tree = g_tree_of_table[g->table_select[i]];
             for (; lp; lp--, mc--) {
                 if (!mc) {
                     if (m >= me) {
@@ -679,7 +728,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
                         step = 3;
                     }
                 }
-                const int y0 = huff_pair(d, h->tree, &part2remain);
+                const int y0 = huff_pair(d, tree, &part2remain);
                 const int x = y0 >> 4, y = y0 & 0xF;
                 if (x) max[lwin] = cb;
                 PUT(lin_value(d, x, h->linbits, v, &part2remain));
@@ -692,6 +741,12 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
         for (; l3 > 0 && part2remain > 0; l3--) {
             const int16_t* val = mp3_htc[g->count1table_select];
             int16_t a;
+            const huff_entry e = g_huff[g_tree_of_count1[g->count1table_select]][peek32(d) >> 24];
+            if (e.leaf && (int)e.len <= part2remain) { /* mpglib's walk, a bit a node, when no bit runs out */
+                d->pos += e.len;
+                part2remain -= e.len;
+                a = e.value;
+            } else
             while ((a = *val++) < 0) {
                 part2remain--;
                 if (part2remain < 0) {
@@ -766,6 +821,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
         for (int i = 0; i < 3; i++) {
             int lp = l[i];
             const mp3_huffman_table* h = &mp3_ht[g->table_select[i]];
+            const int tree = g_tree_of_table[g->table_select[i]];
             for (; lp; lp--, mc--) {
                 if (!mc) {
                     mc = *m++;
@@ -773,7 +829,7 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
                     cb = *m++;
                     if (cb == 21) v = 0.0f; /* the module's band 21 (no scale factor of its own) is silent */
                 }
-                const int y0 = huff_pair(d, h->tree, &part2remain);
+                const int y0 = huff_pair(d, tree, &part2remain);
                 const int x = y0 >> 4, y = y0 & 0xF;
                 if (x) max = cb;
                 PUT(lin_value(d, x, h->linbits, v, &part2remain));
@@ -786,6 +842,12 @@ static void dequantize_sample(mp3_state* d, float xr[SBLIMIT][SSLIMIT], int* scf
         for (; l3 && part2remain > 0; l3--) {
             const int16_t* val = mp3_htc[g->count1table_select];
             int16_t a;
+            const huff_entry e = g_huff[g_tree_of_count1[g->count1table_select]][peek32(d) >> 24];
+            if (e.leaf && (int)e.len <= part2remain) { /* mpglib's walk, a bit a node, when no bit runs out */
+                d->pos += e.len;
+                part2remain -= e.len;
+                a = e.value;
+            } else
             while ((a = *val++) < 0) {
                 part2remain--;
                 if (part2remain < 0) {
@@ -1231,7 +1293,8 @@ static inline int16_t pcm_sample(float sum)
     return (int16_t)(int32_t)sum; /* toward zero, as cflts */
 }
 
-/* The window for one channel's 32 samples (synth_1to1 after its dct64), from buffs[ch] and the current bo. */
+/* The window for one channel's 32 samples (synth_1to1 after its dct64), from buffs[ch] and the current bo: each a sum
+ * of 16 products (the module sums them four lanes at a time too, in another order than mpglib's). */
 static void synth_window(mp3_state* d, int ch, int16_t* out)
 {
     float(*buf)[0x110] = d->buffs[ch];
@@ -1246,58 +1309,61 @@ static void synth_window(mp3_state* d, int ch, int16_t* out)
         bo1 = bo + 1;
     }
     const float* window = g_decwin + 16 - bo1;
+#if defined(__aarch64__)
+    const float32x4_t alt = {1.0f, -1.0f, 1.0f, -1.0f}, even = {1.0f, 0.0f, 1.0f, 0.0f};
     for (int j = 16; j; j--, b0 += 0x10, window += 0x20) {
-        float sum = window[0x0] * b0[0x0];
-        sum -= window[0x1] * b0[0x1];
-        sum += window[0x2] * b0[0x2];
-        sum -= window[0x3] * b0[0x3];
-        sum += window[0x4] * b0[0x4];
-        sum -= window[0x5] * b0[0x5];
-        sum += window[0x6] * b0[0x6];
-        sum -= window[0x7] * b0[0x7];
-        sum += window[0x8] * b0[0x8];
-        sum -= window[0x9] * b0[0x9];
-        sum += window[0xA] * b0[0xA];
-        sum -= window[0xB] * b0[0xB];
-        sum += window[0xC] * b0[0xC];
-        sum -= window[0xD] * b0[0xD];
-        sum += window[0xE] * b0[0xE];
-        sum -= window[0xF] * b0[0xF];
+        float32x4_t acc = vmulq_f32(vld1q_f32(window), vmulq_f32(vld1q_f32(b0), alt));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 4), vmulq_f32(vld1q_f32(b0 + 4), alt)));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 8), vmulq_f32(vld1q_f32(b0 + 8), alt)));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 12), vmulq_f32(vld1q_f32(b0 + 12), alt)));
+        *out++ = pcm_sample(vaddvq_f32(acc));
+    }
+    {
+        float32x4_t acc = vmulq_f32(vld1q_f32(window), vmulq_f32(vld1q_f32(b0), even));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 4), vmulq_f32(vld1q_f32(b0 + 4), even)));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 8), vmulq_f32(vld1q_f32(b0 + 8), even)));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(window + 12), vmulq_f32(vld1q_f32(b0 + 12), even)));
+        *out++ = pcm_sample(vaddvq_f32(acc));
+        b0 -= 0x10;
+        window -= 0x20;
+    }
+    window += bo1 << 1;
+    for (int j = 15; j; j--, b0 -= 0x10, window -= 0x20) {
+        /* -(window[-1] b0[0] + window[-2] b0[1] + ... + window[-15] b0[14] + window[0] b0[15]) */
+        float32x4_t w0 = vld1q_f32(window - 4), w1 = vld1q_f32(window - 8), w2 = vld1q_f32(window - 12),
+                    w3 = vld1q_f32(window - 16);
+        w0 = vrev64q_f32(vextq_f32(w0, w0, 2)); /* window[-1], [-2], [-3], [-4] */
+        w1 = vrev64q_f32(vextq_f32(w1, w1, 2));
+        w2 = vrev64q_f32(vextq_f32(w2, w2, 2));
+        w3 = vrev64q_f32(vextq_f32(w3, w3, 2)); /* window[-13], [-14], [-15], [-16] */
+        w3 = vsetq_lane_f32(window[0], w3, 3);
+        float32x4_t acc = vmulq_f32(w0, vld1q_f32(b0));
+        acc = vaddq_f32(acc, vmulq_f32(w1, vld1q_f32(b0 + 4)));
+        acc = vaddq_f32(acc, vmulq_f32(w2, vld1q_f32(b0 + 8)));
+        acc = vaddq_f32(acc, vmulq_f32(w3, vld1q_f32(b0 + 12)));
+        *out++ = pcm_sample(-vaddvq_f32(acc));
+    }
+#else
+    for (int j = 16; j; j--, b0 += 0x10, window += 0x20) {
+        float sum = 0.0f;
+        for (int k = 0; k < 16; k++) sum += (k & 1 ? -window[k] : window[k]) * b0[k];
         *out++ = pcm_sample(sum);
     }
     {
-        float sum = window[0x0] * b0[0x0];
-        sum += window[0x2] * b0[0x2];
-        sum += window[0x4] * b0[0x4];
-        sum += window[0x6] * b0[0x6];
-        sum += window[0x8] * b0[0x8];
-        sum += window[0xA] * b0[0xA];
-        sum += window[0xC] * b0[0xC];
-        sum += window[0xE] * b0[0xE];
+        float sum = 0.0f;
+        for (int k = 0; k < 16; k += 2) sum += window[k] * b0[k];
         *out++ = pcm_sample(sum);
         b0 -= 0x10;
         window -= 0x20;
     }
     window += bo1 << 1;
     for (int j = 15; j; j--, b0 -= 0x10, window -= 0x20) {
-        float sum = -window[-0x1] * b0[0x0];
-        sum -= window[-0x2] * b0[0x1];
-        sum -= window[-0x3] * b0[0x2];
-        sum -= window[-0x4] * b0[0x3];
-        sum -= window[-0x5] * b0[0x4];
-        sum -= window[-0x6] * b0[0x5];
-        sum -= window[-0x7] * b0[0x6];
-        sum -= window[-0x8] * b0[0x7];
-        sum -= window[-0x9] * b0[0x8];
-        sum -= window[-0xA] * b0[0x9];
-        sum -= window[-0xB] * b0[0xA];
-        sum -= window[-0xC] * b0[0xB];
-        sum -= window[-0xD] * b0[0xC];
-        sum -= window[-0xE] * b0[0xD];
-        sum -= window[-0xF] * b0[0xE];
-        sum -= window[-0x0] * b0[0xF];
+        float sum = 0.0f;
+        for (int k = 0; k < 15; k++) sum -= window[-1 - k] * b0[k];
+        sum -= window[0] * b0[15];
         *out++ = pcm_sample(sum);
     }
+#endif
 }
 
 static void dct64_channel(mp3_state* d, int ch, const float* band)
@@ -1374,11 +1440,19 @@ static inline int in_ls(uint32_t start, uint32_t size) { return start <= PS_SPU_
 
 static void ld_floats(float* dst, const uint8_t* src, int n)
 {
-    for (int i = 0; i < n; i++) dst[i] = ps_ldf32(src + 4 * i);
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) vst1q_f32(dst + i, vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(src + 4 * i))));
+#endif
+    for (; i < n; i++) dst[i] = ps_ldf32(src + 4 * i);
 }
 static void st_floats(uint8_t* dst, const float* src, int n)
 {
-    for (int i = 0; i < n; i++) ps_stf32(dst + 4 * i, src[i]);
+    int i = 0;
+#if defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) vst1q_u8(dst + 4 * i, vrev32q_u8(vreinterpretq_u8_f32(vld1q_f32(src + i))));
+#endif
+    for (; i < n; i++) ps_stf32(dst + 4 * i, src[i]);
 }
 /* A word of a module variable's quadword (the module inserts words: the rest of the quadword stays). */
 static inline void st_var(uint8_t* ls, uint32_t mod, uint32_t var, uint32_t v) { ps_st32(ls + ((mod + var) & LS_MASK), v); }
@@ -1532,8 +1606,8 @@ static void commit(SPUContext* ctx, uint8_t* ls, const mp3_state* d, uint32_t mo
         st_var(ls, mod, VAR_bsbuf, heap + HEAP_BSSPACE + 512);
         st_var(ls, mod, VAR_globalSpaceTaken, HEAP_TAKEN_AFTER);
         st_var(ls, mod, VAR_ssize, (uint32_t)d->ssize);
-        st_var(ls, mod, VAR_bsi, d->bi);
-        st_var(ls, mod, VAR_bsi + 4, heap + HEAP_BSSPACE + d->wp);
+        st_var(ls, mod, VAR_bsi, d->pos & 7);
+        st_var(ls, mod, VAR_bsi + 4, heap + HEAP_BSSPACE + (d->pos >> 3));
         {
             const mp3_frame* fr = &d->fr;
             const uint32_t v[17] = {(uint32_t)fr->stereo, 0, (uint32_t)fr->lsf, (uint32_t)fr->mpeg25, (uint32_t)fr->lay, 0,
@@ -1573,8 +1647,6 @@ int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls)
     pthread_once(&g_tables_once, init_tables_default_fp);
     mp3_state* d = &t_state;
     d->bad = 0;
-    d->rval = ps_ld32(ls + ((mod + VAR_rval) & LS_MASK));
-    d->rval_uc = ls[(mod + VAR_rval_uc) & LS_MASK];
 
     /* readFrame */
     const uint8_t* f = ls + frame;
@@ -1601,10 +1673,9 @@ int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls)
     if (!tag) {
         /* the bitstream buffer: zeros (the heap is zeroed), the reservoir's bytes where set_pointer puts them, the frame
          * at 512 */
-        memset(d->bs, 0, sizeof d->bs);
+        memset(d->bs, 0, BS_SIZE + 16); /* past it: reads that far are declined (wp checked after) */
         memcpy(d->bs + 512, f + 4, (size_t)d->fr.framesize);
-        d->wp = 512;
-        d->bi = 0;
+        d->pos = 512 * 8;
         if (d->fr.error_protection) getbits(d, 16);
         /* decodePacket's III_get_side_info, then set_pointer: the reservoir's last main_data_begin bytes (the caller's
          * backup) go right before the main data, over the side information, and the reading starts there */
@@ -1613,9 +1684,8 @@ int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls)
             get_side_info(d, d->fr.stereo, ms_stereo, d->fr.sampling_frequency);
             if (d->bad) return 0;
             const unsigned backstep = d->si.main_data_begin;
-            d->wp = 512 + (uint32_t)d->ssize - backstep;
-            d->bi = 0;
-            if (backstep) memcpy(d->bs + d->wp, ls + backup + 512 - backstep, backstep);
+            d->pos = (512 + (uint32_t)d->ssize - backstep) * 8;
+            if (backstep) memcpy(d->bs + (d->pos >> 3), ls + backup + 512 - backstep, backstep);
         }
         /* the word of each granule's information the module's antialias reads unwritten (decodePacket's side
          * information at 416 in its frame: 8 bytes, then 132 a granule, 264 a channel) */
@@ -1641,11 +1711,10 @@ int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls)
         }
         d->bo = (int)ps_ld32(ls + p_bo);
         d->pcm_point = 0;
-        memset(d->pcm, 0, sizeof d->pcm);
         if (d->bo < 0 || d->bo > 15) return 0; /* not a position the module wrote */
         decode_packet(d);
         if (d->bad) return 0;
-        if (d->wp + 2 >= BS_SIZE) return 0; /* the reads went past the bitstream buffer into the PCM: not modelled */
+        if ((d->pos >> 3) + 2 >= BS_SIZE) return 0; /* the reads went past the bitstream buffer into the PCM: not modelled */
     }
 
     /* ---- commit: what the module leaves ---- */

@@ -27,6 +27,8 @@
 //                              PSPOCKET_SPU_CAPTURE_EVERY-th call (default 1): the input of spu-native-check. Captures
 //                              hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1).
 //   PSPOCKET_SPU_TRACE_ENTRIES=HASH  records how each entry of the program is entered (write_trace below).
+//   PSPOCKET_SPU_NATIVE_TIME=1  times every call of a listed function, by how it ran (stats(): the host time the
+//                              function takes in the walk, native against lifted, D-974).
 
 #include <cstdint>
 #include <string>
@@ -122,6 +124,7 @@ struct FunctionStats {
     std::string build;
     uint32_t addr = 0;
     uint64_t native = 0, declined = 0, lifted = 0, captured = 0;
+    uint64_t native_ns = 0, lifted_ns = 0; // PSPOCKET_SPU_NATIVE_TIME=1: host time in the calls run each way
 };
 std::vector<FunctionStats> stats();
 
