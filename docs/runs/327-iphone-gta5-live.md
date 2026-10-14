@@ -35,9 +35,27 @@ and the device log streamed (idevicesyslog), the user playing.
 - Logged once each: blend equation 0xf006/0xf006 (add signed: drawn as add, as RPCS3 does), cellGcmSetTileInfo
   compression modes 7 and 10 (not emulated, as RPCS3), rumble not implemented.
 
+## The second session (15:37, D-947 and D-948 in)
+
+- Installed at 15:36 (6d8f509): no preparation (the runtime's ABI unchanged); the shader cache's recorded programs were
+  of another translation (D-948's parameters changed its fingerprint): 6 made ahead, the rest compiled in play, the
+  first minute at 2 to 17 fps with up to 160 draws a frame waiting and 60 drawn by the shader interpreter.
+- D-947 at work in the scenes that ran at 4 to 12 fps before: 7 to 9 feedback copies a frame, and 30 to 460 draws a
+  frame reading a kept copy (the draws behind them: dozens of GTA V's fragment programs reading unit 12, the 1280x720
+  F_W16Z16Y16X16 light buffer at 0xcf1c0000, while drawing into it). GPU time 8 to 11 ms a frame, 60 to 89 passes,
+  GPU memory 300 to 460 MB, no memory warnings; 15 to 28 fps, now held by the CPU (5 cores busy, EDGE/GFX about two
+  SPUs' worth). GTA V invalidates the texture cache 160 to 1,500 times a frame, none of them between two such draws to
+  the same targets (no copies "after a write and an invalidation").
+- The shadows still came out lit (the user's screenshot: Franklin's and a mailbox post's shadows white on a sunny
+  pavement). A frame trace over USB (Documents/pspocket-trace; frame 2816: 3,682 draws, 47 colour targets, 255 PNG
+  files) showed no signed blending in that frame, and the sun's shadow resolve (#2769) reading the cascade atlas with a
+  depth comparison: the comparison was backwards (D-949).
+
 ## What came of it
 
 - D-947: the copy kept as the RSX's texture cache keeps what it read, until the game invalidates the cache or the
   draws go to other targets; a report line names the draws behind the copies.
+- D-948: the signed blend equations in the shader (programmable blending).
+- D-949: shadow-map lookups compare the texel against the reference, as RPCS3's reversed sampler functions do.
 - To look at next (docs/improve.md): in-session SPU translation under heat (it never ran in this session); the sound
   when the game is late; the heat at the start, after a long preparation.
