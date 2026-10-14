@@ -1,7 +1,7 @@
 // Native replacements of SPU middleware functions (D-965): the NEON building blocks against the lifted code's helpers,
-// the derived programs a known build gets (dispatch to native code, the lifted function when it declines), and the
-// lifter's calls through the table into listed functions (D-966).
-// Synthetic programs only (CLAUDE.md rule 1).
+// the derived programs a known build gets (dispatch to native code, the lifted function when it declines), the
+// lifter's calls through the table into listed functions, and the interprocedural liveness that says which registers
+// a replacement must leave exact. Synthetic programs only (CLAUDE.md rule 1).
 
 #include <catch_amalgamated.hpp>
 
@@ -14,6 +14,7 @@
 #include "pspocket/recomp/spu/asm.hpp"
 #include "pspocket/recomp/spu/image.hpp"
 #include "pspocket/recomp/spu/lifter.hpp"
+#include "pspocket/recomp/spu/liveness.hpp"
 #include "pspocket/spu/replace.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spu_test_util.hpp"
@@ -30,6 +31,9 @@ namespace rp = pspocket::spu::replace;
 namespace as = pspocket::recomp::spu::as;
 using pspocket::recomp::spu::AnalyzerOptions;
 using pspocket::recomp::spu::LiftOptions;
+using pspocket::recomp::spu::Liveness;
+using pspocket::recomp::spu::LivenessOptions;
+using pspocket::recomp::spu::LsImage;
 
 TEST_CASE("SPU replace: NEON building blocks give what the lifted code's helpers give (D-965)", "[spu]")
 {
@@ -153,4 +157,77 @@ TEST_CASE("SPU replace: the lifter calls a listed function through the program's
     const std::string listed = unit();
     CHECK(listed.find(direct) == std::string::npos); // listed: leaves for the run loop at F
     CHECK(listed.find(std::format("ctx->pc = 0x{:05X}u;", f_addr)) != std::string::npos);
+}
+
+namespace {
+
+Liveness liveness_of(as::Assembler& a, const LivenessOptions& options = {})
+{
+    const std::vector<u8> code = a.finish();
+    auto image = pspocket::recomp::spu::load_raw_image(code, a.origin(), {a.origin()});
+    REQUIRE(image);
+    const auto program = pspocket::recomp::spu::analyze(*image, AnalyzerOptions{});
+    return pspocket::recomp::spu::analyze_liveness(*image, program, options);
+}
+
+std::vector<u32> regs_of(const spu::RegSet& s)
+{
+    std::vector<u32> out;
+    for (u32 r = 0; r < 128; r++)
+        if (s.test(r)) out.push_back(r);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("SPU liveness: across calls and returns, to the end of the program (D-965)", "[spu]")
+{
+    // E: $5 = 7; call F; $3 = $6 + $7; return (out of the program). F: $6 = $5 + $5; return.
+    as::Assembler a(0x4000);
+    const auto f = a.label();
+    a.emit(as::il(5, 7));
+    a.brsl(0, f);
+    const u32 ret = a.pc();
+    a.emit(as::a(3, 6, 7));
+    a.emit(as::bi(0));
+    a.bind(f);
+    a.emit(as::a(6, 5, 5));
+    a.emit(as::bi(0));
+    const Liveness live = liveness_of(a);
+    const u32 fa = a.address(f);
+    // After F returns: $6 (F's result) and $7 (from E's caller) are read, $0 by E's return.
+    CHECK(regs_of(live.at(ret)) == std::vector<u32>{0, 6, 7});
+    // F reads $5 and its link; it writes $6 on every path; at its entry $7 is still live (E reads it after).
+    CHECK(regs_of(live.uses.at(fa)) == std::vector<u32>{0, 5});
+    CHECK(regs_of(live.kills.at(fa)) == std::vector<u32>{6});
+    CHECK(regs_of(live.at(fa)) == std::vector<u32>{0, 5, 7});
+    // A path to the read, for the report.
+    CHECK(live.why(ret, 7).find("reads it") != std::string::npos);
+    CHECK(live.why(ret, 9) == "not live");
+}
+
+TEST_CASE("SPU liveness: a variadic callee reads only the arguments its caller wrote", "[spu]")
+{
+    // E: $4 = 1; call P (saves $4-$9, as a printf to the PPU does); return. Is $8 live at E's entry?
+    u32 p_addr = 0;
+    const auto program = [&] {
+        as::Assembler a(0x5000);
+        const auto p = a.label();
+        a.emit(as::il(4, 1));
+        a.brsl(0, p);
+        a.emit(as::bi(0));
+        a.bind(p);
+        for (u32 r = 4; r < 10; r++) a.emit(as::stqd(r, -16 * static_cast<s32>(r), 1));
+        a.emit(as::bi(0));
+        p_addr = a.address(p);
+        return a;
+    };
+    as::Assembler plain = program();
+    CHECK(liveness_of(plain).at(0x5000).test(8)); // P stores it: live
+    as::Assembler variadic = program();
+    LivenessOptions options;
+    options.abi_callees.insert(p_addr);
+    const Liveness live = liveness_of(variadic, options);
+    CHECK_FALSE(live.at(0x5000).test(8)); // only $4 is an argument there
+    CHECK_FALSE(live.at(0x5000).test(4)); // written before the call
 }

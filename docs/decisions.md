@@ -15388,3 +15388,31 @@ lifter has no symbol for. One predicate at the one place the call targets are ch
 GTA V's EDGE program lifted again: its code differs from before at those three calls only. It takes effect when the
 game's SPU programs are lifted again (scripts/lift-spu.sh, or the phone's translation). Test: a synthetic program's
 direct call becomes a way out to the listed function once its build is known.
+
+## D-967 · 2026-10-14 · spu-live: what a program may still read after a function returns, and the proof for EDGE
+
+D-965's contract leaves the volatile registers a replaced function's callers never read again unspecified; which those
+are must be shown, not assumed (EDGE's internal functions need not follow the SPU ABI). The lifter's per-function
+analysis cannot say: it counts every register a way out stores as live. recomp/spu/liveness.cpp and the spu-live tool:
+interprocedural liveness over the whole program, from an address on, to the end of the program's run.
+
+- Each frame (an entry called with $lr: a brsl $lr target, an indirect call's target, the program's entry) is summarised
+  by what it may read before writing and what it writes on every path to its returns; a call uses the summary, a return
+  goes on at every return site of its frames (the program's entry returns out: for a job, nothing is read after, the
+  SPURS kernel resets the registers). The get-pc idiom is not a call. Code the analyzer did not lift (behind an indirect
+  jump) is followed too.
+- Where it cannot know it says so: an indirect jump with no known target, a stop, an absolute branch make every
+  register live there. Options feed what it cannot see: --jump (a jump table's targets: GTA V's EDGE tables are
+  table-relative words after an ila of their base, read from the image by a script in inventory/), --call (an indirect
+  call's targets: from PSPOCKET_SPU_TRACE_ENTRIES, D-965), --tail (a jump into another function through a pointer),
+  --abi-unknown-calls (an indirect call no run made goes to an ABI callback: it reads the link, the stack pointer, the
+  callee-saved registers and the arguments its caller wrote, rather than to any fragment of the program), --variadic (a
+  printf to the PPU that saves $4-$19 reads only the arguments written). --why prints a path to each read.
+- GTA V's EDGE job (spu_dad457863220b1cc), with its 8 jump tables, the walk's one indirect call target (0x0F0A4 to
+  0x0ECF8), its assertion printf (0x12200) as variadic and 8 indirect calls no walk made as ABI callbacks: after
+  0x07A38 (returns to 0x11658), 0x0A098 (0x0A8F8) and 0x0ECF8 (0x0F0A8) no register of $2-$79 is read again; after
+  0x0F008 (0x11A18) $3, its result; after the decompression fragments 0x0AC10, 0x0AC20 and 0x0B778 (they go on to the
+  next fragment of the table at 0x0C1B8, or to 0x0AC10) the 26 registers of the state the fragments share. These sets are
+  the functions' live registers in the table of known builds. Without the variadic printf, its saves made $12-$19 live
+  after 0x07A38 and 0x0A098 (only on an assertion's path).
+- Tests: a call and return (what the callee reads, kills, and what is live after it), a variadic callee.
