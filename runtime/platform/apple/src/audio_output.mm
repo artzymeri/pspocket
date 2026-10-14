@@ -7,6 +7,9 @@
 
 #include "pspocket/platform/audio_output.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "pspocket/core/audio_ring.hpp"
 #include "pspocket/core/log.hpp"
 
@@ -47,6 +50,12 @@ AudioOutput::AudioOutput() : impl_(std::make_unique<Impl>())
     [impl->engine attachNode:impl->pitch];
     [impl->engine connect:impl->source to:impl->pitch format:format];
     [impl->engine connect:impl->pitch to:impl->engine.mainMixerNode format:format];
+    // PSPOCKET_AUDIO_VOLUME=0..1 (D-976): the device still pulls the sound at its pace (cellAudio's "sound:" lines
+    // measure the game's lateness against it) at that volume: 0 measures a walk without playing it aloud.
+    if (const char* v = std::getenv("PSPOCKET_AUDIO_VOLUME"); v && *v) {
+        impl->engine.mainMixerNode.outputVolume = std::clamp(static_cast<f32>(std::atof(v)), 0.0f, 1.0f);
+        PS_LOG_INFO(kChan, "sound out at volume {}", impl->engine.mainMixerNode.outputVolume);
+    }
     NSError* error = nil;
     if (![impl->engine startAndReturnError:&error]) {
         PS_LOG_ERROR(kChan, "the audio engine didn't start: {}",

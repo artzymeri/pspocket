@@ -15578,3 +15578,115 @@ walk 12 to 15 targets made a frame: a new Metal texture each (newTextureWithDesc
 - Measured (GTA V's walk, PSPOCKET_RSX_CPU_AB=10:32, the pool alone switched every 10 frames, ten windows): the RSX
   thread's CPU a draw -2.1 to -9.6%, -5.1% on average; with the pool on every target made took a pooled texture. With
   D-953 to D-957: about -21% a draw.
+
+## D-974 · 2026-10-15 · Sony's MP3 decoder module (flashMP3.pic) native; regions a native function may leave equivalent
+
+The plan for a steady 30 fps (docs/improve.md) puts MP3 decoding at 20 to 58% of GTA V's sound mixer (SPURS 0x10016000,
+"Secondary", one SPU): its decode jobs (bb12970d, d07a95df: "Mp3SpuDecode") load Sony's MP3 decoder module,
+dev_flash/sys/external/flashMP3.pic from file offset 0x100 (program 884ae88f68a9e778 at LS 0x17400: every MultiStream
+game loads this build, so it is a table entry, not a title check), and tail-call its decodeFrame through a register
+(no lift needed for the table to take the call). runtime/spu/replace/flashmp3.c decodes as the module does.
+
+- **What the module is.** Michael Hipp's mpglib layer III (its symbols: layer3.c, decoder.c, III_get_side_info,
+  III_dehuffman, III_hybrid, synth_filterbank, DescreteCosineTransform36/12/64), its state kept by the caller:
+  decodeFrame($3 frame, $4 &consumed, $5 &pcm_bytes, $6 heap of 22528 bytes, $7/$8 oldBlock (mpglib's hybrid_block,
+  576 floats a channel), $9/$10 buffs (synth_buffs, 2 x 272 floats), $11 backup (the last 512 bytes of the frame
+  before: the reservoir), $12 &bufferLoc (synth_bo)) returns the PCM's address (heap + 2304: 16-bit samples held to
+  +-32767 and truncated, channel 0 then channel 1 at +4096, planar). The heap holds the bitstream buffer, the PCM, the
+  granule's spectra, the hybrid filter's output and its last new block. An ID3v2 tag or an ID3v1 "TAG" is skipped
+  (0, no PCM), a Xing/Info frame gives -1 PCM bytes, a broken header prints to the PPU and returns -1.
+- **Its own deviations from mpglib**, found against the module itself on the interpreter (below) and on the game's
+  calls: long band 21 is silent (decoded, its lines zero); the 24 kHz table has band 18 at 330 (mpg123's), not 332;
+  MPEG-2's scale factor partitions are indexed in bytes rather than rows of four (so partitions past the first read
+  overlapping rows), with three zeros after them whatever the block type; mixed blocks have eight long bands at every
+  rate (MPEG-2's run 18 lines past a channel's 576, into the next channel's spectrum); region 1 starts at 36 lines for
+  MPEG-1 and MPEG-2's short and mixed blocks, 54 for MPEG-2's others, and at long band 6 (short) or 8 (otherwise) for
+  MPEG-2.5; short blocks are antialiased at subbands 0 and 1 when the tenth word of the granule's information is not
+  zero, a word nothing writes (decodePacket's stack decides: read from local store as the module would); scale
+  factors past those a granule reads come from its stack too; dct36 leaves its input as it was; intensity stereo is
+  refused (printed). The native code declines (the lifted module runs) what prints or what it does not model: broken
+  headers, intensity stereo, reserved rates, layers I and II headers, malformed side information, reads past the
+  bitstream buffer, gains past the table.
+- **How it differs from the module: equivalent, not bit-exact.** The bar for audio: the PCM within one step, the float
+  state within 1e-4 of each region's largest magnitude (both far inside: below). The float order is the host's, in the
+  SPU FP environment (round toward zero) the dispatcher runs it in; the window is summed four lanes at a time in NEON.
+  The D-965 contract gains **regions** (pspocket/spu/replace.hpp `Region`, `KnownFunction::regions`): f32 and s16
+  regions with a tolerance, compared numerically by spu-native-check, and dead regions with the reason in the table;
+  everything else stays bit for bit. For the module: the PCM (s16), the four state buffers and the heap's float
+  scratch (f32); dead: the padding of its variables (each has a quadword; the bytes past its size by the module's
+  symbol table belong to no variable; the job reloads the image before calls anyway: the captured calls find the
+  file's bytes there), its rval (stored 101 times, never loaded, its address never taken) and the stack below the
+  caller's stack pointer. Everything the module writes in its own variables (init_layer3's tables of pointers, the
+  frame header, the timers, the bit position) and the link register in the caller's frame is written as it writes it.
+- **Captures freeze the decrementer** through the captured call (the module times itself with SPU_RdDec): replays of
+  such a function are deterministic; the decrementer runs on afterwards as if the call took no time.
+- **Checked:** 1,161 calls captured over two prologue walks (every 10th of the first 6,000, and every 131st of 72,916):
+  1,161 equivalent, the largest PCM difference one step, the floats 4.8e-6 of their peak, everything else exact.
+  tests/spu/test_flashmp3.cpp (test_spu_mp3): synthetic layer III streams (tests/spu/mp3_writer.hpp: random side
+  information of every kind, Huffman coded with every table, the bit reservoir, garbage ancillary bytes; MPEG-1, 2 and
+  2.5 at every rate; mono, stereo, dual, joint with M/S; CRC) decoded natively against FFmpeg's decoder (the features
+  where the module deviates left out: within 2 steps), tags, Xing frames and declines; and, with the user's firmware
+  (PSPOCKET_TEST_DEV_FLASH), against the module itself on the interpreter: 12 streams, each call from the module's
+  state within one step and every other byte as the module leaves it, each stream decoded natively from its own state
+  within two steps of the module's.
+- **Speed:** the captures x7.9 (59.8 us lifted, 7.6 native a call, the fastest of three on the shared Mac); in the
+  walk (PSPOCKET_SPU_NATIVE_TIME, D-976) 126.9 us lifted, 21.3 native a call (x6.0): at about 630 calls a second,
+  80 ms of the mixer's SPU time a second becomes 13.
+
+## D-975 · 2026-10-15 · zlib 1.2.3's inflate natively on its stream in local store (GTA V's inflateServer task)
+
+RAGE streams its packed resources through zlib on the SPUs: the "inflateServer" SPURS task (spu_3ffe1d50f8a58e15 at
+0x3000, two "zlibInflater" tasksets of SPURS 0x10015000) carries stock zlib 1.2.3 (its version string and messages,
+built without gzip support) and calls inflate(strm, Z_NO_FLUSH) from its main loop for each 4 KB input chunk it DMAs
+in, into 8 KB output chunks it DMAs out, raw deflate (windowBits -15), the 32 KB window in local store, the stream
+kept across calls (inflateReset between streams: the window stays allocated).
+
+- **Why not the host's zlib:** a host zlib (libz, libcompression) gives the same output bytes but keeps its own state;
+  here the state must stay in the program's local store in zlib 1.2.3's layout, because the SPURS task may yield
+  between calls and resume on another SPU from a saved local store, and because native and lifted calls must be able to
+  interleave and be checked bit for bit. runtime/spu/replace/zinflate.c is zlib 1.2.3's inflate.c, inffast.c and
+  inftrees.c (the zlib licence) kept statement for statement over local store: the z_stream and the inflate_state
+  (32-bit: every field four bytes; codes four bytes, op, bits, big-endian val) where the program keeps them, its fixed
+  tables and message strings by their addresses in the program's image (a build of 1.2.3 is a table entry: these
+  addresses), the window, the code tables, lens and work in local store, the bit buffer 32 bits wide as the SPU's
+  unsigned long. Declined (the program's inflate runs): a stream with a zlib or gzip wrapper (check values), a state
+  whose window is not allocated yet (zalloc is the program's code; only the first call of the program's life, since
+  inflateReset keeps the window), buffers that would wrap local store.
+- **Listed for a direct call:** the main loop calls inflate with brsl, so the program is lifted again (D-966) for the
+  call to go through the table: scripts/lift-spu.sh, or the phone's own translation. Its generated code differs from
+  the frozen game library's at that one call; -DPSPOCKET_GAME_SPU_EXTRA links the re-lifted program on the Mac.
+- **Dead regions** (D-974's regions): the stack below the caller's stack pointer, and the task's copy routine's scratch
+  quadword at 0x9720 (zmemcpy's routine at 0x03110 writes it before reading it: 400 captured calls replayed with it
+  scrambled at entry leave everything else as they did).
+- **Checked:** 810 calls captured over two prologue walks (the first 400, and every 97th of 39,328): 808 bit for bit
+  (outside the dead regions), 2 declined without a change (the first call, windowless). tests/spu/test_zinflate.cpp
+  (test_spu_zlib): raw deflate streams from the host's zlib of synthetic data (stored, fixed, dynamic, Huffman only,
+  runs, fast), in the task's chunks and in random ones down to a byte: the output is the data, the counters match,
+  Z_STREAM_END at the end; corrupt streams stop with Z_DATA_ERROR and the program's message addresses; the declines.
+- **Speed:** the captures x6.2 (41.2 us lifted, 6.7 native a call); in the walk 49.3 us lifted, 12.6 native (x3.9).
+
+## D-976 · 2026-10-15 · Each native function's time in a walk (PSPOCKET_SPU_NATIVE_TIME); silent sound measurement; the MP3 and inflate walks
+
+The SPURS time lines of a walk mix every job of a workload, and their 5 s windows follow the scene, so an A/B
+(PSPOCKET_SPU_NATIVE=ab, D-950's halves) of one function shows in them only through noise. Two switches:
+
+- PSPOCKET_SPU_NATIVE_TIME=1 times every call of a listed function by how it ran (runtime/spu/replace/replace.cpp's
+  dispatcher); pspocket-boot's "SPU native" lines at exit give the seconds and the time a call, native and lifted.
+- PSPOCKET_AUDIO_VOLUME=0..1 (runtime/platform/apple/src/audio_output.mm): with --audio the device pulls the sound at
+  its pace, so cellAudio's "sound:" lines (periods skipped because the game was late, its pace) are measured on the
+  Mac, at that volume: 0 measures without playing the walk aloud.
+
+The prologue walk with both replacements in half A (PSPOCKET_SPU_AB=10), on the Mac shared with other work:
+
+| | Native | Lifted | |
+|---|---|---|---|
+| MP3 decodeFrame (D-974), a call | 18.7-21.3 us | 113.5-126.9 us | x6.0 |
+| inflate (D-975), a call | 12.6-13.6 us | 49.3-66.3 us | x3.9-4.9 |
+| the mixer (SPURS 0x10016000 "Secondary"), SPU time per 5 s (run ab4) | 1.77 s | 2.08 s | -15% |
+| cellAudio periods skipped (the game late) per 5 s (run ab4) | 18.7 | 31.7 | -41% |
+| the game's sound pace, lowest window (run ab4) | 0.79 | 0.61 | |
+
+At about 650 MP3 frames a second the decoding takes 13 ms of SPU time a second instead of 75-80; inflate, about 300
+calls a second while streaming, 4 ms instead of 15-20 (zlibInflater's lines: 0.03 s per 5 s in half A against 0.08 in
+half B, run ab3). The window averages move with the scene (other runs: -10% and -1% for the mixer), the per-call times
+do not.

@@ -45,8 +45,10 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
   heat in the log, in-session translation at "serious", the HUD switch), D-971 (vblanks on the screen's refreshes,
   frames held 1/30 s), D-972 (the SPU runtime's channels, SPURS selection and tracker: the Mac walk +12 to +38% frames
   under load), D-973 (QoS for serial workloads, to measure on the phone). In progress in agents' clones: the RSX
-  thread's per-draw costs (inventory/agents/f1), the SPU translator (f2), native EDGE (f3). Next: native MP3 and zlib,
-  the mixer's DSP on vDSP.
+  thread's per-draw costs (inventory/agents/f1), the SPU translator (f2), native EDGE (f3). Native MP3 and zlib done
+  (inventory/agents/f4): D-974 (Sony's flashMP3.pic decodeFrame, equivalent PCM, x6 a call in the walk: the mixer -15%
+  and the periods the game was late -41% in its A/B walk), D-975 (zlib 1.2.3 inflate, bit for bit, x4 a call), D-976
+  (the measurements). Next: the mixer's DSP on vDSP.
 
 ## SPU and SPURS: the biggest cost in play
 
