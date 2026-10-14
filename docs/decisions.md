@@ -16122,6 +16122,10 @@ differed by more than that.
   193,244 to 174,220. Measured in one session (D-962): the code-address change 5.4% less SPU time, the other three 3.0%.
 - The fuzz generator draws shufb with ra == rb in 40% of its cases and brsl .+4 in a quarter; the synthetic program
   takes its own address.
+- GTA V's EDGE build lists three such folded functions for native replacement (0x07A38, 0x0A098, 0x0F008, D-968): the
+  first gate walk interpreted them ("no lifted code") and the derived program found no entry to take over. lift()
+  makes each boundary (D-966) inside a function's code a label of it; test_spu_replace checks a listed function after
+  brsl .+4 has a table entry. The gate then passes (29.8 fps median, nothing interpreted).
 
 ## D-964 · 2026-10-15 · A quadword's byte reversal in one table lookup, for the phone's compiler
 
