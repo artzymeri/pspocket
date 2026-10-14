@@ -490,11 +490,14 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   waiting; a new instance in the same memory then overwrites their saved contexts, and a waiting task woken later
   runs from garbage (lr 0xa5a5a5a5) and crashes. Games are not affected while pspocket's own libsjvtd serves them (it
   has no SPU tasks); a game or Sony module that ends a taskset with tasks still waiting would be.
-- **Try:** what a PS3's SPURS does with a taskset's waiting tasks when it is shut down and joined
-  (cellSpursShutdownTaskset, cellSpursJoinTaskset: RPCS3 cellSpurs.cpp), and whether pspocket's leaves them
-  schedulable; a test with a task blocked on an event flag across the taskset's shutdown, and the same memory reused
-  for a new taskset.
-- **State:** open.
+- **Explained (2026-10-14, agent d, D-946 not yet committed: its test and entry are in clone d):** not a fault of
+  pspocket's SPURS, which handles a task waiting across its taskset's shutdown and a new taskset in the same memory as
+  libsre does. libsjvtd's six tasks live in the caller's taskset, which is never shut down between instances; Sony's
+  ReleaseInstance returns (0x80615880 after a sequence that needed more frame buffers) 83 microseconds after an event
+  flag that lets its tasks end, without waiting for them (all gone 0.88 ms later), so memory reused at once is
+  overwritten under them, on a PS3 as here. The comparison keeps each instance's memory apart (200 ms between
+  instances also works).
+- **State:** explained; nothing to fix.
 
 ## Stability: data races (ThreadSanitizer, D-585)
 
