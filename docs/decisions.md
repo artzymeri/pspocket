@@ -15167,3 +15167,61 @@ comparison itself was backwards.
 - Tests: D-100's (a DEPTH16 texture, LEQUAL against 0.5: the 0.25 half passes, the 0.75 half fails; linear filtering
   blends three quarters and a quarter at the edge) and D-106's (the depth buffer itself: LEQUAL fails against a
   reference of 0, GREATER passes) now expect the RSX's direction; both fail with the old one.
+
+## D-948 (part 2) · 2026-10-14 · B8 and G8B8 targets blend the signed equations in the shader too
+
+GTA V's walk on the Mac logged "blend equation 0xf006/0xf006 (signed) drawn as add (the target's format, MTLPixelFormat
+10)": it blends ADD_SIGNED into a B8 target (R8Unorm), which part 1 left to Metal's add. R8Unorm and RG8Unorm (B8, G8B8)
+now take the shader's blending as the four-channel byte targets do, their bytes read as signed; the walk's RSX failures
+went to 0. The message of a signed equation left to Metal names why (the shader interpreter's draw, or the target's
+format and which). Test: "ADD_SIGNED on a B8 target": 0x80 and a source of -16 give 0x70.
+
+## D-950 · 2026-10-14 · The SPU workers' QoS class, switchable, and their time by host CPU (no gain from interactive)
+
+Run 327 (GTA V on the iPhone 18 Pro Max): 15 to 28 fps held by the CPU, five of the six cores busy, the heat "serious".
+The phone has two performance cores and four efficiency cores, and iOS places threads by their QoS class: the SPU
+workers ran at user-initiated, the RSX thread at interactive.
+
+- PSPOCKET_SPU_QOS (interactive, initiated, default or utility) sets every SPU worker's QoS class when it starts, and
+  PSPOCKET_SPU_QOS_SOLO an instance of one SPU's (GTA V's sound mixer, SPURS "Secondary"); unset, user-initiated as
+  before. PSPOCKET_SPU_AB=S with PSPOCKET_SPU_QOS_B switches the workers between the two every S seconds
+  (pthread_set_qos_class_self_np), so one session measures both in the same scenes; each SPURS time line says its half.
+- The SPURS time line gives the workloads' time by host CPU (pthread_cpu_number_np after each workload's run), as shares.
+- Measured on the phone (run 327's busy windows: EDGE/GFX 7 s or more of SPU time in 5 s, 4.5 cores or more): every
+  worker interactive 18.1 fps (104 windows), user-initiated 18.2 (57): no gain, the two performance cores are full
+  either way. The sound mixer's time fell by about a third at interactive, but with every worker interactive the sound
+  came out worse. The main instance's SPU time ran 61% on CPUs 0 to 3, Secondary's 44% (by inference the efficiency
+  cores: the idle Secondary sits on 4 and 5).
+- Not done: fewer host threads than SPUs. A workload runs only on the SPUs its priorities name (GTA V's EDGE/GFX on SPUs
+  1 to 3, its GraphicsMain on 4 alone), so a worker left out would leave its workloads never run (found by review of
+  the first version, which had PSPOCKET_SPURS_THREADS, before it ran).
+
+## D-951 · 2026-10-14 · A clear is done in the open pass only when that pass covers it (the black fight scene)
+
+The user's screenshot of run 327 (the fight tutorial, 20 fps): the screen black but a lit rectangle in its top-left
+corner, the characters shiny black. GTA V's prologue walk on the Mac (its disc image back) showed the same for whole
+camera shots, half to four fifths of each frame black. The gate's frame jumps compare each frame with the one before:
+a fault over a whole shot passes them.
+
+- Off switches, a walk each: with PSPOCKET_RSX_NO_PASS_MERGING the frames were right; D-947's copies (strict), D-948's
+  shader blending and D-949's comparison were not the cause. Within D-945: the clears that wait (not the stores left
+  out), and of those only a clear of whole targets made while another pass draws.
+- A frame trace (frame 2950): GTA V draws a 320x128 target (pitch 0x2800, part of its 2560-wide character targets) with
+  its 1280x720 Z24S8 depth buffer, clears its G-buffer's first target whole, then clears the depth buffer alone (depth
+  and stencil) under a 1280x720 surface clip. The colour clear used to end the 320x128 pass; under D-945 it waits, and
+  the pass goes on. The depth clear found that pass open with its depth buffer, and do_clear did it there, its region
+  taken inside the pass's area: 320x128 of the depth buffer cleared. The G-buffer was drawn against old depth everywhere
+  else, and only that corner lit (640x256 in other shots, the targets' size there).
+- Fix (do_clear): the clear's region is taken in its own area (its surface clip within its surfaces, as open_pass makes
+  a pass's), and the open pass keeps the clear only when its area holds that region; else the clear goes as any other
+  (it waits, D-945, or has a pass of its own). Before D-945 the same could happen to a clear of a depth buffer alone
+  right after a pass over a smaller target with it, and a scissor wider than the clip cleared past the clip in a larger
+  pass.
+- Test (tests/rsx/test_metal.mm, "D-951"): a 16x16 target drawn, depth-tested, with a 64x64 depth buffer at 0.25;
+  another target cleared whole; the depth buffer cleared alone to 1.0; a triangle at 0.75 drawn against it is drawn
+  outside the corner too. With merging it fails before the fix (the depth there still 0.25).
+- The gate: --frame-jumps also counts dark frames, a third of the 64x36 thumbnail black (every channel 4 or less), the
+  summary's "dark"; games/gta5/gate.json's dark_frames_max.
+- Measured: the walk from frame 2880, every 4th frame saved: no frame with 30% of its pixels black outside the top-left
+  corner (234 frames), where each walk with the fault had whole shots of them (frames 2700 to 2976, 3082 to 3176, 3222
+  to 3238 in one).

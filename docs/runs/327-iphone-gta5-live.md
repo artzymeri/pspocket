@@ -51,11 +51,32 @@ and the device log streamed (idevicesyslog), the user playing.
   files) showed no signed blending in that frame, and the sun's shadow resolve (#2769) reading the cascade atlas with a
   depth comparison: the comparison was backwards (D-949).
 
+## The third session and the Mac (16:00 to 18:00)
+
+- The user: "shadow bug is fixed, the main issue is the fps, it should go 30 fps static always". Busy scenes 15 to 28
+  fps, 5 of 6 cores busy, GPU 8 to 11 ms a frame, the heat "serious" throughout (charging).
+- QoS on the phone (D-950): every SPU worker at interactive, 18.1 fps in the busy windows against 18.2 at
+  user-initiated; the sound mixer faster at interactive alone, the sound worse with all of them. The two performance
+  cores are full either way.
+- The user's screenshot of the fight tutorial: black but a lit top-left rectangle, the characters shiny black. The Mac's
+  walk (the disc image back in inventory/gta5) showed it for whole camera shots; off switches and two frame traces
+  found it in D-945: a depth buffer cleared alone inside an open pass over a 320x128 target, its corner only (D-951).
+  The gate's frame jumps had passed it: it now counts dark frames too.
+- Four research tracks on a steady 30 fps (the CPU budget per frame and what could run natively; Apple's platform
+  levers; the SPU translation, SPU runtime and RSX thread; the SPU runtime and SPURS overhead): the busy scenes need
+  about 277 ms of CPU a frame against 165 to 185 that six cores hold at 30 fps; EDGE/GFX alone is 85 ms (six functions
+  84% of it), the sound mixer a whole core at full pace, the RSX thread 33 ms (12 us a draw). The plan from it is in
+  docs/improve.md ("A steady 30 fps on the phone").
+
 ## What came of it
 
 - D-947: the copy kept as the RSX's texture cache keeps what it read, until the game invalidates the cache or the
   draws go to other targets; a report line names the draws behind the copies.
 - D-948: the signed blend equations in the shader (programmable blending).
 - D-949: shadow-map lookups compare the texel against the reference, as RPCS3's reversed sampler functions do.
+- D-950: the SPU workers' QoS class switchable (and A/B in one session), their time by host CPU; no gain from
+  interactive.
+- D-951: a clear done in the open pass only when that pass covers it (the black fight scene); the gate counts dark
+  frames. D-948 part 2: B8 and G8B8 targets blend the signed equations in the shader too.
 - To look at next (docs/improve.md): in-session SPU translation under heat (it never ran in this session); the sound
   when the game is late; the heat at the start, after a long preparation.

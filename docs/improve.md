@@ -7,6 +7,42 @@ and is struck through. Rule 8 holds: an optimization starts from a measurement a
 Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA V, D-144 and D-145 installed;
 2 performance and 4 efficiency cores, a GPU budget of 33 ms a frame at 30 fps).
 
+## A steady 30 fps on the phone (research, 2026-10-14)
+
+The user's ask in run 327: "it should go 30 fps static always", with iOS's own facilities wherever they help. Four
+research tracks over run 327's logs and profiles, the lifted code and Apple's documentation.
+
+- **The budget (run 327's busy windows, 18 fps):** 277 ms of CPU a frame. EDGE/GFX 85, dependency_spu 36, the RSX
+  thread 33, the sound mixer (SPURS Secondary) 32, GraphicsMain 25, other SPURS work 30, the PPU's main thread 14, the
+  other threads 18. Six cores (two performance, four efficiency) hold about 165 to 185 ms a frame at 30 fps while hot:
+  90 to 115 ms has to go. Hard limits: EDGE/GFX runs on three SPUs only (the game's priorities) and must get about twice
+  as fast; GraphicsMain is 30 ms a frame on one thread (it needs a performance core); the RSX thread would be at 100% at
+  30 fps; the mixer needs a whole core at full sound pace.
+- **Ranked:**
+  1. Cheap and certain: the iOS runtime is built for ARMv8.0 (5,444 LL/SC loops and no LSE atomics in
+     libPSPocketRuntime.a: `-mcpu=apple-a12`, the iOS 17 floor); Game Mode (the app is a developer tool, so neither Game
+     Mode nor its exemption from Adaptive Power applies: the games category, LSSupportsGameMode, GCSupportsGameMode);
+     branch weights on the lifted SPU code's ways out; the RSX thread's per-draw allocations and lookups.
+  2. SPU translation: the MFC parameter channels written inline (8,709 runtime calls, labels and ways out), lazy entry
+     loads (60% of entry loads are never read), the resume path out of the hot function (LLVM sees 132 loops in EDGE's
+     job instead of 65), poll exits that store only live registers. A few % each by estimate.
+  3. SPU runtime: channel fast paths, the SPURS line stored only when it changes, the module tracker's scans: 10 to 15
+     ms a frame.
+  4. Native middleware: Sony's MP3 decoder module (flashMP3.pic, the same in every MultiStream game) as a native program
+     over pspocket's MP3 core: 6 to 17 ms and the sound pace; RAGE's zlib inflate on libz or libcompression: 4 ms, 13 to
+     30 while streaming; EDGE geometry native (recognised by hash: its six hot functions in NEON first, then the whole
+     job, later Metal compute): 40 to 70 ms, the largest.
+  5. Frame pacing: vblank from the display (CAMetalDisplayLink), each frame shown at least 1/30 s, the drawable off the
+     RSX thread: steadier, not faster.
+  6. Heat: sessions start cool and unplugged; thermal and Low Power Mode changes logged; in-session translation at
+     utility QoS rather than waiting while "serious".
+  7. Measuring: iOS 27's Performance Trace (metalperftrace on the Mac), TASK_POWER_INFO_V2's performance-core time, the
+     Metal HUD by a PSPOCKET_ switch.
+- **Not levers:** real-time threads for SPU workers (XNU demotes them after a second without blocking), thread affinity
+  (not on iOS), fewer SPU threads (the game's priorities pin workloads, D-950), every worker at interactive (D-950),
+  -O3 or another -mcpu for the lifted code (under 1% static).
+- **State:** open; item 1 first.
+
 ## SPU and SPURS: the biggest cost in play
 
 - **Seen:** in the heavier stretches of play (17:17:30-50) the main SPURS instance (5 SPUs) was 70 to 85% busy: EDGE/GFX
@@ -116,6 +152,12 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   stretches where feedback copies held the frame at 4 to 12 fps (D-947): the sound follows the frame loop there.
 
 ## RSX and Metal: the GPU
+
+- **Seen (run 327, the fight):** the screen black but a lit corner for whole camera shots, the characters shiny black.
+  **Done (D-951):** a depth buffer cleared alone right after a pass over a smaller target with it was cleared inside
+  that pass's area only (D-945 kept the pass open longer, which let it happen); the clear now takes its own area.
+  **Lesson:** D-945 went in measured on a synthetic frame only (the disc image was away); a change to what passes do
+  needs GTA V's walk and its frames looked at before it ships.
 
 - **Seen (run 327):** up to 335 feedback copies a frame (a draw sampling a target it writes, copied each time), 411
   passes and 3.3 GB of attachments loaded and stored a frame, 80 to 155 ms of GPU time and 8.9 GB of GPU allocations.
@@ -421,6 +463,10 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   PAMF movies (neither local game does: both play Bink on their SPUs) for numbers in play, and the phone.
 
 ## The gate (D-149)
+
+- **Seen (run 327):** D-951's black camera shots passed the frame jumps (they compare each frame with the one before:
+  a fault over a whole shot jumps only at its cuts, as good shots do). **Done (D-951):** the walk counts dark frames
+  (a third of the 64x36 thumbnail black), gate.json's dark_frames_max.
 
 - **Seen (2026-10-07 14:14):** test_lv2 failed once in a `ctest -j8` run (LastTestsFailed.log; its output was
   overwritten), then passed 3 suite runs, 30 runs alone and 25 runs under a full-core load. Some test there is timing
