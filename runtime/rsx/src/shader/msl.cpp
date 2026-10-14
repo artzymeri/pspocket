@@ -138,17 +138,20 @@ static bool rsx_compare(uint func, float a, float b)
     }
 }
 
-// A depth comparison lookup (shadow maps): the reference against the texel at uv, or with linear filtering against the
-// 2x2 texels around it, filtered bilinearly (percentage-closer filtering, as a comparison sampler does). p: the unit's
-// tex_scale (z compare function, w flags). RPCS3 TEX2D_SHADOW: texture(sampler2DShadow, vec3(uv, ref)).xxxx.
+// A depth comparison lookup (shadow maps): the texel at uv against the reference, or with linear filtering the 2x2
+// texels around it, filtered bilinearly (percentage-closer filtering, as a comparison sampler does). p: the unit's
+// tex_scale (z compare function, w flags). RPCS3 TEX2D_SHADOW: texture(sampler2DShadow, vec3(uv, ref)).xxxx, with the
+// sampler's compare function the texture's reversed ("The stored texture function is reversed wrt the textureProj
+// compare function", GL glutils/sampler.cpp; VKDraw.cpp get_compare_func(zfunc, true)): the texel is the left side
+// (D-949; the reference was, and GTA V's shadows came out lit and its sunlit ground shadowed).
 static float4 rsx_shadow(texture2d<float> t, sampler s, float2 uv, float ref, float4 p)
 {
     const uint func = uint(p.z), flags = uint(p.w);
     if ((flags & 2u) != 0u) ref = min(ref, 1.0); // integer depth: the reference saturates as the buffer's values do
-    if ((flags & 1u) == 0u) return float4(rsx_compare(func, ref, t.sample(s, uv).x) ? 1.0 : 0.0);
+    if ((flags & 1u) == 0u) return float4(rsx_compare(func, t.sample(s, uv).x, ref) ? 1.0 : 0.0);
     const float4 d = t.gather(s, uv); // x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0)
-    const float4 c = float4(rsx_compare(func, ref, d.x) ? 1.0 : 0.0, rsx_compare(func, ref, d.y) ? 1.0 : 0.0,
-                            rsx_compare(func, ref, d.z) ? 1.0 : 0.0, rsx_compare(func, ref, d.w) ? 1.0 : 0.0);
+    const float4 c = float4(rsx_compare(func, d.x, ref) ? 1.0 : 0.0, rsx_compare(func, d.y, ref) ? 1.0 : 0.0,
+                            rsx_compare(func, d.z, ref) ? 1.0 : 0.0, rsx_compare(func, d.w, ref) ? 1.0 : 0.0);
     const float2 f = fract(uv * float2(t.get_width(), t.get_height()) - 0.5);
     return float4(mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y));
 }
@@ -158,10 +161,10 @@ static float4 rsx_shadow_depth(depth2d<float> t, sampler s, float2 uv, float ref
 {
     const uint func = uint(p.z), flags = uint(p.w);
     if ((flags & 2u) != 0u) ref = min(ref, 1.0);
-    if ((flags & 1u) == 0u) return float4(rsx_compare(func, ref, t.sample(s, uv)) ? 1.0 : 0.0);
+    if ((flags & 1u) == 0u) return float4(rsx_compare(func, t.sample(s, uv), ref) ? 1.0 : 0.0);
     const float4 d = t.gather(s, uv);
-    const float4 c = float4(rsx_compare(func, ref, d.x) ? 1.0 : 0.0, rsx_compare(func, ref, d.y) ? 1.0 : 0.0,
-                            rsx_compare(func, ref, d.z) ? 1.0 : 0.0, rsx_compare(func, ref, d.w) ? 1.0 : 0.0);
+    const float4 c = float4(rsx_compare(func, d.x, ref) ? 1.0 : 0.0, rsx_compare(func, d.y, ref) ? 1.0 : 0.0,
+                            rsx_compare(func, d.z, ref) ? 1.0 : 0.0, rsx_compare(func, d.w, ref) ? 1.0 : 0.0);
     const float2 f = fract(uv * float2(t.get_width(), t.get_height()) - 0.5);
     return float4(mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y));
 }

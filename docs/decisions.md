@@ -15147,3 +15147,23 @@ lit the target nearly to white.
 - Tests: tests/rsx/test_metal.mm, "D-948": over a 0x808080 target a source of r 0xf0, g 0x10 gives 0x70 and 0x90 with
   ADD_SIGNED (0xff with Metal's add, the bug: it fails without the shader's blending), the reverse with
   REVERSE_SUBTRACT_SIGNED, and REVERSE_ADD_SIGNED takes the target's bytes as signed.
+
+## D-949 · 2026-10-14 · Shadow-map lookups compare the texel against the reference (the shadows were inverted)
+
+The user's screenshot of run 327's second session (D-948 in): Franklin's shadow and a mailbox post's drawn white on a
+sunny pavement; the car's and the parking garage's earlier. A frame trace on the phone (D-947's switch) found the sun's
+shadow resolve, GTA V's draw #2769: the 640x2560 cascade atlas (DEPTH24_D8, compare function from TEXTURE_ADDRESS)
+sampled directly (D-106) into the G-buffer's third target's alpha, multiplied in. No signed blending in that frame: the
+comparison itself was backwards.
+
+- D-100 compared the reference against the texel (`reference op texel`), reading RPCS3's TEX2D_SHADOW alone. RPCS3 sets
+  its comparison samplers to the texture's function reversed (GL glutils/sampler.cpp: "The stored texture function is
+  reversed wrt the textureProj compare function"; VKDraw.cpp get_compare_func(tex.zfunc(), true)): with the reference on
+  the left in GL and Vulkan, the RSX's is `texel op reference`. With the reference first a lit surface (its own depth a
+  little in front of the stored one, with GTA V's bias) failed and a shadowed one passed: the sunlit ground came out
+  shadowed and the shadows lit.
+- rsx_shadow and rsx_shadow_depth (the translation's and the shader interpreter's) now compare the texel against the
+  reference. The prologue's change changes translation_fingerprint(): shader caches recorded before are not used.
+- Tests: D-100's (a DEPTH16 texture, LEQUAL against 0.5: the 0.25 half passes, the 0.75 half fails; linear filtering
+  blends three quarters and a quarter at the edge) and D-106's (the depth buffer itself: LEQUAL fails against a
+  reference of 0, GREATER passes) now expect the RSX's direction; both fail with the old one.

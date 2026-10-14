@@ -4010,8 +4010,10 @@ TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the dept
 {
     REQUIRE_METAL();
     // A 32x64 depth texture over the 64x64 target: depth 0.25 in its left half, 0.75 in its right; the reference (the
-    // texture coordinate's z) is 0.5. LEQUAL passes where 0.5 <= depth (RPCS3 shadow_textures and TEX2D_SHADOW): the
-    // right half white, the left half black; with linear filtering the 2x2 comparisons around the edge blend.
+    // texture coordinate's z) is 0.5. LEQUAL passes where depth <= 0.5: the texel is the comparison's left side, as RPCS3
+    // reverses the texture's function for its comparison samplers, which put the reference there (GL
+    // glutils/sampler.cpp, VKDraw.cpp get_compare_func(zfunc, true); D-949). The left half white, the right half black;
+    // with linear filtering the 2x2 comparisons around the edge blend.
     for (const bool linear : {false, true}) {
         INFO(std::format("{} filtering", linear ? "linear" : "nearest"));
         E2E e;
@@ -4047,16 +4049,16 @@ TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the dept
         for (const auto& f : e.failures) INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
-        CHECK(guest_pixel(e, kSurfaceOffset, 20, 48) == std::array<u8, 4>{0x00, 0x00, 0x00, 0x00});
-        CHECK(guest_pixel(e, kSurfaceOffset, 44, 48) == std::array<u8, 4>{0xff, 0xff, 0xff, 0xff});
-        // Pixels 31 and 32 sample texel coordinates 15.25 and 15.75: between texels 15 (fails) and 16 (passes).
+        CHECK(guest_pixel(e, kSurfaceOffset, 20, 48) == std::array<u8, 4>{0xff, 0xff, 0xff, 0xff});
+        CHECK(guest_pixel(e, kSurfaceOffset, 44, 48) == std::array<u8, 4>{0x00, 0x00, 0x00, 0x00});
+        // Pixels 31 and 32 sample texel coordinates 15.25 and 15.75: between texels 15 (passes) and 16 (fails).
         const int left = guest_pixel(e, kSurfaceOffset, 31, 48)[1], right = guest_pixel(e, kSurfaceOffset, 32, 48)[1];
         if (linear) {
-            CHECK(std::abs(left - 64) <= 4);   // a quarter of texel 16
-            CHECK(std::abs(right - 191) <= 4); // three quarters
+            CHECK(std::abs(left - 191) <= 4); // three quarters of texel 15
+            CHECK(std::abs(right - 64) <= 4); // a quarter
         } else {
-            CHECK(left == 0x00);
-            CHECK(right == 0xff);
+            CHECK(left == 0xff);
+            CHECK(right == 0x00);
         }
     }
 }
@@ -4064,7 +4066,8 @@ TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the dept
 TEST_CASE("metal e2e: a shadow lookup on a depth buffer compares against the buffer itself (D-106)")
 {
     // The depth buffer (Z16, 0.375) sampled directly as DEPTH16 with a compare function; the reference is the texture
-    // coordinate's z, 0 here: LEQUAL passes (white), GREATER fails (black). No conversion, no readback.
+    // coordinate's z, 0 here: the depth against it (D-949), LEQUAL fails (black), GREATER passes (white). No conversion,
+    // no readback.
     REQUIRE_METAL();
     for (const u32 zfunc : {3u, 4u}) {
         INFO(std::format("zfunc {}", zfunc));
@@ -4095,7 +4098,7 @@ TEST_CASE("metal e2e: a shadow lookup on a depth buffer compares against the buf
         CHECK(e.backend->stats().depth_conversions == 0);
         CHECK(e.backend->stats().readbacks == 0);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
-        const u8 v = zfunc == 3 ? 0xff : 0x00;
+        const u8 v = zfunc == 3 ? 0x00 : 0xff;
         CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{v, v, v, v});
     }
 }
