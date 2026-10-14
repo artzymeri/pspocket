@@ -73,15 +73,35 @@ Bucket g_buckets[kBuckets];
 // bumps). A bit once set stays.
 std::atomic<u64> g_watched[kSlots / 64];
 
-inline void watch(u32 index)
+// And the 64 KB granules of guest memory holding a watched line (D-972): a PUT into granules nobody watches (GTA V's RSX
+// commands and vertex data, most PUTs) skips its lines' slots altogether, by the same pairing (the reader sets both
+// bits before its fence, the writer reads the granule's after its own). Set by the address, so a granule bit is never
+// set for a line that hashes to a watched slot without being watched itself.
+constexpr u32 kGranuleShift = 16;
+std::atomic<u64> g_watched_granules[(u64{1} << 32 >> kGranuleShift) / 64];
+
+inline void set_bit(std::atomic<u64>* words, u32 index)
 {
-    std::atomic<u64>& word = g_watched[index / 64];
+    std::atomic<u64>& word = words[index / 64];
     const u64 bit = 1ull << (index % 64);
     if (!(word.load(std::memory_order_relaxed) & bit)) word.fetch_or(bit, std::memory_order_seq_cst);
+}
+
+inline u32 slot_index(u32 addr);
+
+inline void watch(u32 addr)
+{
+    set_bit(g_watched_granules, addr >> kGranuleShift);
+    set_bit(g_watched, slot_index(addr));
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 inline bool watched(u32 index) { return g_watched[index / 64].load(std::memory_order_relaxed) & (1ull << (index % 64)); }
+
+inline bool granule_watched(u32 granule)
+{
+    return g_watched_granules[granule / 64].load(std::memory_order_relaxed) & (1ull << (granule % 64));
+}
 
 static_assert(sizeof(Slot) == 128);
 
@@ -202,7 +222,7 @@ inline void unlock_unchanged(Slot& slot) { slot.version.fetch_sub(1, std::memory
 
 extern "C" uint64_t ps_res_acquire(uint8_t* base, uint32_t addr, void* out128)
 {
-    watch(slot_index(addr));
+    watch(addr);
     Slot& slot = slot_of(addr);
     const u64* line = line_words(base, addr);
     u32 spins = 0;
@@ -228,7 +248,7 @@ extern "C" uint64_t ps_res_acquire(uint8_t* base, uint32_t addr, void* out128)
 
 extern "C" uint64_t ps_res_version(uint32_t addr)
 {
-    watch(slot_index(addr));
+    watch(addr);
     return slot_of(addr).version.load(std::memory_order_acquire) & ~u64{1};
 }
 
@@ -306,7 +326,7 @@ extern "C" bool ps_res_store_conditional(uint8_t* base, uint32_t addr, uint32_t 
 extern "C" bool ps_res_wait_change(uint32_t addr, uint64_t version, uint64_t timeout_ns)
 {
     const u32 index = slot_index(addr);
-    watch(index); // the version waited on came from ps_res_version or ps_res_acquire, which watch it already
+    watch(addr); // the version waited on came from ps_res_version or ps_res_acquire, which watch it already
     Slot& slot = g_slots[index];
     Bucket& bucket = bucket_of(index);
     // Clamp so the deadline can't overflow the clock's signed representation (~31 years is "forever").
@@ -363,6 +383,10 @@ extern "C" void ps_res_notify_write(uint32_t addr, uint32_t size)
         return;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst); // the bytes written before, the bits read after (D-243)
+    bool any = false;
+    for (u64 g = first >> kGranuleShift; g <= (end - 1) >> kGranuleShift && !any; g++)
+        any = granule_watched(static_cast<u32>(g));
+    if (!any) return;
     for (u64 line = first; line < end; line += PS_RES_LINE_SIZE) {
         const u32 index = slot_index(static_cast<u32>(line));
         if (!watched(index)) continue;

@@ -15301,8 +15301,13 @@ SPU threads' busy time outside the translated code. The parts done here, each sa
 - Small: ps_res_store_line copies the caller's 256 bytes before taking the line's lock; GETLLAR tests whether the old
   reservation was lost before taking the context lock (the event alone needs it); the job chain's clock and its pauses
   use ps_host_now_ns and ps_host_sleep_ns.
-- Not done (measured too small or too risky for now): DMA lists in one pass, a granule bitmap for PUT notifications,
-  inline small copies (memmove is mostly the bytes).
+- PUT notifications (part 2): watch() also sets a bit for the line's 64 KB granule of guest memory, and
+  ps_res_notify_write, after its fence, skips a PUT whose granules hold no watched line (GTA V's RSX commands and
+  vertex data, most PUTs) instead of hashing each of its 128-byte lines (a 4.5 KB PUT: 36). The same Dekker pairing as
+  D-243 (the reader sets both bits before its fence). Test: a write from an unwatched granule into a watched one bumps
+  the watched line.
+- Not done (too small or too risky for what they give): DMA lists in one pass (a PUT list needs its per-element
+  release fences for the MFC's order), inline small copies (memmove is mostly the bytes).
 - Tests: tests/spu, test_reservation, test_lv2 and test_hle's SPURS and SPU program cases pass; "a module with data
   copied over its tail" now also checks that data over its tail does not identify it again (fails before the change).
 - Measured on the Mac (GTA V's prologue walk, 128 s; the Mac loaded by three agents' builds, load 30 to 50, so the

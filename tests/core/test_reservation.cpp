@@ -251,6 +251,13 @@ TEST_CASE("reservation: single-thread semantics", "[reservation]")
     CHECK(ps_res_version(line + 0x180) >= l2 + 2);
     CHECK(ps_res_version(line + 0x200) <= l3 + 6); // untouched unless it shares a slot with one of them
     CHECK_FALSE(ps_res_store_conditional(base, line + 0x80, 4, 1, before, snap));
+
+    // A write that starts in a 64 KB granule nobody watches and ends in a watched one bumps the watched line (D-972:
+    // writes into unwatched granules skip their lines; each granule of the range is checked).
+    const u32 far = kArena + 0x60000; // the first line of its granule
+    const u64 w = ps_res_version(far);
+    ps_res_notify_write(far - 0x40, 0x80); // the last 0x40 bytes of the granule before, then 0x40 of this one
+    CHECK(ps_res_version(far) >= w + 2);
 }
 
 TEST_CASE("reservation: 32-bit lwarx/stwcx. counters lose no updates", "[reservation][stress]")
