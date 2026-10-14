@@ -1068,7 +1068,7 @@ void write_avc_frame(u8* base, u32 at, const Picture& p)
 // gives the picture later): the first neither holding a picture not yet released (decoded, announced or not, or of an
 // access unit still in the decoder) nor a reference: the last anchor picture's (I or P), and for a B picture the one
 // before. A skipped picture shows the picture before it again, in its frame buffer. The decoder's thread.
-void vc1_reserve(Vdec& v, const AuMeta& meta)
+[[maybe_unused]] void vc1_reserve(Vdec& v, const AuMeta& meta) // used by the FFmpeg decoders only
 {
     const vdec::Plan& plan = v.plan;
     if (!plan.frames) return;
@@ -1101,7 +1101,7 @@ void vc1_reserve(Vdec& v, const AuMeta& meta)
 // A picture decoded: the frame buffer it takes and its contents there (the decoder's thread). A core with its own
 // frame buffers (Plan::frames) takes them in turn; a VC-1 skipped picture shows the frame before it again. H.264's and
 // MPEG-2's are pspocket's own (D-196): as many of the picture's size as fit after the ring, at most 16.
-void place_picture(u8* base, Vdec& v, Picture& p)
+[[maybe_unused]] void place_picture(u8* base, Vdec& v, Picture& p) // used by the FFmpeg decoders only
 {
     const vdec::Plan& plan = v.plan;
     std::optional<u32> reserved;
