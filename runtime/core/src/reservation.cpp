@@ -236,13 +236,13 @@ extern "C" bool ps_res_store_line(uint8_t* base, uint32_t addr, uint64_t version
     const void* data128)
 {
     Slot& slot = slot_of(addr);
-    if (!try_lock(slot, version)) return false;
-    std::atomic_thread_fence(std::memory_order_release); // the lock is visible before any data store
-
+    // The caller's buffers copied before the lock: its window as short as it can be (D-972).
     u64 expected[kWords];
     u64 data[kWords];
     std::memcpy(expected, expected128, PS_RES_LINE_SIZE);
     std::memcpy(data, data128, PS_RES_LINE_SIZE);
+    if (!try_lock(slot, version)) return false;
+    std::atomic_thread_fence(std::memory_order_release); // the lock is visible before any data store
 
     u64* line = line_words(base, addr);
     if (!line_equals(line, expected)) {

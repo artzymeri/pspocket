@@ -332,6 +332,19 @@ u32 run_end(const u32* owner, u32 from, u32 end, u32 tag)
     return from;
 }
 
+bool any_bit(const uint32_t* bits, u32 a, u32 b);
+
+// Whether lines [l, e) hold any of run r's program's code words (all of its words when it has no map of them).
+bool holds_code(const Run& r, u32 l, u32 e)
+{
+    const u32 a = std::max(r.id_start, l << kLineShift), b = std::min(r.id_end, e << kLineShift);
+    if (a >= b) return false;
+    const u32 n = r.program->code_size / 4;
+    const u32 wa = std::min(n, (a - r.id_start) / 4), wb = std::min(n, (b - r.id_start + 3) / 4);
+    if (!r.program->code_words) return wa < wb;
+    return any_bit(r.program->code_words, wa, wb);
+}
+
 void release(Modules& m, u32 first, u32 last, u32 keep)
 {
     for (u32 l = first; l <= last;) {
@@ -339,7 +352,10 @@ void release(Modules& m, u32 first, u32 last, u32 keep)
         const u32 e = run_end(m.owner.data(), l + 1, last + 1, tag);
         if (Run* r = tag != keep ? run_at(m, tag) : nullptr) {
             note_event('c', r->id_start, r->id_end, r->ea_start);
-            r->resolved = false;
+            // A copy over lines that hold none of its program's code (its data, D-085) leaves the program as it was
+            // identified, for the lines it still holds; anything else is identified again at its next run (D-972: about
+            // 700,000 identifications a walk, each a hash, a compare and a scan of its code words).
+            if (!r->resolved || !r->program || holds_code(*r, l, e)) r->resolved = false;
             r->lines -= e - l;
             if (!r->lines) m.free_slots[m.free_count++] = static_cast<u16>(tag & kSlotMask);
         }
@@ -418,13 +434,28 @@ void log_modified(const u8* ls, const u8* guest, u32 size, u32 ls_start, u32 ea_
 
 // Whether program p lifted any instruction outside [from, to) (offsets from its start): what a copy over part of its
 // module wrote over (D-085: code_words; none means all words are instructions).
-bool lifted_outside(const ps_spu_program* p, u32 from, u32 to)
+// Whether any bit of `bits` in [a, b) is set: 32 words at a time (D-972: the word-by-word test was about 1% of the SPU
+// threads' busy time, on every identification of a module).
+bool any_bit(const uint32_t* bits, u32 a, u32 b)
 {
-    for (u32 w = 0; w < p->code_size / 4; w++) {
-        if (w * 4 >= from && w * 4 < to) continue;
-        if (!p->code_words || ((p->code_words[w >> 5] >> (w & 31)) & 1)) return true;
+    if (a >= b) return false;
+    const u32 first = a >> 5, last = (b - 1) >> 5;
+    for (u32 i = first; i <= last; i++) {
+        u32 mask = ~0u;
+        if (i == first) mask &= ~0u << (a & 31);
+        if (i == last && (b & 31)) mask &= ~0u >> (32 - (b & 31));
+        if (bits[i] & mask) return true;
     }
     return false;
+}
+
+bool lifted_outside(const ps_spu_program* p, u32 from, u32 to)
+{
+    // Words w with from <= w * 4 < to are inside.
+    const u32 n = p->code_size / 4;
+    const u32 lo = std::min(n, (from + 3) / 4), hi = std::max(lo, std::min(n, (to + 3) / 4));
+    if (!p->code_words) return lo > 0 || hi < n;
+    return any_bit(p->code_words, 0, lo) || any_bit(p->code_words, hi, n);
 }
 
 // A module part of whose code was written over: logged once per guest address.
@@ -613,8 +644,7 @@ void save_module_runs(const SPUContext& ctx, u32 save_area, const std::function<
     // Each stretch of lines one run still holds (a run cut in two gives two, with the same identity).
     for (u32 l = 0; l < kLines;) {
         const u32 tag = m.owner[l];
-        u32 e = l + 1;
-        while (e < kLines && m.owner[e] == tag) e++;
+        const u32 e = run_end(m.owner.data(), l + 1, kLines, tag); // eight lines at a time (D-972)
         if (const Run* r = run_at(m, tag)) {
             const u32 ls_start = std::max(r->id_start, l << kLineShift), ls_end = std::min(r->id_end, e << kLineShift);
             if (ls_start < ls_end && keep(ls_start, ls_end))

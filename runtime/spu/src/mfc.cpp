@@ -455,10 +455,11 @@ int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
     case PS_MFC_GETLLAR: {
         const u32 addr = c.eal & ~127u;
         if (addr >= PS_SPU_RAW_BASE) return raise_exception(ctx, pc, PS_SPU_EXC_DMA_ADDRESS, c.eal, "GETLLAR outside main memory");
-        if (ch.res_valid) {
-            // Replacing a reservation that was lost raises LR first (RPCS3 process_mfc_cmd, GETLLAR).
+        if (ch.res_valid && reservation_lost(ctx)) {
+            // Replacing a reservation that was lost raises LR first (RPCS3 process_mfc_cmd, GETLLAR). The test reads
+            // this thread's reservation and guest memory only: the lock for the event alone (D-972).
             ChannelLock lock(ctx);
-            if (reservation_lost(ctx)) set_events(ctx, PS_SPU_EVENT_LR);
+            set_events(ctx, PS_SPU_EVENT_LR);
         }
         alignas(16) u8 line[128];
         const u64 version = ps_res_acquire(ctx->membase, addr, line);

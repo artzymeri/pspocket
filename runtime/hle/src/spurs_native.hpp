@@ -120,6 +120,7 @@ public:
     struct Selection {
         u32 wid = kIdleWid;
         u32 poll_status = 0; // CELL_SPURS_MODULE_POLL_STATUS_*: 1 ready count, 2 signal, 4 workload flag
+        bool serial = false; // its maximum contention is 1: it runs on one SPU at a time (D-973)
     };
     // The SPURS kernel's workload selection (RPCS3 spursKernel1SelectWorkload; for SPURS2 spursKernel2SelectWorkload)
     // on the guest CellSpurs. `poll` asks whether another workload should take this SPU without changing anything
@@ -143,7 +144,8 @@ private:
     Selection select2(bool poll); // kernel 2: SPURS2, workloads 0..31
     // After a selection: the kernel context in local store (CellSpurs line 0's copy, priorities, unique IDs, the
     // current workload ID).
-    void update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid);
+    void update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid,
+        const u8* line0);
 
     void* thread_ = nullptr; // pthread_t
     bool joinable_ = false;
@@ -183,6 +185,9 @@ public:
     // PSPOCKET_SPU_QOS_B (B), so one session measures both in the same scenes. 0: off.
     u64 ab_period_ns = 0;
     int qos_a = 0, qos_b = 0; // qos_class_t
+    // PSPOCKET_SPU_QOS_SERIAL (D-973): the QoS class of a worker while it runs a workload of one SPU at a time (GTA V's
+    // GraphicsMain, 30 ms of each frame on one thread: a performance core shortens the frame's critical path). 0: off.
+    int qos_serial = 0;
     bool in_b(u64 now_ns) const { return ab_period_ns && ((now_ns / ab_period_ns) & 1) != 0; }
     void report_time(u64 now_ns);
     u64 last_report_ns = 0; // the reporting worker's

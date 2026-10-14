@@ -44,6 +44,7 @@
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
+#include "pspocket/core/timebase.h"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
@@ -148,11 +149,7 @@ u64 descriptor_check(lv2::Kernel& kernel, u64 ea, u32 size, u8* head)
     return h | 1;
 }
 
-u64 now_ns()
-{
-    return static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-}
+u64 now_ns() { return ps_host_now_ns(); } // one multiply (D-241, D-972): every job grabbed reads it
 
 std::atomic<u64> g_descriptors_changed{0};
 
@@ -488,7 +485,7 @@ void JobChainPolicy::run()
         if (could_take && !g.changed) {
             pause = std::min<std::chrono::microseconds>(std::max(pause * 2, std::chrono::microseconds(50)),
                 std::chrono::microseconds(1000));
-            std::this_thread::sleep_for(pause);
+            ps_host_sleep_ns(static_cast<u64>(std::chrono::nanoseconds(pause).count()));
         } else {
             pause = std::chrono::microseconds(0);
         }

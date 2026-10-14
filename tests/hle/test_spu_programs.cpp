@@ -537,6 +537,15 @@ TEST_CASE("SPU programs: a module with data copied over its tail still runs lift
     get(kModule + 0xC00, kGuest + 0x8000, 0x400);
     CHECK(run_at(kModule) == 0x42);
     CHECK(spu.ctx.program == &program);
+    // The whole module again and run, then data over its tail (lines it held, none of its code): not identified again
+    // (D-972), the program kept for the lines that hold its code.
+    for (u32 i = 0; i < 4; i++) get(kModule + i * 0x400, kGuest + i * 0x400, 0x400);
+    CHECK(run_at(kModule) == 0x42);
+    const u64 identified = hle::spu_program_stats().modules;
+    get(kModule + 0xC00, kGuest + 0x8000, 0x400);
+    CHECK(run_at(kModule) == 0x42);
+    CHECK(spu.ctx.program == &program);
+    CHECK(hle::spu_program_stats().modules == identified);
     // Data over its code: the rest is interpreted (a branch into the copied part would run stale code), also when
     // the module ran lifted before the copy.
     get(kModule + 0x800, kGuest + 0x8000, 0x400);

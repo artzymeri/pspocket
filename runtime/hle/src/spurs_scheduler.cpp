@@ -270,13 +270,19 @@ void Worker::body()
     const u64 fp_env = ps_spu_fpenv_enter();
     // The host clock of one multiply (D-241): steady_clock's reads were 2% of the workers' busy time (run 221).
     bool in_b = false; // the half of PSPOCKET_SPU_AB this worker's QoS is set for (D-950)
+#if defined(__APPLE__)
+    const int base_qos = sched.ab_period_ns ? sched.qos_a : static_cast<int>(worker_qos(sched.inst.nspus));
+    int qos_now = base_qos; // the class this thread has now (D-973)
+#endif
     while (!sched.stopping.load(std::memory_order_acquire)) {
         if (sched.ab_period_ns) {
             const u64 now = ps_host_now_ns();
             const bool b = sched.in_b(now);
 #if defined(__APPLE__)
-            if (b != in_b && sched.qos_a != sched.qos_b)
+            if (b != in_b && sched.qos_a != sched.qos_b) {
                 pthread_set_qos_class_self_np(static_cast<qos_class_t>(b ? sched.qos_b : sched.qos_a), 0);
+                qos_now = b ? sched.qos_b : sched.qos_a;
+            }
 #endif
             in_b = b;
         }
@@ -292,6 +298,18 @@ void Worker::body()
             sched.wait_ns.fetch_add(waited, std::memory_order_relaxed);
             continue;
         }
+#if defined(__APPLE__)
+        // A workload of one SPU at a time on the QoS class asked for, the others on the worker's own (D-973).
+        if (sched.qos_serial) {
+            // With PSPOCKET_SPU_AB, only in its A half: the B half measures without it in the same session.
+            const bool serial = sel.serial && !(sched.ab_period_ns && in_b);
+            const int want = serial ? sched.qos_serial : (in_b ? sched.qos_b : base_qos);
+            if (want != qos_now) {
+                pthread_set_qos_class_self_np(static_cast<qos_class_t>(want), 0);
+                qos_now = want;
+            }
+        }
+#endif
         const u64 writes = ctx.mem_writes;
         const u64 t0 = ps_host_now_ns();
         // The selection read the workload's state before its update of the line: a shutdown and a join may have come
@@ -404,12 +422,11 @@ void Worker::release()
 
 Worker::Selection Worker::select(bool poll) { return sched.second ? select2(poll) : select1(poll); }
 
-void Worker::update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid)
+void Worker::update_kernel_context(const std::array<u8, 16>& priority, const std::array<u8, 16>& unique, u32 wid,
+    const u8* line0)
 {
     // The kernel context in local store: the CellSpurs line 0 copy (task code reads flags1 at 0x174 from it), the
-    // priorities, the current workload.
-    alignas(16) u8 line0[PS_RES_LINE_SIZE];
-    ps_res_acquire(sched.base, sched.spurs, line0);
+    // priorities, the current workload. The line as the selection left it (D-972: not read again).
     std::memcpy(ls + ls::kernel, line0, PS_RES_LINE_SIZE);
     std::memcpy(ls + ls::k_priority, priority.data(), priority.size());
     std::memcpy(ls + ls::k_unique_ids, unique.data(), unique.size());
@@ -452,6 +469,7 @@ Worker::Selection Worker::select2(bool poll)
 
     Selection sel;
     std::array<u8, CELL_SPURS_MAX_WORKLOAD2> contention{};
+    alignas(16) u8 final_line[PS_RES_LINE_SIZE]; // the line as stored, or as read when nothing changed
     reservation_op(base, spurs, [&](u8* line) {
         sel = Selection{};
         for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD2; i++) {
@@ -482,6 +500,7 @@ Worker::Selection Worker::select2(bool poll)
             if (weight > max_weight) {
                 max_weight = weight;
                 sel.wid = i;
+                sel.serial = max_contention == 1;
                 sel.poll_status = (ready > contention[i] ? CELL_SPURS_MODULE_POLL_STATUS_READYCOUNT : 0) |
                                   (wkl_signal ? CELL_SPURS_MODULE_POLL_STATUS_SIGNAL : 0) |
                                   (wkl_flag ? CELL_SPURS_MODULE_POLL_STATUS_FLAG : 0);
@@ -498,17 +517,25 @@ Worker::Selection Worker::select2(bool poll)
             return true;
         }
         if (sel.wid < CELL_SPURS_MAX_WORKLOAD2) {
+            // Changed only where the bytes change (D-972): a worker picking its own workload again (GTA V's job chains,
+            // over and over) stores nothing, so the line's version stays and its waiters sleep on.
             const u16 signal = ps_read16(line, wkl_signal_of(sel.wid));
-            ps_write16(line, wkl_signal_of(sel.wid), static_cast<u16>(signal & ~wkl_signal_bit(sel.wid)));
-            if (sel.wid == flag_receiver) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+            if (signal & wkl_signal_bit(sel.wid)) {
+                ps_write16(line, wkl_signal_of(sel.wid), static_cast<u16>(signal & ~wkl_signal_bit(sel.wid)));
+                changed = true;
+            }
+            if (sel.wid == flag_receiver && flag != 0xFFFFFFFF) {
+                ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+                changed = true;
+            }
             contention[sel.wid]++;
-            changed = true;
         }
         for (u32 j = 0; j < CELL_SPURS_MAX_WORKLOAD; j++) {
             const u8 v = static_cast<u8>((contention[j] & 0x0F) | (contention[j + 16] << 4));
             changed |= ps_read8(line, wkl_off::currentContention + j) != v;
             ps_write8(line, wkl_off::currentContention + j, v);
         }
+        std::memcpy(final_line, line, PS_RES_LINE_SIZE);
         return changed; // nothing stored while nothing changes (see select1)
     });
     if (poll) return sel;
@@ -516,7 +543,7 @@ Worker::Selection Worker::select2(bool poll)
     loc_contention.fill(0);
     if (sel.wid < CELL_SPURS_MAX_WORKLOAD2) loc_contention[sel.wid & 15] = sel.wid < CELL_SPURS_MAX_WORKLOAD ? 0x01 : 0x10;
     current_wid = sel.wid;
-    update_kernel_context(packed, unique, sel.wid);
+    update_kernel_context(packed, unique, sel.wid, final_line);
     return sel;
 }
 
@@ -545,6 +572,7 @@ Worker::Selection Worker::select1(bool poll)
 
     Selection sel;
     std::array<u8, CELL_SPURS_MAX_WORKLOAD> contention{};
+    alignas(16) u8 final_line[PS_RES_LINE_SIZE]; // the line as stored, or as read when nothing changed
     reservation_op(base, spurs, [&](u8* line) {
         sel = Selection{};
         for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
@@ -583,6 +611,7 @@ Worker::Selection Worker::select1(bool poll)
             if (weight > max_weight) {
                 max_weight = weight;
                 sel.wid = i;
+                sel.serial = max_contention == 1;
                 sel.poll_status = (ready > contention[i] ? CELL_SPURS_MODULE_POLL_STATUS_READYCOUNT : 0) |
                                   (wkl_signal ? CELL_SPURS_MODULE_POLL_STATUS_SIGNAL : 0) |
                                   (wkl_flag ? CELL_SPURS_MODULE_POLL_STATUS_FLAG : 0);
@@ -601,15 +630,23 @@ Worker::Selection Worker::select1(bool poll)
             return true;
         }
         if (sel.wid < CELL_SPURS_MAX_WORKLOAD) {
-            ps_write16(line, wkl_off::signal1, static_cast<u16>(signal & ~(0x8000u >> sel.wid)));
-            if (sel.wid == flag_receiver) ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+            // Changed only where the bytes change (D-972): a worker picking its own workload again stores nothing.
+            const u16 bit = static_cast<u16>(0x8000u >> sel.wid);
+            if (signal & bit) {
+                ps_write16(line, wkl_off::signal1, static_cast<u16>(signal & ~bit));
+                changed = true;
+            }
+            if (sel.wid == flag_receiver && flag != 0xFFFFFFFF) {
+                ps_write32(line, spurs_off::wklFlag, 0xFFFFFFFF);
+                changed = true;
+            }
             contention[sel.wid]++;
-            changed = true;
         }
         for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
             changed |= ps_read8(line, wkl_off::currentContention + i) != contention[i];
             ps_write8(line, wkl_off::currentContention + i, contention[i]);
         }
+        std::memcpy(final_line, line, PS_RES_LINE_SIZE);
         // An SPU that stays idle and changes nothing stores nothing: every store bumps the line's version, which would
         // end its own wait for a change at once (regression: idle workers spun at full speed instead of sleeping).
         return changed;
@@ -619,7 +656,7 @@ Worker::Selection Worker::select1(bool poll)
     loc_contention.fill(0);
     if (sel.wid < CELL_SPURS_MAX_WORKLOAD) loc_contention[sel.wid] = 1;
     current_wid = sel.wid;
-    update_kernel_context(priority, unique, sel.wid);
+    update_kernel_context(priority, unique, sel.wid, final_line);
     return sel;
 }
 
@@ -675,6 +712,12 @@ Scheduler::~Scheduler() { stop(); }
 
 void Scheduler::start()
 {
+#if defined(__APPLE__)
+    if (const char* v = std::getenv("PSPOCKET_SPU_QOS_SERIAL"); v && *v) {
+        qos_serial = qos_named(v);
+        PS_LOG_INFO(kSchedChan, "SPURS {:#x}: workloads of one SPU at a time run at QoS {}", spurs, qos_name(qos_serial));
+    }
+#endif
     // Every SPU a host thread: a workload runs on the SPUs its priorities name (GTA V's EDGE on three of five, its
     // GraphicsMain on one), so fewer threads would leave some never run.
     if (const char* v = std::getenv("PSPOCKET_SPU_AB"); v && std::atoi(v) > 0) {

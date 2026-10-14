@@ -321,33 +321,21 @@ void ps_spu_host_detach(SPUContext* ctx)
 
 // ---- runtime calls ----
 
-int ps_spu_rdch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value)
+namespace {
+
+// The errors of the fast paths below, out of line so that those keep no stack frame (D-972).
+[[gnu::noinline, gnu::cold]] int channel_error(SPUContext* ctx, uint32_t pc, int exc, uint32_t channel, const char* what)
+{
+    return raise_exception(ctx, pc, exc, channel, what);
+}
+
+// The channels that wait, or that state other threads write (mailboxes, signals, events) goes through: under the lock.
+// Out of line, so the fast paths below save no registers for it (D-972).
+[[gnu::noinline]] int rdch_locked(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value)
 {
     ps_spu_channels& ch = ctx->ch;
-    // State only this SPU's own thread writes (its channels, the run loop, the SPURS kernel running on it): read
-    // without the lock (D-128). GTA V's jobs read the decrementer millions of times a second.
-    switch (channel) {
-    case PS_SPU_RdSRR0: *value = ctx->srr0; return 0;
-    case PS_SPU_RdEventMask: *value = ch.event_mask; return 0;
-    case PS_MFC_RdTagMask: *value = ch.tag_mask; return 0;
-    case PS_SPU_RdMachStat: *value = ctx->interrupts_enabled; return 0; // bit 0: interrupts enabled
-    case PS_SPU_RdDec: *value = dec_now(ctx); return 0;
-    default: break;
-    }
     ChannelLock lock(ctx);
     switch (channel) {
-    case PS_MFC_RdTagStat:
-        if (!ch.tag_stat_count)
-            return raise_exception(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdTagStat with no completion pending");
-        ch.tag_stat_count = 0;
-        *value = ch.tag_stat;
-        return 0;
-    case PS_MFC_RdAtomicStat:
-        if (!ch.atomic_stat_count)
-            return raise_exception(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdAtomicStat with no atomic command done");
-        ch.atomic_stat_count = 0;
-        *value = ch.atomic_stat;
-        return 0;
     case PS_MFC_RdListStallStat:
         if (!ch.stall_stat_count)
             return raise_exception(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdListStallStat with no stalled list");
@@ -380,24 +368,58 @@ int ps_spu_rdch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value)
     }
 }
 
+} // namespace
+
+int ps_spu_rdch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* value)
+{
+    ps_spu_channels& ch = ctx->ch;
+    // State only this SPU's own thread writes (its channels, the run loop, the SPURS kernel running on it): read
+    // without the lock (D-128). GTA V's jobs read the decrementer millions of times a second. The tag and atomic
+    // status too: mfc_command sets them on this thread, and no other thread reads them (D-972).
+    switch (channel) {
+    case PS_SPU_RdSRR0: *value = ctx->srr0; return 0;
+    case PS_SPU_RdEventMask: *value = ch.event_mask; return 0;
+    case PS_MFC_RdTagMask: *value = ch.tag_mask; return 0;
+    case PS_SPU_RdMachStat: *value = ctx->interrupts_enabled; return 0; // bit 0: interrupts enabled
+    case PS_SPU_RdDec: *value = dec_now(ctx); return 0;
+    case PS_MFC_RdTagStat:
+        if (!ch.tag_stat_count)
+            return channel_error(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdTagStat with no completion pending");
+        ch.tag_stat_count = 0;
+        *value = ch.tag_stat;
+        return 0;
+    case PS_MFC_RdAtomicStat:
+        if (!ch.atomic_stat_count)
+            return channel_error(ctx, pc, PS_SPU_EXC_DEADLOCK, channel, "MFC_RdAtomicStat with no atomic command done");
+        ch.atomic_stat_count = 0;
+        *value = ch.atomic_stat;
+        return 0;
+    default: return rdch_locked(ctx, pc, channel, value);
+    }
+}
+
 int ps_spu_rchcnt(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* count)
 {
-    ChannelLock lock(ctx);
     const ps_spu_channels& ch = ctx->ch;
+    // This thread's own state (the tag and atomic status, the MFC queue): without the lock (D-972).
+    switch (channel) {
+    case PS_MFC_RdTagStat: *count = ch.tag_stat_count; return 0;
+    case PS_MFC_RdAtomicStat: *count = ch.atomic_stat_count; return 0;
+    case PS_MFC_Cmd: *count = 16 - ch.queue_size; return 0;
+    default: break;
+    }
+    ChannelLock lock(ctx);
     switch (channel) {
     case PS_SPU_WrOutMbox: *count = ch.out_mbox_count ^ 1; return 0;
     case PS_SPU_WrOutIntrMbox: *count = ch.out_intr_mbox_count ^ 1; return 0;
     case PS_SPU_RdInMbox: *count = ch.in_mbox_count; return 0;
-    case PS_MFC_RdTagStat: *count = ch.tag_stat_count; return 0;
     case PS_MFC_RdListStallStat: *count = ch.stall_stat_count; return 0;
     case PS_SPU_RdSigNotify1: *count = ch.snr_count[0]; return 0;
     case PS_SPU_RdSigNotify2: *count = ch.snr_count[1]; return 0;
-    case PS_MFC_RdAtomicStat: *count = ch.atomic_stat_count; return 0;
     case PS_SPU_RdEventStat:
         collect_events(ctx, PS_SPU_EVENT_ALL);
         *count = ctx->ch.event_count;
         return 0;
-    case PS_MFC_Cmd: *count = 16 - ch.queue_size; return 0;
     case PS_MFC_WrTagUpdate:
     case PS_SPU_WrEventMask:
     case PS_SPU_WrEventAck:
@@ -423,42 +445,14 @@ int ps_spu_rchcnt(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t* coun
     }
 }
 
-int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
+namespace {
+
+// The channels that wait, or that state other threads read goes through: under the lock, out of line (D-972).
+[[gnu::noinline]] int wrch_locked(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
 {
     ps_spu_channels& ch = ctx->ch;
-    // A DMA's parameters are state only this SPU's thread reads (mfc_command): no lock for them (D-128), five per DMA.
-    switch (channel) {
-    case PS_SPU_WrSRR0: ctx->srr0 = value & PS_SPU_PC_MASK; return 0;
-    case PS_MFC_LSA: ch.mfc_lsa = value; return 0;
-    case PS_MFC_EAH: ch.mfc_eah = value; return 0;
-    case PS_MFC_EAL: ch.mfc_eal = value; return 0;
-    case PS_MFC_Size: ch.mfc_size = std::min<u32>(value, 0xFFFF); return 0;
-    case PS_MFC_TagID: ch.mfc_tag = value & 0x1F; return 0;
-    case PS_MFC_Cmd: return mfc_command(ctx, pc, value & 0xFF); // DMA may take another context's lock (group MMIO);
-                                                                // mfc.cpp locks for events itself
-    default: break;
-    }
     ChannelLock lock(ctx);
     switch (channel) {
-    case PS_MFC_WrTagMask:
-        ch.tag_mask = value;
-        mfc_update_tag_status(ctx);
-        return 0;
-    case PS_MFC_WrTagUpdate: {
-        if (value > PS_MFC_TAG_UPDATE_ALL)
-            return raise_exception(ctx, pc, PS_SPU_EXC_CHANNEL, channel, "MFC_WrTagUpdate with an invalid request");
-        // RPCS3 set_ch_value(MFC_WrTagUpdate)
-        const u32 completed = mfc_completed(ctx);
-        if (value == PS_MFC_TAG_UPDATE_IMMEDIATE || (value == PS_MFC_TAG_UPDATE_ANY && completed) ||
-            (value == PS_MFC_TAG_UPDATE_ALL && completed == ch.tag_mask)) {
-            ch.tag_update = 0;
-            ch.tag_stat = completed;
-            ch.tag_stat_count = 1;
-        } else {
-            ch.tag_update = value;
-        }
-        return 0;
-    }
     case PS_MFC_WrListStallAck:
         lock.unlock();
         return mfc_stall_ack(ctx, pc, value & 0x1F);
@@ -522,6 +516,46 @@ int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
     case PS_SPU_PM_Start_Ev:
     case PS_SPU_PM_Stop_Ev: return 0;
     default: return raise_exception(ctx, pc, PS_SPU_EXC_CHANNEL, channel, "wrch of an invalid channel");
+    }
+}
+
+} // namespace
+
+int ps_spu_wrch(SPUContext* ctx, uint32_t pc, uint32_t channel, uint32_t value)
+{
+    ps_spu_channels& ch = ctx->ch;
+    // A DMA's parameters are state only this SPU's thread reads (mfc_command): no lock for them (D-128), five per DMA.
+    // The tag mask and tag updates too: the tag status is this thread's alone (mfc_command updates it without the
+    // lock, D-972). The rest goes out of line, so these save no registers for it: lifted code makes six calls a DMA.
+    switch (channel) {
+    case PS_SPU_WrSRR0: ctx->srr0 = value & PS_SPU_PC_MASK; return 0;
+    case PS_MFC_LSA: ch.mfc_lsa = value; return 0;
+    case PS_MFC_EAH: ch.mfc_eah = value; return 0;
+    case PS_MFC_EAL: ch.mfc_eal = value; return 0;
+    case PS_MFC_Size: ch.mfc_size = std::min<u32>(value, 0xFFFF); return 0;
+    case PS_MFC_TagID: ch.mfc_tag = value & 0x1F; return 0;
+    case PS_MFC_Cmd: return mfc_command(ctx, pc, value & 0xFF); // DMA may take another context's lock (group MMIO);
+                                                                // mfc.cpp locks for events itself
+    case PS_MFC_WrTagMask:
+        ch.tag_mask = value;
+        mfc_update_tag_status(ctx);
+        return 0;
+    case PS_MFC_WrTagUpdate: {
+        if (value > PS_MFC_TAG_UPDATE_ALL)
+            return channel_error(ctx, pc, PS_SPU_EXC_CHANNEL, channel, "MFC_WrTagUpdate with an invalid request");
+        // RPCS3 set_ch_value(MFC_WrTagUpdate)
+        const u32 completed = mfc_completed(ctx);
+        if (value == PS_MFC_TAG_UPDATE_IMMEDIATE || (value == PS_MFC_TAG_UPDATE_ANY && completed) ||
+            (value == PS_MFC_TAG_UPDATE_ALL && completed == ch.tag_mask)) {
+            ch.tag_update = 0;
+            ch.tag_stat = completed;
+            ch.tag_stat_count = 1;
+        } else {
+            ch.tag_update = value;
+        }
+        return 0;
+    }
+    default: return wrch_locked(ctx, pc, channel, value);
     }
 }
 
