@@ -471,6 +471,12 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         // A deferred copy to this texture lands first (D-107).
         if (const TextureLayout* layout = layout_for(t)) before_access(*ea, layout->total_size, false);
     }
+    if (!pending_clears.empty() && pass_open && pass_started) {
+        // A clear that waits over this texture's memory runs before the draw reads it: now, when the pass drawing
+        // would go on (D-945; else the next pass's start runs it).
+        const TextureLayout* layout = layout_for(t);
+        if (clear_waits_over(*ea, layout ? layout->total_size : 1)) end_pass_for(kEndFlush);
+    }
 
     // A render target at this address: sample the GPU copy (plan section 7: "bind the Metal texture directly") when
     // the texture reads it in its own format.

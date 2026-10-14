@@ -157,6 +157,15 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
   repeat); on a tile GPU every pass end writes its targets to memory: load and store actions that skip what the next
   pass does not read, memoryless depth where it is never sampled. Metal System Trace on the phone (needs the user)
   to see where the 25 ms go.
+  **Done (D-945, part 1):** clears wait instead of ending the pass drawing: a clear of whole targets is the next pass's
+  load action, a clear of part of them its first draw, the rest run just before the next pass; a pass does not store
+  what the next one clears whole. A synthetic frame shaped like GTA V's (run 324): 57 to 53 passes, 137 to 120 MB
+  loaded and 145 to 127 MB stored a frame; GTA V's traced frame by the same rules 85 to 81 passes, about 17 MB less
+  each way. **Not measured on GTA V yet** (its disc image is not on the Mac): `PSPOCKET_GPU_AB=30 scripts/gate.sh game`
+  gives both halves' passes, MB and GPU time. Copies still end passes: GTA V's need what the pass drew or come with a
+  target change (D-248); memoryless depth needs knowing no later pass loads the buffer, and every depth buffer of the
+  traced frame is read again. **Left:** D-273's subset draws kept in the larger pass (most of what is left: the
+  G-buffer's switches to its first target alone), to try on the iPhone.
 - **Multisampling:** done (D-250): multisampled targets are drawn one texel per sample, as the RSX lays them out, and
   the gate's last RSX failure is gone. WPOS there is the pixel's (D-276).
 - **Blending:** ADD_SIGNED (0xf006) draws as ADD, as RPCS3 does (VKGSRender.cpp): only the log line says otherwise.
@@ -172,7 +181,8 @@ Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA
 - **Render pass traffic (D-273):** GTA V loads about 188 MB and stores 209 MB of attachments a frame (status line).
   Keeping draws to part of the open pass's targets in it cut that by 30% but cost the M4 up to 7% GPU time (not
   kept). Try it on the iPhone when it can be measured; other cuts: a store the next pass's clear makes dead, depth
-  buffers no later pass reads (memoryless).
+  buffers no later pass reads (memoryless). **Done (D-945):** clears folded into the next pass and stores the next
+  pass's clear makes dead (above); the status line counts the MB not stored.
 - **State the RSX keeps that the backend ignored (census, 2026-10-08):** of 32 registers stored without a use, 7 change
   what a game sees. Done: the fog factor in FOGC (D-256), two-sided lighting (D-257), the clip range and depth clamp
   (D-258), user clip planes (D-259), constants and vertex bases written inside a draw (D-260), the depth bounds test

@@ -721,29 +721,33 @@ id<MTLDepthStencilState> MetalBackend::Impl::depth_state_for(const RsxState& sta
     return st;
 }
 
-id<MTLRenderPipelineState> MetalBackend::Impl::clear_pipeline_for(u32 color_mask, bool depth, bool stencil)
+id<MTLRenderPipelineState> MetalBackend::Impl::clear_pipeline_for(const PassTargets& t, u32 cleared, u32 color_mask,
+    bool depth, bool stencil)
 {
-    u64 key = u64{color_mask} | (u64{depth} << 4) | (u64{stencil} << 5) | (u64{pass.color_count} << 6);
-    for (u32 i = 0; i < pass.color_count; i++) key = key * 31 + static_cast<u64>(pass.color[i]->pixel_format);
-    key = key * 31 + (pass.depth ? static_cast<u64>(pass.depth->pixel_format) : 0);
+    cleared &= (1u << t.color_count) - 1;
+    u64 key = u64{color_mask} | (u64{depth} << 4) | (u64{stencil} << 5) | (u64{t.color_count} << 6) | (u64{cleared} << 9);
+    for (u32 i = 0; i < t.color_count; i++) key = key * 31 + static_cast<u64>(t.color[i]->pixel_format);
+    key = key * 31 + (t.depth ? static_cast<u64>(t.depth->pixel_format) : 0);
     if (auto it = clear_pipelines.find(key); it != clear_pipelines.end()) return it->second;
 
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
-    NSString* fs = [NSString stringWithFormat:@"rsx_clear_fs%u", pass.color_count];
+    NSString* fs = [NSString stringWithFormat:@"rsx_clear_fs%u", t.color_count];
     d.fragmentFunction = [kernels newFunctionWithName:fs];
-    for (u32 i = 0; i < pass.color_count; i++) {
-        d.colorAttachments[i].pixelFormat = pass.color[i]->pixel_format;
+    for (u32 i = 0; i < t.color_count; i++) {
+        d.colorAttachments[i].pixelFormat = t.color[i]->pixel_format;
         MTLColorWriteMask m = MTLColorWriteMaskNone;
-        if (color_mask & 1) m |= MTLColorWriteMaskRed;
-        if (color_mask & 2) m |= MTLColorWriteMaskGreen;
-        if (color_mask & 4) m |= MTLColorWriteMaskBlue;
-        if (color_mask & 8) m |= MTLColorWriteMaskAlpha;
+        if ((cleared >> i) & 1) { // a clear of some of the pass's targets leaves the others alone
+            if (color_mask & 1) m |= MTLColorWriteMaskRed;
+            if (color_mask & 2) m |= MTLColorWriteMaskGreen;
+            if (color_mask & 4) m |= MTLColorWriteMaskBlue;
+            if (color_mask & 8) m |= MTLColorWriteMaskAlpha;
+        }
         d.colorAttachments[i].writeMask = m;
     }
-    if (pass.depth) {
-        d.depthAttachmentPixelFormat = pass.depth->pixel_format;
-        if (pass.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = pass.depth->pixel_format;
+    if (t.depth) {
+        d.depthAttachmentPixelFormat = t.depth->pixel_format;
+        if (t.depth->pixel_format == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = t.depth->pixel_format;
     }
     NSError* error = nil;
     id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:d error:&error];

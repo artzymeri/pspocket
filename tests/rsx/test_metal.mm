@@ -696,8 +696,12 @@ constexpr u32 kColorOffset = 0x011000;
 constexpr u32 kUvOffset = 0x012000;
 constexpr u32 kFpOffset = 0x020000;
 constexpr u32 kFp2Offset = 0x021000;
+constexpr u32 kFp3Offset = 0x022000;
 constexpr u32 kTexOffset = 0x030000;
 constexpr u32 kW = 64, kH = 64;
+
+// What a test changes in the backend configuration of the E2E fixtures it makes (the pass bench, D-945).
+std::function<void(MetalBackendConfig&)> g_e2e_config;
 
 struct E2E {
     GuestMemory mem;
@@ -759,6 +763,7 @@ struct E2E {
             std::lock_guard lock(capture_mutex);
             captures.emplace_back(flip, std::vector<u8>(bgra, bgra + usize{w} * h * 4));
         };
+        if (g_e2e_config) g_e2e_config(mc);
         backend = std::make_unique<MetalBackend>(mem, *tracker, mc);
         rsx = std::make_unique<Rsx>(mem, *backend, config);
         rsx->on_failure = [this](const Failure& f) { failures.push_back(f); };
@@ -5489,4 +5494,777 @@ TEST_CASE("metal e2e: a pack next to another write to its register's components 
         CHECK(px[at + 3] == px[at]); // DP2A's w
         CHECK(px[at + 2] == 0.f);    // the pack of H3's (0, 0)
     }
+}
+
+// ---- fewer render passes (D-945) -----------------------------------------------------------------------------------
+
+namespace {
+
+// An E2E whose backend merges passes (D-945) or, with `merging` false, runs every clear where it is, as before.
+std::unique_ptr<E2E> e2e_merging(bool merging)
+{
+    if (!merging) setenv("PSPOCKET_RSX_NO_PASS_MERGING", "1", 1);
+    auto e = std::make_unique<E2E>();
+    unsetenv("PSPOCKET_RSX_NO_PASS_MERGING");
+    return e;
+}
+
+// R0 = f[COL0] for target A, R2 = green for target B (32-bit exports).
+std::vector<u8> fp_two_targets()
+{
+    FpInst green;
+    green.op = 0x01;
+    green.dst = 2;
+    green.src[0] = fp_const();
+    green.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
+    FpInst col;
+    col.op = 0x01;
+    col.dst = 0;
+    col.input = 1;
+    col.src[0] = fp_in();
+    col.end = true;
+    return assemble_fp({green, col});
+}
+
+// R0 = green.
+std::vector<u8> fp_green()
+{
+    FpInst green;
+    green.op = 0x01;
+    green.src[0] = fp_const();
+    green.constant = std::array<float, 4>{0.f, 1.f, 0.f, 1.f};
+    green.end = true;
+    return assemble_fp({green});
+}
+
+// A Z16 depth buffer at `offset`, kW x kH (the surface format's depth bits set to Z16 too).
+void set_z16(CommandBuilder& b, u32 offset)
+{
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (1u << 5) | (1u << 8));
+    b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+    b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, offset);
+    b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 2);
+}
+
+// Colour targets A and B (A8R8G8B8, kW x kH), both written, and a Z16 depth buffer when `depth` is given.
+void setup_targets_ab(CommandBuilder& b, u32 a, u32 b_offset, u32 depth = 0)
+{
+    setup_surface(b, a);
+    if (depth) set_z16(b, depth);
+    b.method(m::NV4097_SET_CONTEXT_DMA_COLOR_B, loc::kDmaFrameBuffer);
+    b.method(m::NV4097_SET_SURFACE_COLOR_BOFFSET, b_offset);
+    b.method(m::NV4097_SET_SURFACE_PITCH_B, kW * 4);
+    b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::AB));
+    b.method(m::NV4097_SET_COLOR_MASK_MRT, 0xfff0); // targets B to D written
+}
+
+void depth_test_less(CommandBuilder& b)
+{
+    b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+    b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Less));
+    b.method(m::NV4097_SET_DEPTH_MASK, 1);
+}
+
+u16 guest_depth16(E2E& e, u32 offset, u32 x, u32 y)
+{
+    return ps_read16(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + offset + y * kW * 2 + x * 2);
+}
+
+constexpr u32 kDepthZ = 0x180000;  // Z16, kW x kH
+constexpr u32 kSurfaceC = 0x1a0000; // a third colour target
+
+using Px = std::array<u8, 4>; // guest A8R8G8B8 bytes: a r g b
+constexpr Px kRed{0xff, 0xff, 0x00, 0x00}, kGreen{0xff, 0x00, 0xff, 0x00}, kBlue{0xff, 0x00, 0x00, 0xff};
+constexpr Px kBlack{0xff, 0x00, 0x00, 0x00}, kNothing{0x00, 0x00, 0x00, 0x00};
+
+} // namespace
+
+TEST_CASE("metal e2e: clears of whole targets are the next pass's load actions, not passes of their own (D-945)")
+{
+    // GTA V clears the first of its G-buffer's four targets alone, then its depth buffer alone, then draws to all four
+    // and the depth buffer: two passes that only stored what the third loaded again (7 MB a frame, D-273).
+    REQUIRE_METAL();
+    struct Result {
+        Px a_in, a_out, b_in, b_out;
+        u16 z_in = 0, z_out = 0;
+        u64 passes = 0, folded = 0, clear_only = 0, loaded = 0;
+    };
+    const auto run = [](bool merging, u32 zclear) {
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_two_targets());
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red, window z 0.75
+        auto b = e->at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu); // blue
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);      // target A alone
+        set_z16(b, kDepthZ);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, zclear);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kDepth); // the depth buffer alone
+        setup_targets_ab(b, kSurfaceOffset, kSurfaceB, kDepthZ);
+        depth_test_less(b);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        draw_triangle(b);
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        Result r;
+        const auto& st = e->backend->stats();
+        r.passes = st.render_passes;
+        r.folded = st.clears_folded;
+        r.clear_only = st.clear_only_passes;
+        r.loaded = st.attachment_load_bytes;
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepthZ, kW * kH * 2));
+        r.a_in = guest_pixel(*e, kSurfaceOffset, 32, 48), r.a_out = guest_pixel(*e, kSurfaceOffset, 2, 2);
+        r.b_in = guest_pixel(*e, kSurfaceB, 32, 48), r.b_out = guest_pixel(*e, kSurfaceB, 2, 2);
+        r.z_in = guest_depth16(*e, kDepthZ, 32, 48), r.z_out = guest_depth16(*e, kDepthZ, 2, 2);
+        return r;
+    };
+    for (const u32 zclear : {0xffffu, 0x4000u}) { // 1.0: the triangle passes the depth test; 0.25: it does not
+        INFO(std::format("depth cleared to {:#x}", zclear));
+        const Result on = run(true, zclear), off = run(false, zclear);
+        const bool drawn = zclear == 0xffff;
+        CHECK(on.a_in == (drawn ? kRed : kBlue));
+        CHECK(on.a_out == kBlue);
+        CHECK(on.b_in == (drawn ? kGreen : kNothing)); // B was never written: it starts cleared
+        CHECK(on.b_out == kNothing);
+        // Metal makes a Z16 clear of 0x4000 (0.25000381) 0x3fff: within one step.
+        CHECK(std::abs(static_cast<int>(on.z_in) - static_cast<int>(drawn ? 0xbfffu : zclear)) <= 1);
+        CHECK(std::abs(static_cast<int>(on.z_out) - static_cast<int>(zclear)) <= 1);
+        // The same pixels as clears in passes of their own.
+        CHECK(on.a_in == off.a_in);
+        CHECK(on.a_out == off.a_out);
+        CHECK(on.b_in == off.b_in);
+        CHECK(on.b_out == off.b_out);
+        CHECK(on.z_in == off.z_in);
+        CHECK(on.z_out == off.z_out);
+        CHECK(on.passes == 1);
+        CHECK(on.folded == 2);
+        CHECK(on.clear_only == 0);
+        CHECK(on.loaded == 0); // nothing loaded: both clears are the pass's load actions, B starts cleared
+        CHECK(off.passes == 3);
+        CHECK(off.clear_only == 2);
+        CHECK(off.loaded == kW * kH * 4 + kW * kH * 2); // the pass loaded what the two clears stored
+    }
+}
+
+TEST_CASE("metal e2e: a clear of a target the pass does not draw to waits, and the pass goes on (D-945)")
+{
+    REQUIRE_METAL();
+    struct Result {
+        Px a_in, a_out, b_left, b_tri_left, b_tri_right, b_right;
+        u64 passes = 0, waited = 0;
+    };
+    const auto run = [](bool merging, bool part) {
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        e->put_local_bytes(kFp2Offset, fp_green());
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b); // B: a red triangle on black
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b); // A: the same
+        setup_surface(b, kSurfaceB);
+        if (part) b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(32u << 16) | 0, (kH << 16) | 0}); // B's left half
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // B blue: A's pass goes on
+        setup_surface(b, kSurfaceOffset);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        draw_triangle(b); // A again: green over the red
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+        Result r;
+        r.passes = e->backend->stats().render_passes;
+        r.waited = e->backend->stats().clears_waited;
+        r.a_in = guest_pixel(*e, kSurfaceOffset, 32, 48), r.a_out = guest_pixel(*e, kSurfaceOffset, 2, 2);
+        r.b_left = guest_pixel(*e, kSurfaceB, 2, 40), r.b_tri_left = guest_pixel(*e, kSurfaceB, 20, 48);
+        r.b_tri_right = guest_pixel(*e, kSurfaceB, 40, 48), r.b_right = guest_pixel(*e, kSurfaceB, 62, 5);
+        return r;
+    };
+    for (const bool part : {false, true}) {
+        INFO((part ? "the left half of B cleared" : "all of B cleared"));
+        const Result on = run(true, part), off = run(false, part);
+        CHECK(on.a_in == kGreen);
+        CHECK(on.a_out == kBlack);
+        CHECK(on.b_left == kBlue);
+        CHECK(on.b_tri_left == kBlue);
+        CHECK(on.b_tri_right == (part ? kRed : kBlue));
+        CHECK(on.b_right == (part ? kBlack : kBlue));
+        for (const auto& [x, y] : {std::pair{on.a_in, off.a_in}, {on.a_out, off.a_out}, {on.b_left, off.b_left},
+                 {on.b_tri_left, off.b_tri_left}, {on.b_tri_right, off.b_tri_right}, {on.b_right, off.b_right}})
+            CHECK(x == y);
+        // B, A (both of its draws), then B's clear in a pass of its own; before: A's pass ended at the clear.
+        CHECK(on.passes == 3);
+        CHECK(on.waited == 1);
+        CHECK(off.passes == 4);
+    }
+}
+
+TEST_CASE("metal e2e: a draw that samples a target whose clear waits sees the clear (D-945)")
+{
+    REQUIRE_METAL();
+    for (const bool merging : {true, false}) {
+        INFO((merging ? "merging" : "not merging"));
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        e->put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b); // B: red on black
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b); // A's pass
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // B blue, waiting
+        setup_surface(b, kSurfaceOffset);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kW * 4);
+        draw_triangle(b); // A samples B where B's triangle was: blue, not red
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(*e, kSurfaceOffset, 32, 48) == kBlue);
+        CHECK(guest_pixel(*e, kSurfaceOffset, 2, 2) == kBlack);
+    }
+}
+
+TEST_CASE("metal e2e: a pass does not store a depth buffer the next pass clears whole, unless it is read in between (D-945)")
+{
+    REQUIRE_METAL();
+    struct Result {
+        Px a_in, b_in, c_in;
+        u16 z_in = 0, z_out = 0;
+        u64 skipped = 0, stored = 0;
+    };
+    const auto run = [](bool merging, bool read_between) {
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        e->put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red, window z 0.75
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        bind_vertex_arrays(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        // Pass 1: A with the depth buffer.
+        setup_surface(b, kSurfaceOffset);
+        set_z16(b, kDepthZ);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffff);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        depth_test_less(b);
+        draw_triangle(b);
+        if (read_between) {
+            // C samples the depth buffer pass 1 left (the depth sampled directly, D-106): pass 1 must store it.
+            setup_surface(b, kSurfaceC);
+            b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 0);
+            set_fragment_program(b, kFp2Offset, 0x40);
+            bind_linear_texture(b, kDepthZ, tex::DEPTH16, kW * 2);
+            draw_triangle(b);
+            set_fragment_program(b, kFpOffset, 0x40);
+            depth_test_less(b);
+        }
+        // Pass 2: B with the depth buffer, cleared whole first.
+        setup_surface(b, kSurfaceB);
+        set_z16(b, kDepthZ);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepth);
+        draw_triangle(b);
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        Result r;
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepthZ, kW * kH * 2));
+        if (read_between) REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceC, kW * kH * 4));
+        r.skipped = e->backend->stats().attachment_store_skipped_bytes;
+        r.stored = e->backend->stats().attachment_store_bytes;
+        r.a_in = guest_pixel(*e, kSurfaceOffset, 32, 48);
+        r.b_in = guest_pixel(*e, kSurfaceB, 32, 48);
+        if (read_between) r.c_in = guest_pixel(*e, kSurfaceC, 32, 48);
+        r.z_in = guest_depth16(*e, kDepthZ, 32, 48), r.z_out = guest_depth16(*e, kDepthZ, 2, 2);
+        return r;
+    };
+    for (const bool read_between : {false, true}) {
+        INFO((read_between ? "read between the passes" : "nothing between the passes"));
+        const Result on = run(true, read_between), off = run(false, read_between);
+        CHECK(on.a_in == kRed);
+        CHECK(on.b_in == kRed); // the depth test passes against the cleared buffer
+        CHECK(on.z_in == 0xbfff);
+        CHECK(on.z_out == 0xffff);
+        CHECK(on.a_in == off.a_in);
+        CHECK(on.b_in == off.b_in);
+        CHECK(on.z_in == off.z_in);
+        CHECK(on.z_out == off.z_out);
+        if (read_between) {
+            CHECK(on.c_in == off.c_in); // what pass 1 stored
+            CHECK(on.c_in[1] == 0xbf);  // its 0.75, not the 1.0 pass 2 clears to
+            CHECK(on.skipped == 0);
+        } else {
+            CHECK(on.skipped == kW * kH * 2); // pass 1's depth
+        }
+        CHECK(off.skipped == 0);
+    }
+}
+
+TEST_CASE("metal e2e: a clear of the first targets of a pass with more leaves the others as they are (D-945)")
+{
+    // The clear goes to the targets the surface registers name (RPCS3 VKGSRender.cpp clear_surface): in a pass over A
+    // and B, a clear made with A alone named cleared B too, by its quad or its load action.
+    REQUIRE_METAL();
+    for (const bool merging : {true, false}) {
+        for (const bool drawn : {true, false}) { // the pass over A and B has drawn (a quad) or not (a load action)
+            INFO(std::format("{}, {}", merging ? "merging" : "not merging", drawn ? "after a draw" : "before any draw"));
+            auto e = e2e_merging(merging);
+            e->put_local_bytes(kFpOffset, fp_two_targets());
+            write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red into A, green into B
+            auto b = e->at(0);
+            setup_targets_ab(b, kSurfaceOffset, kSurfaceB);
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+            if (drawn) {
+                upload_vertex_program(b);
+                set_fragment_program(b, kFpOffset, 0x40);
+                bind_vertex_arrays(b);
+                draw_triangle(b);
+            }
+            b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::A));
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // A alone: blue
+            REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+            for (const auto& f : e->failures) INFO(f.message);
+            CHECK(e->failures.empty());
+            REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+            REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+            CHECK(guest_pixel(*e, kSurfaceOffset, 32, 48) == kBlue);
+            CHECK(guest_pixel(*e, kSurfaceOffset, 2, 2) == kBlue);
+            CHECK(guest_pixel(*e, kSurfaceB, 32, 48) == (drawn ? kGreen : kBlack));
+            CHECK(guest_pixel(*e, kSurfaceB, 2, 2) == kBlack);
+        }
+    }
+}
+
+TEST_CASE("metal e2e: a clear that waits runs before an NV0039 copy, an NV308A write or a flip reads its target (D-945)")
+{
+    REQUIRE_METAL();
+    for (const bool merging : {true, false}) {
+        INFO((merging ? "merging" : "not merging"));
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+        e->rsx->set_display_buffer(0, {kSurfaceC, kW * 4, kW, kH});
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b); // A's pass draws
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // B blue, waiting
+        setup_surface(b, kSurfaceC);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // C green, waiting: the display buffer
+        setup_surface(b, kSurfaceOffset);
+        draw_triangle(b); // A's pass goes on
+        // B to main memory through NV0039 (on the GPU, D-107): blue.
+        b.method(m::NV0039_SET_CONTEXT_DMA_BUFFER_IN, {loc::kDmaFrameBuffer, loc::kDmaHostBuffer});
+        b.method(m::NV0039_OFFSET_IN, {kSurfaceB, 0x100000, kW * 4, kW * 4, kW * 4, kH, 0x101});
+        b.method(m::NV0039_BUFFER_NOTIFY, 0);
+        // A pixel of B written by NV308A: B goes to memory first, with its clear (D-110).
+        b.method(m::NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN, loc::kDmaFrameBuffer);
+        b.method(m::NV3062_SET_COLOR_FORMAT, {10, ((kW * 4) << 16) | (kW * 4), 0, kSurfaceB});
+        b.method(m::NV308A_POINT, {0, 1, 1});
+        b.method(m::NV308A_COLOR, 0xffff0000u); // red at (0, 0)
+        b.method(m::GCM_FLIP_COMMAND, 0);       // shows C: green
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        e->backend->sync();
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        const u8* main = e->mem.host(E2E::kReadbackEa);
+        CHECK(Px{main[(5 * kW + 5) * 4], main[(5 * kW + 5) * 4 + 1], main[(5 * kW + 5) * 4 + 2],
+                  main[(5 * kW + 5) * 4 + 3]} == kBlue);
+        // B went to memory before the NV308A write (its clear in it), and memory is newer now: nothing to write back.
+        CHECK_FALSE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+        CHECK(guest_pixel(*e, kSurfaceB, 0, 0) == kRed);
+        CHECK(guest_pixel(*e, kSurfaceB, 32, 48) == kBlue);
+        REQUIRE(e->present_pixels.size() == 1);
+        const auto& px = e->present_pixels[0];
+        CHECK(std::array<u8, 4>{px[(64 * 128 + 64) * 4], px[(64 * 128 + 64) * 4 + 1], px[(64 * 128 + 64) * 4 + 2],
+                  px[(64 * 128 + 64) * 4 + 3]} == std::array<u8, 4>{0x00, 0xff, 0x00, 0xff}); // green, BGRA
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(*e, kSurfaceOffset, 32, 48) == kRed);
+    }
+}
+
+TEST_CASE("metal e2e: clears of part of a target that wait are the first draws of the next pass that has it (D-945)")
+{
+    // GTA V clears part of a target and its depth buffer, then part of the stencil, with another target's pass still
+    // drawing, then draws to them: the clears wait, and the pass over them does them first, in order. A clear of all of
+    // a target made after one of part of it makes that one moot; one made before it is the pass's load action.
+    REQUIRE_METAL();
+    constexpr u32 kZ24 = 0x1c0000; // Z24S8, kW x kH
+    struct Result {
+        Px a_region, a_out, b_region, b_out;
+        u32 z_region = 0, z_out = 0;
+        u64 passes = 0, folded = 0;
+    };
+    // order 0: part of B and its depth, then part of the stencil; 1: all of B, then part of it; 2: part, then all.
+    const auto run = [](bool merging, int order) {
+        auto e = e2e_merging(merging);
+        e->put_local_bytes(kFpOffset, fp_color(false));
+        e->put_local_bytes(kFp3Offset, fp_two_targets());
+        write_triangle(*e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red into A, green into B (MRT)
+        auto b = e->at(0);
+        upload_vertex_program(b);
+        bind_vertex_arrays(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+        // A: red on black, in a pass that ends; C: a pass that is drawing when the clears come.
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b);
+        setup_surface(b, kSurfaceC);
+        draw_triangle(b);
+        // The clears, of B (target B of the pass after) and the depth buffer.
+        const auto region = [&] { b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(24u << 16) | 4u, (20u << 16) | 30u}); };
+        setup_targets_ab(b, kSurfaceOffset, kSurfaceB);
+        b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(SurfaceTarget::B));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kZ24);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);   // blue
+        b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x40000033u); // depth 0.25, stencil 0x33
+        if (order == 0) {
+            region();
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepthStencil);
+            b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0x40000055u);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kStencil); // the stencil there again: 0x55
+        } else if (order == 1) {
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepthStencil); // all of B and the depth buffer
+            region();
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00u);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // then green there
+        } else {
+            region();
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00u);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // green there
+            b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {kW << 16, kH << 16});
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ffu);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepthStencil); // then all of it blue
+        }
+        // The pass over A and B with the depth buffer, drawing nothing new where the region is (depth test LESS against
+        // 0.25 there fails; 0.75 elsewhere against what is there).
+        setup_targets_ab(b, kSurfaceOffset, kSurfaceB);
+        b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8));
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kZ24);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Less));
+        b.method(m::NV4097_SET_DEPTH_MASK, 0);
+        set_fragment_program(b, kFp3Offset, 0x40);
+        draw_triangle(b);
+        REQUIRE(e->submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e->failures) INFO(f.message);
+        CHECK(e->failures.empty());
+        Result r;
+        r.passes = e->backend->stats().render_passes;
+        r.folded = e->backend->stats().clears_folded;
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
+        REQUIRE(e->backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kZ24, kW * kH * 4));
+        r.a_region = guest_pixel(*e, kSurfaceOffset, 16, 40), r.a_out = guest_pixel(*e, kSurfaceOffset, 32, 60);
+        r.b_region = guest_pixel(*e, kSurfaceB, 16, 40), r.b_out = guest_pixel(*e, kSurfaceB, 32, 60);
+        r.z_region = e->local32(kZ24 + 40 * kW * 4 + 16 * 4), r.z_out = e->local32(kZ24 + 60 * kW * 4 + 32 * 4);
+        return r;
+    };
+    for (const int order : {0, 1, 2}) {
+        INFO(std::format("order {}", order));
+        const Result on = run(true, order), off = run(false, order);
+        CHECK(on.a_region == kRed); // A's own triangle: the clears of B leave it, and the draw fails the depth test there
+        CHECK(on.a_out == kRed); // the draw, or A's own triangle where the depth test failed
+        // Outside the region the draw passes the depth test only where nothing cleared the depth buffer (it started at
+        // 1.0, as a buffer nobody wrote).
+        CHECK(on.b_out == (order == 0 ? kGreen : kBlue));
+        CHECK(on.b_region == (order == 1 ? kGreen : kBlue));
+        CHECK(on.z_region == (order == 0 ? 0x40000055u : 0x40000033u));
+        CHECK(on.z_out == (order == 0 ? 0xffffff00u : 0x40000033u));
+        for (const auto& [x, y] : {std::pair{on.a_region, off.a_region}, {on.a_out, off.a_out},
+                 {on.b_region, off.b_region}, {on.b_out, off.b_out}})
+            CHECK(x == y);
+        CHECK(on.z_region == off.z_region);
+        CHECK(on.z_out == off.z_out);
+        CHECK(on.passes <= off.passes);
+        CHECK(on.folded >= 1);
+    }
+}
+
+// ---- a frame shaped like GTA V's render passes, measured with and without D-945 -------------------------------------
+
+namespace {
+
+// Colour targets (A8R8G8B8, w x h each, pitch w * 4) and a depth buffer (Z24S8, or Z16) at local offsets; viewport and
+// scissor over all of them.
+struct BenchTargets {
+    std::vector<u32> colors;
+    u32 w = 0, h = 0;
+    u32 depth = 0; // 0: none
+    bool z16 = false;
+};
+
+void bench_targets(CommandBuilder& b, const BenchTargets& t)
+{
+    b.method(m::NV4097_SET_SURFACE_FORMAT,
+        static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | ((t.z16 ? 1u : 2u) << 5) | (1u << 8));
+    static constexpr std::array<u32, 4> kDma = {m::NV4097_SET_CONTEXT_DMA_COLOR_A, m::NV4097_SET_CONTEXT_DMA_COLOR_B,
+        m::NV4097_SET_CONTEXT_DMA_COLOR_C, m::NV4097_SET_CONTEXT_DMA_COLOR_D};
+    static constexpr std::array<u32, 4> kOffset = {m::NV4097_SET_SURFACE_COLOR_AOFFSET, m::NV4097_SET_SURFACE_COLOR_BOFFSET,
+        m::NV4097_SET_SURFACE_COLOR_COFFSET, m::NV4097_SET_SURFACE_COLOR_DOFFSET};
+    static constexpr std::array<u32, 4> kPitch = {m::NV4097_SET_SURFACE_PITCH_A, m::NV4097_SET_SURFACE_PITCH_B,
+        m::NV4097_SET_SURFACE_PITCH_C, m::NV4097_SET_SURFACE_PITCH_D};
+    static constexpr std::array<SurfaceTarget, 5> kTarget = {SurfaceTarget::None, SurfaceTarget::A, SurfaceTarget::AB,
+        SurfaceTarget::ABC, SurfaceTarget::ABCD};
+    for (usize i = 0; i < t.colors.size(); i++) {
+        b.method(kDma[i], loc::kDmaFrameBuffer);
+        b.method(kOffset[i], t.colors[i]);
+        b.method(kPitch[i], t.w * 4);
+    }
+    b.method(m::NV4097_SET_SURFACE_COLOR_TARGET, static_cast<u32>(kTarget[t.colors.size()]));
+    b.method(m::NV4097_SET_COLOR_MASK_MRT, 0xfff0);
+    if (t.depth) {
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, t.depth);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, t.w * (t.z16 ? 2 : 4));
+    }
+    b.method(m::NV4097_SET_SURFACE_CLIP_HORIZONTAL, {t.w << 16, t.h << 16});
+    b.method(m::NV4097_SET_VIEWPORT_HORIZONTAL, {t.w << 16, t.h << 16});
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {t.w << 16, t.h << 16});
+    const float hw = static_cast<float>(t.w) / 2.f, hh = static_cast<float>(t.h) / 2.f;
+    b.method(m::NV4097_SET_VIEWPORT_OFFSET, {f2u(hw), f2u(hh), f2u(0.5f), f2u(0.f)});
+    b.method(m::NV4097_SET_VIEWPORT_SCALE, {f2u(hw), f2u(-hh), f2u(0.5f), f2u(0.f)});
+}
+
+void bench_draws(CommandBuilder& b, u32 n)
+{
+    for (u32 i = 0; i < n; i++) draw_triangle(b);
+}
+
+// One frame, its passes in the order GTA V's prologue draws them (runs 291 and 305: D-270, D-273), every draw the same
+// triangle. Synthetic: sizes and patterns only.
+void bench_frame(CommandBuilder& b)
+{
+    constexpr u32 kG = 0x1000000, kZ = 0x2000000, kL = 0x2400000, kF = 0x2800000, kP = 0x2c00000;
+    constexpr u32 kR = 0x3800000, kRZ = 0x3840000, kRO = 0x3880000, kS = 0x3a00000, kC0 = 0x3c00000, kC1 = 0x3c40000;
+    const auto g = [](u32 i) { return kG + i * 0x400000; };
+    const auto sample = [&](u32 offset, u32 w, u32 h) {
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_linear_texture(b, offset, tex::A8R8G8B8, w * 4, w, h);
+    };
+    const auto colour = [&]() { set_fragment_program(b, kFpOffset, 0x40); };
+    const auto depth_off = [&]() { b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 0); };
+    b.method(m::NV4097_SET_STENCIL_MASK, 0xff);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff203040u);
+    b.method(m::NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xffffff00u);
+    // Reflections: a small view drawn, then copied down by a draw that samples it, six times.
+    for (u32 i = 0; i < 6; i++) {
+        bench_targets(b, {{kR}, 256, 128, kRZ});
+        depth_test_less(b);
+        colour();
+        bench_draws(b, 1);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepthStencil); // after a draw: a quad
+        bench_draws(b, 8);
+        bench_targets(b, {{kRO + i * 0x10000}, 128, 128});
+        depth_off();
+        sample(kR, 256, 128);
+        bench_draws(b, 1);
+    }
+    // Small targets cleared, one of them only cleared.
+    bench_targets(b, {{kC0}, 320, 128});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    colour();
+    bench_draws(b, 3);
+    bench_targets(b, {{kC1}, 320, 128});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // The G-buffer: its first target cleared alone, the depth buffer alone, then all four with depth, switching to the
+    // first alone in between.
+    bench_targets(b, {{g(0)}, 1280, 720});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    bench_targets(b, {{}, 1280, 720, kZ});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kDepthStencil);
+    const BenchTargets gbuffer{{g(0), g(1), g(2), g(3)}, 1280, 720, kZ}, first{{g(0)}, 1280, 720, kZ};
+    bench_targets(b, gbuffer);
+    depth_test_less(b);
+    set_fragment_program(b, kFp3Offset, 0x40);
+    bench_draws(b, 100);
+    sample(kC1, 320, 128);
+    bench_draws(b, 5);
+    colour();
+    bench_targets(b, first);
+    bench_draws(b, 16);
+    bench_targets(b, gbuffer);
+    bench_draws(b, 17);
+    bench_targets(b, first);
+    bench_draws(b, 1);
+    bench_targets(b, gbuffer);
+    bench_draws(b, 33);
+    // Shadow tiles: depth only.
+    for (u32 i = 0; i < 8; i++) {
+        bench_targets(b, {{}, 256, 256, kS + i * 0x20000, true});
+        bench_draws(b, 10);
+    }
+    // Lighting, with a chain of small passes before it and a target cleared in part in between.
+    const BenchTargets light{{kL}, 1280, 720, kZ};
+    bench_targets(b, light);
+    bench_draws(b, 2);
+    depth_off();
+    for (u32 i = 0; i < 4; i++) {
+        bench_targets(b, {{kP + i * 0x100000}, 640, 360});
+        sample(i ? kP + (i - 1) * 0x100000 : g(2), i ? 640 : 1280, i ? 360 : 720);
+        bench_draws(b, 1);
+    }
+    bench_targets(b, light);
+    depth_test_less(b);
+    sample(g(0), 1280, 720);
+    bench_draws(b, 50);
+    bench_targets(b, {{kP}, 640, 360});
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {320u << 16, 320u << 16});
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // part of another target
+    bench_targets(b, light);
+    bench_draws(b, 10);
+    bench_targets(b, {{}, 1280, 720, kZ});
+    bench_draws(b, 1);
+    bench_targets(b, light);
+    bench_draws(b, 1);
+    // Post-processing: each pass samples the one before.
+    depth_off();
+    static constexpr std::array<std::pair<u32, u32>, 4> kSizes = {{{640, 360}, {320, 180}, {160, 90}, {80, 45}}};
+    for (u32 i = 0; i < 12; i++) {
+        const auto [w, h] = kSizes[i % 4];
+        const auto [pw, ph] = kSizes[(i + 3) % 4];
+        bench_targets(b, {{kP + 0x400000 + (i % 4) * 0x100000}, w, h});
+        sample(i ? kP + 0x400000 + ((i + 3) % 4) * 0x100000 : kL, i ? pw : 1280, i ? ph : 720);
+        bench_draws(b, 1);
+    }
+    // The last passes: part of a target and of the stencil cleared, then drawn, then the frame.
+    const auto region = [&] { b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(200u << 16) | 86u, (144u << 16) | 525u}); };
+    bench_targets(b, {{g(1)}, 1280, 720, kZ});
+    region();
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor | clear::kDepthStencil);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kStencil);
+    b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {1280u << 16, 720u << 16});
+    depth_test_less(b);
+    colour();
+    bench_draws(b, 40);
+    bench_targets(b, {{g(1)}, 1280, 720});
+    depth_off();
+    bench_draws(b, 1);
+    bench_targets(b, {{kF}, 1280, 720});
+    sample(g(1), 1280, 720);
+    bench_draws(b, 1);
+    bench_targets(b, {{}, 1280, 720, kZ}); // part of the stencil again, between two passes over the frame
+    region();
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kStencil);
+    bench_targets(b, {{kF}, 1280, 720, kZ});
+    depth_test_less(b);
+    colour();
+    bench_draws(b, 1);
+    bench_targets(b, {{kF}, 1280, 720});
+    depth_off();
+    sample(kL, 1280, 720);
+    bench_draws(b, 14);
+    b.method(m::GCM_FLIP_COMMAND, 0);
+}
+
+} // namespace
+
+TEST_CASE("metal bench: render passes, attachment traffic and GPU time of a frame shaped like GTA V's (D-945)", "[.bench]")
+{
+    // Synthetic: GTA V's frame structure (passes, sizes, clears), not its shaders; a measuring aid for D-945, run alone:
+    // test_rsx_metal "[.bench]" (PSPOCKET_BENCH_FRAMES frames each way, 600 by default).
+    REQUIRE_METAL();
+    const char* frames_env = std::getenv("PSPOCKET_BENCH_FRAMES");
+    const u32 frames = std::max(300, frames_env ? std::atoi(frames_env) : 600);
+    for (const bool merging : {false, true, false, true}) {
+        std::vector<metal::WindowStats> windows;
+        g_e2e_config = [&](MetalBackendConfig& c) {
+            c.merge_passes = merging;
+            c.present = nullptr;
+            c.on_window = [&](const metal::WindowStats& w) { windows.push_back(w); };
+        };
+        E2E e;
+        g_e2e_config = nullptr;
+        REQUIRE(e.mem.commit(PS_MEM_RSX_LOCAL_BASE + 0x1000000, 0x3000000));
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        e.put_local_bytes(kFp3Offset, fp_two_targets());
+        write_triangle(e, {0xff0000ff, 0x00ff00ff, 0x0000ffff});
+        e.rsx->set_display_buffer(0, {0x2800000, 1280 * 4, 1280, 720});
+        auto b = e.at(0);
+        upload_vertex_program(b);
+        bind_vertex_arrays(b);
+        bench_frame(b);
+        for (u32 f = 0; f < frames; f++) {
+            e.rsx->set_fifo_pointers(0, 0);
+            REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        }
+        e.backend->sync();
+        for (const auto& fl : e.failures) INFO(fl.message);
+        CHECK(e.failures.empty());
+        REQUIRE(windows.size() >= 1);
+        const metal::WindowStats& w = windows.back();
+        std::string ends;
+        for (usize k = 0; k < w.pass_ends.size(); k++)
+            if (w.pass_ends[k] > 0) ends += std::format("{}{} {:.1f}", ends.empty() ? "" : ", ", metal::kPassEndNames[k], w.pass_ends[k]);
+        std::printf("D-945 bench, %s: GPU %.2f ms a frame, %.1f render passes (%s), attachments %.1f MB loaded, %.1f MB "
+                    "stored, %.1f MB not stored; %.1f clears folded, %.1f let a pass go on\n",
+            merging ? "merging" : "as before", w.gpu_ms, w.render_passes, ends.c_str(), w.attachment_load_mb,
+            w.attachment_store_mb, w.attachment_store_skipped_mb, w.clears_folded, w.clears_waited);
+    }
+    // In one backend, the change on in every other run of 10 frames (PSPOCKET_GPU_AB, D-272): both halves see the same
+    // load on the Mac. The backend logs each half's GPU time, passes and traffic every 200 frames ("GPU A/B").
+    setenv("PSPOCKET_GPU_AB", "10", 1);
+    g_e2e_config = [&](MetalBackendConfig& c) { c.present = nullptr; };
+    E2E e;
+    g_e2e_config = nullptr;
+    unsetenv("PSPOCKET_GPU_AB");
+    REQUIRE(e.mem.commit(PS_MEM_RSX_LOCAL_BASE + 0x1000000, 0x3000000));
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    e.put_local_bytes(kFp3Offset, fp_two_targets());
+    write_triangle(e, {0xff0000ff, 0x00ff00ff, 0x0000ffff});
+    e.rsx->set_display_buffer(0, {0x2800000, 1280 * 4, 1280, 720});
+    auto b = e.at(0);
+    upload_vertex_program(b);
+    bind_vertex_arrays(b);
+    bench_frame(b);
+    for (u32 f = 0; f < 2 * frames; f++) {
+        e.rsx->set_fifo_pointers(0, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    }
+    e.backend->sync();
+    CHECK(e.failures.empty());
 }

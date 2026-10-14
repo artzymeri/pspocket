@@ -12,7 +12,8 @@
 //  - Vertex pulling: vertex shaders read the raw big-endian attribute and index data (shader/msl.hpp).
 //  - Pipeline cache keyed by programs, attachment formats, blend and write masks; depth-stencil and sampler caches.
 //  - Render passes: one per surface configuration, loading only initialised attachments; full-surface clears at
-//    the start of a pass become load-action clears; every attachment is stored (render targets stay on the GPU).
+//    the start of a pass become load-action clears, and a clear of other targets waits for the next pass that has
+//    them (D-945); every attachment is stored (render targets stay on the GPU), unless the next pass clears it whole.
 //  - Flip: the display buffer is scaled into an output texture (1152x640 by default, D-016) and handed to the
 //    host's present callback; the host does MetalFX and pacing. Chosen flips are also copied to the CPU (capture).
 
@@ -53,9 +54,10 @@ using CaptureCallback = std::function<void(const u8* bgra, u32 width, u32 height
 using TraceSurfaceCallback = std::function<void(const std::string& name, const u8* bgra, u32 width, u32 height)>;
 
 // Why render passes end (a pass loads and stores its targets each time), in WindowStats::pass_ends' order (D-148).
-inline constexpr std::array<const char*, 14> kPassEndNames = {"targets", "gpu copy", "feedback copy", "corner copy",
+// "clear": a clear that waited ran in a pass of its own (D-945).
+inline constexpr std::array<const char*, 15> kPassEndNames = {"targets", "gpu copy", "feedback copy", "corner copy",
     "region copy", "grow", "depth conversion", "colour conversion", "target overlay", "submit", "flip", "surface gone",
-    "flush", "other"};
+    "flush", "clear", "other"};
 
 // One report window of the backend (every 300 flips): what its log line says, as numbers, for tools that keep them
 // (pspocket-boot --summary, D-148). Per frame unless said otherwise.
@@ -69,6 +71,9 @@ struct WindowStats {
     double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
     double depth_bounds_draws = 0; // draws with the depth bounds test (D-261)
     double attachment_load_mb = 0, attachment_store_mb = 0; // render pass attachments loaded and stored (D-273)
+    double attachment_store_skipped_mb = 0; // ... not stored: the next pass clears them whole (D-945)
+    double clears_folded = 0;  // clears that became a later pass's load action (D-945)
+    double clears_waited = 0;  // clears of other targets that let the pass drawing go on (D-945)
     double gpu_wait_ms = 0;        // the RSX thread's wait for the GPU at flips (frames in flight capped)
     u64 programs_made = 0, pipelines_made = 0; // in the window, by the RSX thread or for it in the background
     double compile_ms = 0;                      // in the window: the RSX thread's compiling, or waiting for compiles
@@ -129,6 +134,11 @@ struct MetalBackendConfig {
     // What the command buffer being recorded may hold in transient uploads before it is submitted early (D-148): what
     // a frame holds stays allocated until the GPU has run it.
     u64 transient_budget = 256ull << 20;
+    // Fewer render passes for a tile GPU (D-945): a clear of targets the open pass does not draw to waits instead of
+    // ending it, a clear of a whole target becomes the load action of the next pass that has it, and a pass does not
+    // store what the next one clears whole. False (or PSPOCKET_RSX_NO_PASS_MERGING set): every clear ends the pass
+    // and runs where it is, as before.
+    bool merge_passes = true;
 };
 
 struct BackendStats {
@@ -187,6 +197,10 @@ struct BackendStats {
     u64 attachment_load_bytes = 0;   // render pass attachments loaded from memory at their start (D-273)
     u64 attachment_store_bytes = 0;  // ... and stored at their end
     u64 clear_only_passes = 0, clear_only_store_bytes = 0; // passes that only cleared (load-action clears, no draw)
+    u64 attachment_store_skipped_bytes = 0; // attachments not stored: the next pass clears them whole (D-945)
+    u64 clears_folded = 0; // clears that waited and became a later pass's load action (D-945)
+    u64 clears_waited = 0; // clears of other targets made while a pass drew, which went on (D-945)
+    u64 clear_passes = 0;  // clears that waited and then ran in a render pass of their own (D-945)
     u64 corner_textures = 0;   // corner textures allocated (D-120); later corners of the same size reuse them (D-148)
     u64 gpu_wait_ns = 0;       // the RSX thread's wait at flips for the GPU to finish an older frame (D-148)
     u64 budget_submits = 0;    // command buffers submitted early, past MetalBackendConfig::transient_budget (D-148)

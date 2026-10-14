@@ -14836,3 +14836,61 @@ refused (up to 12 16-bit steps: libat3dec's state after its partial decode of th
 Compared: 45 cases of MP3, layers I and II, ATRAC3 and AAC agree, each in every answer, callback, item, information
 byte and PCM sample (floats within their last bits, 16-bit within one step). Still differing (part 3): AC-3.
 
+
+## D-945 · 2026-10-14 · Fewer render passes for a tile GPU (part 1: clears that wait, stores the next pass makes dead)
+
+On a tile GPU every render pass loads its attachments from memory at its start (unless cleared) and stores them at
+its end. GTA V's prologue walk ran 55 to 96 passes a frame, ended mostly by target changes (D-273: 188 MB loaded and
+209 MB stored a frame). What ended them besides (runs 291 and 305, the traced frame): clears. A clear of targets other
+than the open pass's ended it and opened a pass of its own; a pass that only cleared (one target cleared alone, then
+the depth buffer alone, then all four G-buffer targets with depth drawn) stored what the next pass loaded again.
+
+- **Clears that wait** (metal_backend.mm ClearOp): a clear of targets the open pass does not draw to, made while it
+  draws, no longer ends it; nor does a clear of whole surfaces, nor a pass that only cleared when the targets change.
+  The clear waits, its surfaces' state (written, newer on the GPU, generations, D-122's parent and children) set at
+  once as if it had run. The next pass that has its surfaces does it: a clear of whole surfaces it draws whole as its
+  load action, a clear of part of them inside its area as its first draws (a quad, as before). The others run in
+  passes of their own right before that pass starts, or before any other GPU work is recorded (a copy, a conversion,
+  a readback, a flip, a submit: end_pass), and before anything reads their surfaces (a draw sampling one, bind_texture
+  and depth_sampled_directly end the pass drawing first) or reloads them from guest memory (open_pass). In the order
+  they were made: a pass takes a clear only when no clear after it that stays waiting touches its surfaces, and a
+  clear of whole surfaces makes the waiting clears of them before it moot (nothing read them in between), so a pass
+  does a surface's clear of all of it first, by its load action, then the clears of parts of it.
+- **Stores the next pass makes dead:** a pass the targets change away from leaves its encoder open with its store
+  actions unknown (MTLStoreActionUnknown); when the next pass starts, an attachment it clears whole, or a waiting clear
+  clears whole before it, is not stored (DontCare: depth and stencil apart). Any other GPU work recorded first ends
+  the encoder and stores everything (render_buffer()), so nothing can read an attachment between the two passes.
+- Found on the way: a clear made with fewer colour targets than the open pass has (a clear of the first of them) wrote
+  every target of the pass, by its quad or its load action (RPCS3 VKGSRender.cpp clear_surface clears the targets the
+  surface registers name), and a clear naming no depth buffer cleared the pass's. The clear quad's pipeline now takes
+  a mask of the attachments it writes (clear_pipeline_for).
+- Not done: memoryless depth needs to know, before a pass starts, that no later pass loads the buffer and nothing
+  samples or copies it. In GTA V's traced frame every depth buffer is read again (the main one by the next frame's
+  first passes, the shadow tiles sampled, the reflection views' by the next view's first draw); the DontCare store
+  above takes the bandwidth part where it is safe. Copies still end the pass: GTA V's feedback, corner and conversion
+  copies need what the open pass drew or come with a target change anyway (D-248), and NV0039's GPU copy commits its
+  buffer at once so that its readback reaches guest memory before the labels after it (D-107).
+- Measuring aids: the status line and pspocket-boot's --summary windows give MB loaded, stored and not stored a frame,
+  the clears done by a later pass and the clears that let a pass go on; PSPOCKET_GPU_AB's line gives each half's render
+  passes and MB loaded and stored too (one walk measures all of it), and the flip's command buffer now counts in the
+  half of the frame it holds (it went to the next frame's half: one frame in N on the wrong side). Off:
+  MetalBackendConfig::merge_passes = false or PSPOCKET_RSX_NO_PASS_MERGING=1.
+- Tests (tests/rsx/test_metal.mm, "D-945"): clears folded into the next pass's load actions (one pass instead of three,
+  nothing loaded); a clear of another target, whole or in part, letting the pass go on; a draw sampling a target whose
+  clear waits sees it; a depth buffer the next pass clears whole not stored, and stored when a draw reads it in
+  between; a clear of the first targets of a pass with more (fails before the fix); clears waiting before an NV0039
+  copy, an NV308A write and a flip; clears of parts of a target and its depth and stencil done as the next pass's first
+  draws, in three orders. Each against the same commands with merging off, pixel for pixel.
+- Measured (run 324, "metal bench" in test_metal.mm: a synthetic frame shaped like GTA V's, its passes, sizes and
+  clears, every draw one triangle; M4 Mac): render passes a frame 57 to 53, attachments loaded 137.3 to 119.8 MB
+  (-13%) and stored 144.7 to 127.1 MB (-12%). In-run A/B (PSPOCKET_GPU_AB=10, six windows of 100 frames a half, the Mac
+  busy with other builds): GPU time a frame 4.49/4.21, 4.15/4.22, 4.96/4.01, 3.53/3.27, 3.22/3.28, 3.16/3.04 ms
+  (off/on; mean 3.92 to 3.67), the RSX thread's CPU 1.10 to 1.67 ms a frame, 2-4% lower with it in all six. Worked
+  through by hand on GTA V's traced frame (run 291's trace, not run again), the same rules make its 85 passes 81: the
+  clear-only passes of its first G-buffer target and of its depth buffer become the G-buffer pass's load actions, the
+  lighting pass goes on past a clear of part of another target, and a stencil clear between two passes over the frame
+  becomes the second one's first draw (about 17 MB loaded and 17 MB stored less a frame).
+- **GTA V's walk not measured:** its disc image is no longer on this Mac (inventory/gta5/disc.iso is gone, and no other
+  .iso is here), and neither iPhone is connected to copy it back (scripts/ios.sh pull-iso). With it back:
+  `PSPOCKET_GPU_AB=30 scripts/gate.sh game` gives both halves' passes, MB and GPU time from one walk, and the gate's
+  frame checks the rendering.

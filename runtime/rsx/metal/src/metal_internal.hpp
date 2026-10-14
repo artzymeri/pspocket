@@ -465,13 +465,17 @@ struct MetalBackend::Impl {
     std::array<u64, 2> ab_frames{};
     std::array<u64, 2> ab_cpu_ns{}; // the RSX thread's CPU time of each half's frames (D-278)
     u64 ab_cpu_last = 0;
+    // Each half's render passes and attachment traffic (D-945), and the counters at the last flip.
+    std::array<u64, 2> ab_passes{}, ab_load_bytes{}, ab_store_bytes{};
+    std::array<u64, 3> ab_last{};
+    s32 submit_half = -1; // the flip's submit: the half of the frame its buffer holds (ab_on() has moved on by then)
     bool ab_on() const { return !ab_period || (stats.flips / ab_period) % 2 == 1; } // the change applies
     // Why render passes ended (a started pass only), for the same report: the pass loads and stores its targets. The
     // copies between targets are told apart (D-148): an NV0039 copy on the GPU, a target sampled while drawn to, a
     // corner of a larger target, pixels between a target and its parent, a target grown over a smaller one.
     enum PassEnd : u8 { kEndTargets, kEndGpuCopy, kEndFeedbackCopy, kEndCornerCopy, kEndRegionCopy, kEndGrow,
                         kEndDepthConversion, kEndColorConversion, kEndTargetOverlay, kEndSubmit, kEndFlip, kEndSurfaceGone,
-                        kEndFlush, kEndOther, kEndCount };
+                        kEndFlush, kEndClear, kEndOther, kEndCount };
     static_assert(kEndCount == kPassEndNames.size(), "kPassEndNames names every PassEnd");
     PassEnd pass_end_reason = kEndOther;
     std::array<u64, kEndCount> pass_ends{}, report_pass_ends{};
@@ -491,6 +495,7 @@ struct MetalBackend::Impl {
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     u64 report_depth_bounds = 0; // D-261
     u64 report_load_bytes = 0, report_store_bytes = 0, report_clear_only = 0, report_clear_only_bytes = 0; // D-273
+    u64 report_store_skipped = 0, report_clears_folded = 0, report_clears_waited = 0, report_clear_passes = 0; // D-945
     // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
     // frame queued holds what it allocated until then, and nothing else held the RSX thread back.
     dispatch_semaphore_t frames_in_flight = nil;
@@ -516,6 +521,74 @@ struct MetalBackend::Impl {
     bool pass_partial = false; // the pass draws in part of an attachment: its load-action clear would clear the rest
     bool pass_started = false; // encoder created
     u32 pass_width = 0, pass_height = 0;
+
+    // ---- fewer render passes (D-945) ----
+    // A clear that waits: one of targets the open pass does not draw to, made while it draws (the pass goes on); one
+    // of whole targets the open pass does not have (the next pass may have them); or the load-action clears of a pass
+    // that never drew, when the targets change. It runs as the load action of the next pass that draws all of its
+    // surfaces (a clear of whole surfaces), else in a render pass of its own right before the next pass starts or any
+    // other GPU work is recorded, and before anything reads its surfaces (bind_texture, depth_sampled_directly) or
+    // writes them (a reload from guest memory). What it changes in its surfaces' state (initialized, newer on the GPU,
+    // generations, D-122's parent and children) is set when it is made, as if it had run: a write-back, conversion or
+    // copy of one of them is GPU work, so the clear runs before it.
+    struct ClearOp {
+        PassTargets targets;                   // its attachments: colour ones in order, then depth
+        u32 width = 0, height = 0;             // the area a pass over them draws in
+        u32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;    // the region it clears there
+        std::array<MTLClearColor, 4> colors{}; // per colour attachment, as the surface stores it
+        u32 channels = 0xf;                    // colour channels cleared, R G B A as bits 0 to 3
+        double depth = 1.0;
+        u32 stencil = 0;
+        bool clear_depth = false, clear_stencil = false;
+        bool whole = false; // every attachment cleared whole, all its channels: a load action does it
+        // A clear of part of them: the attachments that held something load it, the others start cleared.
+        std::array<bool, 4> color_loaded{};
+        bool depth_loaded = false;
+    };
+    std::vector<ClearOp> pending_clears;
+    // The pass the targets changed away from, its encoder not ended yet (D-945): its store actions were left unknown and
+    // are set when the next encoder is made. When that is the next pass, an attachment it or a waiting clear before it
+    // clears whole is not stored: nothing can have read it in between, since any other GPU work ends this encoder
+    // first and stores everything (render_buffer()).
+    struct Closing {
+        id<MTLRenderCommandEncoder> encoder = nil;
+        PassTargets targets;
+        u32 width = 0, height = 0;
+    };
+    Closing closing;
+    bool pass_store_unknown = false; // the open pass's store actions are set when it ends (D-945)
+    // Clears of other targets made while the open pass drew: counted (BackendStats::clears_waited) when the pass then
+    // draws on, so the pass ended no sooner for them; forgotten when it ends.
+    u32 clears_waiting_on_pass = 0;
+    // On unless configured off, and in the "on" half of PSPOCKET_GPU_AB's frames; never with PSPOCKET_GPU_PASS_TIMES,
+    // which times each pass alone.
+    bool merging() const { return config.merge_passes && ab_on() && !pass_times; }
+    static void target_area(const PassTargets& t, u32& width, u32& height, bool& partial); // as open_pass makes it
+    void wait_pass_clears();     // end_pass: a pass that only cleared, its targets changing: its clears wait
+    void fold_pending_clears();  // open_pass: the waiting clears the new pass does as its load actions
+    void flush_pending_clears(); // each waiting clear runs in a pass of its own, in the order they were made
+    void settle_before_pass();   // start_encoder: the pass before learns what it need not store; the clears run
+    // Ends the closing pass's encoder. `next_pass`: the open pass is about to start, and the waiting clears to run
+    // before it: what they clear whole is not stored; else everything is.
+    void finish_closing(bool next_pass);
+    // Ends a render encoder; with its store actions left unknown, an attachment in `dont_store` is not stored (bits 0
+    // to 3 the colour attachments, 4 the depth, 5 the stencil), the rest is.
+    void end_encoder(id<MTLRenderCommandEncoder> enc, const PassTargets& t, u32 width, u32 height, bool unknown,
+        u32 dont_store);
+    bool clear_waits_on(const Surface* s) const;
+    bool clear_waits_over(u32 addr, u32 size) const;
+    void run_clear_op(const ClearOp& op);
+    // A clear's quad through the scissor: the colour attachments of `t` in the `cleared` bit mask take `channels`, the
+    // others nothing (a clear of some of the targets of a pass with more, D-945).
+    void encode_clear_quad(id<MTLRenderCommandEncoder> enc, const PassTargets& t, u32 cleared, u32 width, u32 height,
+        u32 x0, u32 y0, u32 x1, u32 y1, MTLClearColor color, u32 channels, double depth, u32 stencil, bool clear_depth,
+        bool clear_stencil);
+    // Waiting clears of part of the open pass's attachments it does as its first draws, once its encoder starts
+    // (fold_pending_clears; in order, after its load actions).
+    std::vector<ClearOp> pass_quads;
+    // A clear waits: one of whole surfaces makes the earlier waiting clears of them moot (nothing read them since).
+    void push_pending_clear(ClearOp op);
+    static void drop_target(ClearOp& op, const Surface* s); // a clear that waits no longer clears `s`
 
     // The texture and program caches check guest memory (a content hash) at most once per check epoch, which advances
     // with the RSX's data epoch and with the writes the RSX and this backend make to guest memory themselves (D-104).
@@ -759,7 +832,11 @@ struct MetalBackend::Impl {
     std::optional<CompiledProgram> compile(const shader::TranslateResult& tr, const char* what);
     id<MTLRenderPipelineState> pipeline_for(const CompiledProgram& vp, const CompiledProgram& fp, const RsxState& state);
     id<MTLDepthStencilState> depth_state_for(const RsxState& state);
-    id<MTLRenderPipelineState> clear_pipeline_for(u32 color_mask, bool depth, bool stencil);
+    // The clear quad's pipeline for `t`'s attachments: the colour ones in the `cleared` bit mask written with
+    // `color_mask`, the others not.
+    id<MTLRenderPipelineState> clear_pipeline_for(const PassTargets& t, u32 cleared, u32 color_mask, bool depth,
+        bool stencil);
+    std::array<id<MTLDepthStencilState>, 4> clear_depth_states{}; // by clear_depth | clear_stencil << 1
 };
 
 // Format mapping helpers (surface_cache.mm)

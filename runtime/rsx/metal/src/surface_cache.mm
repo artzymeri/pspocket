@@ -69,6 +69,7 @@ Surface* MetalBackend::Impl::find_surface(u32 address, bool depth) const
 void MetalBackend::Impl::remove_surface(Surface* s)
 {
     if (pass_open && pass.contains(s)) end_pass_for(kEndSurfaceGone);
+    if (closing.encoder && closing.targets.contains(s)) finish_closing(false); // D-945: it stores what it drew
     // A child leaves what it wrote in its parent; children of a parent that goes stand alone (D-122).
     if (Surface* p = s->parent) {
         if (s->newer_than_parent) copy_region(s->texture, 0, 0, p->texture, s->parent_x, s->parent_y, s->width, s->height);
@@ -78,6 +79,10 @@ void MetalBackend::Impl::remove_surface(Surface* s)
         c->parent = nullptr;
         c->older_than_parent = c->newer_than_parent = false;
     }
+    // A clear that waits on it clears the rest of its targets only (a child's ran above, before its copy; D-945). The
+    // open pass's own first-draw clears went with it (it had the surface: it ended above).
+    for (ClearOp& op : pending_clears) drop_target(op, s);
+    std::erase_if(pending_clears, [](const ClearOp& op) { return !op.targets.color_count && !op.targets.depth; });
     tracker.unwatch(s->watch);
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
 }

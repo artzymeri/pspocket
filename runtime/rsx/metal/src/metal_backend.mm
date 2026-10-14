@@ -33,6 +33,9 @@ Surface* MetalBackend::Impl::depth_sampled_directly(const TextureInfo& t)
     Surface* d = find_surface(*ea, true);
     if (!d || !d->initialized || d->cpu_newer || d->swizzled) return nullptr;
     if (t.width != d->width || t.height != d->height || d == draw_targets.depth) return nullptr;
+    // A clear of it that waits runs before a draw reads it: now, when the pass drawing would go on (D-945; else the
+    // next pass's start runs it).
+    if (pass_open && pass_started && clear_waits_on(d)) end_pass_for(kEndFlush);
     return d;
 }
 
@@ -233,6 +236,7 @@ bool MetalBackend::Impl::init()
             pass_times->timestamps ? "yes" : "no", pass_times->gpu_tick_ns);
     }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
+    if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
             config.shader_cache_threads, config.shader_archives);
@@ -269,6 +273,9 @@ void MetalBackend::Impl::unsupported(std::string message) { fail(std::move(messa
 
 id<MTLCommandBuffer> MetalBackend::Impl::render_buffer()
 {
+    // Anything recorded now that is not the next pass may read what the closing pass drew: it stores all of it first
+    // (D-945; start_encoder ends it knowing more).
+    if (closing.encoder) finish_closing(false);
     if (!render_cb) {
         render_cb = [queue commandBuffer];
         render_cb.label = @"rsx render";
@@ -294,7 +301,8 @@ id<MTLCommandBuffer> MetalBackend::Impl::upload_buffer()
 
 void MetalBackend::Impl::submit(bool wait)
 {
-    end_pass_for(kEndSubmit);
+    end_pass_for(kEndSubmit);  // the clears waiting run too (D-945)
+    finish_closing(false);     // a buffer commits with no encoder open
     // Uploads first: the render buffer samples what they decode (same queue, so in order).
     id<MTLCommandBuffer> last = nil;
     if (upload_cb) {
@@ -327,7 +335,7 @@ void MetalBackend::Impl::submit(bool wait)
         transient.retire(render_cb);
         auto gpu = gpu_ns;
         auto ab = ab_period ? ab_ns : nullptr;
-        const usize half = ab_on() ? 1 : 0;
+        const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_on() ? 1 : 0;
         [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             const double s = cb.GPUEndTime - cb.GPUStartTime;
             if (s > 0) gpu->fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
@@ -443,9 +451,15 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
     // since): then it ends, and the new one reloads it (D-110).
     if (pass_open && pass == t && !newer_in_guest(t)) return;
     end_pass_for(kEndTargets);
+    // A target the CPU wrote is reloaded below: the clears still waiting were made before that write, so they run
+    // first (D-945).
+    if (newer_in_guest(t)) flush_pending_clears();
     pass = t;
     pass_open = true;
     pass_started = false;
+    // Its store actions are set when it ends, once what the next pass does to its attachments is known (D-945).
+    pass_store_unknown = merging();
+    const MTLStoreAction store = pass_store_unknown ? MTLStoreActionUnknown : MTLStoreActionStore;
     pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
     pass_width = t.width ? t.width : ~0u;
     pass_height = t.height ? t.height : ~0u;
@@ -455,11 +469,11 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
         if (s->cpu_newer) upload_surface_from_guest(*s);
         MTLRenderPassColorAttachmentDescriptor* a = pass_desc.colorAttachments[i];
         a.texture = s->texture;
-        // Load what is there; a surface nobody wrote yet starts cleared (deterministic) and is always stored:
-        // render targets stay on the GPU (plan section 7).
+        // Load what is there; a surface nobody wrote yet starts cleared (deterministic) and is stored: render targets
+        // stay on the GPU (plan section 7), unless the next pass clears them whole (D-945).
         a.loadAction = s->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
         a.clearColor = MTLClearColorMake(0, 0, 0, 0);
-        a.storeAction = MTLStoreActionStore;
+        a.storeAction = store;
         pass_width = std::min(pass_width, s->width);
         pass_height = std::min(pass_height, s->height);
         pass_partial |= s->width != t.width || s->height != t.height;
@@ -469,12 +483,12 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
         pass_desc.depthAttachment.texture = d->texture;
         pass_desc.depthAttachment.loadAction = d->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
         pass_desc.depthAttachment.clearDepth = 1.0;
-        pass_desc.depthAttachment.storeAction = MTLStoreActionStore;
+        pass_desc.depthAttachment.storeAction = store;
         if (d->pixel_format == MTLPixelFormatDepth32Float_Stencil8) {
             pass_desc.stencilAttachment.texture = d->texture;
             pass_desc.stencilAttachment.loadAction = d->initialized ? MTLLoadActionLoad : MTLLoadActionClear;
             pass_desc.stencilAttachment.clearStencil = 0;
-            pass_desc.stencilAttachment.storeAction = MTLStoreActionStore;
+            pass_desc.stencilAttachment.storeAction = store;
         }
         pass_width = std::min(pass_width, d->width);
         pass_height = std::min(pass_height, d->height);
@@ -482,12 +496,14 @@ void MetalBackend::Impl::open_pass(const PassTargets& t)
     }
     pass_desc.renderTargetWidth = pass_width;
     pass_desc.renderTargetHeight = pass_height;
+    fold_pending_clears(); // D-945
 }
 
 id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
 {
     if (!pass_open) return nil;
     if (!pass_started) {
+        settle_before_pass(); // the pass before ends knowing what this one clears; the clears waiting run (D-945)
         if (pass_times && !pass_times_submitting) {
             // What was recorded since the last pass (conversions, copies) in a command buffer of its own, timed
             // apart from the pass (PSPOCKET_GPU_PASS_TIMES).
@@ -531,7 +547,7 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
         stats.render_passes++;
         pass_draws_start = stats.draws;
         // What the pass moves between memory and the tile memory (D-273): attachments loaded at its start, stored at
-        // its end, over its area.
+        // its end, over its area (stores left unknown are counted when it ends, end_encoder).
         const u64 area = u64{pass_width} * pass_height;
         for (u32 i = 0; i < pass.color_count; i++) {
             const u64 bytes = area * surface_bytes_per_pixel(pass.color[i]->gcm_format, false);
@@ -563,14 +579,35 @@ id<MTLRenderCommandEncoder> MetalBackend::Impl::start_encoder()
             if (pass_desc.depthAttachment.loadAction == MTLLoadActionClear) pass.depth->generation++;
             if (pass_desc.stencilAttachment.loadAction == MTLLoadActionClear) pass.depth->stencil_generation++;
         }
+        // Clears of part of its attachments that waited, as its first draws (D-945; their surfaces' state was set when
+        // they were made).
+        for (const ClearOp& op : pass_quads) {
+            u32 cleared = 0;
+            for (u32 i = 0; i < op.targets.color_count; i++)
+                for (u32 j = 0; j < pass.color_count; j++)
+                    if (pass.color[j] == op.targets.color[i]) cleared |= 1u << j;
+            encode_clear_quad(encoder, pass, cleared, pass_width, pass_height, op.x0, op.y0, op.x1, op.y1, op.colors[0],
+                op.channels, op.depth, op.stencil, op.clear_depth && op.targets.depth, op.clear_stencil && op.targets.depth);
+        }
+        pass_quads.clear();
     }
     return encoder;
 }
 
 void MetalBackend::Impl::end_pass()
 {
-    if (!pass_open) return;
+    // When the targets change (D-945), a pass that only cleared leaves its clears waiting for the next pass, and one
+    // that drew leaves its encoder open until the next encoder is made: its store actions wait for what that one does.
+    // Anything else (a copy, a conversion, a readback, a flip, a submit) runs the clears waiting first.
+    const bool to_next = pass_end_reason == kEndTargets && merging();
+    clears_waiting_on_pass = 0; // they did not keep this pass going
+    if (!pass_open) {
+        if (!to_next) flush_pending_clears();
+        return;
+    }
     if (pass_started) pass_ends[pass_end_reason]++;
+    bool clear_only = false;
+    u64 stored = 0;
     if (!pass_started) {
         // A pass that only clears (load-action clears) must still run.
         bool clears = false;
@@ -578,20 +615,39 @@ void MetalBackend::Impl::end_pass()
             clears |= pass_desc.colorAttachments[i].loadAction == MTLLoadActionClear && pass.color[i]->initialized;
         }
         if (pass.depth) clears |= pass_desc.depthAttachment.loadAction == MTLLoadActionClear && pass.depth->initialized;
-        if (clears) {
-            const u64 stored = stats.attachment_store_bytes;
+        // A Z24S8 buffer's depth and stencil load alike (open_pass, do_clear): a clear of both waits as one.
+        const bool stencil_alike = !pass_desc.stencilAttachment.texture ||
+            (pass_desc.depthAttachment.loadAction == MTLLoadActionClear) ==
+                (pass_desc.stencilAttachment.loadAction == MTLLoadActionClear);
+        if ((clears || !pass_quads.empty()) && to_next && stencil_alike) {
+            // Its load actions' clears wait, then the clears it was to draw first, in that order (D-945).
+            if (clears) wait_pass_clears();
+            for (ClearOp& op : pass_quads) push_pending_clear(std::move(op));
+            pass_quads.clear();
+        } else if (clears || !pass_quads.empty()) {
+            stored = stats.attachment_store_bytes;
             start_encoder();
+            clear_only = true;
             stats.clear_only_passes++;
-            stats.clear_only_store_bytes += stats.attachment_store_bytes - stored;
         }
     }
     const bool timed = pass_times && encoder && !pass_times_submitting;
     if (encoder) {
-        [encoder endEncoding];
+        if (to_next && pass_store_unknown) {
+            if (closing.encoder) finish_closing(false); // never two: start_encoder ends the one before
+            closing.encoder = encoder;
+            closing.targets = pass;
+            closing.width = pass_width;
+            closing.height = pass_height;
+        } else {
+            end_encoder(encoder, pass, pass_width, pass_height, pass_store_unknown, 0);
+        }
         encoder = nil;
     }
+    if (clear_only) stats.clear_only_store_bytes += stats.attachment_store_bytes - stored;
     pass_open = false;
     pass_started = false;
+    if (!to_next) flush_pending_clears(); // made while this pass drew: after its draws, as recorded
     if (timed) {
         // The pass alone in a command buffer, timed (PSPOCKET_GPU_PASS_TIMES).
         auto times = pass_times;
@@ -633,6 +689,362 @@ void MetalBackend::Impl::end_pass()
         return;
     }
     pass = {};
+}
+
+// ---- clears that wait, and stores the next pass makes dead (D-945) ------------------------------------------------
+
+void MetalBackend::Impl::target_area(const PassTargets& t, u32& width, u32& height, bool& partial)
+{
+    width = t.width ? t.width : ~0u;
+    height = t.height ? t.height : ~0u;
+    partial = false;
+    const auto take = [&](const Surface* s) {
+        width = std::min(width, s->width);
+        height = std::min(height, s->height);
+        partial |= s->width != t.width || s->height != t.height;
+    };
+    for (u32 i = 0; i < t.color_count; i++) take(t.color[i]);
+    if (t.depth) take(t.depth);
+}
+
+bool MetalBackend::Impl::clear_waits_on(const Surface* s) const
+{
+    for (const ClearOp& op : pending_clears)
+        if (op.targets.contains(s)) return true;
+    return false;
+}
+
+bool MetalBackend::Impl::clear_waits_over(u32 addr, u32 size) const
+{
+    const u64 end = u64{addr} + size;
+    const auto over = [&](const Surface* s) { return s && u64{s->address} < end && addr < u64{s->address} + s->bytes(); };
+    for (const ClearOp& op : pending_clears) {
+        for (u32 i = 0; i < op.targets.color_count; i++)
+            if (over(op.targets.color[i])) return true;
+        if (over(op.targets.depth)) return true;
+    }
+    return false;
+}
+
+void MetalBackend::Impl::drop_target(ClearOp& op, const Surface* s)
+{
+    u32 k = 0;
+    for (u32 i = 0; i < op.targets.color_count; i++) {
+        if (op.targets.color[i] == s) continue;
+        op.targets.color[k] = op.targets.color[i];
+        op.targets.rsx_index[k] = op.targets.rsx_index[i];
+        op.colors[k] = op.colors[i];
+        op.color_loaded[k] = op.color_loaded[i];
+        k++;
+    }
+    op.targets.color_count = k;
+    if (op.targets.depth == s) {
+        op.targets.depth = nullptr;
+        op.clear_depth = op.clear_stencil = false;
+    }
+}
+
+void MetalBackend::Impl::push_pending_clear(ClearOp op)
+{
+    if (op.whole) {
+        // What clears made before it would do to these surfaces it overwrites whole, and nothing read them since
+        // (reads run the waiting clears first). So each surface has at most one clear of all of it waiting, before any
+        // of part of it: a pass that takes them does that one as its load action and the others as its first draws.
+        for (ClearOp& before : pending_clears) {
+            for (u32 i = 0; i < op.targets.color_count; i++) drop_target(before, op.targets.color[i]);
+            if (op.targets.depth) drop_target(before, op.targets.depth);
+        }
+        std::erase_if(pending_clears, [](const ClearOp& o) { return !o.targets.color_count && !o.targets.depth; });
+    }
+    pending_clears.push_back(std::move(op));
+}
+
+// A pass that only cleared, ended by a change of targets: what it clears at its start waits as one clear, its
+// attachments' state set as start_encoder would have, for the next pass to do as its load actions or to run before
+// it. The attachments it would only have loaded are left as they are.
+void MetalBackend::Impl::wait_pass_clears()
+{
+    ClearOp op;
+    op.whole = true;
+    op.width = op.x1 = pass_width;
+    op.height = op.y1 = pass_height;
+    op.targets.width = pass.width;
+    op.targets.height = pass.height;
+    for (u32 i = 0; i < pass.color_count; i++) {
+        if (pass_desc.colorAttachments[i].loadAction != MTLLoadActionClear) continue;
+        const u32 k = op.targets.color_count++;
+        op.targets.color[k] = pass.color[i];
+        op.targets.rsx_index[k] = pass.rsx_index[i];
+        op.colors[k] = pass_desc.colorAttachments[i].clearColor;
+    }
+    if (pass.depth && pass_desc.depthAttachment.loadAction == MTLLoadActionClear) {
+        op.targets.depth = pass.depth;
+        op.depth = pass_desc.depthAttachment.clearDepth;
+        op.clear_depth = true;
+        if (pass_desc.stencilAttachment.texture) { // cleared with the depth (end_pass checks)
+            op.stencil = pass_desc.stencilAttachment.clearStencil;
+            op.clear_stencil = true;
+        }
+    }
+    for (u32 i = 0; i < op.targets.color_count; i++) {
+        Surface* s = op.targets.color[i];
+        s->initialized = s->gpu_newer = true;
+        s->last_used = tick;
+        s->last_frame = stats.flips;
+        s->generation++;
+        surface_written(*s); // D-122
+    }
+    if (Surface* d = op.targets.depth) {
+        d->initialized = d->gpu_newer = true;
+        d->last_used = tick;
+        d->last_frame = stats.flips;
+        d->generation++;
+        if (op.clear_stencil) d->stencil_generation++;
+    }
+    if (op.targets.color_count || op.targets.depth) push_pending_clear(std::move(op));
+}
+
+// The waiting clears this pass does itself (open_pass): those over attachments of it only, unless a clear made after one
+// that this pass cannot do touches the same surfaces (that one runs before this pass, so it would come first). A clear
+// of whole surfaces this pass draws whole is its load action, a clear of part of them inside its area one of its first
+// draws (in order, after the load actions: each surface has its clear of all of it first, push_pending_clear).
+void MetalBackend::Impl::fold_pending_clears()
+{
+    if (pending_clears.empty()) return;
+    const usize n = pending_clears.size();
+    std::vector<const Surface*> blocked;
+    std::vector<u8> fold(n, 0); // 1: a load action, 2: a first draw
+    for (usize k = n; k-- > 0;) {
+        const ClearOp& op = pending_clears[k];
+        bool mine = true, drawn_whole = true, starts_alike = true;
+        const auto take = [&](const Surface* s, bool loaded) {
+            mine &= pass.contains(s) && !s->cpu_newer && std::find(blocked.begin(), blocked.end(), s) == blocked.end();
+            drawn_whole &= s->width == pass_width && s->height == pass_height;
+            // A surface that held nothing before the clear starts cleared in the clear's own pass: this one must start
+            // it so over the same area.
+            starts_alike &= loaded || (op.width == pass_width && op.height == pass_height);
+        };
+        for (u32 i = 0; i < op.targets.color_count; i++) take(op.targets.color[i], op.color_loaded[i]);
+        if (op.targets.depth) take(op.targets.depth, op.depth_loaded);
+        const bool quad = !op.whole && op.x1 <= pass_width && op.y1 <= pass_height && starts_alike;
+        fold[k] = !mine ? 0 : op.whole ? (drawn_whole ? 1 : 0) : quad ? 2 : 0;
+        if (!fold[k]) {
+            for (u32 i = 0; i < op.targets.color_count; i++) blocked.push_back(op.targets.color[i]);
+            if (op.targets.depth) blocked.push_back(op.targets.depth);
+        }
+    }
+    std::vector<ClearOp> left;
+    for (usize k = 0; k < n; k++) {
+        ClearOp& op = pending_clears[k];
+        if (!fold[k]) {
+            left.push_back(std::move(op));
+            continue;
+        }
+        stats.clears_folded++;
+        if (tracing) {
+            PS_LOG_INFO("rsx.trace", "  a clear that waited is this pass's {}:{}", fold[k] == 1 ? "load action" : "first draw",
+                describe_targets(op.targets));
+        }
+        if (fold[k] == 2) {
+            // What held nothing before it starts cleared, as open_pass starts a surface nobody wrote.
+            for (u32 i = 0; i < op.targets.color_count; i++) {
+                if (op.color_loaded[i]) continue;
+                for (u32 j = 0; j < pass.color_count; j++) {
+                    if (pass.color[j] != op.targets.color[i]) continue;
+                    pass_desc.colorAttachments[j].loadAction = MTLLoadActionClear;
+                    pass_desc.colorAttachments[j].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                }
+            }
+            if (op.targets.depth && !op.depth_loaded) {
+                pass_desc.depthAttachment.loadAction = MTLLoadActionClear;
+                pass_desc.depthAttachment.clearDepth = 1.0;
+                if (pass_desc.stencilAttachment.texture) {
+                    pass_desc.stencilAttachment.loadAction = MTLLoadActionClear;
+                    pass_desc.stencilAttachment.clearStencil = 0;
+                }
+            }
+            pass_quads.push_back(std::move(op));
+            continue;
+        }
+        for (u32 i = 0; i < op.targets.color_count; i++) {
+            for (u32 j = 0; j < pass.color_count; j++) {
+                if (pass.color[j] != op.targets.color[i]) continue;
+                pass_desc.colorAttachments[j].loadAction = MTLLoadActionClear;
+                pass_desc.colorAttachments[j].clearColor = op.colors[i];
+            }
+        }
+        if (op.targets.depth) {
+            pass_desc.depthAttachment.loadAction = MTLLoadActionClear;
+            pass_desc.depthAttachment.clearDepth = op.depth;
+            if (pass_desc.stencilAttachment.texture) {
+                pass_desc.stencilAttachment.loadAction = MTLLoadActionClear;
+                pass_desc.stencilAttachment.clearStencil = op.stencil;
+            }
+        }
+    }
+    pending_clears = std::move(left);
+}
+
+void MetalBackend::Impl::flush_pending_clears()
+{
+    if (pending_clears.empty()) return;
+    PS_CHECK(encoder == nil); // their passes are recorded between others
+    std::vector<ClearOp> ops = std::move(pending_clears);
+    pending_clears.clear();
+    for (const ClearOp& op : ops) run_clear_op(op);
+}
+
+void MetalBackend::Impl::settle_before_pass()
+{
+    finish_closing(true);
+    flush_pending_clears();
+}
+
+void MetalBackend::Impl::finish_closing(bool next_pass)
+{
+    if (!closing.encoder) return;
+    u32 dont_store = 0;
+    if (next_pass) {
+        // What happens first to each of its attachments from here: the waiting clears, in order, then the open pass's
+        // load actions. Overwritten whole before anything reads it: not stored.
+        const auto cleared_whole = [&](const Surface* s, bool stencil) {
+            for (const ClearOp& op : pending_clears)
+                if (op.targets.contains(s)) return op.whole;
+            if (!pass_open || !pass.contains(s) || s->width != pass_width || s->height != pass_height) return false;
+            for (u32 j = 0; j < pass.color_count; j++)
+                if (pass.color[j] == s) return pass_desc.colorAttachments[j].loadAction == MTLLoadActionClear;
+            return (stencil ? pass_desc.stencilAttachment.loadAction : pass_desc.depthAttachment.loadAction) ==
+                   MTLLoadActionClear;
+        };
+        for (u32 i = 0; i < closing.targets.color_count; i++)
+            if (cleared_whole(closing.targets.color[i], false)) dont_store |= 1u << i;
+        if (const Surface* d = closing.targets.depth) {
+            if (cleared_whole(d, false)) dont_store |= 1u << 4;
+            if (cleared_whole(d, true)) dont_store |= 1u << 5;
+        }
+        if (tracing && dont_store) {
+            PS_LOG_INFO("rsx.trace", "  the pass before ({}) does not store {:#x}: this pass clears it whole",
+                describe_targets(closing.targets), dont_store);
+        }
+    }
+    end_encoder(closing.encoder, closing.targets, closing.width, closing.height, true, dont_store);
+    closing = {};
+}
+
+void MetalBackend::Impl::end_encoder(id<MTLRenderCommandEncoder> enc, const PassTargets& t, u32 width, u32 height,
+    bool unknown, u32 dont_store)
+{
+    if (unknown) {
+        const u64 area = u64{width} * height;
+        for (u32 i = 0; i < t.color_count; i++) {
+            const bool skip = (dont_store >> i) & 1;
+            [enc setColorStoreAction:skip ? MTLStoreActionDontCare : MTLStoreActionStore atIndex:i];
+            (skip ? stats.attachment_store_skipped_bytes : stats.attachment_store_bytes) +=
+                area * surface_bytes_per_pixel(t.color[i]->gcm_format, false);
+        }
+        if (const Surface* d = t.depth) {
+            const bool stencil = d->pixel_format == MTLPixelFormatDepth32Float_Stencil8;
+            const bool skip_depth = (dont_store >> 4) & 1, skip_stencil = (dont_store >> 5) & 1;
+            [enc setDepthStoreAction:skip_depth ? MTLStoreActionDontCare : MTLStoreActionStore];
+            if (stencil) [enc setStencilStoreAction:skip_stencil ? MTLStoreActionDontCare : MTLStoreActionStore];
+            // D-273 counts a Z24S8 buffer's four bytes a pixel once, with its depth.
+            (skip_depth && (!stencil || skip_stencil) ? stats.attachment_store_skipped_bytes : stats.attachment_store_bytes) +=
+                area * surface_bytes_per_pixel(d->gcm_format, true);
+        }
+    }
+    [enc endEncoding];
+}
+
+// A clear that waited, in a render pass of its own: its load actions when it clears its surfaces whole, else a quad
+// through its region over what they held (the ones that held nothing start cleared, as open_pass has them).
+void MetalBackend::Impl::run_clear_op(const ClearOp& op)
+{
+    const PassTargets& t = op.targets;
+    MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+    const u64 area = u64{op.width} * op.height;
+    u64 loaded = 0, stored = 0;
+    for (u32 i = 0; i < t.color_count; i++) {
+        MTLRenderPassColorAttachmentDescriptor* a = d.colorAttachments[i];
+        const bool load = !op.whole && op.color_loaded[i];
+        a.texture = t.color[i]->texture;
+        a.loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
+        a.clearColor = op.whole ? op.colors[i] : MTLClearColorMake(0, 0, 0, 0);
+        a.storeAction = MTLStoreActionStore;
+        const u64 bytes = area * surface_bytes_per_pixel(t.color[i]->gcm_format, false);
+        loaded += load ? bytes : 0;
+        stored += bytes;
+    }
+    if (const Surface* z = t.depth) {
+        const bool load = !op.whole && op.depth_loaded;
+        d.depthAttachment.texture = z->texture;
+        d.depthAttachment.loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
+        d.depthAttachment.clearDepth = op.whole ? op.depth : 1.0;
+        d.depthAttachment.storeAction = MTLStoreActionStore;
+        if (z->pixel_format == MTLPixelFormatDepth32Float_Stencil8) {
+            d.stencilAttachment.texture = z->texture;
+            d.stencilAttachment.loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
+            d.stencilAttachment.clearStencil = op.whole ? op.stencil : 0;
+            d.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        const u64 bytes = area * surface_bytes_per_pixel(z->gcm_format, true);
+        loaded += load ? bytes : 0;
+        stored += bytes;
+    }
+    d.renderTargetWidth = op.width;
+    d.renderTargetHeight = op.height;
+    id<MTLRenderCommandEncoder> enc = [render_buffer() renderCommandEncoderWithDescriptor:d];
+    enc.label = @"rsx clear";
+    if (!op.whole) {
+        encode_clear_quad(enc, t, (1u << t.color_count) - 1, op.width, op.height, op.x0, op.y0, op.x1, op.y1,
+            op.colors[0], op.channels, op.depth, op.stencil, op.clear_depth, op.clear_stencil);
+    }
+    [enc endEncoding];
+    stats.render_passes++;
+    stats.clear_passes++;
+    pass_ends[kEndClear]++;
+    stats.attachment_load_bytes += loaded;
+    stats.attachment_store_bytes += stored;
+    if (op.whole) {
+        stats.clear_only_passes++;
+        stats.clear_only_store_bytes += stored;
+    }
+    if (tracing) PS_LOG_INFO("rsx.trace", "  a clear that waited runs in a pass of its own:{}", describe_targets(t));
+}
+
+void MetalBackend::Impl::encode_clear_quad(id<MTLRenderCommandEncoder> enc, const PassTargets& t, u32 cleared, u32 width,
+    u32 height, u32 x0, u32 y0, u32 x1, u32 y1, MTLClearColor color, u32 channels, double depth, u32 stencil,
+    bool clear_depth, bool clear_stencil)
+{
+    id<MTLRenderPipelineState> pso = clear_pipeline_for(t, cleared, channels, clear_depth, clear_stencil);
+    if (!pso) return;
+    __strong id<MTLDepthStencilState>& ds = clear_depth_states[(clear_depth ? 1u : 0u) | (clear_stencil ? 2u : 0u)];
+    if (!ds) {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = clear_depth;
+        if (clear_stencil) {
+            MTLStencilDescriptor* st = [MTLStencilDescriptor new];
+            st.stencilCompareFunction = MTLCompareFunctionAlways;
+            st.depthStencilPassOperation = MTLStencilOperationReplace;
+            st.writeMask = 0xff;
+            dd.frontFaceStencil = st;
+            dd.backFaceStencil = st;
+        }
+        ds = [device newDepthStencilStateWithDescriptor:dd];
+    }
+    [enc setRenderPipelineState:pso];
+    [enc setDepthStencilState:ds];
+    [enc setStencilReferenceValue:stencil];
+    [enc setViewport:MTLViewport{0, 0, static_cast<double>(width), static_cast<double>(height), 0, 1}];
+    [enc setScissorRect:MTLScissorRect{x0, y0, x1 - x0, y1 - y0}];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setTriangleFillMode:MTLTriangleFillModeFill];
+    const float z = static_cast<float>(depth);
+    [enc setVertexBytes:&z length:sizeof(z) atIndex:0];
+    const float c[4] = {static_cast<float>(color.red), static_cast<float>(color.green), static_cast<float>(color.blue),
+        static_cast<float>(color.alpha)};
+    [enc setFragmentBytes:c length:sizeof(c) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
 // The passes that took most GPU time (PSPOCKET_GPU_PASS_TIMES): by their place in the frame, since the game draws its
@@ -768,27 +1180,15 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     if (!select_targets(state, t, mask)) return;
     if (!(mask & clear::kColor)) t.color_count = 0;
     if (!(mask & clear::kDepthStencil)) t.depth = nullptr;
-    // Keep the open pass if it already has these surfaces (clearing mid-pass), else switch.
-    if (pass_open) {
-        bool subset = true;
-        for (u32 i = 0; i < t.color_count; i++) {
-            subset &= i < pass.color_count && pass.color[i] == t.color[i];
-        }
-        if (t.depth && t.depth != pass.depth) subset = false;
-        if (!subset || newer_in_guest(t)) open_pass(t);
-    } else {
-        open_pass(t);
-    }
-    if (!pass_open) return;
 
     const SurfaceInfo si = state.surface();
     const ScissorInfo sc = state.scissor();
     const AaFactors aa = aa_factors(si.antialias); // the scissor is in pixels, the pass in samples (D-250)
-    const u32 x0 = std::min<u32>(sc.x * aa.x, pass_width), y0 = std::min<u32>(sc.y * aa.y, pass_height);
-    const u32 x1 = std::min<u32>((u32{sc.x} + sc.width) * aa.x, pass_width);
-    const u32 y1 = std::min<u32>((u32{sc.y} + sc.height) * aa.y, pass_height);
-    if (x1 <= x0 || y1 <= y0) return;
-    const bool full = x0 == 0 && y0 == 0 && x1 == pass_width && y1 == pass_height;
+    // The region: the scissor within an area.
+    const auto region = [&](u32 w, u32 h, u32& rx0, u32& ry0, u32& rx1, u32& ry1) {
+        rx0 = std::min<u32>(sc.x * aa.x, w), ry0 = std::min<u32>(sc.y * aa.y, h);
+        rx1 = std::min<u32>((u32{sc.x} + sc.width) * aa.x, w), ry1 = std::min<u32>((u32{sc.y} + sc.height) * aa.y, h);
+    };
 
     // The clear writes its 32-bit value into each pixel as it is. A8B8G8R8 targets keep r g b a in their RGBA8Unorm
     // copy, so the value's red byte is their blue: red and blue trade places, in the value and in the channel mask
@@ -810,20 +1210,98 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     const u32 channels =
         abgr ? (register_channels & 0xau) | ((register_channels & 1u) << 2) | ((register_channels >> 2) & 1u)
              : register_channels;
+    // The clear's own targets only: in a pass with more colour targets than the clear's (its first ones, below), the
+    // others keep what they hold, and a depth buffer the clear has none of is not cleared (RPCS3 VKGSRender.cpp
+    // clear_surface clears the targets the surface registers name).
+    const bool clear_depth = (mask & clear::kDepth) && t.depth;
+    const bool clear_stencil = (mask & clear::kStencil) && t.depth && z24;
+
+    // Keep the open pass if it already has these surfaces (clearing mid-pass), else switch.
+    bool here = false;
+    if (pass_open) {
+        bool subset = true;
+        for (u32 i = 0; i < t.color_count; i++) {
+            subset &= i < pass.color_count && pass.color[i] == t.color[i];
+        }
+        if (t.depth && t.depth != pass.depth) subset = false;
+        here = subset && !newer_in_guest(t);
+    }
+    if (!here && merging() && !newer_in_guest(t) && (t.color_count || t.depth)) {
+        // D-945: a clear of targets the pass drawing does not have waits, and the pass goes on (the clear runs before
+        // anything reads its surfaces); so does a clear of whole surfaces, which the next pass that has them all does
+        // as its load actions, without a pass of its own that stores them for that pass to load.
+        ClearOp op;
+        op.targets = t;
+        if (t.depth && !clear_depth && !clear_stencil) op.targets.depth = nullptr; // attached, not cleared
+        bool partial = false;
+        target_area(t, op.width, op.height, partial);
+        region(op.width, op.height, op.x0, op.y0, op.x1, op.y1);
+        if (op.x1 <= op.x0 || op.y1 <= op.y0 || (!op.targets.color_count && !op.targets.depth)) return; // nothing to do
+        const bool full = op.x0 == 0 && op.y0 == 0 && op.x1 == op.width && op.y1 == op.height;
+        op.whole = full && !partial && (!op.targets.color_count || channels == 0xf) &&
+                   (!op.targets.depth || (clear_depth && (clear_stencil || !z24)));
+        bool shared = false;
+        for (u32 i = 0; i < op.targets.color_count; i++) shared |= pass_open && pass.contains(op.targets.color[i]);
+        shared |= pass_open && op.targets.depth && pass.contains(op.targets.depth);
+        const bool goes_on = pass_open && pass_started && !shared;
+        if (goes_on || op.whole) {
+            op.colors.fill(color);
+            op.channels = channels;
+            op.depth = depth;
+            op.stencil = stencil;
+            op.clear_depth = clear_depth;
+            op.clear_stencil = clear_stencil;
+            for (u32 i = 0; i < op.targets.color_count; i++) op.color_loaded[i] = op.targets.color[i]->initialized;
+            op.depth_loaded = op.targets.depth && op.targets.depth->initialized;
+            if (!goes_on && pass_open) end_pass_for(kEndTargets); // what that pass cleared waits too, before this
+            // Its surfaces' state as start_encoder and the clear set it.
+            for (u32 i = 0; i < op.targets.color_count; i++) {
+                Surface* s = op.targets.color[i];
+                s->initialized = s->gpu_newer = true;
+                s->last_used = tick;
+                s->last_frame = stats.flips;
+                if (channels) s->generation++;
+                surface_written(*s); // D-122
+            }
+            if (Surface* d = op.targets.depth) {
+                d->initialized = d->gpu_newer = true;
+                d->last_used = tick;
+                d->last_frame = stats.flips;
+                if (clear_depth) d->generation++;
+                if (clear_stencil) d->stencil_generation++;
+            }
+            if (op.whole) stats.load_action_clears++;
+            if (goes_on) clears_waiting_on_pass++;
+            if (tracing) {
+                trace_targets_of(t);
+                PS_LOG_INFO("rsx.trace", "#{} clear {:#x} ->{}: colour {:#010x}, depth/stencil {:#010x}, region {},{} to {},{} "
+                    "(waits{})", ++trace_count, mask, describe_targets(t), register_argb, zs, op.x0, op.y0, op.x1, op.y1,
+                    goes_on ? "; the pass drawing goes on" : "");
+            }
+            push_pending_clear(std::move(op));
+            return;
+        }
+    }
+    if (!here) open_pass(t);
+    if (!pass_open) return;
+
+    u32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    region(pass_width, pass_height, x0, y0, x1, y1);
+    if (x1 <= x0 || y1 <= y0) return;
+    const bool full = x0 == 0 && y0 == 0 && x1 == pass_width && y1 == pass_height;
     if (tracing) {
         trace_targets_of(t);
         PS_LOG_INFO("rsx.trace", "#{} clear {:#x} ->{}: colour {:#010x}, depth/stencil {:#010x}, region {},{} to {},{}",
             ++trace_count, mask, describe_targets(t), register_argb, zs, x0, y0, x1, y1);
     }
-    const bool clear_depth = (mask & clear::kDepth) && pass.depth;
-    const bool clear_stencil = (mask & clear::kStencil) && pass.depth && z24;
 
-    if (!pass_started && full && !pass_partial) {
+    if (!pass_started && full && !pass_partial && pass_quads.empty()) {
         // At the start of a pass a full clear is free on a tile-based GPU: make it the load action. Not in a pass that
-        // draws in part of a larger target: the load action clears all of it (D-120).
+        // draws in part of a larger target: the load action clears all of it (D-120). Not after clears this pass does
+        // as its first draws (D-945): its load action would run before them.
         bool done_color = channels == 0xf || channels == 0;
         if (channels == 0xf) {
-            for (u32 i = 0; i < pass.color_count; i++) {
+            for (u32 i = 0; i < t.color_count; i++) {
                 pass_desc.colorAttachments[i].loadAction = MTLLoadActionClear;
                 pass_desc.colorAttachments[i].clearColor = color;
                 pass.color[i]->initialized = true;
@@ -837,7 +1315,7 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
                 pass_desc.stencilAttachment.loadAction = MTLLoadActionClear;
                 pass_desc.stencilAttachment.clearStencil = stencil;
             }
-            pass.depth->initialized = true;
+            t.depth->initialized = true;
             done_depth = true;
         }
         if (done_color && done_depth) {
@@ -849,37 +1327,12 @@ void MetalBackend::Impl::do_clear(u32 mask, const RsxState& state)
     // A partial clear: draw a quad with the clear values through the scissor.
     id<MTLRenderCommandEncoder> enc = start_encoder();
     if (channels) {
-        for (u32 i = 0; i < pass.color_count; i++) pass.color[i]->generation++;
+        for (u32 i = 0; i < t.color_count; i++) pass.color[i]->generation++;
     }
-    if (clear_depth && pass.depth) pass.depth->generation++;
-    if (clear_stencil && pass.depth) pass.depth->stencil_generation++;
-    const u32 color_mask = channels ? channels : 0;
-    id<MTLRenderPipelineState> pso = clear_pipeline_for(pass.color_count ? color_mask : 0, clear_depth, clear_stencil);
-    if (!pso) return;
-    MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
-    dd.depthCompareFunction = MTLCompareFunctionAlways;
-    dd.depthWriteEnabled = clear_depth;
-    if (clear_stencil) {
-        MTLStencilDescriptor* st = [MTLStencilDescriptor new];
-        st.stencilCompareFunction = MTLCompareFunctionAlways;
-        st.depthStencilPassOperation = MTLStencilOperationReplace;
-        st.writeMask = 0xff;
-        dd.frontFaceStencil = st;
-        dd.backFaceStencil = st;
-    }
-    [enc setRenderPipelineState:pso];
-    [enc setDepthStencilState:[device newDepthStencilStateWithDescriptor:dd]];
-    [enc setStencilReferenceValue:stencil];
-    [enc setViewport:MTLViewport{0, 0, static_cast<double>(pass_width), static_cast<double>(pass_height), 0, 1}];
-    [enc setScissorRect:MTLScissorRect{x0, y0, x1 - x0, y1 - y0}];
-    [enc setCullMode:MTLCullModeNone];
-    [enc setTriangleFillMode:MTLTriangleFillModeFill];
-    const float z = static_cast<float>(depth);
-    [enc setVertexBytes:&z length:sizeof(z) atIndex:0];
-    const float c[4] = {static_cast<float>(color.red), static_cast<float>(color.green), static_cast<float>(color.blue),
-        static_cast<float>(color.alpha)};
-    [enc setFragmentBytes:c length:sizeof(c) atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (clear_depth) t.depth->generation++;
+    if (clear_stencil) t.depth->stencil_generation++;
+    encode_clear_quad(enc, pass, (1u << t.color_count) - 1, pass_width, pass_height, x0, y0, x1, y1, color, channels,
+        depth, stencil, clear_depth, clear_stencil);
 }
 
 // ---- draws ------------------------------------------------------------------------------------------------------
@@ -1506,6 +1959,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 
     // ---- encode ----
     open_pass(targets);
+    if (pass_started && clears_waiting_on_pass) { // the pass draws on past clears of other targets (D-945)
+        stats.clears_waited += clears_waiting_on_pass;
+        clears_waiting_on_pass = 0;
+    }
     id<MTLRenderPipelineState> pso = interpret ? nil : pipeline_for(*vp, *fp, state);
     skip_reason = compile_pending ? "pipeline state compiling" : "pipeline state";
     if (!interpret && !pso) {
@@ -1730,12 +2187,19 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
 {
     tick++;
     end_pass_for(kEndFlip);
+    finish_closing(false); // the frame's stores are counted in it (D-945)
+    const usize half = ab_on() ? 1 : 0; // the PSPOCKET_GPU_AB half of the frame that ends here
     if (ab_period) {
         // The RSX thread's CPU time of the frame that ends here, to the half its draws were in (D-278): with GPU time
         // alone a change on the CPU side could not be told within one run.
         const u64 now = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
-        if (ab_cpu_last) ab_cpu_ns[ab_on() ? 1 : 0] += now - ab_cpu_last;
+        if (ab_cpu_last) ab_cpu_ns[half] += now - ab_cpu_last;
         ab_cpu_last = now;
+        // Its render passes and what they loaded and stored (D-945).
+        ab_passes[half] += stats.render_passes - ab_last[0];
+        ab_load_bytes[half] += stats.attachment_load_bytes - ab_last[1];
+        ab_store_bytes[half] += stats.attachment_store_bytes - ab_last[2];
+        ab_last = {stats.render_passes, stats.attachment_load_bytes, stats.attachment_store_bytes};
     }
     stats.flips++;
     if (pass_times) {
@@ -1743,17 +2207,20 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         if (stats.flips % 300 == 0) log_pass_times();
     }
     if (ab_period) {
-        ab_frames[ab_on() ? 1 : 0]++; // the frame that ends here (D-272)
+        ab_frames[half]++; // the frame that ends here (D-272)
         if (stats.flips % (ab_period * 20) == 0) {
             const double off = static_cast<double>((*ab_ns)[0].exchange(0)), on = static_cast<double>((*ab_ns)[1].exchange(0));
+            const auto per = [&](u64 v, usize h) { return ab_frames[h] ? static_cast<double>(v) / static_cast<double>(ab_frames[h]) : 0.0; };
             PS_LOG_INFO(kChan, "GPU A/B (PSPOCKET_GPU_AB): change off {:.3f} ms a frame ({} frames), on {:.3f} ms ({} frames); "
-                "RSX thread CPU off {:.3f} ms a frame, on {:.3f} ms",
-                ab_frames[0] ? off / 1e6 / static_cast<double>(ab_frames[0]) : 0.0, ab_frames[0],
-                ab_frames[1] ? on / 1e6 / static_cast<double>(ab_frames[1]) : 0.0, ab_frames[1],
-                ab_frames[0] ? static_cast<double>(ab_cpu_ns[0]) / 1e6 / static_cast<double>(ab_frames[0]) : 0.0,
-                ab_frames[1] ? static_cast<double>(ab_cpu_ns[1]) / 1e6 / static_cast<double>(ab_frames[1]) : 0.0);
+                "RSX thread CPU off {:.3f} ms a frame, on {:.3f} ms; render passes off {:.1f}, on {:.1f}; attachments "
+                "loaded off {:.1f} MB, on {:.1f} MB, stored off {:.1f} MB, on {:.1f} MB",
+                per(static_cast<u64>(off), 0) / 1e6, ab_frames[0], per(static_cast<u64>(on), 1) / 1e6, ab_frames[1],
+                per(ab_cpu_ns[0], 0) / 1e6, per(ab_cpu_ns[1], 1) / 1e6, per(ab_passes[0], 0), per(ab_passes[1], 1),
+                per(ab_load_bytes[0], 0) / 1048576.0, per(ab_load_bytes[1], 1) / 1048576.0,
+                per(ab_store_bytes[0], 0) / 1048576.0, per(ab_store_bytes[1], 1) / 1048576.0);
             ab_frames = {};
             ab_cpu_ns = {};
+            ab_passes = ab_load_bytes = ab_store_bytes = {};
         }
     }
     compile_wait_left_ns = static_cast<s64>(config.compile_wait_ms * 1e6); // each frame's budget (D-158)
@@ -1853,7 +2320,9 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     // The frame's last buffer gives its place back when the GPU has run it (completion handlers run on error too).
     dispatch_semaphore_t slots = frames_in_flight;
     [cb addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(slots); }];
+    submit_half = static_cast<s32>(half); // its GPU time to the half of the frame it holds, not the next one's
     submit(false);
+    submit_half = -1;
     // At most frames_in_flight frames queued (D-148): wait for the oldest before the RSX goes on to the next.
     const auto t0 = std::chrono::steady_clock::now();
     dispatch_semaphore_wait(frames_in_flight, DISPATCH_TIME_FOREVER);
@@ -1972,6 +2441,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.depth_bounds_draws = per_frame(m.stats.depth_bounds_draws, m.report_depth_bounds);
         w.attachment_load_mb = per_frame(m.stats.attachment_load_bytes, m.report_load_bytes) / 1048576.0;
         w.attachment_store_mb = per_frame(m.stats.attachment_store_bytes, m.report_store_bytes) / 1048576.0;
+        w.attachment_store_skipped_mb = per_frame(m.stats.attachment_store_skipped_bytes, m.report_store_skipped) / 1048576.0;
+        w.clears_folded = per_frame(m.stats.clears_folded, m.report_clears_folded);
+        w.clears_waited = per_frame(m.stats.clears_waited, m.report_clears_waited);
         w.corner_textures = per_frame(m.stats.corner_textures, m.report_corners);
         w.surface_reloads = per_frame(m.stats.surface_reloads, m.report_reloads);
         w.gpu_wait_ms = per_frame(m.stats.gpu_wait_ns, m.report_gpu_wait_ns) / 1e6;
@@ -1988,8 +2460,9 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.gpu_allocated_mb = static_cast<double>(m.device.currentAllocatedSize) / 1048576.0;
         w.deferred_queue = m.deferred.size();
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}; "
-                           "attachments {:.1f} MB loaded, {:.1f} MB stored; {:.1f} passes only clearing, {:.1f} MB "
-                           "stored by them); "
+                           "attachments {:.1f} MB loaded, {:.1f} MB stored, {:.1f} MB not (the next pass clears them); "
+                           "{:.1f} passes only clearing, {:.1f} MB stored by them; {:.1f} clears a later pass's load "
+                           "action, {:.1f} letting the pass drawing go on, {:.1f} in passes of their own); "
                            "{:.2f} readbacks ({:.2f} deferred, {:.2f} accesses waited for one), {:.2f} ms waiting for them; "
                            "{:.2f} targets laid over memory on the GPU; "
                            "{:.0f} texture checks ({:.2f} MB hashed, {:.1f} write faults); {:.1f} textures decoded "
@@ -1999,8 +2472,10 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                            "{:.2f} feedback copies ({:.1f} draws with depth bounds), {:.2f} corner textures, {:.2f} "
                            "surface reloads; {:.2f} ms waiting for the GPU; GPU memory {:.0f} MB, {} deferred",
             w.flips, w.gpu_ms, w.draws, w.render_passes, ends, w.attachment_load_mb, w.attachment_store_mb,
-            per_frame(m.stats.clear_only_passes, m.report_clear_only),
-            per_frame(m.stats.clear_only_store_bytes, m.report_clear_only_bytes) / 1048576.0, w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
+            w.attachment_store_skipped_mb, per_frame(m.stats.clear_only_passes, m.report_clear_only),
+            per_frame(m.stats.clear_only_store_bytes, m.report_clear_only_bytes) / 1048576.0, w.clears_folded,
+            w.clears_waited, per_frame(m.stats.clear_passes, m.report_clear_passes),
+            w.readbacks, w.deferred_readbacks, w.deferred_conflicts,
             w.readback_wait_ms, w.texture_overlays, w.texture_checks, w.texture_mb_hashed, w.write_faults,
             per_frame(m.stats.textures_decoded, m.report_decoded), per_frame(m.stats.textures_decoded_overlay,
                 m.report_decoded_overlay), per_frame(m.stats.textures_decoded_written, m.report_decoded_written),
@@ -2031,6 +2506,10 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_store_bytes = m.stats.attachment_store_bytes;
         m.report_clear_only = m.stats.clear_only_passes;
         m.report_clear_only_bytes = m.stats.clear_only_store_bytes;
+        m.report_store_skipped = m.stats.attachment_store_skipped_bytes;
+        m.report_clears_folded = m.stats.clears_folded;
+        m.report_clears_waited = m.stats.clears_waited;
+        m.report_clear_passes = m.stats.clear_passes;
         m.report_corners = m.stats.corner_textures;
         m.report_reloads = m.stats.surface_reloads;
         m.report_gpu_wait_ns = m.stats.gpu_wait_ns;

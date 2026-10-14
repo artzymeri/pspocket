@@ -798,13 +798,17 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
         for (usize k = 0; k < w.pass_ends.size(); k++)
             ends += std::format("{}{}: {:.2f}", k ? ", " : "", json_string(rsx::metal::kPassEndNames[k]), w.pass_ends[k]);
         j += std::format("{}\n    {{\"last_flip\": {}, \"gpu_ms\": {:.2f}, \"draws\": {:.0f}, \"render_passes\": {:.1f}, "
-                         "\"pass_ends\": {{{}}}, \"readbacks\": {:.2f}, \"readback_wait_ms\": {:.2f}, "
+                         "\"pass_ends\": {{{}}}, \"attachment_load_mb\": {:.1f}, \"attachment_store_mb\": {:.1f}, "
+                         "\"attachment_store_skipped_mb\": {:.1f}, \"clears_folded\": {:.2f}, \"clears_waited\": {:.2f}, "
+                         "\"readbacks\": {:.2f}, \"readback_wait_ms\": {:.2f}, "
                          "\"texture_checks\": {:.0f}, \"write_faults\": {:.1f}, \"feedback_copies\": {:.2f}, "
                          "\"corner_textures\": {:.2f}, \"surface_reloads\": {:.2f}, \"gpu_wait_ms\": {:.2f}, "
                          "\"programs_made\": {}, \"pipelines_made\": {}, \"compile_ms\": {:.1f}, "
                          "\"draws_compiling\": {:.2f}, \"textures\": {}, "
                          "\"surfaces\": {}, \"gpu_allocated_mb\": {:.0f}, \"deferred_queue\": {}}}",
-            i ? "," : "", w.last_flip, w.gpu_ms, w.draws, w.render_passes, ends, w.readbacks, w.readback_wait_ms,
+            i ? "," : "", w.last_flip, w.gpu_ms, w.draws, w.render_passes, ends, w.attachment_load_mb,
+            w.attachment_store_mb, w.attachment_store_skipped_mb, w.clears_folded, w.clears_waited, w.readbacks,
+            w.readback_wait_ms,
             w.texture_checks, w.write_faults, w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms,
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.surfaces, w.gpu_allocated_mb,
             w.deferred_queue);
