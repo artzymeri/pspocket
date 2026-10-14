@@ -2275,6 +2275,14 @@ TEST_CASE("cellAdec: the cores on FFmpeg against Sony's cores (D-944)", "[.][hle
                 BigFixture f;
                 GuestThread t(f, 0, "ppu");
                 FirmwareCores cores(f, t, *flash);
+                // Sony's core module linked for cellAdec, not pspocket's (the compared cores serve games, D-944).
+                static constexpr std::pair<u32, std::pair<const char*, u32>> kSonyCores[] = {
+                    {kTypeMp3, {"cellMP3dec", 0x84276A23}}, {kTypeMpegL1, {"cellMPL1dec", 0xBBC70551}},
+                    {kTypeMpegL2, {"cellM2BCdec", 0x300AFE4D}}, {kTypeM4Aac, {"cellM4AacDec", 0xAB61278D}},
+                    {kTypeM4Aac2ch, {"cellM4AacDec2ch", 0xE996C664}}, {kTypeM4Aac2chMod, {"cellM4AacDec2chmod", 0xDBD26836}},
+                    {kTypeAc3, {"cell_libac3dec", 0xC58BB170}}, {kTypeAtrac3, {"cellAtrac3dec", 0x60487D65}}};
+                for (const auto& [type, core] : kSonyCores)
+                    if (type == c.type) REQUIRE(f.hle->imported(core.first, core.second) != 0);
                 theirs = run_core(f.base(), hle_calls(f, t), c.type, c.param, c.feed);
             }
             std::vector<std::string> differ;
