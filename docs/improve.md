@@ -469,6 +469,13 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
 
 ## The gate (D-149)
 
+- **Seen (2026-10-14 20:40, the Mac at a load of 30 to 140 with four agents' builds):** test_rsx_metal's "with background
+  compiles, a draw whose programs or pipeline are compiling is drawn by the shader interpreter (D-940)" failed once:
+  the first draw, expected left out (its programs compiling), came out 0x6d6d0000 with draws_compiling 0. It passed 5
+  of 5 alone and in the next gate. Also once: cellRudp's comparison (a keep-alive "after the silence", 2 of 2,647
+  observations) under the same load, then 3 of 3 alone. **Try:** make both independent of the machine's speed (the
+  first: hold the background compile until the draw is in; the second: a clock the test drives).
+
 - **Seen (run 327):** D-951's black camera shots passed the frame jumps (they compare each frame with the one before:
   a fault over a whole shot jumps only at its cuts, as good shots do). **Done (D-951):** the walk counts dark frames
   (a third of the 64x36 thumbnail black), gate.json's dark_frames_max.
