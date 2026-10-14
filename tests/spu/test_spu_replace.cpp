@@ -159,6 +159,48 @@ TEST_CASE("SPU replace: the lifter calls a listed function through the program's
     CHECK(listed.find(std::format("ctx->pc = 0x{:05X}u;", f_addr)) != std::string::npos);
 }
 
+TEST_CASE("SPU replace: the lifter leaves at a loop boundary entered forward, loops locally on its back edge", "[spu]")
+{
+    // $3 = 0; $4 = 10; head: $3 += 1; $4 -= 1; brnz $4, head; exit: return.
+    as::Assembler a(0x6000);
+    a.emit(as::il(3, 0));
+    a.emit(as::il(4, 10));
+    const auto head = a.here();
+    a.emit(as::ai(3, 3, 1));
+    a.emit(as::ai(4, 4, -1));
+    a.brnz(4, head);
+    const auto exit = a.here();
+    a.emit(as::bi(0));
+    const std::vector<u8> code = a.finish();
+    auto image = pspocket::recomp::spu::load_raw_image(code, 0x6000, {0x6000});
+    REQUIRE(image);
+    const u32 h = a.address(head), x = a.address(exit);
+    const auto program = pspocket::recomp::spu::analyze(*image, AnalyzerOptions{});
+    LiftOptions options;
+    options.name = "replace_loop_test";
+    options.comments = false;
+    const auto unit = [&] {
+        const auto lifted = pspocket::recomp::spu::lift(*image, program, options);
+        for (const auto& file : lifted.files)
+            if (file.name == "replace_loop_test_0.c") return file.content;
+        return std::string();
+    };
+    const std::string leave_head = std::format("ctx->pc = 0x{:05X}u;", h), leave_exit = std::format("ctx->pc = 0x{:05X}u;", x);
+    const std::string plain = unit();
+    CHECK(plain.find(std::format("goto L_{:05X};", h)) != std::string::npos);
+    options.boundaries = {h, x};
+    const std::string bounded = unit();
+    CHECK(bounded.find(std::format("goto L_{:05X};", h)) != std::string::npos); // the back edge: local
+    CHECK(bounded.find(leave_exit) != std::string::npos);                        // falls into the exit: leaves
+    // Falling into the head from the entry leaves there (plain code only writes the head's pc in its attention poll).
+    const auto count = [](const std::string& text, const std::string& what) {
+        usize n = 0;
+        for (usize at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) n++;
+        return n;
+    };
+    CHECK(count(bounded, leave_head) == count(plain, leave_head) + 1);
+}
+
 namespace {
 
 Liveness liveness_of(as::Assembler& a, const LivenessOptions& options = {})

@@ -39,6 +39,8 @@ namespace pspocket::spu::replace {
 // The lifter's question: is the function at `addr` of the program with key `hash` lifted at `code_start` listed for
 // replacement? Calls into it are then lifted as calls through the program's table.
 bool listed(uint64_t hash, uint32_t code_start, uint32_t addr);
+// Every address listed for that program (functions and loop heads and exits): the lifter's boundaries.
+std::vector<uint32_t> listed_addresses(uint64_t hash, uint32_t code_start);
 
 // A native implementation. Entered as the lifted function would be at its entry (ctx->pc the entry plus ctx->reloc,
 // ctx->program the program, the SPU FP environment), it leaves what the lifted function leaves in every local-store

@@ -15389,6 +15389,15 @@ GTA V's EDGE program lifted again: its code differs from before at those three c
 game's SPU programs are lifted again (scripts/lift-spu.sh, or the phone's translation). Test: a synthetic program's
 direct call becomes a way out to the listed function once its build is known.
 
+Extended the same day (agreed with the main session): most of the remaining time is in single loops inside large
+functions (0x07A38: one loop 78% of its instructions, three 95%), so a loop's head and exit can be listed too. The
+listed addresses are the lift's boundaries (LiftOptions::boundaries, filled from the table): a call into one, a forward
+jump or a fall-through into one leaves for the run loop; a back edge to one stays a local jump, so a loop whose native
+code declines or is switched off runs as before once entered. The predicate is one call at each place a call target,
+a local jump or a fall-through is emitted. All 150 of GTA V's SPU programs lifted again with it: the generated code of
+the 149 not in the table is byte for byte what it was. Test: a synthetic loop with its head and exit as boundaries
+leaves where it falls into either and keeps its back edge local.
+
 ## D-967 · 2026-10-14 · spu-live: what a program may still read after a function returns, and the proof for EDGE
 
 D-965's contract leaves the volatile registers a replaced function's callers never read again unspecified; which those

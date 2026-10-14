@@ -362,6 +362,17 @@ bool listed(uint64_t hash, uint32_t code_start, uint32_t addr)
     }) != nullptr;
 }
 
+std::vector<uint32_t> listed_addresses(uint64_t hash, uint32_t code_start)
+{
+    std::vector<uint32_t> out;
+    each_build([&](const Build& b) {
+        if (b.hash == hash && b.code_start == code_start)
+            for (const Function& f : b.functions) out.push_back(f.addr);
+        return false;
+    });
+    return out;
+}
+
 void add_build(const char* name, uint64_t hash, uint32_t code_start, uint32_t code_size, std::vector<KnownFunction> functions)
 {
     auto a = std::make_unique<AddedBuild>();

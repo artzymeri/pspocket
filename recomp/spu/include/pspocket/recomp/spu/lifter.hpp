@@ -16,6 +16,7 @@
 //   N_0.c ...    the lifted functions (options.tu_count units)
 //   N_reg.c      the program descriptor (key, code range, entries) and N_register()
 
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,6 +35,10 @@ struct LiftOptions {
     // Position independent (D-081): runs ctx->reloc bytes past the image's base. Every address the code derives from
     // its own (pcs, links, relative branch and load targets) adds it; absolute branches leave to the run loop.
     bool relocatable = false;
+    // Addresses lifted code reaches only through the program's table (D-966): a call into one, a forward jump or a
+    // fall-through into one leaves for the run loop (a back edge to one stays a local jump). lift() adds those
+    // pspocket::spu::replace lists for the program: native replacements of functions and of loops.
+    std::set<u32> boundaries;
 };
 
 struct OutputFile {
