@@ -15398,6 +15398,14 @@ a local jump or a fall-through is emitted. All 150 of GTA V's SPU programs lifte
 the 149 not in the table is byte for byte what it was. Test: a synthetic loop with its head and exit as boundaries
 leaves where it falls into either and keeps its back edge local.
 
+Fixed the same day: a boundary reached only by falling into it (0x0B778's decode loop: its head follows the code that
+sets it up, its exit follows the loop's last branch) starts no block, so it was no label and no entry of the program:
+the lifted code left there for the run loop, which had nothing to go on with. lift() now makes each boundary inside a
+function a label of it (an entry in the program's table, a case of the function's switch). A program without listed
+addresses is lifted from the analysis as before: all 150 of GTA V's SPU programs lifted again, the 149 not in the
+table byte for byte as they were. Test: the synthetic loop's exit, no label of its own, is a label and an entry once
+it is a boundary.
+
 ## D-967 · 2026-10-14 · spu-live: what a program may still read after a function returns, and the proof for EDGE
 
 D-965's contract leaves the volatile registers a replaced function's callers never read again unspecified; which those

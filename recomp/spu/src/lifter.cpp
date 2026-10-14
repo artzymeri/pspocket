@@ -1029,8 +1029,19 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
     for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
     std::map<u32, std::string> callable = symbols;
     std::erase_if(callable, [&](const auto& s) { return bounded.boundaries.contains(s.first); });
+    // A boundary inside a function is a label of it, an entry the run loop goes on at: a loop head or exit reached by
+    // fall-through starts no block of its own.
+    Program labelled;
+    const Program* lifted = &program;
+    if (!bounded.boundaries.empty()) {
+        labelled = program;
+        for (Function& f : labelled.functions)
+            for (const u32 a : bounded.boundaries)
+                if (std::binary_search(f.insns.begin(), f.insns.end(), a)) f.labels.insert(a);
+        lifted = &labelled;
+    }
     usize index = 0;
-    for (const Function& f : program.functions) {
+    for (const Function& f : lifted->functions) {
         units[index++ % tus] += lift_function(image, f, symbols[f.entry], callable, sums, bounded);
         result.stats.instructions += f.insns.size();
         result.stats.labels += f.labels.size();
@@ -1039,7 +1050,7 @@ LiftResult lift(const LsImage& image, const Program& program, const LiftOptions&
 
     // Program descriptor: every label is an entry (the function whose entry it is wins)
     std::map<u32, std::string> entries;
-    for (const Function& f : program.functions)
+    for (const Function& f : lifted->functions)
         for (u32 l : f.labels) {
             auto [it, inserted] = entries.emplace(l, symbols[f.entry]);
             if (!inserted && l == f.entry) it->second = symbols[f.entry];

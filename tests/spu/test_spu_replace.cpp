@@ -179,12 +179,13 @@ TEST_CASE("SPU replace: the lifter leaves at a loop boundary entered forward, lo
     LiftOptions options;
     options.name = "replace_loop_test";
     options.comments = false;
-    const auto unit = [&] {
+    const auto file = [&](const std::string& name) {
         const auto lifted = pspocket::recomp::spu::lift(*image, program, options);
-        for (const auto& file : lifted.files)
-            if (file.name == "replace_loop_test_0.c") return file.content;
+        for (const auto& f : lifted.files)
+            if (f.name == name) return f.content;
         return std::string();
     };
+    const auto unit = [&] { return file("replace_loop_test_0.c"); };
     const std::string leave_head = std::format("ctx->pc = 0x{:05X}u;", h), leave_exit = std::format("ctx->pc = 0x{:05X}u;", x);
     const std::string plain = unit();
     CHECK(plain.find(std::format("goto L_{:05X};", h)) != std::string::npos);
@@ -199,6 +200,15 @@ TEST_CASE("SPU replace: the lifter leaves at a loop boundary entered forward, lo
         return n;
     };
     CHECK(count(bounded, leave_head) == count(plain, leave_head) + 1);
+    // The exit, reached only by falling through, is no block start of its own: as a boundary it is a label and an
+    // entry of the program, where the run loop goes on.
+    const std::string entry_x = std::format("{{0x{:05X}u, ", x);
+    options.boundaries = {};
+    CHECK(plain.find(std::format("L_{:05X}:", x)) == std::string::npos);
+    CHECK(file("replace_loop_test_reg.c").find(entry_x) == std::string::npos);
+    options.boundaries = {h, x};
+    CHECK(bounded.find(std::format("L_{:05X}:", x)) != std::string::npos);
+    CHECK(file("replace_loop_test_reg.c").find(entry_x) != std::string::npos);
 }
 
 namespace {
