@@ -16008,3 +16008,126 @@ found none for pspocket-boot (a command-line tool), and the phone's own records 
 - scripts/trace_profile.py summarises a Time Profiler trace: each thread's share of the samples, and one thread's
   functions by their own samples and in all (what the RSX thread's measurements in D-953 and D-984 were read with).
   perftrace prints both for the RSX thread.
+
+
+## D-958 · 2026-10-15 · Branch weights on lifted SPU code's ways out
+
+lifted.h's PSL_UNLIKELY (__builtin_expect) on the runtime calls that stop (channels, stop, interrupts, events), the
+halts, the back edges' attention polls and an indirect call with no lifted target. GTA V's EDGE job (LLVM 22 -O2
+-mcpu=apple-m4, the phone's compiler): 160,279 to 154,734 host instructions (-3.5%), spills 38,789 to 35,576 (-8.3%).
+Not kept: the weight on the check after a call (ctx->pc != the return address) and the likely weight on the entry
+check. Measured in one session (D-962): every weight on, 5.2% more SPU time than none (GraphicsMain +24%); without
+those two, 4.8% less than with all: callees that leave for the run loop and functions entered at their fast entries
+(D-961) are common. A build may define PSL_UNLIKELY as (x) to compare.
+
+## D-959 · 2026-10-15 · The MFC's parameter channels written inline; channels that never block start no block
+
+Each of a DMA's parameter writes (MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID) and SPU_WrSRR0 was a call of
+ps_spu_wrch, a way out and a block start (a label, so a case of the function's dispatch switch), though ps_spu_wrch
+only stores a field for them. lower() now stores the field itself (Size capped at 0xFFFF, TagID masked, as
+channels.cpp does). rchcnt, MFC_WrTagMask and MFC_WrTagUpdate never block: their call stays (they can raise an SPU
+exception, which ends the thread) but they start no block (analyzer.hpp: inline_channel_write, restarts_in_place).
+
+- scripts/lift-spu.sh carried every entry of a program's previous lift over as seeds, which would bring the old block
+  starts back as labels reached through registers. It now keeps OUT/NAME/NAME.seeds, the seeds it used, as
+  runtime/prepare does (improve.md's open item). For an existing lift the seeds were derived once: the entries the
+  lifter makes with only the images' own seeds subtracted from the old entries, plus the old functions' entries (the
+  old lifter then makes the same labels; only some code-word bitmaps differ, toward D-205).
+- With D-958 over all 150 programs (LLVM 22): 8,024,636 to 7,380,180 host instructions (-8.0%), spills 2,145,002 to
+  1,674,897 (-21.9%), runtime calls 26,872 to 17,978; program entries 39,069 to 30,681.
+- Measured in one session (D-962): the final lift against it without D-959, 3.6% less SPU time (GraphicsMain -8.9%).
+
+## D-960 · 2026-10-15 · A function called at its entry loads only what it reads before writing
+
+60% of the entry loads (52,227 of 86,743 in GTA V) were never read before written: the live analysis counts each
+store of dirty registers as a read, so a register written on one path only was loaded at the entry for the paths
+that skip the write. Now (RegFlow::lazy_loads) the entry loads the registers read before written (real liveness), and
+a register is loaded on the edge where a path whose local does not hold it joins one whose local does, when the join
+needs it: a forward must-analysis of the locals that hold ctx's value, started with everything valid so the loads
+settle on the edges into loops; every read and every store of dirty registers is then checked against it, and a
+failure would load at the entry (none in GTA V's 150 programs; clang's uninitialised-use errors over all of them
+agree).
+
+- Entry loads 86,684 to 34,514 (static); loads on edges 227,339 to 329,993. Host instructions: +0.7% with every
+  function one C function (the run loop's resume points merge every register at every label), +0.2% with D-961.
+- Measured in one session (D-962): the final lift against it without D-960, 1.8% less SPU time.
+
+## D-961 · 2026-10-15 · Each SPU function a fast C function and a cold twin for the run loop's resumes
+
+Every label of a function was a case of its dispatch switch, so the run loop could resume it anywhere: 83% of the
+backward branches had a label inside their loop, and the C compiler saw irreducible cycles (no loop optimizations:
+GTA V's EDGE job hoisted 2,347 instructions out of its loops).
+
+- **The fast function** is entered at its entry, and at the few labels the run loop resumes it at that add no second
+  way into any cycle of its flow (fast_entries: strongly connected components; candidates are returns of calls that
+  may leave for the run loop, the labels after stops and indirect calls, labels reached through registers, the
+  native replacements' boundaries; a candidate that would add one is replaced by the header of the outermost loop
+  around it, if that adds none). A call that always leaves has no way on to its return, which often breaks the loop
+  around it. Such entries load only their live registers.
+- **The twin** (N_resume_*.c, `__attribute__((cold))`, built at -O1 by CMake and by prepare: half the compile time)
+  holds the function as before, entered at every other label (PSL_RELOAD and a switch), and leaves for the run loop
+  at a backward branch to a fast entry, so it runs at most the rest of one round of such a loop. The entry table
+  sends those labels to it. spu-lift --whole keeps the old shape.
+- First tries: every loop header an entry made the outer loops irreducible again (EDGE: 2,507 hoists; 146,465 fast
+  instructions); outermost headers only, 2,783 hoists; the entry alone, 3,588 hoists and 128,413 instructions but the
+  twin then ran whole loops: GTA V's EDGE job's main function is resumed 9 times per entry (after the job kernel's
+  calls), 21% of the run loop's entries went to twins, and GraphicsMain took twice the time. The chosen entries:
+  2,843 hoists.
+- Static over all 150 programs (LLVM 22; with D-958, D-959, D-960, D-963 and D-964 in both): 5,477,958 host
+  instructions with one C function each, 4,770,792 in the fast functions (-12.9%), spills 1,311,508 to 1,109,264
+  (-15.4%); the twins 4,482,941 at -O1. Translation: GTA V's SPU programs compile in 453 CPU seconds (fast at -O2,
+  twins at -O1) against 1,084 for the lift before this work, measured under similar load (LLVM 22, three threads).
+- Measured in one session (D-962): the final lift against it without D-961, 6.5% less SPU time (GraphicsMain -19%).
+
+## D-962 · 2026-10-15 · Two translations of the SPU programs in one session; poll exits that store only live registers (not kept)
+
+The steady-30 plan's SPU translation track (improve.md, item 2) needed before/after numbers for changes worth a few
+percent each, on a Mac whose load average swung from 8 to 100 with three agents building: two walks of one build
+differed by more than that.
+
+- **The harness.** scripts/spu-ab-lift.sh copies a lift with its symbols renamed (spb_); -DPSPOCKET_GAME_SPU_B=DIR builds
+  it into pspocket-boot beside the default lift (-DPSPOCKET_GAME_SPU), each program registering as the B twin of the
+  default program with its key (ps_spu_register_program_b, registry.hpp). With PSPOCKET_SPU_AB=S the SPURS workers run
+  the twins in every other S seconds (spu::set_translation_b, applied when a program is attached, D-950's halves), and
+  each SPURS time line gives the workloads' total and the part run in half B (A = total - B). spu-lift
+  --no-replace-boundaries lifts the functions listed for native replacement as any other, so both halves run with
+  PSPOCKET_SPU_NATIVE=0 on equal terms. With 10-second halves the scenes decided (the same two builds, three walks:
+  1.20, 0.77, 1.25); with 1-second halves both halves see the same frames, and two walks (34 windows) agree to a few
+  percent.
+- **All of D-958 to D-964 against the lift before them** (the main checkout's, both with PSPOCKET_SPU_NATIVE=0, three
+  walks, 51 windows): the main SPURS instance's SPU time 5.4% less (each walk 5.8%, 6.0%, 4.3%): EDGE/GFX -3.9%,
+  dependency_spu -9.3%, GraphicsMain -1.4%, Physics -13.3%; the sound mixer (Secondary) -12.1%. Each part's share is in
+  its entry, against the final lift without it. Apple clang builds the Mac's translation; D-964 is the phone's only.
+- **Poll exits storing only the live registers (S5), not kept.** At a loop's attention poll only the dirty registers
+  live at the header need storing (the others are written again before anything reads them, here or in a caller).
+  Statically on GTA V's EDGE job (LLVM 22, entry-only fast functions): 128,413 host instructions with it, 126,862
+  without (+1.2%), spills +1.1%: each poll got an exit block of its own. Dropped.
+- **Tail calls, not needed.** A jump to another function of the same program never leaves through the run loop in
+  GTA V's 150 programs (0 sites): the analyzer traces a branch's target as part of the jumping function.
+
+## D-963 · 2026-10-15 · Small lowerings: shufb on one register, insertion masks from a table, conversions in NEON, the code's own address
+
+- shufb with ra == rb (20,595 of GTA V's 59,299 sites): one TBL over the one register (vqtbl1q with the index masked
+  to 0-15), the special controls by TBX as before; the two-register table needs its registers consecutive (moves).
+- cbd/chd/cwd/cdd and the x forms (22,233 sites): psl_cmask_t, a load from a 64-entry table by size and the address's
+  low bits.
+- csflt/cuflt in the approximate model with a scale of 2^-n (n = 155 - i8, 0 to 32; 1,671 sites): SCVTF/UCVTF with n
+  fraction bits, which round x / 2^n once toward zero as FPCR says: what the double-precision path's one rounding of
+  the exact quotient gave; no result is denormal.
+- brsl $rt, .+4 (600 sites: position independent code taking its own address) was a call, and the analyzer started a
+  function at the next instruction holding the rest of the caller again. Now a plain write of rt (analyzer: get_pc).
+  GTA V's EDGE job: 18,082 lifted instructions to 12,206, 88 functions to 65.
+- Static (LLVM 22, all 150 programs, one C function each, with D-958 to D-960): the code-address change 7,428,266 to
+  5,908,699 host instructions (-20.5%), spills -22.0%; the other three 5,908,699 to 5,601,900 (-5.2%), vector moves
+  193,244 to 174,220. Measured in one session (D-962): the code-address change 5.4% less SPU time, the other three 3.0%.
+- The fuzz generator draws shufb with ra == rb in 40% of its cases and brsl .+4 in a quarter; the synthetic program
+  takes its own address.
+
+## D-964 · 2026-10-15 · A quadword's byte reversal in one table lookup, for the phone's compiler
+
+Every LS access reverses 16 bytes (D-004): rev64 and ext. psl_rev now does one TBL whose index goes through an empty
+asm, so the compiler cannot turn it back into the two; Apple clang built one of GTA V's programs wrong with a table
+lookup (D-253), so the Mac's own builds keep the shuffle (`!defined(__apple_build_version__)`). LLVM 22 over all 150
+programs: rev64 and ext 312,177 to 12,390, TBL +150,519, host instructions 5,601,900 to 5,477,958 (-2.2%), spills
++0.5% (the index takes a register). spu-check over a game library LLVM 22 built (pspocket-prepare with a stand-in
+PPU translation, `--library`): 150 programs, 68,836 trials, no difference. Not measurable on the Mac (Apple clang).

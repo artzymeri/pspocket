@@ -25,7 +25,14 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
      branch weights on the lifted SPU code's ways out; the RSX thread's per-draw allocations and lookups.
   2. SPU translation: the MFC parameter channels written inline (8,709 runtime calls, labels and ways out), lazy entry
      loads (60% of entry loads are never read), the resume path out of the hot function (LLVM sees 132 loops in EDGE's
-     job instead of 65), poll exits that store only live registers. A few % each by estimate.
+     job instead of 65), poll exits that store only live registers. A few % each by estimate. **Done (D-958 to
+     D-964):** fast functions and cold twins, lazy loads, inline DMA parameters, branch weights where they pay, shufb on
+     one register, mask tables, conversions in NEON, the get-pc idiom no call, one-TBL byte reversal on the phone;
+     poll exits with live registers only did not pay (D-962). The Mac's walk, A/B in one session (D-962): the main SPU
+     threads -5.4%, the mixer -12%; statically (LLVM 22) the code the run loop calls 8.02 M host instructions to 4.77 M,
+     spills 2.15 M to 1.11 M, and GTA V's SPU code compiles in under half the time. Next: the twins (21% of the run
+     loop's entries in GTA V go to one: the jobs' calls of the SPURS kernel leave for the run loop and come back),
+     callee variants storing only what the caller needs, the phone's numbers.
   3. SPU runtime: channel fast paths, the SPURS line stored only when it changes, the module tracker's scans: 10 to 15
      ms a frame.
   4. Native middleware: Sony's MP3 decoder module (flashMP3.pic, the same in every MultiStream game) as a native program
