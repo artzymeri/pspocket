@@ -37,7 +37,19 @@ pspocket_set_warnings(pspocket-boot)
 # repository (CLAUDE.md rule 1); -DPSPOCKET_GAME_SPU=DIR builds them into pspocket-boot. Lifted code is never built
 # with -ffast-math (CLAUDE.md).
 set(PSPOCKET_GAME_SPU "" CACHE PATH "Lifted SPU programs (scripts/lift-spu.sh output) to build into pspocket-boot")
-if(PSPOCKET_GAME_SPU)
+# A second build directory (an agent's clone, a sanitizer build) can link the game's code another build compiled from
+# the same lift instead of compiling it again (an hour and more for GTA V): -DPSPOCKET_GAME_SPU_LIB and
+# -DPSPOCKET_GAME_PPU_LIB name that build's libpspocket_game_spu.a and libpspocket_game_ppu.a. Only while this tree's
+# ABI headers (PSPOCKET_GAME_ABI_HEADERS) are the ones it was built with.
+set(PSPOCKET_GAME_SPU_LIB "" CACHE FILEPATH "libpspocket_game_spu.a of another build of PSPOCKET_GAME_SPU, linked as it is")
+set(PSPOCKET_GAME_PPU_LIB "" CACHE FILEPATH "libpspocket_game_ppu.a of another build of PSPOCKET_GAME_PPU, linked as it is")
+if(PSPOCKET_GAME_SPU AND PSPOCKET_GAME_SPU_LIB)
+    add_library(pspocket_game_spu STATIC IMPORTED)
+    set_target_properties(pspocket_game_spu PROPERTIES IMPORTED_LOCATION ${PSPOCKET_GAME_SPU_LIB}
+        INTERFACE_LINK_LIBRARIES pspocket::spu)
+    target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu)
+    target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
+elseif(PSPOCKET_GAME_SPU)
     file(GLOB_RECURSE pspocket_game_spu_sources CONFIGURE_DEPENDS ${PSPOCKET_GAME_SPU}/*.c)
     if(NOT pspocket_game_spu_sources)
         message(FATAL_ERROR "PSPOCKET_GAME_SPU=${PSPOCKET_GAME_SPU} holds no lifted programs")
@@ -67,7 +79,13 @@ pspocket_set_warnings(spu-check)
 # -DPSPOCKET_GAME_PPU=DIR builds it into pspocket-boot, which registers it in the dispatch table. About 800 MB of C
 # for GTA V: built without debug information.
 set(PSPOCKET_GAME_PPU "" CACHE PATH "Lifted PPU code (ppu-lift output, --name game_ppu) to build into pspocket-boot")
-if(PSPOCKET_GAME_PPU)
+if(PSPOCKET_GAME_PPU AND PSPOCKET_GAME_PPU_LIB)
+    add_library(pspocket_game_ppu STATIC IMPORTED)
+    set_target_properties(pspocket_game_ppu PROPERTIES IMPORTED_LOCATION ${PSPOCKET_GAME_PPU_LIB}
+        INTERFACE_LINK_LIBRARIES pspocket::ppu)
+    target_link_libraries(pspocket-boot PRIVATE pspocket_game_ppu)
+    target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_PPU=1)
+elseif(PSPOCKET_GAME_PPU)
     file(GLOB pspocket_game_ppu_sources CONFIGURE_DEPENDS ${PSPOCKET_GAME_PPU}/*.c)
     if(NOT pspocket_game_ppu_sources)
         message(FATAL_ERROR "PSPOCKET_GAME_PPU=${PSPOCKET_GAME_PPU} holds no lifted code")
