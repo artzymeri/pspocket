@@ -233,3 +233,244 @@ int ps_edge_dad4_0ecf8(SPUContext* ctx, uint8_t* ls)
     ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * 0x0F008: the culling stage (entered by the get-pc idiom from 0x0EFF8, which saved $126 at sp - 0x40). Arguments: $3 the
+ * batch context (as 0x0ECF8's), $4 the mode (1: cull one facing, 2 and 3 the other; 0 culls nothing), $5 an offset in
+ * vertices into the output of the callback. It calls the vertex-output callback (the pointer at ctx + 0x174, its
+ * argument at ctx + 0x178; none: the transform at 0x0E8D8 directly), then culls the batch's triangles four at a time:
+ * the indices (u16, three a triangle, at the word ctx + 0x50) pick the callback's 16-byte vertices (s_x, s_y,
+ * outcode << 24, packed); a triangle is culled when
+ *   - its facing (the sign of (B - A) x (C - A) in screen space, flipped by the winding flag of ctx byte 6) is not the
+ *     mode's, or a vertex is behind the near plane (outcode bit 31) or has w <= 0 (packed bit 31 clear) — combined by
+ *     the mode's fnms — or all three share an outcode bit;
+ *   - or (when ctx + 0x13D is not zero) it covers no pixel: its integer coordinates all equal in x or in y, or its
+ *     x + y or x - y (as cflts of the floats) all equal.
+ * The indices of the triangles kept are written back over the index buffer, packed, through the job's tables of
+ * shuffles (by the four triangles' culled mask) and of byte shifts (by the output's alignment), three quadwords a group
+ * (the last two to a scratch quadword pair on the stack near the buffer's end). The count of indices kept goes to the
+ * halfword at ctx + 0x17E and is the result ($3); the buffer's new aligned end to the word at ctx + 0x58.
+ *
+ * Natively: the same sequence of local-store reads and writes, group by group (the job's loop overlaps three groups;
+ * here the loads and stores of each happen in the job's order relative to the others: index loads, then the stores of
+ * the group three behind, then the vertex loads), the tests four triangles a vector, one triangle a lane.
+ * =================================================================================================================== */
+
+static const edge_const k_0f008[] = {
+    {0x126F0, {0xFFFFFFEFu, 0xFFFFFFDFu, 0x00000000u, 0x00000000u}}, /* the buffer-end limits of the 2nd/3rd store */
+    {0x12700, {0x08080808u, 0x08080808u, 0x18181818u, 0x18181818u}}, /* toggles the index shuffle by 8 bytes */
+    {0x12AA0, {0x00010203u, 0x10111213u, 0x04050607u, 0x14151617u}}, /* (a0, b0, a1, b1): x and y of two vertices */
+    {0x12AF0, {0x00010203u, 0x04050607u, 0x08090A0Bu, 0x0C0D0E0Fu}}, /* identity */
+    {0x13240, {0x08090A0Bu, 0x18191A1Bu, 0x80808080u, 0x80808080u}}, /* outcodes */
+    {0x13250, {0x0C0D0E0Fu, 0x1C1D1E1Fu, 0x80808080u, 0x80808080u}}, /* packed coordinates */
+    {0x13260, {0x00010203u, 0x04050607u, 0x10111213u, 0x14151617u}}, /* (a0, a1, b0, b1) */
+};
+
+/* Four vertices (16 bytes each, big-endian words) to (x, y, outcode, packed) of each, one vertex a lane. */
+static inline __attribute__((always_inline)) uint32x4x4_t vertices4(const uint8_t* ls, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    const uint32x4_t r0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ls + a0)));
+    const uint32x4_t r1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ls + a1)));
+    const uint32x4_t r2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ls + a2)));
+    const uint32x4_t r3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(ls + a3)));
+    const uint32x4_t t0 = vtrn1q_u32(r0, r1), t1 = vtrn2q_u32(r0, r1), t2 = vtrn1q_u32(r2, r3), t3 = vtrn2q_u32(r2, r3);
+    uint32x4x4_t v;
+    v.val[0] = vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+    v.val[1] = vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+    v.val[2] = vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+    v.val[3] = vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+    return v;
+}
+
+static inline uint32_t rotl32(uint32_t x, unsigned n) { return (x << n) | (x >> (32u - n)); }
+
+typedef struct {
+    uint32_t vbase;                      /* the vertices' LS address (the callback's output + 16 * $5) */
+    uint32x4_t flip, mode, pad; /* xor into the area's sign; the fnms factor; the last group's padding triangles */
+    int nopix_on;               /* the "no pixel" test (ctx byte 0x13D not zero) */
+} cull_0f008;
+
+/* The culled mask of one group (bit 3 - t: triangle t), from its indices (two quadwords as the job shuffles them). */
+static unsigned cull_group_0f008(const uint8_t* ls, const cull_0f008* c, ps_spu_vec i56, ps_spu_vec i55, int last)
+{
+    /* The vertex of each index: the job adds index * 16 (a word of two indices rotated by 4, or 20, bits) to the base. */
+    uint32_t a[12];
+    for (int k = 0; k < 4; k++) {
+        const uint32_t w = w_of(i56, k);
+        a[2 * k] = (c->vbase + rotl32(w, 20)) & PS_SPU_QW_MASK;
+        a[2 * k + 1] = (c->vbase + rotl32(w, 4)) & PS_SPU_QW_MASK;
+    }
+    for (int k = 0; k < 2; k++) {
+        const uint32_t w = w_of(i55, k);
+        a[8 + 2 * k] = (c->vbase + rotl32(w, 20)) & PS_SPU_QW_MASK;
+        a[9 + 2 * k] = (c->vbase + rotl32(w, 4)) & PS_SPU_QW_MASK;
+    }
+    /* triangle t: A = vertex 3t, B = 3t + 1, C = 3t + 2 */
+    const uint32x4x4_t va = vertices4(ls, a[0], a[3], a[6], a[9]);
+    const uint32x4x4_t vb = vertices4(ls, a[1], a[4], a[7], a[10]);
+    const uint32x4x4_t vc = vertices4(ls, a[2], a[5], a[8], a[11]);
+#define V(x) ((ps_spu_vec)(x))
+    const ps_spu_vec ax = V(va.val[0]), ay = V(va.val[1]), bx = V(vb.val[0]), by = V(vb.val[1]);
+    const ps_spu_vec cx = V(vc.val[0]), cy = V(vc.val[1]);
+    const ps_spu_vec aoc = V(va.val[2]), boc = V(vb.val[2]), coc = V(vc.val[2]);
+    const ps_spu_vec ap = V(va.val[3]), bp = V(vb.val[3]), cp = V(vc.val[3]);
+    /* facing, depth and w */
+    const ps_spu_vec ex1 = psl_fs(bx, ax), ex2 = psl_fs(cx, ax), ey1 = psl_fs(by, ay), ey2 = psl_fs(cy, ay);
+    const ps_spu_vec area = psl_fms(ex1, ey2, psl_fm(ey1, ex2));
+    const ps_spu_vec facing = (ps_spu_vec)psn_fcgt_k(psn_fkey((uint32x4_t)psl_xor(V(c->flip), area)), vdupq_n_s32(0));
+    const ps_spu_vec uni = psl_or(psl_or(aoc, boc), coc), inter = psl_and(psl_and(aoc, boc), coc);
+    const ps_spu_vec in_front = psl_clgt(psl_splat32(0x80000000u), uni);
+    const ps_spu_vec w_pos = psl_srai(psl_and(cp, psl_and(bp, ap)), 31);
+    const ps_spu_vec keep = psl_and(psl_and(facing, in_front), w_pos);
+    const ps_spu_vec out_side = psl_clgt(inter, psl_splat32(0));
+    const ps_spu_vec geom = psl_fnms(keep, V(c->mode), out_side);
+    ps_spu_vec culled = geom;
+    if (c->nopix_on) {
+        /* no pixel: equal integer x or y (the packed halfwords), or equal x + y or x - y (switched off, it is 0) */
+        const ps_spu_vec same_xy = psl_clgt(psl_and(psl_ceqh(ap, cp), psl_ceqh(ap, bp)), psl_splat32(0));
+        const ps_spu_vec sa = psl_cflts(psl_fa(ax, ay), 173), da = psl_cflts(psl_fs(ax, ay), 173);
+        const ps_spu_vec sb = psl_cflts(psl_fa(bx, by), 173), db = psl_cflts(psl_fs(bx, by), 173);
+        const ps_spu_vec sc = psl_cflts(psl_fa(cx, cy), 173), dc = psl_cflts(psl_fs(cx, cy), 173);
+        const ps_spu_vec same_d = psl_or(psl_and(psl_ceq(sc, sa), psl_ceq(sb, sa)), psl_and(psl_ceq(dc, da), psl_ceq(db, da)));
+        culled = psl_or(psl_or(same_d, same_xy), geom);
+    }
+#undef V
+    unsigned mask = 0;
+    for (int t = 0; t < 4; t++) mask |= (culled[t] & 1u) << (3 - t); /* natural lanes: lane t is triangle t */
+    if (last) mask |= vgetq_lane_u32(c->pad, 0);
+    return mask & 15u;
+}
+
+int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t rel = ctx->reloc;
+    const uint32_t s = pref(ctx, 3), mode = pref(ctx, 4), sp = pref(ctx, 1);
+    if (mode < 1 || mode > 3) return 0;               /* 0 culls nothing, above 3 skips the loop: the lifted paths */
+    if (!(psl_rotqby(psl_lq(ls, s), 13)[3] & 0x80u)) return 0; /* ctx byte 0's top bit clear: the job asserts */
+    if (!constants_hold(ls, rel, k_0f008, (int)(sizeof k_0f008 / sizeof k_0f008[0]))) return 0;
+
+    /* The frame: $80-$82 and the link saved, the stack pointer below the 144 bytes it takes. The job's base as it
+     * computes it ($126, the link of the get-pc call, less the offset 0x0EFF8 put in $2). */
+    const ps_spu_vec in0 = psl_ld(ctx, 0), in1 = psl_ld(ctx, 1);
+    const ps_spu_vec in4 = psl_ld(ctx, 4), in3 = psl_ld(ctx, 3), in5 = psl_ld(ctx, 5);
+    const ps_spu_vec v126 = psl_sf(psl_ld(ctx, 2), psl_ld(ctx, 126));
+    const uint32_t base = psl_u32p(v126);
+    psl_stq(ls, sp - 0x10, psl_ld(ctx, 80));
+    psl_stq(ls, sp - 0x20, psl_ld(ctx, 81));
+    psl_stq(ls, sp - 0x30, psl_ld(ctx, 82));
+    psl_stq(ls, sp + 0x10, in0);
+    psl_stq(ls, sp - 0x90, in1);
+    const uint32_t sp2 = sp - 144;
+
+    /* The callback through the program's table (native or lifted), with the registers the job calls it with. */
+    {
+        const ps_spu_vec cbq = psl_lq(ls, s + 0x170);
+        const uint32_t cb = w_of(cbq, 1);
+        const uint32_t target = cb ? cb & PS_SPU_PC_MASK : (0x0E8D8u + rel) & PS_SPU_PC_MASK;
+        const uint32_t link = ((cb ? 0x0F0A8u : 0x0F0B0u) + rel) & PS_SPU_PC_MASK;
+        psl_st(ctx, 2, psl_rotqby(cbq, 4));
+        if (cb) psl_st(ctx, 4, psl_rotqby(cbq, 8));
+        psl_st(ctx, 0, psl_pref(link));
+        psl_st(ctx, 1, psl_a(in1, psl_splat32((uint32_t)-144)));
+        psl_st(ctx, 80, in4);
+        psl_st(ctx, 81, in3);
+        psl_st(ctx, 82, in5);
+        psl_st(ctx, 126, v126);
+        ctx->pc = target;
+        /* With no lifted code there, or when the callback stops before it returns (a stop request at a loop's back
+         * edge), the run loop takes over from where it is: the registers are the job's at its call, and the lifted
+         * code resumes the culling at the return address. */
+        const ps_spu_fn fn = ps_spu_lookup(ctx, target);
+        if (!fn) return 1;
+        fn(ctx, ls);
+        if (ctx->pc != link || ctx->stop_reason != PS_SPU_STOP_NONE) return 1;
+    }
+
+    /* The batch: triangles (a third of the index count, the low half of the word at ctx + 0x17C), the index buffer
+     * (the word at ctx + 0x50), the vertices (the callback's output: the word at ctx + 0x10 + 4 * (ctx byte 0 & 15),
+     * plus 16 * $5). */
+    const ps_spu_vec q170 = psl_lq(ls, s + 0x170), q0 = psl_lq(ls, s), q130 = psl_lq(ls, s + 0x130), q50 = psl_lq(ls, s + 0x50);
+    const uint32_t count = w_of(psl_rotqby(q170, 12), 0) & 0xFFFFu;
+    const uint32_t tris = (count / 3) & 0xFFFFu;
+    const uint32_t which = (w_of(psl_rotqby(q0, 13), 0) & 15u) << 2;
+    const uint32_t outp = w_of(psl_rotqby(psl_lq(ls, s + which + 0x10), (s + which) & 15u), 0);
+    const uint32_t idx = w_of(q50, 0);
+    const uint32_t groups = (tris + 3) >> 2;
+    const uint32_t end = idx + ((6 * tris + 15) & ~15u);
+    const uint32_t scratch = sp2 + 32;
+
+    cull_0f008 c;
+    c.vbase = (in5[3] << 4) + outp;
+    /* the winding flag (ctx byte 6's high nibble 0 or 2) flips the area's sign; mode 2 flips it back */
+    const uint32_t b6 = (w_of(psl_rotqby(q0, 3), 0) & 255u) >> 4;
+    const uint32_t flip = ((b6 == 2 || b6 == 0) ? 0x80000000u : 0u) ^ (mode == 2 ? 0u : 0x80000000u);
+    c.flip = vdupq_n_u32(flip);
+    c.mode = vdupq_n_u32(mode == 1 ? 0u : 0xFFFFFFFFu);
+    c.nopix_on = (psl_rotqby(q130, 10)[3] & 0xFFu) != 0;
+    c.pad = vdupq_n_u32((tris & 3) ? 15u >> (tris & 3) : 0u);
+
+    /* The shuffles of the indices (two quadwords a group, 24 bytes: the job alternates by 8 bytes), the compaction and
+     * shift tables (read where the job reads them, as it does). */
+    const ps_spu_vec ident = psl_lq(ls, 0x12AF0u + rel), toggle = psl_lq(ls, 0x12700u + rel);
+    const ps_spu_vec pat[2] = {ident, psl_xor(ident, toggle)};
+    const uint32_t t66 = base + 0xE050u, t67 = base + 0xE150u, t68 = base + 0xE250u;
+    const ps_spu_vec all = psl_splat32(0xFFFFFFFFu);
+    const ps_spu_vec lim = psl_a(psl_splat32(end), psl_lq(ls, 0x126F0u + rel));
+
+    /* The job's loop, group by group in its order of loads and stores: iteration k loads group k's indices, stores the
+     * packed indices of group k - 3 (none kept for the two before the first), loads group k - 1's vertices. */
+    ps_spu_vec ring56[4], ring55[4];
+    unsigned ringmask[4];
+    ring56[0] = psl_shufb(psl_lq(ls, idx), psl_lq(ls, idx + 16), pat[0]);
+    ring55[0] = psl_shufb(psl_lq(ls, idx + 16), psl_lq(ls, idx + 16), pat[0]);
+    uint32_t pos = idx, kept6 = 0, align = 0, total = 0;
+    for (uint32_t k = 1; k <= groups + 2; k++) {
+        if (k < groups) {
+            const uint32_t off = 24 * k;
+            const ps_spu_vec q1 = psl_lq(ls, idx + off), q2 = psl_lq(ls, idx + 16 + off);
+            ring56[k & 3] = psl_shufb(q1, q2, pat[k & 1]);
+            ring55[k & 3] = psl_shufb(q2, q2, pat[k & 1]);
+        }
+        /* the store of group k - 3 */
+        {
+            const int virt = k < 3;
+            const uint32_t g = k - 3;
+            const unsigned m = virt ? 15u : ringmask[g & 3];
+            const ps_spu_vec i7 = virt ? psl_splat32(0) : ring56[g & 3], i6 = virt ? psl_splat32(0) : ring55[g & 3];
+            pos += kept6;
+            const uint32_t kept = 4u - (uint32_t)__builtin_popcount(m);
+            const ps_spu_vec p66 = psl_lq(ls, t66 + 16 * m), p67 = psl_lq(ls, t67 + 16 * m);
+            const ps_spu_vec d10 = psl_shufb(i7, i6, p66), d16 = psl_shufb(i6, i6, p67);
+            const ps_spu_vec shift = psl_lq(ls, t68 + 16 * align);
+            const ps_spu_vec sel = psl_selb(ident, shift, psl_rotqmby(all, align));
+            psl_stq(ls, pos, psl_shufb(psl_lq(ls, pos), d10, sel));
+            const ps_spu_vec over = psl_cgt(psl_splat32(pos), lim);
+            const ps_spu_vec at = psl_selb(psl_splat32(pos), psl_splat32(scratch), over);
+            psl_stq(ls, at[3] + 0x10, psl_shufb(d10, d16, shift));
+            psl_stq(ls, at[2] + 0x20, psl_shufb(d16, d16, shift));
+            kept6 = (kept * 6) & 0xFFFFu;
+            align = (align + kept6) & 15u;
+            total += kept;
+        }
+        if (k - 1 < groups) {
+            const uint32_t g = k - 1;
+            ringmask[g & 3] = cull_group_0f008(ls, &c, ring56[g & 3], ring55[g & 3], g == groups - 1);
+        }
+    }
+
+    /* The count of indices kept to the halfword at ctx + 0x17E (where the job's chd puts it), the new end to ctx + 0x58,
+     * then the frame undone. */
+    const uint32_t n = 3 * total;
+    psl_stq(ls, s + 0x170, psl_shufb(psl_splat32(n), psl_lq(ls, s + 0x170), psl_cmask(sp2 + 14, 2)));
+    const uint32_t new_end = (w_of(psl_lq(ls, s + 0x50), 0) + 2 * n + 15) & ~15u;
+    psl_stq(ls, s + 0x50, psl_shufb(psl_splat32(new_end), psl_lq(ls, s + 0x50), psl_cmask(sp2 + 8, 4)));
+    psl_st(ctx, 0, psl_lq(ls, sp + 0x10));
+    psl_st(ctx, 1, in1);
+    psl_st(ctx, 3, psl_splat32(n));
+    psl_st(ctx, 80, psl_lq(ls, sp - 0x10));
+    psl_st(ctx, 81, psl_lq(ls, sp - 0x20));
+    psl_st(ctx, 82, psl_lq(ls, sp - 0x30));
+    psl_st(ctx, 126, psl_lq(ls, sp - 0x40));
+    ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
+    return 1;
+}

@@ -1,7 +1,7 @@
 // spu-native-check: native replacements of SPU middleware functions against the lifted functions, on states captured
 // from a game (D-965; pspocket/spu/replace.hpp, PSPOCKET_SPU_CAPTURE).
 //
-//   spu-native-check CAPTURE... [--library FILE] [--time N] [--max N] [--quiet]
+//   spu-native-check CAPTURE... [--library FILE] [--time N] [--max N] [--callees native|lifted] [--quiet]
 //
 // CAPTURE: capture files (.cap) or directories of them. For each capture the lifted function runs from the state at
 // entry and must give the state at exit the capture holds (the capture is of the lifted function: this checks that the
@@ -13,7 +13,8 @@
 // time a call of each: the fastest of the N runs of each capture (local store and registers restored before each run,
 // outside the timing), averaged over the captures.
 //
-// The game's lifted programs come built in (-DPSPOCKET_GAME_SPU, as spu-check) or from a game library (--library). The
+// The function checked calls the other listed functions through the derived program, natively where they have native
+// code (--callees lifted: the lifted program, every callee lifted). The game's lifted programs come built in (-DPSPOCKET_GAME_SPU, as spu-check) or from a game library (--library). The
 // captures hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1); nothing of the game is in
 // this source.
 
@@ -148,7 +149,7 @@ int main(int argc, char** argv)
     std::string library;
     u32 time_runs = 0;
     u64 max = 0;
-    bool quiet = false, verbose = false, bench = false;
+    bool quiet = false, verbose = false, bench = false, callees_native = true;
     u32 bench_runs = 1000;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -164,6 +165,7 @@ int main(int argc, char** argv)
         else if (a == "--max") max = std::stoull(value());
         else if (a == "--quiet") quiet = true;
         else if (a == "--verbose") verbose = true;
+        else if (a == "--callees") callees_native = value() != "lifted";
         else if (a == "--bench") bench = true;
         else if (a == "--bench-runs") bench_runs = static_cast<u32>(std::stoul(value()));
         else if (a.rfind("--", 0) == 0) {
@@ -187,8 +189,9 @@ int main(int argc, char** argv)
     std::sort(files.begin(), files.end());
     if (max && files.size() > max) files.resize(max);
 
-    // The lifted programs as they are: nothing derived from them.
-    rp::set_mode(rp::Mode::off);
+    // Derived programs (the listed functions through the dispatcher) unless --callees lifted: the function checked calls
+    // the others as the game does (natively where there is native code); the function itself is run directly.
+    rp::set_mode(callees_native ? rp::Mode::on : rp::Mode::off);
     static GuestMemory memory; // DMA from a captured function reads zeros (the functions checked make none)
     if (!memory.reserve()) {
         std::fprintf(stderr, "spu-native-check: cannot reserve guest memory\n");
@@ -226,7 +229,8 @@ int main(int argc, char** argv)
         const rp::CaptureHeader& h = c.header;
         Totals& t = totals[{h.hash, h.addr}];
         t.captures++;
-        const ps_spu_program* p = ps_spu_find_program(h.hash, h.code_start, h.code_size);
+        const ps_spu_program* run = ps_spu_find_program(h.hash, h.code_start, h.code_size);
+        const ps_spu_program* p = run && rp::original_of(run) ? rp::original_of(run) : run;
         if (!p || !p->table || h.addr < p->code_start || h.addr - p->code_start >= p->code_size) {
             std::printf("SKIP %s: program %016llx is not built in\n", file.string().c_str(),
                 static_cast<unsigned long long>(h.hash));
@@ -239,7 +243,7 @@ int main(int argc, char** argv)
             std::memcpy(ls, c.ls_in.data(), kLsSize);
             ctx = SPUContext{};
             ps_spu_context_init(&ctx, ls, memory.base());
-            ps_spu_attach_program_at(&ctx, p, (h.code_start + h.reloc) & PS_SPU_LS_MASK);
+            ps_spu_attach_program_at(&ctx, run, (h.code_start + h.reloc) & PS_SPU_LS_MASK);
             rp::load_state(c.in, ctx);
         };
         // The replay: the lifted function from the captured entry gives the captured exit.

@@ -15416,3 +15416,27 @@ interprocedural liveness over the whole program, from an address on, to the end 
   the functions' live registers in the table of known builds. Without the variadic printf, its saves made $12-$19 live
   after 0x07A38 and 0x0A098 (only on an assertion's path).
 - Tests: a call and return (what the callee reads, kills, and what is live after it), a variadic callee.
+
+## D-968 · 2026-10-14 · EDGE's culling stage (0x0F008) native, and the native functions of GTA V's EDGE build
+
+D-965's machinery took 0x0ECF8 first. The functions of GTA V's EDGE build (spu_dad457863220b1cc) native so far, each
+checked by spu-native-check on 400 calls captured over a whole walk (every 1000th call) and timed there (the fastest of
+7 runs a capture, callees native as in the game; the Mac shared with other work):
+
+| Function | What | Exact | Lifted | Native | |
+|---|---|---|---|---|---|
+| 0x0ECF8 | vertex output: screen-space transform, outcodes | 400 of 400 | 2.85 µs | 1.93 µs | x1.47 |
+| 0x0F008 | culling stage (with the callback above) | 400 of 400 | 5.55 µs | 3.62 µs | x1.53 (its own part x2.1) |
+
+- 0x0F008, the culling stage: it calls the vertex-output callback through the table (native or lifted; a callback that
+  stops before returning leaves the rest to the lifted code, which resumes at its return address), then culls four
+  triangles at a time: facing by the sign of the screen-space cross product (the winding flag of ctx byte 6, the mode),
+  behind the near plane or w <= 0, an outcode bit all three vertices share (combined by the mode's fnms, as the job
+  does), and, when the context enables it, no pixel covered (equal integer x or y, or equal x + y or x - y). The kept
+  triangles' indices are packed back over the index buffer through the job's own tables of shuffles and byte shifts,
+  read from its image as it reads them, with the same three quadword stores a group (the job's pipeline writes garbage
+  past the end of what it keeps, and the last two stores go to a stack scratch pair near the buffer's end: all of it is
+  in local store, so all of it is reproduced). The job's loop overlaps three groups; here each group's index loads,
+  stores and vertex loads keep the job's order relative to the others (the output is written over the input), and a
+  group's tests are four triangles a vector. The "no pixel" test is off in 77% of the captured calls: its six cflts are
+  then left out (exact: its result is masked off).

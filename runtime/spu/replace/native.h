@@ -16,6 +16,7 @@ extern "C" {
 
 /* EDGE geometry, the build of spu_dad457863220b1cc (edge_dad4.c). */
 int ps_edge_dad4_0ecf8(SPUContext* ctx, uint8_t* ls);
+int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls);
 
 #ifdef __cplusplus
 }

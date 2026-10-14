@@ -61,7 +61,7 @@ constexpr Function kEdgeDad4[] = {
     {0x0AC20, nullptr, kFragmentState},
     {0x0B778, nullptr, kFragmentState},
     {0x0ECF8, ps_edge_dad4_0ecf8, {}},
-    {0x0F008, nullptr, regs({3})},
+    {0x0F008, ps_edge_dad4_0f008, regs({3})},
 };
 
 constexpr Build kBuilds[] = {
