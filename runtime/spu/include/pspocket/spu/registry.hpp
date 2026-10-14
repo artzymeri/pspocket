@@ -48,6 +48,14 @@ void set_pending_home(SPUContext* ctx, uint64_t hash, uint32_t ls_start, uint32_
 // Contexts switched to a program registered while they ran its image so far.
 uint64_t pending_homes_adopted();
 
+// A second translation of the game's SPU programs, to compare two translations in one session (D-962): a program
+// registered with ps_spu_register_program_b is the B twin of the registered program with its key (register both at
+// startup, the default first), and a context attached on a thread with translation_b set runs the twin (the SPURS
+// workers set it in PSPOCKET_SPU_AB's half B). Each twin is only found that way.
+extern "C" void ps_spu_register_program_b(ps_spu_program* program);
+bool has_translation_b();
+void set_translation_b(bool on);
+
 // Steps the interpreter ran in images with no lifted program (contexts with a pending home), the n largest.
 struct InterpretedImage {
     uint64_t hash;

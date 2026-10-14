@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -80,6 +81,10 @@ struct ImageSite {
 constexpr u32 kImageSites = 1024;
 ImageSite g_image_sites[kImageSites];
 std::atomic<u64> g_pending_adopted{0};
+// The B translation (D-962): each default program's twin, set at startup before SPU threads run, read without a lock.
+std::unordered_map<const ps_spu_program*, const ps_spu_program*> g_twin_b;
+std::atomic<bool> g_have_b{false};
+thread_local bool t_translation_b = false;
 std::mutex g_pending_log_mutex;
 std::unordered_set<u64> g_pending_logged;
 
@@ -151,6 +156,8 @@ u32 reloc_for(const ps_spu_program* p, u32 code_start)
 
 void set_current(SPUContext* ctx, const ps_spu_program* p, u32 reloc)
 {
+    if (t_translation_b && p)
+        if (const auto it = g_twin_b.find(p); it != g_twin_b.end()) p = it->second;
     ctx->program = p;
     ctx->reloc = reloc;
     if (p) ctx->xfloat = p->xfloat;
@@ -259,6 +266,22 @@ uint64_t ps_spu_hash64(const uint8_t* data, size_t size)
     return h;
 }
 
+namespace {
+
+ps_spu_fn* build_table(const ps_spu_program* program)
+{
+    ps_spu_fn* table = new ps_spu_fn[program->code_size / 4]();
+    for (u32 i = 0; i < program->entry_count; i++) {
+        const ps_spu_entry& e = program->entries[i];
+        const u32 off = e.addr - program->code_start;
+        PS_CHECK(off < program->code_size && (off & 3) == 0);
+        table[off >> 2] = e.fn;
+    }
+    return table;
+}
+
+} // namespace
+
 void ps_spu_register_program(ps_spu_program* program)
 {
     PS_CHECK(program && (program->code_start & 3) == 0 && (program->code_size & 3) == 0);
@@ -273,16 +296,7 @@ void ps_spu_register_program(ps_spu_program* program)
         std::lock_guard lock(g_registry_mutex);
         built_already = program->table != nullptr;
     }
-    ps_spu_fn* table = nullptr;
-    if (!built_already) {
-        table = new ps_spu_fn[program->code_size / 4]();
-        for (u32 i = 0; i < program->entry_count; i++) {
-            const ps_spu_entry& e = program->entries[i];
-            const u32 off = e.addr - program->code_start;
-            PS_CHECK(off < program->code_size && (off & 3) == 0);
-            table[off >> 2] = e.fn;
-        }
-    }
+    ps_spu_fn* table = built_already ? nullptr : build_table(program);
     {
         std::lock_guard lock(g_registry_mutex);
         if (!program->table) std::swap(program->table, table); // another thread's registration may have won
@@ -313,6 +327,21 @@ void ps_spu_unregister_program(ps_spu_program* program)
 }
 
 uint64_t ps_spu_registry_generation(void) { return g_registry_generation.load(std::memory_order_acquire); }
+
+void ps_spu_register_program_b(ps_spu_program* program)
+{
+    PS_CHECK(program && (program->code_start & 3) == 0 && program->code_start + program->code_size <= PS_SPU_LS_SIZE);
+    if (!program->table) program->table = build_table(program);
+    std::lock_guard lock(g_registry_mutex);
+    for (const ps_spu_program* p : g_programs)
+        if (p->hash == program->hash && p->code_start == program->code_start && p->code_size == program->code_size &&
+            p->relocatable == program->relocatable && p->xfloat == program->xfloat) {
+            g_twin_b[p] = program;
+            g_have_b.store(true, std::memory_order_release);
+            return;
+        }
+    PS_LOG_WARN("spu", "B translation of {}: no program of its key registered", program->name);
+}
 
 const ps_spu_program* ps_spu_find_program(uint64_t hash, uint32_t code_start, uint32_t code_size)
 {
@@ -462,6 +491,8 @@ uint32_t ps_spu_interpret(SPUContext* ctx, uint64_t max_steps)
 namespace pspocket::spu {
 
 uint64_t registry_additions() { return g_registry_additions.load(std::memory_order_acquire); }
+bool has_translation_b() { return g_have_b.load(std::memory_order_acquire); }
+void set_translation_b(bool on) { t_translation_b = on; }
 uint64_t registry_removals() { return g_registry_removals.load(std::memory_order_acquire); }
 
 void set_pending_home(SPUContext* ctx, uint64_t hash, uint32_t ls_start, uint32_t size, bool relocatable,

@@ -177,6 +177,9 @@ int usage()
 #if defined(PSPOCKET_HAVE_GAME_SPU)
 extern "C" void pspocket_game_spu_register(void); // the game's lifted SPU programs (scripts/lift-spu.sh, D-076)
 #endif
+#if defined(PSPOCKET_HAVE_GAME_SPU_B)
+extern "C" void pspocket_game_spu_b_register(void); // a second translation of them (scripts/spu-ab-lift.sh, D-962)
+#endif
 #if defined(PSPOCKET_HAVE_GAME_PPU)
 extern "C" {
 void game_ppu_register(void); // the game's PPU code translated ahead of time (ppu-lift, D-092)
@@ -1315,6 +1318,9 @@ int main(int argc, char** argv)
     // --builtin-spu a game library runs alone, to test what it holds.
     if (game_library.empty() || builtin_spu) {
         pspocket_game_spu_register();
+#if defined(PSPOCKET_HAVE_GAME_SPU_B)
+        pspocket_game_spu_b_register(); // the twins PSPOCKET_SPU_AB's half B runs (D-962)
+#endif
         if (!std::exchange(spu_modules, true)) hle::enable_spu_modules();
     }
 #endif

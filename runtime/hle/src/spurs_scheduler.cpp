@@ -32,6 +32,7 @@
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/sync.hpp"
 #include "pspocket/spu/fp.h"
+#include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spurs_native.hpp"
 
@@ -284,6 +285,7 @@ void Worker::body()
                 qos_now = b ? sched.qos_b : sched.qos_a;
             }
 #endif
+            if (b != in_b) spu::set_translation_b(b); // the B translation of the SPU programs, when built in (D-962)
             in_b = b;
         }
         // The version is read before selecting, so a change made while selecting ends the wait at once.

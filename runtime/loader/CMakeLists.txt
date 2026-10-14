@@ -68,6 +68,24 @@ elseif(PSPOCKET_GAME_SPU)
     target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu)
     target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
 endif()
+# A second translation of the game's SPU programs, to compare two translations in one session (D-962):
+# scripts/spu-ab-lift.sh renames a lift's symbols (spb_ for spu_) into DIR, -DPSPOCKET_GAME_SPU_B=DIR builds it in, and
+# PSPOCKET_SPU_AB=S switches the SPURS workers to it every other S seconds.
+set(PSPOCKET_GAME_SPU_B "" CACHE PATH "A second lift (scripts/spu-ab-lift.sh output) for PSPOCKET_SPU_AB's half B")
+if(PSPOCKET_GAME_SPU_B AND PSPOCKET_GAME_SPU)
+    file(GLOB_RECURSE pspocket_game_spu_b_sources CONFIGURE_DEPENDS ${PSPOCKET_GAME_SPU_B}/*.c)
+    set(pspocket_game_spu_b_twins ${pspocket_game_spu_b_sources})
+    list(FILTER pspocket_game_spu_b_twins INCLUDE REGEX "_resume_[0-9]+\\.c$")
+    if(pspocket_game_spu_b_twins)
+        set_source_files_properties(${pspocket_game_spu_b_twins} PROPERTIES COMPILE_OPTIONS -O1)
+    endif()
+    add_library(pspocket_game_spu_b STATIC ${pspocket_game_spu_b_sources})
+    target_link_libraries(pspocket_game_spu_b PRIVATE pspocket::spu)
+    pspocket_set_warnings(pspocket_game_spu_b)
+    pspocket_set_generated_warnings(pspocket_game_spu_b)
+    target_link_libraries(pspocket-boot PRIVATE pspocket_game_spu_b)
+    target_compile_definitions(pspocket-boot PRIVATE PSPOCKET_HAVE_GAME_SPU_B=1)
+endif()
 # spu-check DUMP: translated SPU functions against the interpreter from random states (D-132): the game's built in
 # (-DPSPOCKET_GAME_SPU), or a game or system library's (--library, D-191).
 add_executable(spu-check tools/spu_check.cpp)
