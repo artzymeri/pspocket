@@ -39,6 +39,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/mmio.hpp"
+#include "pspocket/core/png.hpp"
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
 #include "pspocket/hle/audio.hpp"
@@ -114,6 +115,10 @@ struct Session {
     // Its own PRX modules translated ahead of time (D-238): after `modules`, which it is installed on.
     std::unique_ptr<loader::GameModules> game_modules;
     std::string coverage; // where the SPU images it meets are saved
+    // The app's Documents folder (the log's), where a frame trace is asked for and kept (D-947): an empty file
+    // Documents/pspocket-trace, put there over USB, has the backend trace the next frame into Documents/trace-<flip>/.
+    std::string documents;
+    std::string trace_dir;
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -262,6 +267,23 @@ bool read_file(const char* path, std::vector<u8>& out)
     return true;
 }
 
+// The Mac's PSPOCKET_* switches for a run on the phone (D-947): Documents/pspocket-env.txt, a NAME=VALUE a line ('#'
+// starts a comment), put there over USB (afcclient). Only PSPOCKET_ names; each one set is logged.
+void set_env_from_file(const std::filesystem::path& path)
+{
+    std::ifstream f(path);
+    if (!f) return;
+    for (std::string line; std::getline(f, line);) {
+        if (const usize hash = line.find('#'); hash != std::string::npos) line.resize(hash);
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+        const usize eq = line.find('=');
+        if (eq == std::string::npos || !line.starts_with("PSPOCKET_")) continue;
+        const std::string name = line.substr(0, eq), value = line.substr(eq + 1);
+        setenv(name.c_str(), value.c_str(), 1);
+        PS_LOG_INFO(kChan, "{}={} (from {})", name, value, path.filename().string());
+    }
+}
+
 } // namespace
 
 extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_size)
@@ -280,6 +302,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         g_log_fd = open(o->log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     }
     ps_ios_install_log_sink(on_log, nullptr);
+    if (o->log_path) set_env_from_file(std::filesystem::path(o->log_path).parent_path() / "pspocket-env.txt");
 
     std::vector<u8> bytes;
     if (!read_file(o->elf_path, bytes)) return fail(error, error_size, std::string("cannot read ") + o->elf_path);
@@ -302,6 +325,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
 
     auto s = std::make_unique<Session>();
     s->exe = *exe;
+    if (o->log_path) s->documents = std::filesystem::path(o->log_path).parent_path().string();
     s->memory = std::make_unique<GuestMemory>();
     if (!s->memory->reserve()) return fail(error, error_size, "cannot reserve the 4 GB guest address space");
     // PPU code the translation has not reached (or all of it, in a build without the game's translated code) is
@@ -359,6 +383,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         // a game the phone has never seen plays from the start without stalls.
         mc.async_shaders = true;
         mc.compile_wait_ms = 4.0;
+        // A frame trace asked for over USB (D-947): its targets and textures as PNG files beside its log lines.
+        mc.trace_surface = [raw](const std::string& name, const u8* bgra, u32 w, u32 h) {
+            if (!raw->trace_dir.empty()) write_png_rgb(raw->trace_dir + "/" + name + ".png", bgra, w, h, w * 4, true);
+        };
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();
@@ -387,6 +415,20 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
                         ppu - raw->rate_ppu_interpreted, spu - raw->rate_spu_interpreted);
                     raw->rate_ppu_interpreted = ppu;
                     raw->rate_spu_interpreted = spu;
+                }
+                // A frame trace asked for (D-947): Documents/pspocket-trace, taken away as the trace starts.
+                if (!raw->documents.empty()) {
+                    std::error_code ec;
+                    const std::filesystem::path ask = std::filesystem::path(raw->documents) / "pspocket-trace";
+                    if (std::filesystem::exists(ask, ec) && std::filesystem::remove(ask, ec)) {
+                        if (rsx::metal::MetalBackend* b = raw->backend.load(std::memory_order_acquire)) {
+                            raw->trace_dir = std::format("{}/trace-{}", raw->documents, flips + 1);
+                            std::filesystem::create_directories(raw->trace_dir, ec);
+                            b->trace_next_frame();
+                            PS_LOG_INFO(kChan, "a frame trace asked for: the frame after flip {}, into {}", flips,
+                                raw->trace_dir);
+                        }
+                    }
                 }
                 // Under 1.5 GB left before iOS stops the app: the backend frees what it can make again (D-148).
                 if (os_proc_available_memory() < (1536ull << 20)) {
