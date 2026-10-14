@@ -15376,3 +15376,15 @@ first part: the machinery, and the first function native (runtime/spu/replace/, 
 - Tests (tests/spu/test_spu_replace.cpp): the NEON blocks against the lifted helpers (frest and frsqest over every
   index and exponent, fm, fma, fcgt keys over every float class); a synthetic program and build: derived, native,
   declined, the original untouched, unregistered together.
+
+## D-966 · 2026-10-14 · The lifter calls a function listed for a native replacement through the program's table
+
+Three of the six EDGE functions GTA V's geometry job spends its time in (0x07A38, 0x0F008, 0x0A098) are entered only by
+the get-pc idiom (brsl $x, next) from functions the job calls directly: the lifted code calls them as C functions,
+past any table, so a derived program (D-965) could not take them over. lift() now leaves out of the call targets the
+functions pspocket::spu::replace::listed() names for the program (its key and code start): a call into one leaves for
+the run loop, which calls it through the program's table and comes back at the return address, as for any target the
+lifter has no symbol for. One predicate at the one place the call targets are chosen; nothing else in the lifter moves.
+GTA V's EDGE program lifted again: its code differs from before at those three calls only. It takes effect when the
+game's SPU programs are lifted again (scripts/lift-spu.sh, or the phone's translation). Test: a synthetic program's
+direct call becomes a way out to the listed function once its build is known.

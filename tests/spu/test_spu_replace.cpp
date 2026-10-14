@@ -1,5 +1,6 @@
 // Native replacements of SPU middleware functions (D-965): the NEON building blocks against the lifted code's helpers,
-// and the derived programs a known build gets (dispatch to native code, the lifted function when it declines).
+// the derived programs a known build gets (dispatch to native code, the lifted function when it declines), and the
+// lifter's calls through the table into listed functions (D-966).
 // Synthetic programs only (CLAUDE.md rule 1).
 
 #include <catch_amalgamated.hpp>
@@ -9,6 +10,10 @@
 #include <vector>
 
 #include "pspocket/core/be.h"
+#include "pspocket/recomp/spu/analyzer.hpp"
+#include "pspocket/recomp/spu/asm.hpp"
+#include "pspocket/recomp/spu/image.hpp"
+#include "pspocket/recomp/spu/lifter.hpp"
 #include "pspocket/spu/replace.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spu_test_util.hpp"
@@ -22,6 +27,9 @@ unsigned ps_test_replace_ld4(void);
 
 using namespace pspocket;
 namespace rp = pspocket::spu::replace;
+namespace as = pspocket::recomp::spu::as;
+using pspocket::recomp::spu::AnalyzerOptions;
+using pspocket::recomp::spu::LiftOptions;
 
 TEST_CASE("SPU replace: NEON building blocks give what the lifted code's helpers give (D-965)", "[spu]")
 {
@@ -112,4 +120,37 @@ TEST_CASE("SPU replace: a known build is found as a program derived from it, its
     // Taking the original out takes the derived one out with it.
     ps_spu_unregister_program(&t.program);
     CHECK(ps_spu_find_program(t.program.hash, kStart, kSize) == nullptr);
+}
+
+TEST_CASE("SPU replace: the lifter calls a listed function through the program's table", "[spu]")
+{
+    // E calls F directly (brsl $lr), then returns; F returns.
+    as::Assembler a(0x2000);
+    const auto f = a.label();
+    a.emit(as::il(5, 7));
+    a.brsl(0, f);
+    a.emit(as::a(3, 3, 5));
+    a.emit(as::bi(0));
+    a.bind(f);
+    a.emit(as::ai(3, 3, 1));
+    a.emit(as::bi(0));
+    const std::vector<u8> code = a.finish();
+    auto image = pspocket::recomp::spu::load_raw_image(code, 0x2000, {0x2000});
+    REQUIRE(image);
+    const u32 f_addr = a.address(f);
+    const auto program = pspocket::recomp::spu::analyze(*image, AnalyzerOptions{});
+    LiftOptions options;
+    options.name = "replace_lift_test";
+    const std::string direct = pspocket::recomp::spu::function_symbol(image->hash(), 0x2000, f_addr) + "(ctx, ls);";
+    const auto unit = [&] {
+        const auto lifted = pspocket::recomp::spu::lift(*image, program, options);
+        for (const auto& file : lifted.files)
+            if (file.name == "replace_lift_test_0.c") return file.content;
+        return std::string();
+    };
+    CHECK(unit().find(direct) != std::string::npos); // not listed: a C call
+    rp::add_build("replace lift test", image->hash(), 0x2000, image->code_size(), {{f_addr, nullptr, {}}});
+    const std::string listed = unit();
+    CHECK(listed.find(direct) == std::string::npos); // listed: leaves for the run loop at F
+    CHECK(listed.find(std::format("ctx->pc = 0x{:05X}u;", f_addr)) != std::string::npos);
 }
