@@ -21,6 +21,7 @@ void ps_test_oracle_012b_05b20(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_2828_0a920(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_2828_06048(SPUContext* ctx, uint8_t* ls);
 void ps_test_oracle_2828_08748(SPUContext* ctx, uint8_t* ls);
+void ps_test_oracle_bb12_08000(SPUContext* ctx, uint8_t* ls);
 }
 
 namespace {
@@ -325,4 +326,64 @@ TEST_CASE("GTA V audio: the submix job's delay (0x08748) is the job's, bit for b
         check(c, ps_gta5_2828_08748, ps_test_oracle_2828_08748, {}, d);
     }
     CHECK(d.declined == 2);
+}
+
+namespace {
+
+// The sample-rate converter's loop (0x08000): its state in registers as the job sets it before the loop: positions
+// (floats, and 16.48 fixed point), steps, the samples at 0x20000 (int16), the output at 0x28000.
+Case src_case(Rng& r, Mix mix, uint32_t count, uint32_t reloc, bool bad_constant)
+{
+    Case c;
+    for (size_t i = 0; i < c.ls.size(); i += 4) ps_st32(c.ls.data() + i, r.next());
+    for (int reg = 0; reg < 128; reg++) set_reg(c.ctx, reg, r.next(), r.next(), r.next(), r.next());
+    set_reg(c.ctx, 13, 0x007FFFFFu, 0x007FFFFFu, 0x007FFFFFu, 0x007FFFFFu);
+    set_reg(c.ctx, 14, 0x03030303u, 0x07070707u, 0x0B0B0B0Bu, 0x0F0F0F0Fu);
+    set_reg(c.ctx, 15, 0x00000809u, 0x00000A0Bu, 0x00000C0Du, 0x00000E0Fu);
+    set_reg(c.ctx, 16, 0x00000001u, 0x00000203u, 0x00000405u, 0x00000607u);
+    set_reg(c.ctx, 17, 0x04050607u, 0x80808080u, 0x0C0D0E0Fu, bad_constant ? 0x80808081u : 0x80808080u);
+    set_reg(c.ctx, 18, 0x00010203u, 0x00010203u, 0x00010203u, 0x00010203u);
+    set_reg(c.ctx, 87, 0x04050607u, 0x04050607u, 0x04050607u, 0x04050607u);
+    set_reg(c.ctx, 88, 0x00010203u, 0x00010203u, 0x00010203u, 0x00010203u);
+    // A pitch and a start: the float positions as the job makes them (start + pitch * (0, 1, 2, 3)), or the mix's.
+    const float pitch = 0.25f + static_cast<float>(r.next() % 1000) / 400.0f, start = static_cast<float>(r.next() % 4000) / 37.0f;
+    uint32_t w[4], s[4];
+    for (int k = 0; k < 4; k++) {
+        const float p = start + pitch * static_cast<float>(k), st = 4.0f * pitch;
+        std::memcpy(&w[k], &p, 4);
+        std::memcpy(&s[k], &st, 4);
+        if (mix == Mix::specials && r.next() % 3 == 0) w[k] = pick(r, mix);
+        if (mix == Mix::zeros && r.next() % 3 == 0) w[k] = r.next() & 0x80000000u;
+    }
+    set_reg(c.ctx, 80, w[0], w[1], w[2], w[3]);
+    set_reg(c.ctx, 84, s[0], s[1], s[2], s[3]);
+    const uint64_t pos = static_cast<uint64_t>(static_cast<double>(start) * 281474976710656.0);
+    const uint64_t step = static_cast<uint64_t>(static_cast<double>(4.0f * pitch) * 281474976710656.0);
+    set_reg(c.ctx, 10, static_cast<uint32_t>(pos >> 32), static_cast<uint32_t>(pos), r.next(), r.next());
+    set_reg(c.ctx, 82, static_cast<uint32_t>(step >> 32), static_cast<uint32_t>(step), r.next(), r.next());
+    set_reg(c.ctx, 83, 0x20000 + 2 * (r.next() % 8), 0, 0, 0);
+    set_reg(c.ctx, 85, count, 0, 0, 0);
+    set_reg(c.ctx, 11, 0x38000, 0, 0, 0);
+    set_reg(c.ctx, 12, 0, 0, 0, 0);
+    if (mix == Mix::silence)
+        for (uint32_t i = 0; i < 0x8000; i += 4) ps_st32(c.ls.data() + 0x20000 + i, 0);
+    c.ctx.reloc = reloc;
+    c.ctx.pc = 0x08000 + reloc;
+    return c;
+}
+
+} // namespace
+
+TEST_CASE("GTA V audio: the voice job's sample-rate converter loop (0x08000) is the job's, bit for bit (D-982)", "[games]")
+{
+    Rng r;
+    Tally t, d;
+    for (const Mix mix : {Mix::audio, Mix::zeros, Mix::specials, Mix::silence})
+        for (const uint32_t count : {0u, 1u, 4u, 5u, 64u, 256u})
+            for (const uint32_t reloc : {0u, 0x400u})
+                for (int rep = 0; rep < 4; rep++)
+                    check(src_case(r, mix, count, reloc, false), ps_gta5_bb12_08000, ps_test_oracle_bb12_08000, {79}, t);
+    CHECK(t.ran == 4 * 6 * 2 * 4);
+    check(src_case(r, Mix::audio, 64, 0, true), ps_gta5_bb12_08000, ps_test_oracle_bb12_08000, {79}, d);
+    CHECK(d.declined == 1);
 }

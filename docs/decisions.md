@@ -15878,3 +15878,30 @@ Two more of the submix job's (spu_28281614459ce75e) effects, each called about 1
   lifted, 245 ns native (x2.7); 167 ns (x3.9) once the position step skips the division in its usual case (D-980's).
 - Tests (tests/games): oracles in the job's order (records read and written each frame) against both over the four
   mixes, frame counts, relocation, in place or not; slots inside the context declined.
+
+## D-982 · 2026-10-14 · The voice job's sample-rate converter loop native (a loop region), exact, x2.1
+
+The mixer's third-largest job by time after MP3 is the voice job (spu_bb12970d56fb7b8a: "PCMSource", "SrcDownsampleBuf",
+"Mp3InputBuffer"; 12-15% of Secondary). Its costliest function, 0x07F28 (2.4% of Secondary), converts a voice's int16
+samples to the mixer's rate by linear interpolation; its loop (0x08000 to 0x080D8) is nearly all of it. The function's
+setup converts the pitch to a 16.48 fixed-point step through two soft-float helpers: it stays lifted, and the loop is
+listed as a region (head and exit, D-966): the lifted code leaves at the head, the native loop runs to the exit.
+
+- Four outputs an iteration: the positions are kept twice, as floats (four lanes, a step apart) and as 16.48 fixed
+  point; the fixed point's integer part addresses 16 bytes of samples (unaligned), each lane's offset from lane 0 is
+  the float positions' integer parts' difference (cflts 171: four bytes a sample), and the job's shuffle controls
+  (that offset's low byte in every byte plus 0x00010203 or 0x04050607, word adds, then & 31) pick each lane's two
+  neighbours among the eight samples; out = fma(fs(s1, s0), frac, s0). Natively the same values: the integer part by
+  the job's masking (|P| < 1 to +0, exponent 158 and up kept), the controls as table lookups over the samples' bytes.
+  The registers the loop takes as constants ($13-$18, $87, $88, set by the setup) are checked (else declined); an
+  iteration's samples that a later output store would overwrite first are declined too (order dependent).
+- Its exact registers: $1, $79 (spu-live at the exit: the epilogue reloads $80-$89 and $126) and the ABI's; $80, the
+  float positions, as the loop leaves them.
+- Checked: 300 captured entries of a walk (every 997th of 581,000), all exact; 865 ns lifted, 405 ns native (x2.1).
+  Test: an oracle lane by lane (the masking in scalar, the samples through csflt, the shuffles byte by byte) over four
+  mixes (special positions: zeros, denormals, exponent 255, negative), counts 0 to 256, relocated; a changed constant
+  register declined.
+- Needs the lifter to make a boundary inside a function an entry of the program (the EDGE agent's ad69fe2, "a boundary
+  inside a function is a label and an entry of the program", not yet in main when this was written): without it the
+  head is no entry, the derived program leaves the region out with a warning, and the lifted code falling into the
+  head is run by the interpreter there (correct, slow). Lift the voice job again once both are in.

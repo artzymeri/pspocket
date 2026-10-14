@@ -23,6 +23,9 @@ int ps_gta5_2828_06048(SPUContext* ctx, uint8_t* ls); /* reverb (Freeverb's stru
 int ps_gta5_2828_08748(SPUContext* ctx, uint8_t* ls); /* delay */
 int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls); /* reverb */
 
+/* The mixer's voice job, spu_bb12970d56fb7b8a (rage_voices.c). */
+int ps_gta5_bb12_08000(SPUContext* ctx, uint8_t* ls); /* sample-rate converter's loop */
+
 #ifdef __cplusplus
 }
 #endif

@@ -37,6 +37,14 @@ const bool registered = [] {
             {0x08748, ps_gta5_2828_08748, {}},
             {0x0A920, ps_gta5_2828_0a920, {}},
         });
+    // The mixer's voice job ("PCMSource", "SrcDownsampleBuf", "Mp3InputBuffer"): the sample-rate converter's loop, from
+    // its head to its exit (listed too: the lifted code leaves there). Live at the exit (spu-live): $79 of $2-$79; the
+    // others are the ABI's.
+    rp::add_build("RAGE audio voices (spu_bb12970d56fb7b8a)", 0xBB12970D56FB7B8Aull, 0x04C00, 0xBFA0,
+        {
+            {0x08000, ps_gta5_bb12_08000, regs({79})},
+            {0x080D8, nullptr, {}},
+        });
     return true;
 }();
 

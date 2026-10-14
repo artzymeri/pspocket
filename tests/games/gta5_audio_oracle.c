@@ -6,6 +6,9 @@
  * for synthetic inputs (CLAUDE.md rule 1). Run in the SPU FP environment.
  */
 #include <stdint.h>
+#include <string.h>
+
+#include "pspocket/core/be.h"
 
 #include "pspocket/spu/lifted.h"
 
@@ -249,4 +252,64 @@ void ps_test_oracle_2828_08748(SPUContext* ctx, uint8_t* ls)
         psl_stq(ls, out + 32 * f + 16, eh);
     }
     ctx->pc = psl_u32p(psl_ld(ctx, 0)) & PS_SPU_PC_MASK;
+}
+
+/* ---- spu_bb12970d56fb7b8a ---- */
+
+/* The sample-rate converter's loop (0x08000 to 0x080D8), lane by lane. Registers in, their words in guest order. */
+static uint32_t gword(const SPUContext* ctx, int r, int k) { return ctx->gpr[r].u32[3 - k]; }
+
+void ps_test_oracle_bb12_08000(SPUContext* ctx, uint8_t* ls)
+{
+    ps_spu_vec P, step;
+    for (int k = 0; k < 4; k++) P[k] = gword(ctx, 80, k), step[k] = gword(ctx, 84, k);
+    const uint32_t src = gword(ctx, 83, 0), count = gword(ctx, 85, 0), step_hi = gword(ctx, 82, 0), step_lo = gword(ctx, 82, 1);
+    uint32_t pos_hi = gword(ctx, 10, 0), pos_lo = gword(ctx, 10, 1), out = gword(ctx, 11, 0), done = gword(ctx, 12, 0);
+    do {
+        ps_spu_vec T;
+        for (int k = 0; k < 4; k++) {
+            const uint32_t e = (P[k] >> 23) & 255, amount = (e - 127) & 63;
+            const uint32_t fraction = amount < 32 ? 0x007FFFFFu >> amount : 0;
+            const uint32_t m = (e < 158 ? fraction : 0) | (e < 127 ? 0xFFFFFFFFu : 0);
+            T[k] = P[k] & ~m;
+        }
+        const ps_spu_vec frac = psl_fs(P, T), d = psl_cflts(psl_fs(T, psl_splat32(T[0])), 171);
+        const uint32_t a = 2u * (pos_hi >> 16) + src;
+        uint8_t q[32], sb[32];
+        memcpy(q, ls + (a & PS_SPU_QW_MASK), 16);
+        memcpy(q + 16, ls + ((a + 16) & PS_SPU_QW_MASK), 16);
+        ps_spu_vec lo, hi;
+        for (int j = 0; j < 4; j++) {
+            lo[j] = (uint32_t)(int32_t)(int16_t)((q[(a & 15) + 2 * j] << 8) | q[(a & 15) + 2 * j + 1]);
+            hi[j] = (uint32_t)(int32_t)(int16_t)((q[(a & 15) + 8 + 2 * j] << 8) | q[(a & 15) + 9 + 2 * j]);
+        }
+        lo = psl_csflt(lo, 140, 0);
+        hi = psl_csflt(hi, 140, 0);
+        for (int j = 0; j < 4; j++) {
+            for (int b = 0; b < 4; b++) {
+                sb[4 * j + b] = (uint8_t)(lo[j] >> (24 - 8 * b));
+                sb[16 + 4 * j + b] = (uint8_t)(hi[j] >> (24 - 8 * b));
+            }
+        }
+        ps_spu_vec s0, s1;
+        for (int k = 0; k < 4; k++) {
+            for (int which = 0; which < 2; which++) {
+                const uint32_t w = (d[k] & 255) * 0x01010101u + (which ? 0x04050607u : 0x00010203u);
+                uint32_t v = 0;
+                for (int b = 0; b < 4; b++) v = (v << 8) | sb[(w >> (24 - 8 * b)) & 31];
+                if (which) s1[k] = v;
+                else s0[k] = v;
+            }
+        }
+        const ps_spu_vec y = psl_fma(psl_fs(s1, s0), frac, s0);
+        for (int k = 0; k < 4; k++) ps_st32(ls + (out & PS_SPU_QW_MASK) + 4 * k, y[k]);
+        out += 16;
+        P = psl_fa(P, step);
+        const uint32_t l = pos_lo + step_lo;
+        pos_hi += step_hi + (l < pos_lo);
+        pos_lo = l;
+        done += 4;
+    } while (count > done);
+    for (int k = 0; k < 4; k++) ctx->gpr[80].u32[3 - k] = P[k];
+    ctx->pc = (0x080D8u + ctx->reloc) & PS_SPU_PC_MASK;
 }
