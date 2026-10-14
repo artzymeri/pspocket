@@ -30,6 +30,7 @@ static inline void stw(uint8_t* ls, uint32_t addr, uint32_t v) { ps_st32(ls + (a
 /* The job's signed remainder (its shift-and-subtract division of magnitudes, the dividend's sign given back). */
 static inline uint32_t srem(uint32_t a, uint32_t b)
 {
+    if ((int32_t)a >= 0 && (int32_t)b > 0 && a < b) return a; /* the usual step: no division */
     const uint32_t ua = (int32_t)a < 0 ? 0u - a : a, ub = (int32_t)b < 0 ? 0u - b : b;
     const uint32_t r = ua % ub;
     return (int32_t)a < 0 ? 0u - r : r;
@@ -82,7 +83,7 @@ static int constants_hold(const uint8_t* ls, uint32_t rel, const img_const* k, i
 #define CTX_SIZE 0xA40u
 #define AP_LINES 4u
 #define BANK_LINES 6u
-#define MAX_FRAMES 256u
+#define MAX_FRAMES 64u
 
 typedef struct {
     ps_spu_vec b, a, p, o, z;
@@ -108,17 +109,6 @@ static inline void pack(uint8_t* ls, uint32_t slot, ps_spu_vec lo, ps_spu_vec hi
     const int16x8_t h = vcombine_s16(vmovn_s32(vreinterpretq_s32_u32((uint32x4_t)clamp16(psl_cflts(lo, 158)))),
         vmovn_s32(vreinterpretq_s32_u32((uint32x4_t)clamp16(psl_cflts(hi, 158)))));
     vst1q_u8(ls + slot, vrev16q_u8(vreinterpretq_u8_s16(h)));
-}
-
-/* A delay line's record: where its slot is now, and its step. */
-static inline uint32_t slot_of(const uint8_t* ls, uint32_t base_at, uint32_t pos_at)
-{
-    return (ldw(ls, base_at) + 16u * ldw(ls, pos_at)) & PS_SPU_QW_MASK;
-}
-static inline void step_line(uint8_t* ls, uint32_t pos_at, uint32_t count_at, uint32_t len_at)
-{
-    stw(ls, pos_at, srem(ldw(ls, pos_at) + 1u, ldw(ls, len_at)));
-    stw(ls, count_at, ldw(ls, count_at) + 1u);
 }
 
 /* The records of every line (base, position, length): all-pass lines first, then banks 1-3 by i. */
@@ -152,22 +142,31 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
     if (!constants_hold(ls, rel, k_2828_reverb, 3)) return 0;
 
     /* Every slot every frame will use, before anything changes. */
-    uint32_t base_at[22], pos_at[22], len_at[22], count_at[22];
+    uint32_t base_at[22], pos_at[22], len_at[22], count_at[22], pos_end[22], slots[22][MAX_FRAMES];
     line_records(cx, base_at, pos_at, len_at, count_at);
     for (uint32_t n = 0; n < 22; n++) {
         const uint32_t base = ldw(ls, base_at[n]), len = ldw(ls, len_at[n]);
         uint32_t pos = ldw(ls, pos_at[n]);
         if (len == 0) return 0;
         for (uint32_t f = 0; f < frames; f++) {
-            const uint32_t slot = (base + 16u * pos) & PS_SPU_QW_MASK;
+            const uint32_t slot = slots[n][f] = (base + 16u * pos) & PS_SPU_QW_MASK;
             if (overlaps(slot, 16, cx, CTX_SIZE) || overlaps(slot, 16, in, 32 * frames) || overlaps(slot, 16, out, 32 * frames))
                 return 0;
             for (int k = 0; k < 3; k++)
                 if (overlaps(slot, 16, (k_2828_reverb[k].addr + rel) & PS_SPU_QW_MASK, 16)) return 0;
             pos = srem(pos + 1u, len);
         }
+        pos_end[n] = pos;
     }
 
+    /* Nothing of the context beyond the host's range (exponent 255): see the filters below. Slots hold int16 and the
+     * context is written only with results of finite operands, so this holds for the whole call. */
+    uint32x4_t e255 = vdupq_n_u32(0);
+    for (uint32_t at = 0; at < CTX_SIZE; at += 16) {
+        const uint32x4_t q = (uint32x4_t)ldq(ls, cx + at);
+        e255 = vorrq_u32(e255, vceqq_u32(vandq_u32(q, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0x7F800000u)));
+    }
+    const int finite = vmaxvq_u32(e255) == 0;
     const ps_spu_vec minus1 = psl_splat32(0xBF800000u);
     for (uint32_t f = 0; f < frames; f++) {
         const ps_spu_vec c10 = ldq(ls, cx + 0x10), c20 = ldq(ls, cx + 0x20), c30 = ldq(ls, cx + 0x30);
@@ -177,13 +176,12 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
         for (uint32_t k = 0; k < AP_LINES; k++) {
             const uint32_t r = cx + 2368 + 64 * k;
             const ps_spu_vec g = ldq(ls, r), c = ldq(ls, r + 16), ng = psl_fm(g, minus1);
-            const uint32_t slot = slot_of(ls, base_at[k], pos_at[k]);
+            const uint32_t slot = slots[k][f];
             ps_spu_vec d0, d1;
             unpack(ls, slot, &d0, &d1);
             y1 = psl_fma(x1, ng, psl_fm(d1, c));
             y0 = psl_fma(x0, ng, psl_fm(d0, c));
             pack(ls, slot, psl_fma(y0, g, x0), psl_fma(y1, g, x1));
-            step_line(ls, pos_at[k], count_at[k], len_at[k]);
             x0 = y0, x1 = y1;
         }
 
@@ -195,7 +193,7 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
                 const uint32_t n = AP_LINES + 3 * i + t;
                 const ps_spu_vec g = ldq(ls, cx + 1504 + 288 * t + 48 * i);
                 ps_spu_vec dl, dh;
-                unpack(ls, slot_of(ls, base_at[n], pos_at[n]), &dl, &dh);
+                unpack(ls, slots[n][f], &dl, &dh);
                 tap_lo[t] = psl_fma(dl, g, tap_lo[t]);
                 tap_hi[t] = psl_fma(dh, g, tap_hi[t]);
             }
@@ -210,11 +208,10 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
             for (uint32_t t = 0; t < 3; t++) {
                 const uint32_t n = AP_LINES + 3 * i + t;
                 const ps_spu_vec g = ldq(ls, cx + 1504 + 288 * t + 48 * i);
-                const uint32_t slot = slot_of(ls, base_at[n], pos_at[n]);
+                const uint32_t slot = slots[n][f];
                 ps_spu_vec dl, dh;
                 unpack(ls, slot, &dl, &dh);
                 pack(ls, slot, mix_lo[t], mix_hi[t]);
-                step_line(ls, pos_at[n], count_at[n], len_at[n]);
                 if (t == 0) {
                     t1lo[i] = psl_fm(dl, g), t1hi[i] = psl_fm(dh, g);
                 } else {
@@ -225,20 +222,48 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
                 }
             }
 
-        /* The twelve filters, side by side: four steps on the lo tap (its last p kept), four on the hi tap. */
+        /* The twelve filters, side by side: four steps on the lo tap (its last p kept), four on the hi tap. With nothing
+         * beyond the host's range in the context (finite), every value here stays finite (rounding toward zero never
+         * overflows to infinity), so fs's clamp of p does nothing; a and b are the same for the eight steps, their
+         * "not a zero" masks made once. Else the lifted code's helpers as they are. */
         ps_spu_vec p_lo[2][BANK_LINES];
-        for (uint32_t h = 0; h < 2; h++) {
-            for (uint32_t step = 0; step < 4; step++)
-                for (uint32_t b = 0; b < 2; b++)
-                    for (uint32_t i = 0; i < BANK_LINES; i++) {
-                        svf* v = &st[b][i];
-                        v->p = psl_fma(v->a, v->z, v->p);
-                        v->o = psl_fma(v->b, v->z, psl_fs(h ? tin_hi[b][i] : tin_lo[b][i], v->p));
-                        v->z = psl_fma(v->a, v->o, v->z);
-                    }
-            if (h == 0)
-                for (uint32_t b = 0; b < 2; b++)
-                    for (uint32_t i = 0; i < BANK_LINES; i++) p_lo[b][i] = st[b][i].p;
+        if (finite) {
+            uint32x4_t nza[2][BANK_LINES], nzb[2][BANK_LINES];
+            for (uint32_t b = 0; b < 2; b++)
+                for (uint32_t i = 0; i < BANK_LINES; i++)
+                    nza[b][i] = psn_nz((uint32x4_t)st[b][i].a), nzb[b][i] = psn_nz((uint32x4_t)st[b][i].b);
+            for (uint32_t h = 0; h < 2; h++) {
+                for (uint32_t step = 0; step < 4; step++)
+                    for (uint32_t b = 0; b < 2; b++)
+                        for (uint32_t i = 0; i < BANK_LINES; i++) {
+                            svf* v = &st[b][i];
+                            const uint32x4_t a = (uint32x4_t)v->a, z = (uint32x4_t)v->z, nzz = psn_nz(z);
+                            const uint32x4_t p = psn_fma_n(a, z, (uint32x4_t)v->p, vandq_u32(nza[b][i], nzz));
+                            const uint32x4_t t = (uint32x4_t)(h ? tin_hi[b][i] : tin_lo[b][i]);
+                            const uint32x4_t u = vreinterpretq_u32_f32(vsubq_f32(vreinterpretq_f32_u32(t), vreinterpretq_f32_u32(p)));
+                            const uint32x4_t o = psn_fma_n((uint32x4_t)v->b, z, u, vandq_u32(nzb[b][i], nzz));
+                            v->p = (ps_spu_vec)p;
+                            v->o = (ps_spu_vec)o;
+                            v->z = (ps_spu_vec)psn_fma_n(a, o, z, vandq_u32(nza[b][i], psn_nz(o)));
+                        }
+                if (h == 0)
+                    for (uint32_t b = 0; b < 2; b++)
+                        for (uint32_t i = 0; i < BANK_LINES; i++) p_lo[b][i] = st[b][i].p;
+            }
+        } else {
+            for (uint32_t h = 0; h < 2; h++) {
+                for (uint32_t step = 0; step < 4; step++)
+                    for (uint32_t b = 0; b < 2; b++)
+                        for (uint32_t i = 0; i < BANK_LINES; i++) {
+                            svf* v = &st[b][i];
+                            v->p = psl_fma(v->a, v->z, v->p);
+                            v->o = psl_fma(v->b, v->z, psl_fs(h ? tin_hi[b][i] : tin_lo[b][i], v->p));
+                            v->z = psl_fma(v->a, v->o, v->z);
+                        }
+                if (h == 0)
+                    for (uint32_t b = 0; b < 2; b++)
+                        for (uint32_t i = 0; i < BANK_LINES; i++) p_lo[b][i] = st[b][i].p;
+            }
         }
 
         /* The outputs, in the job's order, and the filters' states. */
@@ -259,6 +284,12 @@ int ps_gta5_2828_0a920(SPUContext* ctx, uint8_t* ls)
         }
         stq(ls, out + 32 * f, acc_lo);
         stq(ls, out + 32 * f + 16, acc_hi);
+    }
+    /* The lines' positions and counters as the frames left them (the job writes them each frame: nothing reads them
+     * in between but the job, and no slot is inside the context). */
+    for (uint32_t n = 0; n < 22; n++) {
+        stw(ls, pos_at[n], pos_end[n]);
+        stw(ls, count_at[n], ldw(ls, count_at[n]) + frames);
     }
     ctx->pc = pref(ctx, 0) & PS_SPU_PC_MASK;
     return 1;

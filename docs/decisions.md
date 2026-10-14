@@ -15855,6 +15855,12 @@ divisions that wrap the positions under 8%.
   0-16 frames, relocated, in place or not, negative positions; a slot inside the context declined. A walk with
   PSPOCKET_SPU_NATIVE_SCRAMBLE=1 (the registers outside the contracts garbage after each call): 94,484 native calls of
   it, 926,000 of D-979's two, nothing declined, no RSX failure.
+- Later the same night: the usual position step (0 <= pos + 1 < len) without a division, each frame's slots kept from
+  the check before the call (positions and counters written once, at the end: nothing but the job reads them and no
+  slot is in the context), and, when no word of the context is beyond the host's range (then every value stays finite:
+  rounding toward zero never overflows), the filters' fs without its clamp and fma's zero tests of a and b made once.
+  200 captured calls still exact: 5.05 us a call (x3.3). Running the twelve filters six at a time instead measured
+  slower (6.3 us).
 
 ## D-981 · 2026-10-14 · The submix job's comb reverb (0x06048) and delay (0x08748) native, exact
 
@@ -15869,6 +15875,6 @@ Two more of the submix job's (spu_28281614459ce75e) effects, each called about 1
   calls exact; 2.06 us lifted, 0.94 us native (x2.2).
 - 0x08748: an echo, one delay line of int16 pairs (the record as 0x0A920's bank lines) with feedback: the slot's halves
   times the gain are the output, and with the input times the feedback written back. 200 captured calls exact; 656 ns
-  lifted, 245 ns native (x2.7).
+  lifted, 245 ns native (x2.7); 167 ns (x3.9) once the position step skips the division in its usual case (D-980's).
 - Tests (tests/games): oracles in the job's order (records read and written each frame) against both over the four
   mixes, frame counts, relocation, in place or not; slots inside the context declined.
