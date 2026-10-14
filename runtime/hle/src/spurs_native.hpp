@@ -176,6 +176,14 @@ public:
     // Workers inside each workload right now (D-136): a join waits for them to leave before the game frees its memory.
     std::array<std::atomic<u32>, CELL_SPURS_MAX_WORKLOAD2> inside{};
     std::atomic<u64> idle_poll_ns{0}, wait_ns{0};
+    // The workloads' time by the host CPU the worker ran on (D-950): where the phone puts the SPU threads, its two
+    // performance cores or its four efficiency cores.
+    std::array<std::atomic<u64>, 16> cpu_ns{};
+    // PSPOCKET_SPU_AB=S (D-950): the workers alternate every S seconds between their QoS class (A) and
+    // PSPOCKET_SPU_QOS_B (B), so one session measures both in the same scenes. 0: off.
+    u64 ab_period_ns = 0;
+    int qos_a = 0, qos_b = 0; // qos_class_t
+    bool in_b(u64 now_ns) const { return ab_period_ns && ((now_ns / ab_period_ns) & 1) != 0; }
     void report_time(u64 now_ns);
     u64 last_report_ns = 0; // the reporting worker's
 

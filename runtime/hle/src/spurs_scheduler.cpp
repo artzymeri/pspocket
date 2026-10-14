@@ -58,6 +58,36 @@ constexpr u64 SYS_SPU_THREAD_EVENT_USER_KEY = 0xFFFFFFFF53505501ull;
 // which the worker reports).
 int worker_stop(SPUContext*, uint32_t) { return 0; }
 
+#if defined(__APPLE__)
+// The workers' QoS class (D-950): user initiated, or PSPOCKET_SPU_QOS for all of them (interactive, initiated, default,
+// utility), PSPOCKET_SPU_QOS_SOLO for an instance of one SPU (GTA V's sound mixer). Measuring aids for the phone,
+// where six cores of two kinds run them.
+qos_class_t qos_named(const char* v)
+{
+    const std::string_view s = v ? v : "";
+    return s == "interactive" ? QOS_CLASS_USER_INTERACTIVE
+         : s == "default"     ? QOS_CLASS_DEFAULT
+         : s == "utility"     ? QOS_CLASS_UTILITY
+                              : QOS_CLASS_USER_INITIATED;
+}
+
+qos_class_t worker_qos(u32 nspus)
+{
+    const char* v = std::getenv("PSPOCKET_SPU_QOS");
+    if (const char* solo = std::getenv("PSPOCKET_SPU_QOS_SOLO"); solo && nspus == 1) v = solo;
+    return qos_named(v);
+}
+
+const char* qos_name(int q)
+{
+    return q == QOS_CLASS_USER_INTERACTIVE ? "interactive"
+         : q == QOS_CLASS_USER_INITIATED   ? "initiated"
+         : q == QOS_CLASS_DEFAULT          ? "default"
+         : q == QOS_CLASS_UTILITY          ? "utility"
+                                           : "other";
+}
+#endif
+
 // sys_event_flag_set_bit (code 128, answers in the inbound mailbox) and sys_event_flag_set_bit_impatient (192, does
 // not): bit `value & 0xFFFFFF` of the lv2 event flag whose ID is in the outbound mailbox (RPCS3 SPUThread.cpp
 // set_ch_value, SPU_WrOutIntrMbox).
@@ -197,7 +227,7 @@ bool Worker::start()
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, kWorkerStack);
 #if defined(__APPLE__)
-    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
+    pthread_attr_set_qos_class_np(&attr, worker_qos(sched.inst.nspus), 0);
 #endif
     if (!thread_) thread_ = new pthread_t{};
     const int rc = pthread_create(static_cast<pthread_t*>(thread_), &attr, &Worker::entry, this);
@@ -239,7 +269,17 @@ void Worker::body()
     // workers' time). The scheduler and policies around the SPU code do no floating point.
     const u64 fp_env = ps_spu_fpenv_enter();
     // The host clock of one multiply (D-241): steady_clock's reads were 2% of the workers' busy time (run 221).
+    bool in_b = false; // the half of PSPOCKET_SPU_AB this worker's QoS is set for (D-950)
     while (!sched.stopping.load(std::memory_order_acquire)) {
+        if (sched.ab_period_ns) {
+            const u64 now = ps_host_now_ns();
+            const bool b = sched.in_b(now);
+#if defined(__APPLE__)
+            if (b != in_b && sched.qos_a != sched.qos_b)
+                pthread_set_qos_class_self_np(static_cast<qos_class_t>(b ? sched.qos_b : sched.qos_a), 0);
+#endif
+            in_b = b;
+        }
         // The version is read before selecting, so a change made while selecting ends the wait at once.
         const u64 version = ps_res_version(sched.spurs);
         const Selection sel = select(false);
@@ -289,6 +329,11 @@ void Worker::body()
             ns_work += dt;
             idle_streak = 0;
             backoff_ns = 0;
+#if defined(__APPLE__)
+            size_t cpu = 0;
+            if (pthread_cpu_number_np(&cpu) == 0 && cpu < sched.cpu_ns.size())
+                sched.cpu_ns[cpu].fetch_add(dt, std::memory_order_relaxed);
+#endif
         }
     }
     release();
@@ -321,10 +366,24 @@ void Scheduler::report_time(u64 now_ns)
             parts += std::format("{}{} {:.2f} s", parts.empty() ? "" : ", ", name, static_cast<double>(t) / 1e9);
         }
     }
+    // The workloads' time by host CPU (D-950), as shares.
+    std::array<u64, 16> by_cpu{};
+    u64 all_cpus = 0;
+    for (usize i = 0; i < by_cpu.size(); i++) all_cpus += by_cpu[i] = cpu_ns[i].exchange(0, std::memory_order_relaxed);
+    std::string cpus;
+    for (usize i = 0; i < by_cpu.size() && all_cpus; i++) {
+        if (by_cpu[i] * 100 >= all_cpus) {
+            cpus += std::format("{}{} {:.0f}%", cpus.empty() ? "" : ", ", i,
+                100.0 * static_cast<double>(by_cpu[i]) / static_cast<double>(all_cpus));
+        }
+    }
+    std::string half;
+    if (ab_period_ns) half = std::format("; half {}", in_b(now_ns) ? "B" : "A");
     PS_LOG_INFO(kSchedChan, "SPURS {:#x}, SPU time in {:.1f} s on {} SPUs: {}; empty policy polls {:.2f} s; waiting "
-        "for work {:.2f} s", spurs, secs, workers_.size(), parts.empty() ? "nothing" : parts,
+        "for work {:.2f} s{}{}", spurs, secs, workers_.size(), parts.empty() ? "nothing" : parts,
         static_cast<double>(idle_poll_ns.exchange(0, std::memory_order_relaxed)) / 1e9,
-        static_cast<double>(wait_ns.exchange(0, std::memory_order_relaxed)) / 1e9);
+        static_cast<double>(wait_ns.exchange(0, std::memory_order_relaxed)) / 1e9,
+        cpus.empty() ? "" : "; by host CPU: " + cpus, half);
 }
 
 // Gives this SPU's contention back (the worker stops). SPURS2's packed share subtracts byte by byte: this SPU's nibble
@@ -616,6 +675,17 @@ Scheduler::~Scheduler() { stop(); }
 
 void Scheduler::start()
 {
+    // Every SPU a host thread: a workload runs on the SPUs its priorities name (GTA V's EDGE on three of five, its
+    // GraphicsMain on one), so fewer threads would leave some never run.
+    if (const char* v = std::getenv("PSPOCKET_SPU_AB"); v && std::atoi(v) > 0) {
+        ab_period_ns = static_cast<u64>(std::atoi(v)) * 1'000'000'000ull;
+#if defined(__APPLE__)
+        qos_a = worker_qos(inst.nspus);
+        qos_b = std::getenv("PSPOCKET_SPU_QOS_B") ? qos_named(std::getenv("PSPOCKET_SPU_QOS_B")) : qos_a;
+        PS_LOG_INFO(kSchedChan, "SPURS {:#x}: every {} s QoS {} (A) and {} (B) in turn", spurs, std::atoi(v),
+            qos_name(qos_a), qos_name(qos_b));
+#endif
+    }
     for (u32 i = 0; i < inst.nspus; i++) {
         workers_.push_back(std::make_unique<Worker>(*this, i));
         if (!workers_.back()->start()) {
