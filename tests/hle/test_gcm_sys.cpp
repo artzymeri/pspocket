@@ -5,6 +5,7 @@
 #include "hle_test_util.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <functional>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include "internal.hpp" // runtime/lv2/src (white-box): the RSX device's Z-cull regions and display sync
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
+#include "pspocket/hle/display.hpp"
 #include "pspocket/lv2/syscalls.hpp"
 #include "pspocket/recomp/nid.hpp"
 #include "pspocket/rsx/gcm.hpp"
@@ -156,6 +158,57 @@ void write_failing_callbacks(u8* b)
 }
 
 } // namespace
+
+TEST_CASE("cellGcmSys: vblanks follow the screen's refresh when the platform reports it (D-971)", "[hle][gcm]")
+{
+    using namespace std::chrono;
+    using Clock = steady_clock;
+    const auto at = [](double ms) {
+        return Clock::time_point(duration_cast<Clock::duration>(duration<double, std::milli>(1e6 + ms)));
+    };
+    const auto ms_of = [](Clock::time_point t) {
+        return duration<double, std::milli>(t.time_since_epoch()).count() - 1e6;
+    };
+    const auto step = microseconds(16683); // the free-running 59.94 Hz period
+    hle::display_vsync_reset();
+    SECTION("no reports: the nominal time, as before")
+    {
+        CHECK(hle::next_vblank(at(0), at(0) + step, at(1)) == at(0) + step);
+    }
+    SECTION("a 60 Hz screen: locked to its refreshes, no drift")
+    {
+        const auto period = nanoseconds(16'666'667);
+        hle::display_vsync(at(0), period);
+        auto t = at(3); // the free-running timer's phase, 3 ms after a refresh
+        for (int i = 1; i <= 600; i++) {
+            const auto next = hle::next_vblank(t, t + step, t);
+            hle::display_vsync(next, period); // the screen keeps reporting
+            if (i > 1) CHECK(std::abs(ms_of(next) - ms_of(t) - 16.6667) < 0.01); // one refresh apart, every time
+            t = next;
+        }
+        CHECK(std::abs(std::fmod(ms_of(t) + 1e-6, 16.6666667)) < 0.01); // on the grid after 10 s
+    }
+    SECTION("a 120 Hz screen: every second refresh")
+    {
+        hle::display_vsync(at(0), nanoseconds(8'333'333));
+        const auto next = hle::next_vblank(at(0), at(0) + step, at(1));
+        CHECK(std::abs(ms_of(next) - 16.6667) < 0.01);
+    }
+    SECTION("never two vblanks for one refresh")
+    {
+        hle::display_vsync(at(0), nanoseconds(16'666'667));
+        // The previous vblank late (just before the next refresh): the next one is the refresh after.
+        const auto next = hle::next_vblank(at(15), at(15) + step, at(15));
+        CHECK(ms_of(next) - 15 >= 8.3);
+        CHECK(std::abs(ms_of(next) - 33.3333) < 0.01);
+    }
+    SECTION("reports older than 100 ms are not used")
+    {
+        hle::display_vsync(at(0), nanoseconds(16'666'667));
+        CHECK(hle::next_vblank(at(200), at(200) + step, at(201)) == at(200) + step);
+    }
+    hle::display_vsync_reset();
+}
 
 TEST_CASE("cellGcmSys (D-170): every function RPCS3 implements is registered under its NID", "[hle][gcm]")
 {

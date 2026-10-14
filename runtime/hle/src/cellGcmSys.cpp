@@ -42,6 +42,7 @@
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/timebase.h"
+#include "pspocket/hle/display.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
@@ -330,7 +331,8 @@ void _pspocket_gcm_interrupt_thread(PPUContext& ctx, u64)
     bool logged = false;
     std::array<bool, 4> handler_logged{}; // by event source
     for (;;) {
-        next += kVblankPeriod;
+        // On the screen's refresh when the platform reports it (D-971), else every 1/59.94 s.
+        next = next_vblank(next, next + kVblankPeriod, std::chrono::steady_clock::now());
         // Until the vblank: the flip, user and queue handlers the RSX thread asks for, on this thread (as RPCS3's).
         for (auto now = std::chrono::steady_clock::now(); next > now; now = std::chrono::steady_clock::now()) {
             const u64 us = static_cast<u64>(
@@ -1870,6 +1872,47 @@ void register_cellGcmSys(Registry& r)
         f("cellGcmUpdateCursor", &thunk<&cellGcmUpdateCursor>),
         f("cellGcmSortRemapEaIoAddress", &thunk<&cellGcmSortRemapEaIoAddress>),
     });
+}
+
+// ---- the screen's refresh (D-971) ----------------------------------------------------------------------------------
+
+namespace {
+std::atomic<s64> g_vsync_ns{0};        // the last reported refresh, steady_clock nanoseconds (0: none)
+std::atomic<s64> g_vsync_period_ns{0}; // the time from one refresh to the next
+} // namespace
+
+void display_vsync(std::chrono::steady_clock::time_point at, std::chrono::nanoseconds period)
+{
+    if (period.count() <= 0) return;
+    g_vsync_period_ns.store(period.count(), std::memory_order_relaxed);
+    g_vsync_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count(),
+        std::memory_order_release);
+}
+
+void display_vsync_reset()
+{
+    g_vsync_ns.store(0, std::memory_order_release);
+    g_vsync_period_ns.store(0, std::memory_order_relaxed);
+}
+
+std::chrono::steady_clock::time_point next_vblank(std::chrono::steady_clock::time_point previous,
+    std::chrono::steady_clock::time_point nominal, std::chrono::steady_clock::time_point now)
+{
+    using std::chrono::nanoseconds;
+    const s64 last = g_vsync_ns.load(std::memory_order_acquire);
+    const s64 period = g_vsync_period_ns.load(std::memory_order_relaxed);
+    const auto ns = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration_cast<nanoseconds>(t.time_since_epoch()).count();
+    };
+    if (last == 0 || period <= 0 || ns(now) - last > 100'000'000) return nominal;
+    // Refreshes fall at last + k * period, k of either sign: the one nearest the nominal time.
+    const s64 d = ns(nominal) - last;
+    const s64 k = d >= 0 ? (d + period / 2) / period : -((-d + period / 2) / period);
+    s64 t = last + k * period;
+    const s64 earliest = ns(previous) + (ns(nominal) - ns(previous)) / 2;
+    while (t < earliest) t += period;
+    using Clock = std::chrono::steady_clock;
+    return Clock::time_point(std::chrono::duration_cast<Clock::duration>(nanoseconds(t)));
 }
 
 } // namespace pspocket::hle
