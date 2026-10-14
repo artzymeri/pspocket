@@ -1,7 +1,8 @@
 // spu-native-check: native replacements of SPU middleware functions against the lifted functions, on states captured
 // from a game (D-965; pspocket/spu/replace.hpp, PSPOCKET_SPU_CAPTURE).
 //
-//   spu-native-check CAPTURE... [--library FILE] [--time N] [--max N] [--callees native|lifted] [--quiet]
+//   spu-native-check CAPTURE... [--library FILE] [--time N] [--max N] [--callees native|lifted] [--coverage FILE]
+//                    [--quiet]
 //
 // CAPTURE: capture files (.cap) or directories of them. For each capture the lifted function runs from the state at
 // entry and must give the state at exit the capture holds (the capture is of the lifted function: this checks that the
@@ -11,7 +12,8 @@
 // leave otherwise: their count is reported. A native implementation that declines
 // the inputs must leave everything as it was. --time N runs each function N more times on each capture and reports the
 // time a call of each: the fastest of the N runs of each capture (local store and registers restored before each run,
-// outside the timing), averaged over the captures.
+// outside the timing), averaged over the captures. --coverage FILE runs each capture in the interpreter and writes how
+// many times each instruction ran ("function address count" lines): the paths and loops the game uses.
 //
 // The function checked calls the other listed functions through the derived program, natively where they have native
 // code (--callees lifted: the lifted program, every callee lifted). The game's lifted programs come built in (-DPSPOCKET_GAME_SPU, as spu-check) or from a game library (--library). The
@@ -150,6 +152,8 @@ int main(int argc, char** argv)
     u32 time_runs = 0;
     u64 max = 0;
     bool quiet = false, verbose = false, bench = false, callees_native = true;
+    std::string coverage_path;
+    std::map<std::pair<u32, u32>, u64> coverage; // (function, address) -> instructions run
     u32 bench_runs = 1000;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -166,6 +170,7 @@ int main(int argc, char** argv)
         else if (a == "--quiet") quiet = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "--callees") callees_native = value() != "lifted";
+        else if (a == "--coverage") coverage_path = value();
         else if (a == "--bench") bench = true;
         else if (a == "--bench-runs") bench_runs = static_cast<u32>(std::stoul(value()));
         else if (a.rfind("--", 0) == 0) {
@@ -246,6 +251,17 @@ int main(int argc, char** argv)
             ps_spu_attach_program_at(&ctx, run, (h.code_start + h.reloc) & PS_SPU_LS_MASK);
             rp::load_state(c.in, ctx);
         };
+        // --coverage FILE: the interpreter from the captured entry to the captured exit, every instruction counted by
+        // address (the program's own): which paths the game takes, how hot each loop is.
+        if (!coverage_path.empty()) {
+            reset();
+            for (u64 steps = 0; steps < 50'000'000; steps++) {
+                const u32 at = (ctx.pc - h.reloc) & PS_SPU_LS_MASK;
+                coverage[{h.addr, at}]++;
+                if (ps_spu_interpret(&ctx, 1) != PS_SPU_STOP_LIMIT) break;
+                if (ctx.pc == c.out.pc) break;
+            }
+        }
         // The replay: the lifted function from the captured entry gives the captured exit.
         reset();
         lifted(&ctx, ls);
@@ -333,6 +349,10 @@ int main(int argc, char** argv)
         }
     }
     ps_spu_fpenv_leave(fp);
+    if (!coverage_path.empty()) {
+        std::ofstream out(coverage_path);
+        for (const auto& [key, n] : coverage) out << std::format("{:05x} {:05x} {}\n", key.first, key.second, n);
+    }
     for (const auto& [key, t] : totals) {
         std::printf("%016llx %05x: %llu captures; replay differs %llu; native: %llu exact, %llu differ, %llu declined (%llu of "
                     "them changed something)",
