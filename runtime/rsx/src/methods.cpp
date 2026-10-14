@@ -12,6 +12,8 @@
 #include "pspocket/rsx/method_names.hpp"
 #include "pspocket/rsx/rsx.hpp"
 
+#include "methods_upload.hpp"
+
 namespace pspocket::rsx {
 
 namespace {
@@ -211,35 +213,12 @@ void Rsx::m_clear_surface(u32, u32 value) { backend_.clear(value, state_); }
 
 // ---- NV4097 vertex program, constants, immediate data ------------------------------------------------------------
 
-void Rsx::m_transform_program(u32 reg, u32 value)
-{
-    // RPCS3 nv4097.cpp set_transform_program: words land at load * 4 + (index % 4); the load pointer advances by
-    // one instruction after the fourth word.
-    const u32 index = reg - m::NV4097_SET_TRANSFORM_PROGRAM;
-    const u32 load = state_.regs[m::NV4097_SET_TRANSFORM_PROGRAM_LOAD];
-    const u32 slot = load * 4 + (index % 4);
-    if (slot < state_.transform_program.size()) {
-        state_.transform_program[slot] = value;
-    } else {
-        fail(FailKind::Unsupported, reg,
-            std::format("vertex program upload past instruction {} ignored", kMaxVertexProgramInstructions));
-    }
-    if (index % 4 == 3) state_.regs[m::NV4097_SET_TRANSFORM_PROGRAM_LOAD] = load + 1;
-    state_.dirty_bits |= dirty::kVertexProgram;
-}
+// m_transform_program and m_transform_constant: methods_upload.hpp (inline: the FIFO reader calls them straight, D-955).
 
-void Rsx::m_transform_constant(u32 reg, u32 value)
+void Rsx::program_upload_past_end(u32 reg)
 {
-    // RPCS3 nv4097.cpp set_transform_constant: index / 4 is the constant, index % 4 the component; writes past the
-    // usable [0, 467] range are ignored.
-    const u32 index = reg - m::NV4097_SET_TRANSFORM_CONSTANT;
-    const u32 slot = state_.regs[m::NV4097_SET_TRANSFORM_CONSTANT_LOAD] + index / 4;
-    if (slot < kTransformConstantCount) {
-        state_.transform_constants[slot][index % 4] = bits_to_float(value);
-        state_.dirty_bits |= dirty::kVertexConstants;
-    } else {
-        PS_LOG_TRACE(kChan, "transform constant {} out of range, ignored", slot);
-    }
+    fail(FailKind::Unsupported, reg,
+        std::format("vertex program upload past instruction {} ignored", kMaxVertexProgramInstructions));
 }
 
 void Rsx::m_vertex_data(u32 reg, u32 value)

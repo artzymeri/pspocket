@@ -205,6 +205,12 @@ private:
     // FIFO
     RunStatus step(u64 max_words);
     RunStatus step_commands(u64 max_words);
+    // A packet's arguments from `get` (its first word, `word`, already read and recorded at `ea`), as many as can be
+    // read at once (D-955). Sets `used` to the words taken; Blocked as dispatch() is.
+    Dispatch read_arguments(u32 get, u32 ea, u32 put, u32 word, u64 budget, u64& used);
+    // PSPOCKET_RSX_CPU_AB with the FIFO's bit (D-955): the argument runs on in every other run of N frames only.
+    u32 fifo_ab_period_ = 0;
+    bool fifo_fast() const { return !fifo_ab_period_ || (flips_.load(std::memory_order_relaxed) / fifo_ab_period_) % 2 == 1; }
     Dispatch dispatch(u32 reg, u32 value);
     // Whether writing `value` to `reg` between BEGIN and END changes what the vertices drawn so far saw (D-260).
     bool splits_draw(u32 reg, u32 value) const;
@@ -212,6 +218,15 @@ private:
     void submit_draw_clause();
     void fifo_error(std::string message);
     void publish_get();
+    // The get register as the guest last saw it (D-955): with the argument runs it is published before every method
+    // the guest can see the effect of or that blocks, when the reader stops, at jumps, and at least every
+    // kLazyPublishBytes of commands in between, not after every word.
+    static constexpr u32 kLazyPublishBytes = 1024;
+    u32 published_get_ = 0;
+    void maybe_publish()
+    {
+        if (get_.load(std::memory_order_relaxed) - published_get_ >= kLazyPublishBytes) publish_get();
+    }
     void thread_main();
     void wait_for_work(RunStatus why);
     bool blocked_condition_cleared();
@@ -248,6 +263,7 @@ private:
     void m_clear_surface(u32, u32);
     void m_transform_program(u32, u32);
     void m_transform_constant(u32, u32);
+    [[gnu::noinline, gnu::cold]] void program_upload_past_end(u32 reg);
     void m_vertex_data(u32, u32);
     void m_get_report(u32, u32);
     void m_clear_report_value(u32, u32);

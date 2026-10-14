@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <time.h>
 #include <vector>
 
 #include "rsx_test_util.hpp"
@@ -81,13 +82,15 @@ void run(bool guest)
     }
     constexpr u32 kRounds = 40;
     std::chrono::duration<double> spent{};
-    u64 words_read = 0;
+    u64 words_read = 0, cpu_ns = 0;
     for (u32 r = 0; r < kRounds; r++) {
         f.backend.events.clear();
         f.rsx->set_fifo_pointers(0, 0);
         f.set_put(end);
         const auto start = std::chrono::steady_clock::now();
+        const u64 cpu_start = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
         REQUIRE(f.rsx->run_until_idle() == Rsx::RunStatus::Idle);
+        cpu_ns += clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpu_start;
         spent += std::chrono::steady_clock::now() - start;
         words_read += end / 4;
     }
@@ -96,8 +99,10 @@ void run(bool guest)
     REQUIRE(f.backend.of(RecordingBackend::Kind::Draw).size() == draws);
     REQUIRE(f.failures.empty());
     const double ns = spent.count() * 1e9 / static_cast<double>(words_read);
-    std::printf("FIFO%s: %.2f ns a word (%u draws of %u words, %u rounds)\n", guest ? " with a polling guest" : "", ns,
-        draws, end / 4 / draws, kRounds);
+    // The thread's CPU time too: on a Mac busy with other work the wall time counts the time the thread waited.
+    const double cpu = static_cast<double>(cpu_ns) / static_cast<double>(words_read);
+    std::printf("FIFO%s: %.2f ns a word, %.2f ns of CPU (%u draws of %u words, %u rounds)\n",
+        guest ? " with a polling guest" : "", ns, cpu, draws, end / 4 / draws, kRounds);
 }
 
 } // namespace

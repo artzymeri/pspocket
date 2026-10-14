@@ -670,3 +670,25 @@ TEST_CASE("the running RSX never sees words older than the put that covers them 
     for (u32 i = 0; i < clears.size(); i++) ordered = ordered && clears[i] == i / 4;
     CHECK(ordered);
 }
+
+TEST_CASE("the get register reaches the guest before a method it can see, after a long upload (D-955)")
+{
+    // The reader publishes get lazily over uploads and plain registers, but before a method whose effect the guest can
+    // see (a clear here; labels, flips, acquires alike), as when every word published it, and where it stops.
+    Fixture f;
+    auto b = f.at(0);
+    const std::vector<u32> words(32, 0x3f800000);
+    b.method(m::NV4097_SET_TRANSFORM_CONSTANT_LOAD, 0);
+    for (u32 i = 0; i < 40; i++) b.method(m::NV4097_SET_TRANSFORM_CONSTANT, std::span<const u32>(words));
+    for (u32 i = 0; i < 300; i++) b.method(m::NV4097_SET_ALPHA_REF, i);
+    const u32 clear_at = b.offset() + 4; // its argument's word
+    b.method(m::NV4097_CLEAR_SURFACE, 0xf3);
+    b.method(m::NV4097_SET_ALPHA_REF, 7);
+    u32 seen = 0;
+    f.backend.on_clear = [&](u32) { seen = f.get_register(); };
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(seen == clear_at);
+    CHECK(f.get_register() == b.offset());
+    CHECK(f.state().transform_constants[7][3] == 1.f);
+    CHECK(f.failures.empty());
+}

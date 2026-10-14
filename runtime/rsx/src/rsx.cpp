@@ -1,6 +1,9 @@
 #include "pspocket/rsx/rsx.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <format>
 
 #if defined(__APPLE__)
@@ -14,6 +17,8 @@
 #include "pspocket/rsx/gcm.hpp"
 #include "pspocket/rsx/method_names.hpp"
 
+#include "methods_upload.hpp"
+
 namespace pspocket::rsx {
 
 namespace {
@@ -25,6 +30,10 @@ constexpr std::string_view kChan = "rsx";
 struct Rsx::HandlerTable {
     std::array<Handler, m::kMethodCount> table{};
     std::array<bool, m::kMethodCount> known{};
+    // A method whose handler the guest can see the effect of, or that can block (D-955): the get register is published
+    // up to it first, as when every word published it. The others (registers without a handler, program and constant
+    // uploads, vertex data, dirty bits, draw ranges) leave it to Rsx::maybe_publish.
+    std::array<bool, m::kMethodCount> publishes{};
 
     void bind(u32 reg, Handler h) { table[reg] = h; }
     void bind_range(u32 base, u32 count, u32 stride, Handler h)
@@ -127,6 +136,18 @@ struct Rsx::HandlerTable {
         // Valid but meaningless to us (RPCS3 trace_method)
         bind(0x171c >> 2, &Rsx::m_trace);
         bind(0x2100 >> 2, &Rsx::m_trace);
+
+        // D-955: every method with a handler publishes get before it, but these.
+        const std::array quiet{&Rsx::m_transform_program, &Rsx::m_transform_constant, &Rsx::m_vertex_data,
+            &Rsx::m_draw_arrays, &Rsx::m_draw_index_array, &Rsx::m_inline_array, &Rsx::m_array_element16,
+            &Rsx::m_array_element32, &Rsx::m_dirty_surface, &Rsx::m_dirty_vertex_program,
+            &Rsx::m_dirty_fragment_program, &Rsx::m_invalidate_l2, &Rsx::m_dirty_fragment_texture,
+            &Rsx::m_dirty_vertex_texture, &Rsx::m_dirty_pipeline, &Rsx::m_dirty_viewport, &Rsx::m_dirty_vertex_arrays,
+            &Rsx::m_trace};
+        for (u32 r = 0; r < m::kMethodCount; r++) {
+            publishes[r] = table[r] && std::find(quiet.begin(), quiet.end(), table[r]) == quiet.end();
+        }
+        publishes[m::NV406E_SEMAPHORE_ACQUIRE] = true; // dispatch() blocks there
     }
 };
 
@@ -144,6 +165,11 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     fifo_location_.store(config_.fifo_location, std::memory_order_release);
     return_stack_.reserve(config_.call_stack_depth);
     (void)handlers();
+    // PSPOCKET_RSX_CPU_AB=N[:MASK] (D-953): bit 32 of MASK (all by default) is the FIFO's argument runs (D-955).
+    if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) {
+        const char* mask = std::strchr(f, ':');
+        if (!mask || (std::strtoul(mask + 1, nullptr, 0) & 32)) fifo_ab_period_ = static_cast<u32>(std::max(1, std::atoi(f)));
+    }
     backend_.attach(*this);
 }
 
@@ -316,7 +342,11 @@ u32 Rsx::read_put() const
     return ps_bswap32(raw) & ~3u;
 }
 
-void Rsx::publish_get() { write32_release(config_.layout.get_addr(), get_.load(std::memory_order_relaxed)); }
+void Rsx::publish_get()
+{
+    published_get_ = get_.load(std::memory_order_relaxed);
+    write32_release(config_.layout.get_addr(), published_get_);
+}
 
 Rsx::Status Rsx::status() const
 {
@@ -501,6 +531,20 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
         fifo_reset_.store(false, std::memory_order_release);
     }
 
+    // With the argument runs the get register reaches the guest lazily (D-955), and where the reader stops, unless a
+    // reset is waiting (its pointers are the registers' then).
+    const bool fast = fifo_fast();
+    struct PublishOnExit {
+        Rsx& rsx;
+        bool on;
+        ~PublishOnExit()
+        {
+            if (on && !rsx.fifo_reset_.load(std::memory_order_acquire)) {
+                rsx.get_.store(rsx.get_.load(std::memory_order_relaxed), std::memory_order_release);
+                rsx.publish_get();
+            }
+        }
+    } publish_on_exit{*this, fast};
     for (u64 n = 0; n < max_words; n++) {
         u32 get = get_.load(std::memory_order_relaxed);
         const u32 put = read_put();
@@ -522,6 +566,13 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
         words_since_flow_++;
         if (replay_end_ != 0 && get >= replay_end_) replay_end_ = 0; // past the point of the desync
 
+        if (packet_remaining_ > 0 && fast) {
+            // Method arguments, a run of them (D-955).
+            u64 used = 0;
+            if (read_arguments(get, *ea, put, word, max_words - n, used) == Dispatch::Blocked) return RunStatus::Blocked;
+            n += used - 1; // the run's first word is this one
+            continue;
+        }
         if (packet_remaining_ > 0) {
             // Method argument
             if (dispatch(packet_reg_, word) == Dispatch::Blocked) return RunStatus::Blocked;
@@ -595,16 +646,86 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
 
         // Method header
         const u32 count = (word >> cmd::kCountShift) & cmd::kCountMask;
-        get_.store(get + 4, std::memory_order_release);
+        get_.store(get + 4, fast ? std::memory_order_relaxed : std::memory_order_release);
         if (count != 0) {
             packet_header_ = word;
             packet_reg_ = (word & cmd::kMethodMask) >> 2;
             packet_inc_ = (word & cmd::kNonIncrementMask) == cmd::kNonIncrement ? 0 : 1;
             packet_remaining_ = count;
         }
-        publish_get();
+        if (fast) maybe_publish();
+        else publish_get();
     }
     return RunStatus::Budget;
+}
+
+// The arguments of the packet being read, from `get` on, as far as the reader may go without looking at put again:
+// put (when it is ahead), the packet's end, the 1 MB IO page (the next may map elsewhere) and the step's budget. Each
+// word is read and recorded as a word at a time was (an acquire load, the read history, the desync checks) and get_
+// moves past it, but put and the FIFO's address are looked at once a run (the reset flag after a method the guest can
+// see), the words are counted once, and the get register reaches the guest before such a method, else lazily
+// (maybe_publish). Program and constant uploads, two thirds of GTA V's words, go to their handlers straight: what
+// dispatch() does besides is nothing for them, but splitting a draw at a constant (D-260).
+Rsx::Dispatch Rsx::read_arguments(u32 get, u32 ea, u32 put, u32 word, u64 budget, u64& used)
+{
+    const HandlerTable& h = handlers();
+    u64 n = packet_remaining_;
+    if (put > get) n = std::min<u64>(n, (put - get) / 4);
+    n = std::min<u64>({n, (IoMap::kPageSize - (get & (IoMap::kPageSize - 1))) / 4, std::max<u64>(budget, 1)});
+    used = 0;
+    bool moved = false;
+    for (u64 k = 0; k < n; k++) {
+        const u32 at = get + static_cast<u32>(k) * 4;
+        if (k) {
+            word = read32_acquire(ea + static_cast<u32>(k) * 4);
+            read_history_[read_next_++ % read_history_.size()] = {at, word};
+            words_since_flow_++;
+            if (replay_end_ != 0 && at >= replay_end_) replay_end_ = 0;
+        }
+        const u32 reg = packet_reg_;
+        if (reg - m::NV4097_SET_TRANSFORM_CONSTANT < 32 && !(state_.in_begin_end && !state_.draw.ranges.empty())) {
+            state_.regs[reg] = word;
+            m_transform_constant(reg, word);
+        } else if (reg - m::NV4097_SET_TRANSFORM_PROGRAM < 32) {
+            state_.regs[reg] = word;
+            m_transform_program(reg, word);
+        } else {
+            const bool seen = h.publishes[reg];
+            if (seen) publish_get();
+            if (dispatch(reg, word) == Dispatch::Blocked) { // get stays at the word, as the guest sees it
+                words_.fetch_add(used, std::memory_order_relaxed);
+                get_.store(at, std::memory_order_release);
+                publish_get();
+                return Dispatch::Blocked;
+            }
+            // New FIFO pointers set meanwhile: taken at the next step, as after any word (D-123).
+            if (seen && fifo_reset_.load(std::memory_order_acquire)) {
+                used++;
+                moved = true;
+                break;
+            }
+        }
+        used++;
+        // A FIFO error in the handler recovered to put (fifo_error): the reader goes on from there (D-277).
+        if (get_.load(std::memory_order_relaxed) != at) {
+            moved = true;
+            break;
+        }
+        get_.store(at + 4, std::memory_order_relaxed);
+        packet_reg_ = (reg + packet_inc_) & (m::kMethodCount - 1);
+        packet_remaining_--;
+        if (desync_suspect_) { // an unknown method or an impossible primitive (D-118)
+            desync_suspect_ = false;
+            publish_get();
+            report_desync("a method the reader cannot have meant", at);
+            reread_after_desync(at);
+            moved = true;
+            break;
+        }
+    }
+    words_.fetch_add(used, std::memory_order_relaxed);
+    if (!moved) maybe_publish();
+    return Dispatch::Done;
 }
 
 Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
