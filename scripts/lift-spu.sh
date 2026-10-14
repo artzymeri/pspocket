@@ -6,9 +6,8 @@
 # DUMP holds spu_<hash>_<lsaddr>.bin (the code, from the user's game) and .txt (kind, guest address, LS base, size,
 # entry, and for modules "seed" lines: addresses execution entered them at). Every image is lifted at its LS base with
 # its entry and seeds; the logs of earlier runs with lifted programs add the addresses where execution left lifted code
-# ("no lifted code at ...") as seeds too, so the next lift covers them, and the entry points of the programs already in
-# OUT stay seeds (the seeds accumulate). OUT gets
-# one directory per program and game_spu.c, whose pspocket_game_spu_register() registers them all. DUMP and OUT hold
+# ("no lifted code at ...") as seeds too, so the next lift covers them, and the seeds the programs already in OUT were
+# lifted with (OUT/NAME/NAME.seeds) stay seeds (the seeds accumulate). OUT gets one directory per program and game_spu.c, whose pspocket_game_spu_register() registers them all. DUMP and OUT hold
 # code derived from the game: keep them in the gitignored inventory/ or build/ (CLAUDE.md rule 1).
 #
 # Job binaries and modules are position independent: they are lifted relocatable (spu-lift --relocatable, D-081), once
@@ -48,12 +47,19 @@ done | sort > "$TMP/images"
         name="$(basename "$meta" .txt)"
         value seed "$meta" | sed "s/^/$name /"
     done
-    # The entry points of the programs an earlier lift made: a seed stays once found, though the logs that gave it
-    # are not kept.
+    # The seeds an earlier lift used (NAME.seeds, as runtime/prepare keeps them): a seed stays once found, though the
+    # logs that gave it are not kept. A program lifted before the script kept them carries its entries over instead,
+    # which are every label: those of code only discovery or a constant found, and block starts a newer lifter no
+    # longer makes (D-958), which as seeds would come back as labels.
     for reg in "$OUT"/spu_*/spu_*_reg.c; do
         [ -e "$reg" ] || continue
-        name="$(basename "$(dirname "$reg")")"
-        sed -n 's/^    {\(0x[0-9A-Fa-f]*\)u, .*/\1/p' "$reg" | sed "s/^/$name /"
+        dir="$(dirname "$reg")"
+        name="$(basename "$dir")"
+        if [ -f "$dir/$name.seeds" ]; then
+            sed "s/^/$name /" "$dir/$name.seeds"
+        else
+            sed -n 's/^    {\(0x[0-9A-Fa-f]*\)u, .*/\1/p' "$reg" | sed "s/^/$name /"
+        fi
     done
 } > "$TMP/raw-seeds"
 
@@ -91,6 +97,9 @@ while read -r name kind base size entry; do
     canonical="$(awk -v n="$name" '$1 == n { print $2 }' "$TMP/canon")"
     if [ -n "$canonical" ] && [ "$canonical" != "$name" ]; then merged=$((merged + 1)); continue; fi
     args=(--image "$DUMP/$name.bin" --base "$base" --entry "$entry" --name "$name" --out "$OUT/$name" --quiet)
+    # More spu-lift options for every program (comparisons: PSPOCKET_SPU_LIFT_ARGS=--whole).
+    extra=(${PSPOCKET_SPU_LIFT_ARGS:-})
+    args+=(${extra[@]+"${extra[@]}"})
     case "$kind" in job|module) args+=(--relocatable) ;; esac
     # Seeds inside the image's code only: execution also leaves lifted code for code outside it (the SPURS syscall
     # stubs, modules a program loads), which spu-lift refuses as seeds.
@@ -99,6 +108,7 @@ while read -r name kind base size entry; do
         if [ $((seed)) -ge $((base)) ] && [ $((seed)) -lt $((base + size)) ]; then args+=(--seed "$seed"); fi
     done < "$TMP/seeds"
     if "$LIFT" "${args[@]}" > "$OUT/$name.log" 2>&1; then
+        printf '%s\n' "${args[@]}" | awk 'prev == "--seed" { print } { prev = $0 }' > "$OUT/$name/$name.seeds"
         DECLS="${DECLS}void ${name}_register(void);"$'\n'
         CALLS="${CALLS}    ${name}_register();"$'\n'
         count=$((count + 1))
