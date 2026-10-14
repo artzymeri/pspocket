@@ -584,8 +584,10 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             return sample_view(c.texture, c.views, src);
         }
         if (draw_targets.contains(s)) {
-            // Reading a surface the draw also renders to: sample a copy taken before the draw (D-148).
+            // Reading a surface the draw also renders to: sample a copy taken before the draw (D-148), kept as the
+            // RSX's texture cache keeps what it read (D-947).
             bind_source = "target copy";
+            feedback_unit = unit;
             return sample_view(feedback_copy(*s), s->feedback.views, src);
         }
         return sample_view(tex, s->views, src);

@@ -261,6 +261,7 @@ private:
     void m_dirty_surface(u32, u32);
     void m_dirty_vertex_program(u32, u32);
     void m_dirty_fragment_program(u32, u32);
+    void m_invalidate_l2(u32, u32);
     void m_dirty_fragment_texture(u32, u32);
     void m_dirty_vertex_texture(u32, u32);
     void m_dirty_pipeline(u32, u32);

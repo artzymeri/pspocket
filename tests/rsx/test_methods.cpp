@@ -219,6 +219,20 @@ TEST_CASE("user commands drain the backend and call the HLE handler")
     CHECK(f.backend.of(Kind::Sync).size() == 2);
 }
 
+TEST_CASE("NV4097_INVALIDATE_L2 counts texture cache invalidations and marks the fragment program dirty (D-947)")
+{
+    Fixture f;
+    const u64 before = f.rsx->state().texture_cache_epoch;
+    f.rsx->state().dirty_bits = 0;
+    auto b = f.at(0);
+    b.method(m::NV4097_INVALIDATE_L2, 1); // cellGcmSetInvalidateTextureCache(CELL_GCM_INVALIDATE_TEXTURE)
+    b.method(m::NV4097_INVALIDATE_L2, 2); // ... (CELL_GCM_INVALIDATE_VERTEX_TEXTURE)
+    REQUIRE(f.submit(b) == Rsx::RunStatus::Idle);
+    CHECK(f.failures.empty());
+    CHECK(f.rsx->state().texture_cache_epoch == before + 2);
+    CHECK((f.rsx->state().dirty_bits & dirty::kFragmentProgram) != 0);
+}
+
 TEST_CASE("sync_on_label waits for the GPU before label writes")
 {
     Config cfg = test_config();

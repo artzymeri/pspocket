@@ -87,11 +87,11 @@ struct Rsx::HandlerTable {
                  m::NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, m::NV4097_SET_TRANSFORM_PROGRAM_LOAD}) {
             bind(r, &Rsx::m_dirty_vertex_program);
         }
-        for (u32 r : {m::NV4097_SET_SHADER_PROGRAM, m::NV4097_SET_SHADER_CONTROL, m::NV4097_INVALIDATE_L2,
-                 m::NV4097_SET_SHADER_PACKER, m::NV4097_SET_SHADER_WINDOW, m::NV4097_SET_TWO_SIDE_LIGHT_EN,
-                 m::NV4097_SET_POINT_SPRITE_CONTROL}) {
+        for (u32 r : {m::NV4097_SET_SHADER_PROGRAM, m::NV4097_SET_SHADER_CONTROL, m::NV4097_SET_SHADER_PACKER,
+                 m::NV4097_SET_SHADER_WINDOW, m::NV4097_SET_TWO_SIDE_LIGHT_EN, m::NV4097_SET_POINT_SPRITE_CONTROL}) {
             bind(r, &Rsx::m_dirty_fragment_program);
         }
+        bind(m::NV4097_INVALIDATE_L2, &Rsx::m_invalidate_l2);
         bind_range(m::NV4097_SET_TEX_COORD_CONTROL, 10, 1, &Rsx::m_dirty_fragment_program);
         for (u32 r : {m::NV4097_SET_TEXTURE_OFFSET, m::NV4097_SET_TEXTURE_FORMAT, m::NV4097_SET_TEXTURE_ADDRESS,
                  m::NV4097_SET_TEXTURE_CONTROL0, m::NV4097_SET_TEXTURE_CONTROL1, m::NV4097_SET_TEXTURE_FILTER,

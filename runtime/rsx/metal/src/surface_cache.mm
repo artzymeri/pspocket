@@ -346,11 +346,31 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blit_pipeline_for(MTLPixelFormat 
 // (GTA V's, colour mask 0 there) share one copy and keep their pass. A new copy is a new texture: copying into the
 // one earlier draws read made the GPU wait for them each time (GPU time per frame 8.5 ms to 22 ms on the Mac walk);
 // the old one goes when the GPU is done with it, so a frame holds as many as it has writes between such draws.
+//
+// The RSX reads such a target through its texture cache, which sees what draws wrote to it only after the game
+// invalidates the cache (cellGcmSetInvalidateTextureCache, NV4097_INVALIDATE_L2): until then a draw may read what the
+// cache took in before. The copy plays the cache (D-947): kept, though the target was written, while the draws go on to
+// the same targets and no invalidation came, so a run of such draws keeps its pass (GTA V's: up to 400 copies and
+// passes a frame on the iPhone, 80 to 155 ms of GPU time, run 327; RPCS3 samples the target in place unless in its
+// strict rendering mode, texture_cache_helpers.h force_strict_fbo_sampling). The depth bounds test's copy is not one.
 id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s, bool depth_only)
 {
     Surface::Conversion& c = s.feedback;
-    const bool fresh = !c.texture || c.generation != s.generation ||
-        (!depth_only && c.stencil_generation != s.stencil_generation);
+    const bool written = c.generation != s.generation || (!depth_only && c.stencil_generation != s.stencil_generation);
+    bool fresh = !c.texture || written;
+    const bool cached = feedback_cached && !depth_only && ab_on();
+    if (fresh && c.texture && cached && c.bind_epoch == bind_epoch && c.cache_epoch == cache_epoch) {
+        fresh = false;
+        stats.feedback_reused++;
+        feedback_sources[feedback_source(s)].reused++;
+    }
+    if (fresh && !depth_only) {
+        if (!c.texture) stats.feedback_first++;
+        else if (!cached) stats.feedback_strict++;
+        else if (c.bind_epoch != bind_epoch) stats.feedback_rebound++;
+        else stats.feedback_invalidated++;
+        feedback_sources[feedback_source(s)].made++;
+    }
     if (fresh) {
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s.texture.pixelFormat
                                                                                      width:s.texture.width
@@ -366,9 +386,17 @@ id<MTLTexture> MetalBackend::Impl::feedback_copy(Surface& s, bool depth_only)
         [blit endEncoding];
         c.generation = s.generation;
         c.stencil_generation = s.stencil_generation;
+        c.bind_epoch = bind_epoch;
+        c.cache_epoch = cache_epoch;
         stats.feedback_copies++;
     }
     return c.texture;
+}
+
+std::string MetalBackend::Impl::feedback_source(const Surface& s) const
+{
+    return std::format("fragment program {:#x} unit {} reading target {:#010x} {}x{} format {}", feedback_fp,
+        feedback_unit, s.address, s.width, s.height, s.gcm_format);
 }
 
 Surface::Conversion* MetalBackend::Impl::depth_as_texture(Surface& d, u32 mode)

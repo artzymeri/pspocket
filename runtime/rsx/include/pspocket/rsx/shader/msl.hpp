@@ -111,8 +111,15 @@ struct alignas(16) MslFsParams {
     u32 fog_mode = 0x800;                 // NV4097_SET_FOG_MODE and _PARAMS: FOGC's fog factor (D-256)
     float fog_param[2] = {};
     u32 aa = 0x0101;                      // samples across (bits 0-7) and down (8-15) a pixel: WPOS in pixels (D-276)
+    // The blending FpOptions::blend_in_shader's outputs do in the shader (D-948): NV4097_SET_BLEND_EQUATION, _FUNC_SFACTOR
+    // and _FUNC_DFACTOR as the registers hold them (RGB in the low 16 bits, alpha in the high), and the blend colour.
+    u32 blend_equation = 0x80068006;
+    u32 blend_sfactor = 0x00010001;
+    u32 blend_dfactor = 0;
+    u32 pad0 = 0;
+    float blend_color[4] = {};
 };
-static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64 + 16);
+static_assert(sizeof(MslFsParams) == 16 + 256 + 16 + 64 + 64 + 16 + 32);
 
 // Shadow2D: a depth texture sampled with a depth comparison (RPCS3 shadow_textures: a depth format and a compare
 // function other than never and always); the lookup returns the comparison's result in every channel.
@@ -175,6 +182,12 @@ struct FpOptions {
     // depth of a fragment function that can discard unclamped: such a program exports its rasterized depth, which Metal
     // clamps as it clamps every exported depth (D-266, D-941).
     bool clamp_depth = false;
+    // Outputs (bit n: colour n) whose blending the shader does, reading the pixel from the target (programmable
+    // blending, [[color(n)]]), with MslFsParams' equations and factors: the signed equations, which Metal's blending
+    // has not (RPCS3 RSXThread.cpp evaluate_programmable_blending_state, RSXProgrammableBlendPrologue.glsl; D-948).
+    // blend_unorm: those whose target holds bytes, where a signed equation reads one as two's complement.
+    u8 blend_in_shader = 0;
+    u8 blend_unorm = 0;
     bool operator==(const FpOptions&) const = default;
 };
 

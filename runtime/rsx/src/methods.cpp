@@ -437,6 +437,14 @@ void Rsx::m_index_array_dma(u32, u32 value)
 void Rsx::m_dirty_surface(u32, u32) { state_.dirty_bits |= dirty::kSurface | dirty::kPipeline; }
 void Rsx::m_dirty_vertex_program(u32, u32) { state_.dirty_bits |= dirty::kVertexProgram; }
 void Rsx::m_dirty_fragment_program(u32, u32) { state_.dirty_bits |= dirty::kFragmentProgram; }
+// The texture cache invalidated (cellGcmSetInvalidateTextureCache): the fragment program is fetched again, as RPCS3
+// does (rsx_methods.cpp binds NV4097_INVALIDATE_L2 to set_shader_program_dirty), and texture reads after it see what
+// draws wrote to their targets before it (D-947).
+void Rsx::m_invalidate_l2(u32, u32)
+{
+    state_.dirty_bits |= dirty::kFragmentProgram;
+    state_.texture_cache_epoch++;
+}
 void Rsx::m_dirty_fragment_texture(u32, u32) { state_.dirty_bits |= dirty::kFragmentTextures; }
 void Rsx::m_dirty_vertex_texture(u32, u32) { state_.dirty_bits |= dirty::kVertexTextures; }
 void Rsx::m_dirty_pipeline(u32, u32) { state_.dirty_bits |= dirty::kPipeline; }

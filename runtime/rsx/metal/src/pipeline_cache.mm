@@ -461,6 +461,7 @@ const CompiledProgram* MetalBackend::Impl::fragment_program_for(const RsxState& 
     if (options.point_coord_mask) opt += std::format(".p{:x}", options.point_coord_mask); // D-262
     if (options.polygon_stipple) opt += ".s"; // D-263
     if (options.clamp_depth) opt += ".z";     // D-941
+    if (options.blend_in_shader) opt += std::format(".pb{:x}{:x}", options.blend_in_shader, options.blend_unorm); // D-948
     for (u32 t = 0; t < 16; t++) {
         if (!(fp.texture_mask & (1u << t))) continue;
         opt += std::format(".{}{}", t, static_cast<u32>(options.texture_kind[t]));
@@ -580,7 +581,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::pipeline_for(const CompiledProgra
         const u32 rsx_index = pass.rsx_index[i];
         p.color_formats[i] = static_cast<u32>(s->pixel_format);
         p.write_masks[i] = static_cast<u32>(write_mask(masks.mask[rsx_index], s->gcm_format));
-        p.blend_on[i] = blend.enabled_for(rsx_index) ? 1 : 0;
+        p.blend_on[i] = blend.enabled_for(rsx_index) && !(shader_blend & (1u << i)) ? 1 : 0; // D-948: the shader's
     }
     p.sfactor_rgb = blend.sfactor_rgb, p.dfactor_rgb = blend.dfactor_rgb;
     p.sfactor_a = blend.sfactor_a, p.dfactor_a = blend.dfactor_a;

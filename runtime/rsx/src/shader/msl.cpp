@@ -36,6 +36,7 @@ struct rsx_fs_params {
     uint tex_control[16]; // per unit: the texel conversions (pspocket/rsx/texture.hpp texctl)
     float tex_bias[16];   // per unit: the LOD bias
     uint fog_mode; float fog_param0; float fog_param1; uint aa; // FOGC's fog factor; samples across and down a pixel
+    uint blend_equation; uint blend_sfactor; uint blend_dfactor; uint pad0; float4 blend_color; // in-shader blending
 };
 
 // FOGC as the RSX gives it: x the fog coordinate (the vertex program's o5.x), y the fog factor from NV4097_SET_FOG_MODE
@@ -1225,6 +1226,61 @@ TranslateResult translate_fragment_program(const FragmentProgram& fp, const FpOp
         src += "static float4 rsx_lif(float4 v) { return float4(1.0, v.y, v.y > 0.0 ? exp2(v.w) : 0.0, 1.0); }\n";
     }
     if (uses_refl) src += "static float4 rsx_refl(float4 i, float4 n) { return i - 2.0 * dot(n, i) * n; }\n";
+    if (opt.blend_in_shader && mrt > 0) {
+        // Blending in the shader (D-948), as RPCS3 RSXProgrammableBlendPrologue.glsl does it: on a target of bytes the
+        // signed equations read the source byte (REVERSE_ADD_SIGNED: the destination's) as two's complement over 255
+        // and apply no factors; the others saturate the source term there. Alpha takes the factors' alpha.
+        src += R"MSL(static float4 rsx_signed_byte(float4 v)
+{
+    const uint4 b = uint4(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+    return float4(as_type<int4>(b << 24u) >> 24) / 255.0;
+}
+static float4 rsx_blend_factor(uint f, float4 s, float4 d, float4 k)
+{
+    switch (f) {
+    case 0x0000u: return float4(0.0);
+    case 0x0001u: return float4(1.0);
+    case 0x0300u: return s;
+    case 0x0301u: return 1.0 - s;
+    case 0x0302u: return s.wwww;
+    case 0x0303u: return 1.0 - s.wwww;
+    case 0x0304u: return d.wwww;
+    case 0x0305u: return 1.0 - d.wwww;
+    case 0x0306u: return d;
+    case 0x0307u: return 1.0 - d;
+    case 0x0308u: { const float m = min(s.w, 1.0 - d.w); return float4(m, m, m, 1.0); }
+    case 0x8001u: return k;
+    case 0x8002u: return 1.0 - k;
+    case 0x8003u: return k.wwww;
+    case 0x8004u: return 1.0 - k.wwww;
+    }
+    return float4(0.0);
+}
+static float4 rsx_blend_op(uint e, uint sf, uint df, float4 s, float4 d, float4 k, bool unorm)
+{
+    const float4 ss = unorm ? saturate(s) : s;
+    switch (e) {
+    case 0x8007u: return min(ss, d);
+    case 0x8008u: return max(ss, d);
+    case 0xf005u: return d - (unorm ? rsx_signed_byte(s) : s);
+    case 0xf006u: return (unorm ? rsx_signed_byte(s) : s) + d;
+    case 0xf007u: return ss + (unorm ? rsx_signed_byte(d) : d);
+    }
+    float4 a = s * rsx_blend_factor(sf, s, d, k);
+    const float4 b = d * rsx_blend_factor(df, s, d, k);
+    if (unorm) a = saturate(a);
+    return e == 0x800au ? a - b : e == 0x800bu ? b - a : a + b;
+}
+static float4 rsx_blend(float4 s, float4 d, constant rsx_fs_params& fp, bool unorm)
+{
+    const float4 c = rsx_blend_op(fp.blend_equation & 0xffffu, fp.blend_sfactor & 0xffffu, fp.blend_dfactor & 0xffffu, s, d,
+                                  fp.blend_color, unorm);
+    const float4 a = rsx_blend_op(fp.blend_equation >> 16, fp.blend_sfactor >> 16, fp.blend_dfactor >> 16, s, d,
+                                  fp.blend_color, unorm);
+    return float4(c.xyz, a.w);
+}
+)MSL";
+    }
     if (uses_pack) src += kPackHelpers;
     if (uses_to_srgb || (opt.srgb_output && mrt > 0)) {
         // RPCS3 RSXFragmentPrologue.glsl linear_to_srgb.
@@ -1291,6 +1347,9 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
     if (opt.depth_bounds) params += std::format(",\n    depth2d<float> depth_bounds [[texture({})]]", slot::kFsDepthBounds);
     if (opt.point_coord_mask) params += ",\n    float2 point_coord [[point_coord]]";
     if (opt.polygon_stipple) params += std::format(",\n    constant uint* stipple [[buffer({})]]", slot::kFsStipple);
+    for (u32 i = 0; i < mrt; i++) { // the pixels in the targets, for blending in the shader (D-948)
+        if (opt.blend_in_shader & (1u << i)) params += std::format(",\n    float4 dst{} [[color({})]]", i, i);
+    }
     src += std::format("fragment rsx_fs_out {}({})\n{{\n", result.shader.entry, params);
     // The pixel's centre: a multisampled target is drawn one texel per sample (D-250), and the RSX gives a fragment its
     // pixel's position (D-276). With one sample a pixel it is the position as it is.
@@ -1353,6 +1412,14 @@ static float4 rsx_texel(float4 v, uint c, bool bx2)
         } else {
             auto ch = [&](u8 k) { return k < 4 ? std::format("{}.{}", outputs[i], kChan[k]) : std::string(kChan[std::min<u8>(k, 5)]); };
             src += std::format("    out.c{} = float4({}, {}, {}, {});\n", i, ch(sw[0]), ch(sw[1]), ch(sw[2]), ch(sw[3]));
+        }
+    }
+    // Blending in the shader (D-948): the output as the target takes it against the pixel there, as Metal's blending
+    // would do it.
+    for (u32 i = 0; i < mrt; i++) {
+        if (opt.blend_in_shader & (1u << i)) {
+            src += std::format("    out.c{} = rsx_blend(out.c{}, dst{}, fp, {});\n", i, i, i,
+                (opt.blend_unorm & (1u << i)) ? "true" : "false");
         }
     }
     if (mrt == 0 && !depth_out) src += "    out.c0 = float4(0.0);\n";

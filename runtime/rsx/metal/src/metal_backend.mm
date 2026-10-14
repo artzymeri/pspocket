@@ -237,6 +237,7 @@ bool MetalBackend::Impl::init()
     }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
+    if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK")) feedback_cached = false;            // D-947's comparison
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
             config.shader_cache_threads, config.shader_archives);
@@ -1449,6 +1450,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     PassTargets targets;
     skip_reason = "no render target";
     if (!select_targets(state, targets, ~0u)) return skip("");
+    // The texture cache a target this draw samples while drawing to it is read through (D-947): what its copy was
+    // made under, the targets and the game's invalidations.
+    if (!(targets == bind_targets)) {
+        bind_targets = targets;
+        bind_epoch++;
+    }
+    cache_epoch = state.texture_cache_epoch;
+    feedback_fp = state.shader_program().offset;
     const bool points = d.primitive == Primitive::Points;
     compile_pending = false;
     shader::FpOptions fo;
@@ -1505,6 +1514,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     fo.srgb_output = state.reg(m::NV4097_SET_SHADER_PACKER) != 0 && !(fo.shader_control & 0x40) && !float_target &&
                      targets.color_count > 0;
     fo.alpha_to_coverage = ((state.reg(m::NV4097_SET_ANTI_ALIASING_CONTROL) >> 4) & 1) != 0;
+    // The signed blend equations, which Metal's blending has not, are done in the shader, which reads the target's
+    // pixel (D-948; RPCS3 RSXThread.cpp evaluate_programmable_blending_state): on four-channel targets.
+    const BlendInfo draw_blend = state.blend();
+    const auto is_signed = [](u32 e) { return e == 0xf005 || e == 0xf006 || e == 0xf007; };
+    if (!draw_blend.logic_op_enable && (is_signed(draw_blend.equation_rgb) || is_signed(draw_blend.equation_a))) {
+        for (u32 i = 0; i < targets.color_count; i++) {
+            if (!draw_blend.enabled_for(targets.rsx_index[i])) continue;
+            const MTLPixelFormat pf = targets.color[i]->pixel_format;
+            const bool unorm = pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatBGRA8Unorm;
+            if (!unorm && pf != MTLPixelFormatRGBA16Float && pf != MTLPixelFormatRGBA32Float) continue;
+            fo.blend_in_shader = static_cast<u8>(fo.blend_in_shader | (1u << i));
+            if (unorm) fo.blend_unorm = static_cast<u8>(fo.blend_unorm | (1u << i));
+        }
+    }
     const shader::FragmentProgram* fprog = nullptr;
     u32 fp_ea = 0;
     const CompiledProgram* fp = fragment_program_for(state, fo, &fprog, fp_ea);
@@ -1569,6 +1592,18 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     std::array<id<MTLTexture>, kFragmentTextureCount> bound{};
     std::string trace_tex;
     shader::MslFsParams fs{};
+    // Blending in the shader (D-948): the translation's only; the interpreter's draws blend as Metal can.
+    shader_blend = interpret ? 0 : fo.blend_in_shader;
+    if (shader_blend) {
+        fs.blend_equation = state.reg(m::NV4097_SET_BLEND_EQUATION);
+        fs.blend_sfactor = state.reg(m::NV4097_SET_BLEND_FUNC_SFACTOR);
+        fs.blend_dfactor = state.reg(m::NV4097_SET_BLEND_FUNC_DFACTOR);
+        fs.blend_color[0] = static_cast<float>((draw_blend.color >> 16) & 0xff) / 255.f;
+        fs.blend_color[1] = static_cast<float>((draw_blend.color >> 8) & 0xff) / 255.f;
+        fs.blend_color[2] = static_cast<float>(draw_blend.color & 0xff) / 255.f;
+        fs.blend_color[3] = static_cast<float>(draw_blend.color >> 24) / 255.f;
+        stats.shader_blend_draws++;
+    }
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         fs.tex_scale[t][0] = fs.tex_scale[t][1] = 1.f;
         if (!(fp_textures & (1u << t))) continue;
@@ -2298,6 +2333,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     }
     frame_event_value++;
     [cb encodeSignalEvent:frame_event value:frame_event_value];
+    if (trace_requested.exchange(false, std::memory_order_acq_rel) && !tracing) config.trace_frame = request.flip_index + 1;
     if (config.trace_frame && request.flip_index + 1 == config.trace_frame) {
         tracing = true;
         trace_count = 0;
@@ -2374,6 +2410,7 @@ MetalBackend::~MetalBackend()
 }
 
 void MetalBackend::trim_memory() { impl_->trim_requested.store(true, std::memory_order_release); }
+void MetalBackend::trace_next_frame() { impl_->trace_requested.store(true, std::memory_order_release); }
 
 bool MetalBackend::valid() const { return impl_->device != nil; }
 void* MetalBackend::device() const { return (__bridge void*)impl_->device; }
@@ -2438,6 +2475,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.texture_mb_hashed = per_frame(m.stats.texture_check_bytes, m.report_texture_bytes) / 1048576.0;
         w.write_faults = per_frame(m.tracker.faults_handled(), m.report_faults);
         w.feedback_copies = per_frame(m.stats.feedback_copies, m.report_feedback);
+        w.feedback_reused = per_frame(m.stats.feedback_reused, m.report_feedback_reused);
+        w.texture_cache_invalidations = per_frame(m.cache_epoch, m.report_cache_epoch);
         w.depth_bounds_draws = per_frame(m.stats.depth_bounds_draws, m.report_depth_bounds);
         w.attachment_load_mb = per_frame(m.stats.attachment_load_bytes, m.report_load_bytes) / 1048576.0;
         w.attachment_store_mb = per_frame(m.stats.attachment_store_bytes, m.report_store_bytes) / 1048576.0;
@@ -2483,6 +2522,35 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             w.surfaces, w.surface_mb,
             w.feedback_copies, w.depth_bounds_draws, w.corner_textures, w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
             w.deferred_queue);
+        // The draws that sampled a target they drew to (D-947): copies made and why, copies kept as the texture
+        // cache, the game's invalidations, and the draws behind most of them.
+        if (w.feedback_copies + w.feedback_reused >= 1.0) {
+            std::vector<std::pair<std::string, Impl::FeedbackSource>> top(m.feedback_sources.begin(), m.feedback_sources.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+                return a.second.made + a.second.reused > b.second.made + b.second.reused;
+            });
+            std::string most;
+            for (usize i = 0; i < top.size() && i < 3; i++) {
+                most += std::format("{}{} ({:.1f} copies, {:.1f} kept a frame)", i ? "; " : "", top[i].first,
+                    static_cast<double>(top[i].second.made) / n, static_cast<double>(top[i].second.reused) / n);
+            }
+            PS_LOG_INFO(kChan, "feedback (last {}): {:.2f} copies a frame ({:.2f} the first, {:.2f} after a write and "
+                               "a texture cache invalidation, {:.2f} after the targets changed, {:.2f} with the cache "
+                               "rule off), {:.2f} draws a frame read a kept copy; {:.2f} texture cache invalidations a "
+                               "frame; most: {}",
+                w.flips, w.feedback_copies, per_frame(m.stats.feedback_first, m.report_feedback_first),
+                per_frame(m.stats.feedback_invalidated, m.report_feedback_invalidated),
+                per_frame(m.stats.feedback_rebound, m.report_feedback_rebound),
+                per_frame(m.stats.feedback_strict, m.report_feedback_strict), w.feedback_reused,
+                w.texture_cache_invalidations, most);
+        }
+        m.feedback_sources.clear();
+        m.report_feedback_reused = m.stats.feedback_reused;
+        m.report_feedback_first = m.stats.feedback_first;
+        m.report_feedback_invalidated = m.stats.feedback_invalidated;
+        m.report_feedback_rebound = m.stats.feedback_rebound;
+        m.report_feedback_strict = m.stats.feedback_strict;
+        m.report_cache_epoch = m.cache_epoch;
         if (m.config.on_window) m.config.on_window(w);
         m.report_programs = m.stats.programs_compiled;
         m.report_pipelines = m.stats.pipelines_created;

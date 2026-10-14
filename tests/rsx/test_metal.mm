@@ -3768,9 +3768,10 @@ TEST_CASE("metal e2e: draws that sample the target they draw to, without writing
     CHECK(e.backend->stats().render_passes <= 2); // the clear's, then the draws' after the one copy
 }
 
-TEST_CASE("metal e2e: a draw that samples the target it draws to sees the draws before it (D-148)")
+TEST_CASE("metal e2e: a draw that samples the target it draws to sees the draws before it after an invalidation (D-148)")
 {
-    // The copy is shared until the target is written: a draw after a write samples the write.
+    // The copy is shared until the target is written and the game invalidates the texture cache (D-947): a draw after
+    // both samples the write.
     REQUIRE_METAL();
     E2E e;
     e.put_local_bytes(kFpOffset, fp_color(false));
@@ -3790,13 +3791,142 @@ TEST_CASE("metal e2e: a draw that samples the target it draws to sees the draws 
     b.method(m::NV4097_SET_COLOR_MASK, 0x01010101);
     draw_triangle(b); // writes green
     set_fragment_program(b, kFp2Offset, 0x40);
+    b.method(m::NV4097_INVALIDATE_L2, 1); // cellGcmSetInvalidateTextureCache
     draw_triangle(b); // samples the green (a new copy) and writes it: black here would be the old copy
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
     for (const auto& f : e.failures) INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().feedback_copies == 2);
+    CHECK(e.backend->stats().feedback_invalidated == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+}
+
+TEST_CASE("metal e2e: without an invalidation, a draw that samples its target reads it as the texture cache took it (D-947)")
+{
+    // GTA V's draws that read the target they write, up to 400 a frame on the iPhone (run 327): a copy and a render pass
+    // each. On the RSX they read it through the texture cache, which sees later writes only after the game invalidates
+    // it: the first draw's copy serves the ones after it, and they keep their pass.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff}); // green
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceOffset, tex::A8R8G8B8, kW * 4);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    b.method(m::NV4097_SET_COLOR_MASK, 0);
+    draw_triangle(b); // samples the black clear (a copy), writes nothing
+    set_fragment_program(b, kFpOffset, 0x40);
+    b.method(m::NV4097_SET_COLOR_MASK, 0x01010101);
+    draw_triangle(b); // writes green
+    set_fragment_program(b, kFp2Offset, 0x40);
+    for (int i = 0; i < 20; i++) draw_triangle(b); // read the black the cache took in, and write it
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().feedback_copies == 1);
+    CHECK(e.backend->stats().feedback_reused == 20);
+    CHECK(e.backend->stats().render_passes <= 2); // the clear's, then the draws' after the one copy
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0x00});
+}
+
+TEST_CASE("metal e2e: a target sampled again after the draws went to other targets is copied again (D-947)")
+{
+    // The copy stands for the texture cache over one run of draws to the same targets: draws to others in between end
+    // it, as the RSX's small cache would have let go of the lines by then.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.put_local_bytes(kFp2Offset, fp_texture());
+    write_triangle(e, {0x00ff00ff, 0x00ff00ff, 0x00ff00ff}); // green
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff000000);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    bind_vertex_arrays(b);
+    bind_linear_texture(b, kSurfaceOffset, tex::A8R8G8B8, kW * 4);
+    set_fragment_program(b, kFp2Offset, 0x40);
+    b.method(m::NV4097_SET_COLOR_MASK, 0);
+    draw_triangle(b); // samples the black clear (a copy), writes nothing
+    set_fragment_program(b, kFpOffset, 0x40);
+    b.method(m::NV4097_SET_COLOR_MASK, 0x01010101);
+    draw_triangle(b); // writes green
+    setup_surface(b, kSurfaceB); // a draw to another target
+    draw_triangle(b);
+    setup_surface(b, kSurfaceOffset); // and back
+    set_fragment_program(b, kFp2Offset, 0x40);
+    draw_triangle(b); // samples the green (a new copy): the targets changed since the first
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().feedback_copies == 2);
+    CHECK(e.backend->stats().feedback_rebound == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0xff, 0x00});
+}
+
+TEST_CASE("metal e2e: the signed blend equations are done in the shader (D-948)")
+{
+    // GTA V draws with NV4097_SET_BLEND_EQUATION ADD_SIGNED: the source byte, as two's complement, added to the target
+    // (RPCS3 RSXProgrammableBlendPrologue.glsl). Drawn as Metal's add, a source of 0xf0 (-16) lit the target to white
+    // where it darkens it (run 327: bright patches around the cars on the iPhone).
+    REQUIRE_METAL();
+    const auto run = [](u32 equation) {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xf0100000, 0xf0100000, 0xf0100000}); // r 0xf0 (-16), g 0x10 (+16), b 0, a 0
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+        b.method(m::NV4097_SET_BLEND_EQUATION, equation);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().shader_blend_draws == 1);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto px = guest_pixel(e, kSurfaceOffset, 32, 48);
+        return std::array<int, 4>{px[0], px[1], px[2], px[3]}; // a r g b
+    };
+    const auto near = [](const std::array<int, 4>& got, const std::array<int, 4>& want) {
+        for (usize i = 0; i < 4; i++) {
+            if (std::abs(got[i] - want[i]) > 1) return false;
+        }
+        return true;
+    };
+    SECTION("ADD_SIGNED: the target plus the signed source")
+    {
+        const auto px = run(0xf006f006);
+        INFO(px[0] << " " << px[1] << " " << px[2] << " " << px[3]);
+        CHECK(near(px, {0xff, 0x70, 0x90, 0x80}));
+    }
+    SECTION("REVERSE_SUBTRACT_SIGNED: the target minus the signed source")
+    {
+        const auto px = run(0xf005f005);
+        INFO(px[0] << " " << px[1] << " " << px[2] << " " << px[3]);
+        CHECK(near(px, {0xff, 0x90, 0x70, 0x80}));
+    }
+    SECTION("REVERSE_ADD_SIGNED: the source plus the signed target")
+    {
+        // The target's 0x80 is -128 as a signed byte and its 0xff -1: the source minus 128/255 (alpha minus 1/255),
+        // clamped.
+        const auto px = run(0xf007f007);
+        INFO(px[0] << " " << px[1] << " " << px[2] << " " << px[3]);
+        CHECK(near(px, {0x00, 0x70, 0x00, 0x00}));
+    }
 }
 
 TEST_CASE("metal e2e: draws that write the stencil of the depth buffer they read convert it once (D-105)")

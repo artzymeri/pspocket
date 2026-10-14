@@ -69,6 +69,8 @@ struct WindowStats {
     double readbacks = 0, deferred_readbacks = 0, deferred_conflicts = 0, readback_wait_ms = 0;
     double texture_overlays = 0, texture_checks = 0, texture_mb_hashed = 0, write_faults = 0;
     double feedback_copies = 0, corner_textures = 0, surface_reloads = 0;
+    double feedback_reused = 0;         // draws that sampled a feedback copy older than their target's writes (D-947)
+    double texture_cache_invalidations = 0; // NV4097_INVALIDATE_L2 commands (D-947)
     double depth_bounds_draws = 0; // draws with the depth bounds test (D-261)
     double attachment_load_mb = 0, attachment_store_mb = 0; // render pass attachments loaded and stored (D-273)
     double attachment_store_skipped_mb = 0; // ... not stored: the next pass clears them whole (D-945)
@@ -192,7 +194,12 @@ struct BackendStats {
     u64 texture_overlays = 0;  // targets laid over guest memory on the GPU for a texture decoded from it (D-137)
     u64 occlusion_reports = 0; // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) answered from the GPU's counters (D-102)
     u64 feedback_copies = 0;   // copies of a target a draw samples while drawing to it, made once per write (D-148)
+    // ... made for the first such draw since the copy before (D-947), after a write and a texture cache invalidation,
+    // after the draws' targets changed, or after a write with the texture cache rule off (PSPOCKET_RSX_STRICT_FEEDBACK)
+    u64 feedback_first = 0, feedback_invalidated = 0, feedback_rebound = 0, feedback_strict = 0;
+    u64 feedback_reused = 0;   // draws that sampled the copy although the target was written since: the cache's (D-947)
     u64 depth_bounds_draws = 0; // draws with the depth bounds test, which read a copy of the depth buffer (D-261)
+    u64 shader_blend_draws = 0; // draws whose fragment shader blended (signed equations, D-948)
     u64 ranges_indexed_by_metal = 0; // indexed ranges Metal ran over the game's own indices (D-271)
     u64 attachment_load_bytes = 0;   // render pass attachments loaded from memory at their start (D-273)
     u64 attachment_store_bytes = 0;  // ... and stored at their end
@@ -244,6 +251,9 @@ public:
     // Any thread: frees what can be made again (textures and surfaces unused for 60 flips, finished readbacks) at the
     // next flip, on the RSX thread. The iOS app calls it when iOS says memory runs low (D-148).
     void trim_memory();
+    // Any thread: traces the frame after the next flip as MetalBackendConfig::trace_frame does (the iOS app, when a
+    // trace is asked for over USB: D-947).
+    void trace_next_frame();
     // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.
     void wait_for_shader_cache();
     void wait_for_async_compiles(); // until the background compiles are done (tests; D-158)

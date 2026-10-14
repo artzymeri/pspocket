@@ -252,6 +252,9 @@ public:
     // Set by method handlers, cleared by the backend as it consumes them (both on the RSX thread; the backend sees
     // the state as const).
     mutable u32 dirty_bits = dirty::kAll;
+    // NV4097_INVALIDATE_L2 commands so far (cellGcmSetInvalidateTextureCache): the RSX's texture cache sees what draws
+    // wrote to a target only after one (D-947).
+    u64 texture_cache_epoch = 0;
 
     u32 reg(u32 r) const { return regs[r]; }
     float reg_f(u32 r) const { return bits_to_float(regs[r]); }

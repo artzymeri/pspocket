@@ -102,6 +102,7 @@ struct Surface {
         u64 generation = 0;
         u64 stencil_generation = 0;
         std::unordered_map<u32, id<MTLTexture>> views;
+        u64 bind_epoch = 0, cache_epoch = 0; // a feedback copy's: the targets and texture cache it was made in (D-947)
     };
     std::unordered_map<u32, Conversion> conversions;
     // Its top-left corner sampled as a smaller texture at its start (D-120), by width << 16 | height.
@@ -494,6 +495,8 @@ struct MetalBackend::Impl {
     u64 report_draws_interpreted = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     u64 report_depth_bounds = 0; // D-261
+    u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
+    u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947
     u64 report_load_bytes = 0, report_store_bytes = 0, report_clear_only = 0, report_clear_only_bytes = 0; // D-273
     u64 report_store_skipped = 0, report_clears_folded = 0, report_clears_waited = 0, report_clear_passes = 0; // D-945
     // At most config.frames_in_flight frames queued for the GPU (D-148): a flip waits for the oldest to complete. Each
@@ -501,6 +504,7 @@ struct MetalBackend::Impl {
     dispatch_semaphore_t frames_in_flight = nil;
     u32 frames_in_flight_limit = 0;
     std::atomic<bool> trim_requested{false}; // MetalBackend::trim_memory
+    std::atomic<bool> trace_requested{false}; // MetalBackend::trace_next_frame
     void trim();                             // serves it, at a flip
     __strong id<MTLBuffer> visibility = nil; // the render buffer's counters
     u32 visibility_next = 0;
@@ -517,6 +521,20 @@ struct MetalBackend::Impl {
     std::shared_ptr<ReportsInFlight> reports_in_flight = std::make_shared<ReportsInFlight>();
     PassTargets pass{};
     PassTargets draw_targets{}; // targets of the draw being prepared (render-target feedback detection)
+    // The RSX's texture cache over a target a draw samples while drawing to it (D-947): the copy is the cache, kept
+    // while the draws go on to the same targets and the game does not invalidate the texture cache. The targets the
+    // draws went to (bind_epoch counts their changes) and the state's texture_cache_epoch at this draw.
+    PassTargets bind_targets{};
+    u64 bind_epoch = 0;
+    u64 cache_epoch = 0;
+    bool feedback_cached = true; // PSPOCKET_RSX_STRICT_FEEDBACK: off, a copy after every write (D-148)
+    u8 shader_blend = 0; // the draw's colour attachments its fragment shader blends (D-948): no blending in the pipeline
+    // For the report: the fragment program and unit of the texture being bound, and the copies by where they came from.
+    u32 feedback_fp = 0, feedback_unit = 0;
+    struct FeedbackSource {
+        u64 made = 0, reused = 0;
+    };
+    std::unordered_map<std::string, FeedbackSource> feedback_sources; // this report window's
     bool pass_open = false;    // targets chosen (descriptor built)
     bool pass_partial = false; // the pass draws in part of an attachment: its load-action clear would clear the rest
     bool pass_started = false; // encoder created
@@ -793,6 +811,7 @@ struct MetalBackend::Impl {
     void remove_surface(Surface* s);
     // D-148; `depth_only`: a stencil written since does not matter (the depth bounds test reads the depth, D-261).
     id<MTLTexture> feedback_copy(Surface& s, bool depth_only = false);
+    std::string feedback_source(const Surface& s) const; // the report's name for a feedback copy's draw (D-947)
     void log_pass_times();
     // A depth buffer as the texture of decode `mode` sees it (rsx_depth_to_texture), converted on the GPU when the
     // buffer was drawn to since; nil when it cannot be.
