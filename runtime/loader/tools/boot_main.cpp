@@ -47,10 +47,10 @@
 // --press-file FILE reads presses from FILE, as --press takes them (whitespace or lines apart; # starts a comment): a
 // scripted walk (games/<title>/walk-*.txt). --frame-jumps compares each saved frame (every --frame-every, from
 // --frame-from) with the one before as 64x36 thumbnails and counts the jumps (mean difference over 25 of 255, big over
-// 60): the colour flicker of run 088 in a number, without writing a frame (--frames still saves them). --summary FILE
-// writes the run as JSON when it ends (scripts/gate.sh reads it, D-149): how it ended, fps per 5 s, the Metal
-// backend's report windows, the peak memory footprint, RSX failures, unimplemented calls, SPU code interpreted, frame
-// jumps and every warning and error by shape (numbers as #).
+// 60): the colour flicker of run 088 in a number, without writing a frame (--frames still saves them); and the dark
+// frames, a third of the thumbnail black (D-951). --summary FILE writes the run as JSON when it ends (scripts/gate.sh
+// reads it, D-149): how it ended, fps per 5 s, the Metal backend's report windows, the peak memory footprint, RSX
+// failures, unimplemented calls, SPU code interpreted, frame jumps and every warning and error by shape (numbers as #).
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
 // as the phone does) instead of the translation built into this program: its PPU functions and SPU programs, for the
 // executable it was made from only; a library made for another runtime or executable stops the run. With
@@ -656,6 +656,10 @@ struct RunSummary {
     u64 frames_compared = 0, jumps = 0, big_jumps = 0;
     std::vector<std::pair<u64, double>> jump_at; // the first jumps: flip, mean difference
     std::vector<int> previous;                   // the last thumbnail, B G R per pixel
+    // Frames a third or more of whose thumbnail is black (every channel 4 or less): a fault that lasts a whole camera
+    // shot passes the jumps, which compare neighbours (run 327's fight, D-951).
+    u64 dark_frames = 0;
+    std::vector<std::pair<u64, double>> dark_at; // the first ones: flip, the black share
 };
 RunSummary g_summary;
 
@@ -693,7 +697,14 @@ void summary_sink(void*, log::Level level, std::string_view channel, std::string
             for (u32 c = 0; c < 3; c++) thumb[(ty * kW + tx) * 3 + c] = static_cast<int>(sum[c] / n);
         }
     }
+    u32 black = 0;
+    for (usize i = 0; i < thumb.size(); i += 3) black += thumb[i] <= 4 && thumb[i + 1] <= 4 && thumb[i + 2] <= 4;
+    const double black_share = static_cast<double>(black) / (kW * kH);
     std::lock_guard lock(g_summary.mutex);
+    if (black_share >= 1.0 / 3) {
+        g_summary.dark_frames++;
+        if (g_summary.dark_at.size() < 20) g_summary.dark_at.emplace_back(flip, black_share);
+    }
     if (!g_summary.previous.empty()) {
         u64 total = 0;
         for (usize i = 0; i < thumb.size(); i++) total += static_cast<u64>(std::abs(thumb[i] - g_summary.previous[i]));
@@ -790,6 +801,9 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
         g_summary.frames_compared, g_summary.jumps, g_summary.big_jumps);
     for (usize i = 0; i < g_summary.jump_at.size(); i++)
         j += std::format("{}[{}, {:.1f}]", i ? ", " : "", g_summary.jump_at[i].first, g_summary.jump_at[i].second);
+    j += std::format("], \"dark\": {}, \"dark_at\": [", g_summary.dark_frames);
+    for (usize i = 0; i < g_summary.dark_at.size(); i++)
+        j += std::format("{}[{}, {:.2f}]", i ? ", " : "", g_summary.dark_at[i].first, g_summary.dark_at[i].second);
     j += "]},\n  \"gpu_windows\": [";
 #if defined(PSPOCKET_HAVE_METAL)
     for (usize i = 0; i < g_summary.windows.size(); i++) {

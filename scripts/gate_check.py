@@ -51,6 +51,10 @@ def main(argv):
           jumps["compared"] >= c["frames_compared_min"])
     check("frame jumps (64x36 mean difference > 25)", jumps["jumps"], f"<= {c['frame_jumps_max']}",
           jumps["jumps"] <= c["frame_jumps_max"])
+    if "dark_frames_max" in c:  # a fault over a whole camera shot passes the jumps (D-951)
+        dark = jumps.get("dark", 0)
+        check("dark frames (a third of the 64x36 thumbnail black)", dark, f"<= {c['dark_frames_max']}",
+              dark <= c["dark_frames_max"])
 
     windows = summary["gpu_windows"]
     play = [w for w in windows if w["last_flip"] > c["play_from_flip"]]

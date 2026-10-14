@@ -11,6 +11,7 @@
     "fps_floor": 24,
     "frames_compared_min": 700,
     "frame_jumps_max": 2,
+    "dark_frames_max": 2,
     "play_from_flip": 2150,
     "gpu_ms_max": 30,
     "render_passes_max": 90,
