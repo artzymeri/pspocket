@@ -15449,3 +15449,114 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
   stores and vertex loads keep the job's order relative to the others (the output is written over the input), and a
   group's tests are four triangles a vector. The "no pixel" test is off in 77% of the captured calls: its six cflts are
   then left out (exact: its result is masked off).
+## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
+
+The plan for a steady 30 fps (docs/improve.md): on the iPhone 18 Pro Max the RSX thread (the FIFO reader and the Metal
+encoding) costs 12.2 us a draw, some 2,700 draws a frame, a whole core at 30 fps. D-953 to D-957 cut what it does a
+draw; this one gives the measure and the lookups.
+
+- Measuring: PSPOCKET_RSX_CPU_AB=N[:MASK] switches the RSX thread's fast paths off in every other run of N frames and
+  logs every 20N frames its CPU time a draw in each half ("RSX CPU A/B"), with the program lookups' counts. Unlike
+  PSPOCKET_GPU_AB the GPU-side experiments (D-945's merging, D-947's cache) stay on in both halves. MASK picks the
+  items: 1 the lookups (this), 4 the encoder setters (D-954), 8 the kept lists and pooled copies (D-956), 16 the index
+  scan (D-957), 32 the FIFO's argument runs (D-955); all by default. Off, a path is the code before. The halves see the
+  same scenes, which separate runs on this Mac did not (three agents and the main session building: load average 30 to
+  70). Kept as a comparison switch, for the phone too.
+- Where the time went (xctrace's Time Profiler on the walk, 10 s; `sample` gives no call graph on macOS 27.0.1): FIFO
+  reading 13%, do_draw's own code 10%, the vertex and index copies 7%, Metal's encoder creation 7% and its draw state
+  14%, texture binds 5.5%, the fragment program lookup 4.5% (scanning programs written over each other 3.2%), and the
+  surface lookups, the pipeline map, the keys (std::format) of program variants not in their lists, malloc.
+- Surfaces by address: an index (address to the surfaces there, in the order they were made) beside the list. A
+  surface's address is set only when it is made, and it leaves only through remove_surface. find_surface (up to four
+  for a texture a draw binds), get_color_surface and get_depth_surface read it instead of scanning 100 to 150 surfaces.
+- Pipelines in an unordered_map by a hash of the key, the last one found first (a std::map of the 72-byte key before).
+  The shader cache's and the background compiles' results are taken once a draw, at its start (each of the three
+  lookups took them).
+- Program variants: a fragment program's compiles are keyed by options without the texture kinds of the units it does
+  not sample (their stale registers made one program's draws look different; past the list's 8, every such draw built
+  its key and looked it up by string). Both programs' variant lists keep the most recently drawn first, 16 of them.
+- The fragment program scan (a program found where another was, D-240) reads the end bit, the opcode and the sources'
+  register types instead of decoding every instruction. Test: tests/rsx/test_shader.cpp "the program scan agrees with
+  the full decode (D-953)" (3,000 random programs: length, hash and constants as the decode finds them).
+- The deferred actions' envelope (D-107): what they touch together, widened as they queue, made again as they leave.
+  An access outside it is compared with none of them (GTA V keeps some 250 queued, labels behind readbacks; a draw
+  makes about ten accesses).
+- Tried, not kept: 64 vertex programs decoded kept instead of 16. GTA V decodes 55 to 65 a frame with either (of some
+  430 looked up): programs it writes anew, not ones it comes back to.
+- Measured: 11.60 to 11.15 us a draw (-3.9%; eight windows, -1.2% to -7.1%); an earlier build without the envelope
+  -5.1% (five windows).
+
+## D-954 · 2026-10-14 · A draw's state decoded once; encoder state set only when it changes
+
+- The draw encoder's state is kept as the draws set it (pipeline, depth-stencil state, stencil references, viewport,
+  depth clip mode, scissor, cull mode, winding, fill mode, depth bias, blend colour, the three vertex buffers, the
+  fragment and vertex textures and samplers, the fragment constants' and parameters' bytes): a setter whose value the
+  encoder holds is left out. Forgotten at each new encoder, after encode_clear_quad (which sets its own state on the
+  pass's encoder), and for the texture bindings after a draw by the shader interpreter (D-940). The record holds the
+  encoder, so no new one can take its address meanwhile.
+- The draw's 16 fragment texture units are decoded once, with texture_control of the enabled ones; the units it
+  samples and their samplers use them (each sampled unit was decoded twice more). Vertex units once, when its program
+  samples them. The depth-stencil, blend, colour mask, surface and shader program registers once a draw.
+- Tried, not kept: the texture units decoded only after one of their registers took a new value (a table from register
+  to unit in the FIFO's dispatch): +0.5% (four windows, -0.3% to +1.2%). And the vertex parameters (864 bytes a range)
+  bound by offset from the transient memory instead of set as bytes: the setters with it -4.4% (ten windows), without
+  -4.9% (five).
+- Measured, the setters: 13.53 to 12.87 us a draw (-4.9%; five windows, -2.3% to -10.6%).
+
+## D-955 · 2026-10-14 · The FIFO reads a packet's arguments a run at a time; the get register published lazily
+
+- Rsx::read_arguments takes a method's arguments as far as put (when ahead), the packet's end, the 1 MB IO page and
+  the step's budget allow. Each word is read once, as before (an acquire load, the read history, the desync checks),
+  and get_ moves past it, but put and the FIFO's address are looked at once a run and the words counted once. Vertex
+  program and constant words (two thirds of GTA V's 214 a draw) go to their handlers straight (inline,
+  methods_upload.hpp), unless a constant splits a draw (D-260). A FIFO reset set while a method's handler ran ends the
+  run, as it ended the batch after any word (D-123).
+- The get register reaches the guest before every method whose effect it can see or that blocks (any handler but the
+  uploads, vertex data, draw ranges and dirty bits; the semaphore acquire), where the reader stops (idle, blocked, out
+  of budget), at jumps, calls and returns, and at least every 1 KB of commands between, no longer after every word: a
+  guest polling get took the cache line from the reader at each one, and the next word's acquire load waited for the
+  release store. Labels, semaphores, flips and references see get as before. Test: tests/rsx/test_fifo.cpp "the get
+  register reaches the guest before a method it can see, after a long upload (D-955)".
+- D-229 and D-277 tried runs of words and measured no change, GTA V's RSX thread in separate runs (1.70 to 1.71 and
+  1.338 to 1.341 s per 5 s). This one sends the uploads to their handlers straight and is measured in one session.
+- Measured: tests/rsx/bench_fifo.cpp (now in thread CPU time too: the busy Mac's wall time counts waits) 7.9 to 9.3 ns
+  of CPU a word before, 4.2 to 6.0 after; with a polling guest 18.7 to 24.9 before, 4.8 to 7.2 after. The walk: 12.14
+  to 11.61 us a draw (-4.3%; eight windows, -2.8% to -5.1%).
+- Not run: scripts/tsan.sh. On this Mac (macOS 27.0.1) a ThreadSanitizer build of a two-line program crashes at start.
+
+## D-956 · 2026-10-14 · No heap allocation a draw; target copies into pooled textures
+
+- A draw's working lists (ranges, index offsets, restart positions, the indices Metal runs, the vertex copies and their
+  spans, the fragment constants, a converted range's index list) are kept from draw to draw and cleared; the restart
+  positions of all its ranges in one list. convert_primitive and restart_list append to the kept list.
+- The feedback report (D-947) keys its sources by numbers (fragment program, unit, the target's address, size and
+  format) and names them when it logs; a name was formatted for every copy and every draw that read a kept one.
+- Feedback copies (D-148) and corners (D-120) go into a new texture at each change, so the GPU never waits for the draws
+  that read the old one; making a texture was some 3% of the RSX thread (six of each a frame in GTA V). The old one now
+  waits in a pool until the frame that last used it has run (the frame event), then serves the next copy of its format
+  and size; one not taken within 8 frames goes, and the pool goes at a memory trim. The 300-frame report counts the
+  copies made into pooled textures.
+- Measured: 12.27 to 11.70 us a draw (-4.7%; ten windows, +0.4% to -7.5%); the lists alone -2.4% (six windows).
+
+## D-957 · 2026-10-14 · The index scan in NEON
+
+- An indexed draw's indices are scanned (the vertices they reach, where the restart indices are, whether one is all
+  ones) in NEON (pspocket/rsx/index_scan.hpp): blocks of 32 16-bit indices (16 32-bit), one look for the restart index a
+  block, which is then scanned one index at a time in order (positions ascending, as before); 16-bit indices whose base
+  keeps them below 2^20 are compared in their own lanes. An index of all ones is the largest: the largest seen tells
+  it.
+- Tests: tests/rsx/test_index_scan.cpp, 4,000 random buffers against the scalar scan (restart indices, all ones, bases
+  that wrap past 20 bits) and the edge cases; a hidden bench: 3,000 16-bit indices 6.6 us scalar, 0.43 us NEON.
+- Measured: 13.24 to 12.95 us a draw (-2.2%; eight windows, +4.8% to -6.8%).
+
+All five (D-953 to D-957) on GTA V's walk, A/B in one session: 13.91 to 11.64 us a draw (-16.3%; ten windows, -14.0%
+to -19.4%). Parts of D-953, D-954 and D-956 are on in both halves, so against the build before it is a little more;
+separate walks of the two builds in turn: 12.73 and 14.67 us a draw before, 11.99 and 12.16 after (-12%, the Mac's
+load average 30 to 140 then). The frame rate: the same binary with every fast path off and on in turn, 3,327 and
+3,398 flips in 128 s off, 3,590 and 2,976 on: no difference the load lets through. The gate (scripts/gate.sh game):
+RSX failures, frame jumps and dark frames pass; its frame rate floors fail for the build before as for this one under
+that load.
+At the iPhone's 12.2 us a draw that would be some 10.2 us, 28 ms a frame of 2,700 draws: still most of a core at 30
+fps. Left: Metal's encoder creation (7.5% of the thread, one a pass) and its draw state (about 14%), the vertex and
+index copies (7.5%), a target GTA V makes again every frame (make_surface 2.6%, the report's "grow 1.0"), the vertex
+programs it writes anew (decoding them 1.3%), the FIFO (about 10%).
