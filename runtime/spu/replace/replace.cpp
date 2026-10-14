@@ -54,17 +54,30 @@ struct Build {
 // decompression fragments, the state the next fragment of the table at 0x0C1B8 (or 0x0AC10 after 0x0AC20) goes on with.
 constexpr Registers kFragmentState = regs({4, 35, 37, 39, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
     61, 65, 66, 67, 72, 76});
+constexpr Registers kAfterSkinning = regs({1, 36, 39, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 81, 82,
+    84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+    111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 127});
 constexpr Function kEdgeDad4[] = {
     {0x07A38, nullptr, {}},
-    // its skinning loop (78% of its instructions): head and exit; after the exit the job reads these
-    {0x080F8, ps_edge_dad4_080f8,
+    // its one-bone skinning loop (8%) and four-bone one (78% of its instructions): heads and their exit; after the exit
+    // the job reads these
+    {0x07EF4, ps_edge_dad4_07ef4, kAfterSkinning, nullptr, 0x082E8},
+    {0x080F8, ps_edge_dad4_080f8, kAfterSkinning, nullptr, 0x082E8},
+    {0x082E8, nullptr, {}},
+    // its normals and tangents through the skinning rows (9% of its instructions): to the code after them
+    {0x084AC, ps_edge_dad4_084ac,
         regs({1, 36, 39, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 81, 82, 84, 85, 86, 87, 88, 89, 90,
             91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,
             115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 127}),
-        nullptr, 0x082E8},
-    {0x082E8, nullptr, {}},
+        nullptr, 0x088F8},
+    {0x088F8, nullptr, {}},
     {0x0A098, nullptr, {}},
-    {0x0AC10, nullptr, kFragmentState},
+    // a fragment's blocks (94% of its instructions in one loop): to the code after them, which reads these
+    {0x0AC10, ps_edge_dad4_0ac10,
+        regs({1, 35, 37, 39, 41, 42, 43, 44, 45, 46, 48, 51, 52, 53, 54, 55, 56, 57, 61, 65, 66, 67, 72, 76, 80, 81, 82, 85,
+            86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+            112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127}),
+        nullptr, 0x0BF60},
     {0x0AC20, nullptr, kFragmentState},
     {0x0B778, nullptr, kFragmentState},
     // its decode loop (97% of its instructions): head and exit; nothing the loop writes is read after the exit
@@ -74,6 +87,7 @@ constexpr Function kEdgeDad4[] = {
             114, 115, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127}),
         nullptr, 0x0B9B0},
     {0x0B9B0, nullptr, kFragmentState},
+    {0x0BF60, nullptr, kFragmentState},
     {0x0ECF8, ps_edge_dad4_0ecf8, {}},
     {0x0F008, ps_edge_dad4_0f008, regs({3})},
 };

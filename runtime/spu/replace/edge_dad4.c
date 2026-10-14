@@ -783,3 +783,319 @@ int ps_edge_dad4_0b850(SPUContext* ctx, uint8_t* ls)
     ctx->pc = (0x0B9B0u + ctx->reloc) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * The decompression fragment 0x0AC10 (to 0x0BF60, where its blocks are done): unit normals (or tangents) from two
+ * stored components, a block of vertices at a time ($47 from 0 up to $56). For each vertex, four streams (two quadword
+ * pointers each: $44/$55, $42/$53, $43/$54, $45/$52, at the block's offset mpya(block, $51, $50) plus the vertex's
+ * stride $35 times its index) are each
+ *   s = selb($65, rotm(shufb(lq(p1), lq(p2), pattern), $67), $66)     (one pattern a block: $72 plus its offset's
+ *                                                                      bytes by $61, then by the image's control at
+ *                                                                      0x12A20)
+ * and, with the shuffle $107 pairing the first and third and the second and fourth,
+ *   y = fma(shufb(s1, s3, $107), $93, $92)               two components a lane pair, scaled and biased
+ *   n = fm(t, fi(t, frsqest(t))) with t = fs($114, fa(shlqbyi(fm(y, y), 4), fm(y, y)))     the third: sqrt(1 - a^2 - b^2)
+ *   out_k = shufb(selb(n, T_k, $108), y, selb($87, T_k, $86) (+ $99 for the second and fourth))
+ * where T_k is the quadword of the table at the word at $sp + 0x30 (read each block) indexed by word 0 of s_k: where
+ * the third component goes and its sign. The four outputs go to word k of the output position (16 a block plus $49,
+ * advancing by $41), or to the scratch quadword $37 where that is past the limit $39; the block ends after the vertex
+ * whose word 0 is past it (stored to the scratch). The job's loop runs three vertices deep: a vertex's streams are read
+ * two vertices ahead and its table quadwords one ahead of its stores. The native loop keeps that order of reads and
+ * writes (exact where outputs overlap inputs) and computes each vertex at once, in the job's operations (pspocket/spu/
+ * lifted.h helpers) in the register order. Nothing it writes is read after 0x0BF60 (spu-live): its contract is local
+ * store and the pc.
+ * =================================================================================================================== */
+
+/* Vectors in local-store word order here (lane i = guest word i: ld_words), the registers' constants turned to it once,
+ * shuffles by psn_shufb_w (controls known ahead as lookups). */
+typedef struct {
+    uint32x4_t s[4]; /* the four streams decoded: 0 = $44/$55, 1 = $42/$53, 2 = $43/$54, 3 = $45/$52 */
+    uint32x4_t y[2]; /* fma'd pairs: 0 = streams 0 and 2 ($23), 1 = streams 1 and 3 ($22) */
+} normal_vertex;
+
+typedef struct {
+    uint32_t p1[4], p2[4]; /* the streams' pointers (word 0) */
+    psn_shufb_key_t pattern, pair;
+    int32x4_t shift; /* -(rotm count) */
+    uint32x4_t r65, r66, r93, r92, r93nz, r114, r108, r87, r86, r99;
+    psn_frsqest_tables rsqrt;
+} normal_0ac10;
+
+static inline uint32x4_t reg_w(const SPUContext* ctx, int r) { return psn_rev4((uint32x4_t)psl_ld(ctx, r)); }
+
+static inline __attribute__((always_inline)) void normal_read(const uint8_t* ls, const normal_0ac10* n, uint32_t x,
+    normal_vertex* v)
+{
+    for (int k = 0; k < 4; k++) {
+        const uint8x16x2_t t = {{vld1q_u8(ls + ((n->p1[k] + x) & PS_SPU_QW_MASK)), vld1q_u8(ls + ((n->p2[k] + x) & PS_SPU_QW_MASK))}};
+        /* the pattern's lookup reads the quadwords as local store has them: its indices are in guest byte order */
+        const uint32x4_t raw = vreinterpretq_u32_u8(vorrq_u8(vqtbl2q_u8(t, n->pattern.idx), n->pattern.orr));
+        v->s[k] = vbslq_u32(n->r66, vshlq_u32(raw, n->shift), n->r65);
+    }
+    for (int i = 0; i < 2; i++) {
+        const uint32x4_t p = psn_shufb_k(v->s[i], v->s[i + 2], n->pair);
+        v->y[i] = psn_fma_n(p, n->r93, n->r92, vandq_u32(psn_nz(p), n->r93nz));
+    }
+}
+
+/* sqrt(1 - a^2 - b^2) as the job computes it, for each pair of lanes of y: fm, fa of the pair, fs from $114, then
+ * fm(t, fi(t, frsqest(t))) */
+static inline __attribute__((always_inline)) uint32x4_t normal_third(const normal_0ac10* n, uint32x4_t y)
+{
+    const uint32x4_t sq = psn_fm(y, y);
+    const uint32x4_t sum = vreinterpretq_u32_f32(
+        vaddq_f32(vreinterpretq_f32_u32(vextq_u32(sq, vdupq_n_u32(0), 1)), vreinterpretq_f32_u32(sq))); /* shlqbyi 4 */
+    const uint32x4_t t = vreinterpretq_u32_f32(vsubq_f32(vreinterpretq_f32_u32(n->r114), vreinterpretq_f32_u32(psn_clamp(sum))));
+    return psn_fm(t, (uint32x4_t)psl_fi((ps_spu_vec)t, (ps_spu_vec)psn_frsqest_t(t, &n->rsqrt)));
+}
+
+int ps_edge_dad4_0ac10(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t blocks = pref(ctx, 56); /* $47 counts from 0 */
+    if (blocks > 0x1000u) return 0;
+    const ps_spu_vec r49 = psl_ld(ctx, 49), r41 = psl_ld(ctx, 41), r39 = psl_ld(ctx, 39);
+    const int32_t step = (int32_t)w_of(r41, 0), limit = (int32_t)w_of(r39, 0);
+    /* each block ends (word 0 of the position passes the limit without wrapping) within a bound */
+    uint64_t work = 0;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const int32_t s0 = (int32_t)(16u * b + w_of(r49, 0));
+        uint64_t n = 1;
+        if (s0 <= limit) {
+            if (step <= 0) return 0;
+            const int64_t j = ((int64_t)limit - s0) / step + 1;
+            if ((int64_t)s0 + j * step > INT32_MAX) return 0;
+            n = (uint64_t)j + 1;
+        }
+        work += n;
+        if (work > (1u << 20)) return 0;
+    }
+    normal_0ac10 n;
+    static const uint8_t first[4] = {44, 42, 43, 45}, second[4] = {55, 53, 54, 52};
+    for (int k = 0; k < 4; k++) {
+        n.p1[k] = pref(ctx, first[k]);
+        n.p2[k] = pref(ctx, second[k]);
+    }
+    n.shift = vnegq_s32(vreinterpretq_s32_u32(vandq_u32(vsubq_u32(vdupq_n_u32(0), reg_w(ctx, 67)), vdupq_n_u32(63))));
+    n.r65 = reg_w(ctx, 65);
+    n.r66 = reg_w(ctx, 66);
+    n.pair = psn_shufb_key(reg_w(ctx, 107));
+    n.r93 = reg_w(ctx, 93);
+    n.r93nz = psn_nz(n.r93);
+    n.r92 = reg_w(ctx, 92);
+    n.r114 = reg_w(ctx, 114);
+    n.r108 = reg_w(ctx, 108);
+    n.r87 = reg_w(ctx, 87);
+    n.r86 = reg_w(ctx, 86);
+    n.r99 = reg_w(ctx, 99);
+    n.rsqrt = psn_frsqest_load();
+    const uint32x4_t pos0 = reg_w(ctx, 49), steps = reg_w(ctx, 41), limits = reg_w(ctx, 39), scratch = reg_w(ctx, 37);
+    const ps_spu_vec r51 = psl_ld(ctx, 51), r50 = psl_ld(ctx, 50), r61 = psl_ld(ctx, 61), r72 = psl_ld(ctx, 72);
+    const uint32_t stride = pref(ctx, 35), sp = pref(ctx, 1);
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t table = psl_u32p(psl_lq(ls, sp + 0x30));
+        const ps_spu_vec control = psl_lq(ls, 0x12A20u + ctx->reloc);
+        const ps_spu_vec m = psl_mpya(psl_splat32(b), r51, r50);
+        const ps_spu_vec t = psl_a(r72, psl_shufb(psl_and(m, psl_splat32(15)), m, r61));
+        /* the block's pattern on the quadwords as local store has them: guest byte order, so (c & 31) unchanged */
+        {
+            const uint32x4_t c = psn_rev4((uint32x4_t)psl_shufb(t, t, control));
+            const psn_shufb_key_t k = psn_shufb_key(c);
+            /* psn_shufb_key indexes {a, b} in local-store word order (guest byte g at g ^ 3); these quadwords are in
+             * guest byte order: the ^ 3 undone on the bytes picked */
+            n.pattern.idx = veorq_u8(k.idx, vandq_u8(vcltq_u8(k.idx, vdupq_n_u8(32)), vdupq_n_u8(3)));
+            n.pattern.orr = k.orr;
+        }
+        uint32x4_t pos = vaddq_u32(vdupq_n_u32(16u * b), pos0);
+        uint32_t x = psl_u32p(m);
+        normal_vertex v[3]; /* vertex j, j + 1, j + 2 by j % 3 */
+        normal_read(ls, &n, x, &v[0]);
+        normal_read(ls, &n, x + stride, &v[1]);
+        uint32x4_t tq[4]; /* vertex j's table quadwords */
+        for (int k = 0; k < 4; k++) tq[k] = ld_words(ls, table + vgetq_lane_u32(v[0].s[k], 0));
+        for (uint32_t j = 0;; j++) {
+            const normal_vertex* cur = &v[j % 3];
+            const uint32x4_t n0 = normal_third(&n, cur->y[0]), n1 = normal_third(&n, cur->y[1]);
+            const uint32x4_t past = vcgtq_s32(vreinterpretq_s32_u32(pos), vreinterpretq_s32_u32(limits));
+            const uint32x4_t at = vbslq_u32(past, scratch, pos);
+            /* streams 0 and 2 with the first pair, 1 and 3 with the second: table quadwords by stream 0, 2, 1, 3 */
+            const uint32x4_t o0 = psn_shufb_w(vbslq_u32(n.r108, tq[0], n0), cur->y[0], vbslq_u32(n.r86, tq[0], n.r87));
+            const uint32x4_t o1 = psn_shufb_w(vbslq_u32(n.r108, tq[2], n0), cur->y[0],
+                vaddq_u32(vbslq_u32(n.r86, tq[2], n.r87), n.r99));
+            const uint32x4_t o2 = psn_shufb_w(vbslq_u32(n.r108, tq[1], n1), cur->y[1], vbslq_u32(n.r86, tq[1], n.r87));
+            const uint32x4_t o3 = psn_shufb_w(vbslq_u32(n.r108, tq[3], n1), cur->y[1],
+                vaddq_u32(vbslq_u32(n.r86, tq[3], n.r87), n.r99));
+            st_words(ls, vgetq_lane_u32(at, 0), o0);
+            st_words(ls, vgetq_lane_u32(at, 1), o1);
+            st_words(ls, vgetq_lane_u32(at, 2), o2);
+            st_words(ls, vgetq_lane_u32(at, 3), o3);
+            if (vgetq_lane_u32(past, 0)) break;
+            normal_read(ls, &n, x + 2 * stride, &v[(j + 2) % 3]);
+            const normal_vertex* next = &v[(j + 1) % 3];
+            for (int k = 0; k < 4; k++) tq[k] = ld_words(ls, table + vgetq_lane_u32(next->s[k], 0));
+            x += stride;
+            pos = vaddq_u32(pos, steps);
+        }
+    }
+    ctx->pc = (0x0BF60u + ctx->reloc) & PS_SPU_PC_MASK;
+    return 1;
+}
+
+/* ===================================================================================================================
+ * 0x084AC of 0x07A38 (to 0x088F8): the skinned vertices' normals, and tangents, through the rows the skinning loop
+ * (0x080F8) left on the stack, by the count in $64 (a multiple of 4), four vertices an iteration:
+ *   v' = fma(v.zxyw, R2, fma(v.yzxw, R1, fm(v, R0)))          rows R0-R2 of the vertex, 48 bytes a vertex
+ * in place: normals at $62, tangents at $65, by the mode in $66 (1: normals, 2: both, 3: another path, declined;
+ * anything else: neither). The first four vertices' rows are at $39, the next ones' at $73 on. The job's loop reads the
+ * next four vertices' normals and rows before it stores this iteration's (and the tangents just before), in the orders
+ * kept here, so local store sees the same reads and writes. After it the job reads the pointers $62 and $65 advanced
+ * (spu-live: nothing else the code here writes).
+ * =================================================================================================================== */
+
+static inline __attribute__((always_inline)) uint32x4_t rows_xform(uint32x4_t v, const uint32x4_t r[3])
+{
+    const uint8x16_t yzxw = {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15};
+    const uint8x16_t zxyw = {8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15};
+    const uint32x4_t vy = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), yzxw));
+    const uint32x4_t vz = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), zxyw));
+    uint32x4_t o = psn_fm(v, r[0]);
+    o = psn_fma(vy, r[1], o);
+    return psn_fma(vz, r[2], o);
+}
+
+int ps_edge_dad4_084ac(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t mode = pref(ctx, 66);
+    if (mode == 3) return 0;
+    const uint32_t exit = (0x088F8u + ctx->reloc) & PS_SPU_PC_MASK;
+    if (mode != 1 && mode != 2) { /* neither: what the code reads on the way is dead */
+        ctx->pc = exit;
+        return 1;
+    }
+    const uint32_t count = pref(ctx, 64);
+    if (count == 0 || (count & 3) || count > 0x10000u) return 0;
+    /* the shuffles to (y, z, x, w) and (z, x, y, w) */
+    static const uint32_t yzx[4] = {0x04050607u, 0x08090A0Bu, 0x00010203u, 0x0C0D0E0Fu};
+    static const uint32_t zxy[4] = {0x08090A0Bu, 0x00010203u, 0x04050607u, 0x0C0D0E0Fu};
+    for (int w = 0; w < 4; w++)
+        if (ctx->gpr[36].u32[3 - w] != yzx[w] || ctx->gpr[82].u32[3 - w] != zxy[w]) return 0;
+    uint32_t normals = pref(ctx, 62), tangents = pref(ctx, 65), rows = pref(ctx, 73);
+    const uint32_t first = pref(ctx, 39);
+    uint32x4_t n[4], r[4][3];
+    for (int i = 0; i < 4; i++) {
+        n[i] = ld_words(ls, normals + 16u * (uint32_t)i);
+        for (int k = 0; k < 3; k++) r[i][k] = ld_words(ls, first + 48u * (uint32_t)i + 16u * (uint32_t)k);
+    }
+    for (uint32_t it = 0; it < count / 4; it++) {
+        uint32x4_t t[4];
+        if (mode == 2)
+            for (int i = 0; i < 4; i++) t[i] = ld_words(ls, tangents + 16u * (uint32_t)i);
+        uint32x4_t no[4], to[4];
+        for (int i = 0; i < 4; i++) {
+            no[i] = rows_xform(n[i], r[i]);
+            if (mode == 2) to[i] = rows_xform(t[i], r[i]);
+        }
+        /* the next four vertices' normals and rows, read before this iteration's stores */
+        for (int i = 0; i < 4; i++) {
+            n[i] = ld_words(ls, normals + 0x40u + 16u * (uint32_t)i);
+            for (int k = 0; k < 3; k++) r[i][k] = ld_words(ls, rows + 48u * (uint32_t)i + 16u * (uint32_t)k);
+        }
+        if (mode == 2) {
+            st_words(ls, normals + 0x30u, no[3]);
+            st_words(ls, normals, no[0]);
+            st_words(ls, normals + 0x10u, no[1]);
+            st_words(ls, normals + 0x20u, no[2]);
+            st_words(ls, tangents + 0x10u, to[1]);
+            st_words(ls, tangents + 0x20u, to[2]);
+            st_words(ls, tangents, to[0]);
+            st_words(ls, tangents + 0x30u, to[3]);
+            tangents += 64;
+        } else {
+            st_words(ls, normals + 0x20u, no[2]);
+            st_words(ls, normals, no[0]);
+            st_words(ls, normals + 0x10u, no[1]);
+            st_words(ls, normals + 0x30u, no[3]);
+        }
+        normals += 64;
+        rows += 192;
+    }
+    const uint32_t moved = 16u * count;
+    psl_st(ctx, 62, psl_a(psl_ld(ctx, 62), psl_splat32(moved)));
+    if (mode == 2) psl_st(ctx, 65, psl_a(psl_ld(ctx, 65), psl_splat32(moved)));
+    ctx->pc = exit;
+    return 1;
+}
+
+/* ===================================================================================================================
+ * 0x07EF4 of 0x07A38 (to 0x082E8, where the four-bone loop also ends): skinning by one bone a vertex, two vertices an
+ * iteration, $64 of them (even). Each vertex's bone is a byte of the stream at $83 (two a halfword, read as the job
+ * reads them: rotqby of the quadword by the pointer, its first two bytes); with its rows A, B, C (at $100, $101, $89 +
+ * 48 * bone), m = $84 (the lanes kept) and t = shufb(shufb(B, A, $70), C, $69) (the rows' last words),
+ *   A' = A & m, B' = B & m, C' = selb($97, C, m)            stored for the normals (C', B', A' a vertex, 48 bytes)
+ *   p' = fma(p.zxy, A', fma(p.yzx, B', fma(p, C', t)))       over the position at $86, in place (.yzx, .zxy: shufb
+ *                                                              with $81 by $36 and $82)
+ * The job reads the next pair's bones and positions before it stores this pair's rows (first vertex 1's A', then
+ * vertex 0's C', B', A', vertex 1's C', B') and positions, and the pair's rows after the last pair's stores: kept here.
+ * After it the job reads $86 (advanced) and $72 ($83 + $64), nothing else written here (spu-live).
+ * =================================================================================================================== */
+
+/* the two bones' row offsets as the job forms them: (b0 << 16 | b1) * 48 in a word, and that rotated by 16 */
+static inline void one_bone_offsets(const uint8_t* ls, uint32_t a, uint32_t* o0, uint32_t* o1)
+{
+    const uint8_t* q = ls + (a & PS_SPU_QW_MASK);
+    const uint32_t w = ((uint32_t)q[a & 15] << 16) | q[(a + 1) & 15];
+    const uint32_t m = (w << 5) + (w << 4);
+    *o1 = m;
+    *o0 = (m << 16) | (m >> 16);
+}
+
+int ps_edge_dad4_07ef4(SPUContext* ctx, uint8_t* ls)
+{
+    const uint32_t count = pref(ctx, 64);
+    if (count == 0 || (count & 1) || count > 0x10000u) return 0;
+    const uint32_t base[3] = {pref(ctx, 100), pref(ctx, 101), pref(ctx, 89)}; /* rows A, B, C */
+    const uint32x4_t keep = reg_w(ctx, 84), r97 = reg_w(ctx, 97), r81 = reg_w(ctx, 81);
+    const psn_shufb_key_t k70 = psn_shufb_key(reg_w(ctx, 70)), k69 = psn_shufb_key(reg_w(ctx, 69));
+    const psn_shufb_key_t yzx = psn_shufb_key(reg_w(ctx, 36)), zxy = psn_shufb_key(reg_w(ctx, 82));
+    uint32_t bones = pref(ctx, 83), pos = pref(ctx, 86), next = pref(ctx, 9), rows = pref(ctx, 67);
+    uint32_t o[2];
+    one_bone_offsets(ls, bones, &o[0], &o[1]);
+    uint32x4_t p[2] = {ld_words(ls, pos), ld_words(ls, pos + 16)};
+    for (uint32_t pair = 0; pair < count / 2; pair++) {
+        uint32x4_t a[2], b[2], c[2];
+        for (int v = 0; v < 2; v++) {
+            a[v] = ld_words(ls, base[0] + o[v]);
+            b[v] = ld_words(ls, base[1] + o[v]);
+            c[v] = ld_words(ls, base[2] + o[v]);
+        }
+        bones += 2;
+        one_bone_offsets(ls, bones, &o[0], &o[1]); /* the next pair's bones */
+        const uint32x4_t np0 = ld_words(ls, next), np1 = ld_words(ls, next + 16);
+        uint32x4_t a2[2], b2[2], c2[2], out[2];
+        for (int v = 0; v < 2; v++) {
+            a2[v] = vandq_u32(a[v], keep);
+            b2[v] = vandq_u32(b[v], keep);
+            c2[v] = vbslq_u32(keep, c[v], r97);
+            const uint32x4_t t = psn_shufb_k(psn_shufb_k(b[v], a[v], k70), c[v], k69);
+            uint32x4_t r = psn_fma(p[v], c2[v], t);
+            r = psn_fma(psn_shufb_k(p[v], r81, yzx), b2[v], r);
+            out[v] = psn_fma(psn_shufb_k(p[v], r81, zxy), a2[v], r);
+        }
+        st_words(ls, rows + 0x50, a2[1]);
+        st_words(ls, rows + 0x00, c2[0]);
+        st_words(ls, rows + 0x10, b2[0]);
+        st_words(ls, rows + 0x20, a2[0]);
+        st_words(ls, rows + 0x30, c2[1]);
+        st_words(ls, rows + 0x40, b2[1]);
+        st_words(ls, pos, out[0]);
+        st_words(ls, pos + 16, out[1]);
+        p[0] = np0;
+        p[1] = np1;
+        rows += 96;
+        pos += 32;
+        next += 32;
+    }
+    psl_st(ctx, 72, psl_a(psl_ld(ctx, 83), psl_ld(ctx, 64)));
+    psl_st(ctx, 86, psl_a(psl_ld(ctx, 86), psl_splat32(16u * count)));
+    ctx->pc = (0x082E8u + ctx->reloc) & PS_SPU_PC_MASK;
+    return 1;
+}

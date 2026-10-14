@@ -15446,6 +15446,9 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
 | 0x0F008 | culling stage (with the callback above) | 400 of 400 | 5.55 µs | 3.62 µs | x1.53 (its own part x2.1) |
 | loop 0x080F8 of 0x07A38 | four-bone skinning, two vertices an iteration | 398 of 400 (2 declined) | 2.54 µs | 0.95 µs | x2.68 |
 | loop 0x0B850 of 0x0B778 | fixed-point attributes to floats, four streams | 3000 of 3000 | 1.40 µs | 0.40 µs | x3.50 |
+| 0x07EF4 of 0x07A38 (to 0x082E8) | one-bone skinning, two vertices an iteration | 3000 of 3000 | 0.62 µs | 0.42 µs | x1.47 |
+| 0x084AC of 0x07A38 (to 0x088F8) | normals and tangents through the skinning rows | 2607 of 2607 | 0.40 µs | 0.22 µs | x1.79 |
+| 0x0AC10 (to 0x0BF60) | unit normals from two stored components | 2639 of 2639 | 3.0 µs | 2.8 µs | x1.04 to x1.19 |
 
 A larger capture of the walk for each (every 300th to 1000th call, up to 3000, so the whole walk's scenes): 0x0ECF8
 2764 of 2764 exact, 0x0F008 2764 of 2764, loop 0x080F8 2988 of 3000 (12 declined to the lifted code: exact),
@@ -15483,6 +15486,21 @@ PSPOCKET_SPU_NATIVE=ab, 10 s halves, the dispatcher's host time a call, contenti
   and writes, so it is exact even where outputs overlap inputs. It declines when a block's loop would not end within
   2^20 iterations (its step not positive, or the position wrapping). Nothing it writes is read after the exit
   (spu-live), so its contract is local store and the pc.
+- The rest of 0x07A38's time, two regions from a head reached by falling into it to the code after them (D-966):
+  0x07EF4, the one-bone path beside the four-bone loop (a vertex's three rows by its bone byte, kept on the stack with
+  the w lanes masked, the position through them plus their last words: fma by row, as the job does it), and 0x084AC,
+  the normals (mode 1) or normals and tangents (mode 2) through the rows either path left on the stack, four vertices
+  an iteration (mode 3, another path, declined; never in the walk). Both keep the job's order of reads and writes
+  (it reads the next pair or four before it stores), and leave what the job reads after them: the pointers advanced
+  and, after 0x07EF4, $72.
+- 0x0AC10, a decompression fragment, from its entry to where its blocks are done (0x0BF60): two components a lane pair
+  from four streams (a block pattern on two quadwords, shifted, an exponent put in, then fma by a scale and bias), the
+  third as sqrt(1 - a^2 - b^2) by fm, fa, fs, frsqest, fi and fm, put in place by a shuffle from a table indexed by
+  the stream's first word. The job's loop runs three vertices deep; the native one reads in its order and computes each
+  vertex at once, in local-store word order (shuffles through psn_shufb_w and lookups made once a block). It gains
+  little: the work is the SPU's float model operation for operation (frsqest, fi and the clamps) on every lane, as
+  dense natively as lifted.
+
 
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 
