@@ -27,8 +27,8 @@
 <text x="838" y="177" font-size="12.5" fill="#24292f">86%  (9/11 done)</text>
 <text x="4" y="203" font-size="12.5" fill="#24292f">Sound</text>
 <rect x="300" y="191" width="530" height="16" rx="3" fill="#e6e8eb"/>
-<rect x="300" y="191" width="331.2" height="16" rx="3" fill="#d4a72c"/>
-<text x="838" y="203" font-size="12.5" fill="#24292f">62%  (2/4 done)</text>
+<rect x="300" y="191" width="397.5" height="16" rx="3" fill="#57ab5a"/>
+<text x="838" y="203" font-size="12.5" fill="#24292f">75%  (3/4 done)</text>
 <text x="4" y="229" font-size="12.5" fill="#24292f">Video and images</text>
 <rect x="300" y="217" width="530" height="16" rx="3" fill="#e6e8eb"/>
 <rect x="300" y="217" width="477.0" height="16" rx="3" fill="#2da44e"/>
