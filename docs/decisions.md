@@ -16357,3 +16357,20 @@ reachable in the gate's prologue walk:
 - The notes' kind: first the digits each as '#', so numbers of different lengths made kinds of their own; now each
   number (decimal or hex) is one '#'. Tests: the driver's steps leave a job to the SPU, leave_cull told one
   triangle (the count, the halfword, the buffer's end), the kinds.
+
+## D-1013 · 2026-10-15 · Code copied from the executable's read-only segments is not checked again at each load
+
+The research after run 332 (docs/improve.md, "The last 10% to a steady 30"): GTA V's walk loads SPU job binaries and
+modules about 2.3 million times, and identify() checked each one whole (content_check, up to 66 KB: EDGE's job 59 KB,
+GraphicsMain's 66 KB) against the image it remembered, 2.5 to 3.4% of the SPURS threads' time. GTA V's SPU code all
+lies in its executable's first segment, read-only for the PPU and the SPUs (flags 0x400005); on a PS3 a store or DMA
+there faults, so the bytes are the same at every load.
+
+- pspocket/core/immutable_memory.hpp: up to eight guest ranges nothing writes after the executable loaded. The loader
+  marks every segment without a write flag for the PPU, the SPUs or the RSX (cleared first, per executable).
+- identify(): an image read from guest memory (not a local store copy, D-206) inside a marked range takes a fixed
+  check value instead of content_check, so the per-thread table of known images answers at once. Modules still compare
+  their local store copy with the guest copy (the SPU may write into its own copy).
+- Measured (the gate's walk, xctrace 20 s on the SPURS threads): content_check 0.00% of the main instance's samples,
+  identify 0.87% in all. The gate passes (29.8 fps median, slowest 5 s window 29.2). Test: tests/core
+  test_immutable_memory.cpp.

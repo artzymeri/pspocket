@@ -23,6 +23,7 @@
 #include <arm_neon.h>
 #endif
 
+#include "pspocket/core/immutable_memory.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/npdrm.hpp"
@@ -153,7 +154,10 @@ u64 content_check(const u8* data, usize size)
 const ps_spu_program* identify(u8* base, const SpuImage& image, u64* hash)
 {
     const u8* bytes = image.bytes ? image.bytes : base + image.guest;
-    const u64 check = content_check(bytes, image.size);
+    // Code copied from a read-only segment of the executable is the same every time (D-1013): GTA V's walk loaded jobs
+    // and modules 2.3 million times, each checked whole (up to 66 KB), 2.5 to 3.4% of its SPU threads.
+    const bool fixed = !image.bytes && immutable_range(image.guest, image.size);
+    const u64 check = fixed ? 0x1D5Eull : content_check(bytes, image.size);
     // Read before the lookup: a program registered meanwhile makes the entry stale, never wrong.
     const u64 additions = spu::registry_additions(), removals = spu::registry_removals();
     KnownImage& k = t_known[((image.guest >> 4) ^ (image.size >> 2) ^ image.ls_start) % kKnownImages];

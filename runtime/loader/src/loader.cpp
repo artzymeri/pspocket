@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "pspocket/core/immutable_memory.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
@@ -300,6 +301,7 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
             return err(lv2::CELL_ENOMEM);
         }
     }
+    clear_immutable_ranges(); // a new process's (an earlier executable's in tests)
     for (const auto& seg : image->segments()) {
         if (seg.memsz == 0) continue;
         std::memcpy(base + seg.vaddr, seg.data.data(), seg.data.size());
@@ -307,6 +309,9 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         PS_LOG_DEBUG(kChan, "segment {:#010x}+{:#x} (file {:#x}, flags {:#x})", seg.vaddr, seg.memsz, seg.data.size(),
             seg.flags);
         rep.segments++;
+        // Written by nobody from now on (D-1013): the SPU program tracker need not check code copied from it again.
+        if (!(seg.flags & (recomp::elf::kPfW | recomp::elf::kPfSpuW | recomp::elf::kPfRsxW)))
+            add_immutable_range(static_cast<u32>(seg.vaddr), static_cast<u32>(seg.vaddr + seg.memsz));
     }
 
     // Which system libraries this game gets from the firmware's own modules and which from the host (D-175).

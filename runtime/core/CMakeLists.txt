@@ -1,6 +1,7 @@
 add_library(pspocket_core STATIC
     src/edge_registry.cpp
     src/guest_memory.cpp
+    src/immutable_memory.cpp
     src/mmio.cpp
     src/log.cpp
     src/png.cpp
