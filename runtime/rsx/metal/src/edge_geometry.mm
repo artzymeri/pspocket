@@ -10,6 +10,9 @@
 
 #include "metal_internal.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "pspocket/core/edge_job.h"
 #include "pspocket/core/edge_registry.hpp"
 
@@ -130,7 +133,15 @@ static_assert(sizeof(Dispatch) == 32);
 
 } // namespace
 
-std::string edge_kernel_source() { return std::string(kEdgePrefix) + kEdgeDecls + "\n" + kEdgeCode + kEdgeKernel; }
+std::string edge_kernel_source()
+{
+    // PSPOCKET_EDGE_GPU_EXACT=0: the GPU's own rounding, not the SPU's emulated (about half the kernels' time on the
+    // Mac; the outputs then differ in the last bits and the culling at its borders, D-990)
+    const char* e = std::getenv("PSPOCKET_EDGE_GPU_EXACT");
+    const bool exact = !(e && std::strcmp(e, "0") == 0);
+    return std::string(kEdgePrefix) + (exact ? "#define EK_EXACT 1\n" : "#define EK_EXACT 0\n") + kEdgeDecls + "\n" + kEdgeCode +
+           kEdgeKernel;
+}
 
 void* edge_kernel_options()
 {
@@ -234,7 +245,8 @@ bool MetalBackend::Impl::edge_init()
         return false;
     }
     edge_threads = std::min<u32>(256, static_cast<u32>(edge_pipeline.maxTotalThreadsPerThreadgroup));
-    PS_LOG_INFO(kChan, "EDGE geometry kernels ready ({} threads a job, {} bytes of source)", edge_threads, source.size());
+    PS_LOG_INFO(kChan, "EDGE geometry kernels ready ({} threads a job, {} bytes of source, {})", edge_threads, source.size(),
+        source.find("#define EK_EXACT 1") != std::string::npos ? "the SPU's rounding" : "the GPU's rounding");
     edge::set_consumer(true); // from now on the SPU jobs may leave their work to the GPU
     return true;
 }

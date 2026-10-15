@@ -50,6 +50,7 @@ EK_INLINE float ek_signed_zero(float x) { return ek_as_f32(ek_as_u32(x) & 0x8000
  * denormal: zero (keeping the sign) */
 EK_INLINE float ek_round_down(float r, float e)
 {
+    if (!EK_EXACT) return r; /* PSPOCKET_EDGE_GPU_EXACT=0: rounding to nearest, the GPU's own (cheaper, not the SPU's bits) */
     const ek_u32 u = ek_as_u32(r);
     if ((u & 0x7F800000u) == 0x7F800000u) return ek_as_f32((u & 0x80000000u) | 0x7F7FFFFFu);
     if ((u & 0x7F800000u) == 0u) return ek_signed_zero(r);

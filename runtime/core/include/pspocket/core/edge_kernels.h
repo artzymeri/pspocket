@@ -17,6 +17,7 @@
 #define EK_PAL const
 #define EK_TABLE static const
 #define EK_INLINE static inline
+#define EK_EXACT 1 // the SPU's rounding emulated (the Metal source chooses at the backend's start)
 typedef uint32_t ek_u32;
 typedef int32_t ek_s32;
 typedef uint8_t ek_u8;
