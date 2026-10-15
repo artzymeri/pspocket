@@ -58,8 +58,14 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
   (the measurements). 2026-10-15: native EDGE's hot pieces merged (D-965 to D-969: one-bone skinning, normals and
   tangents, EDGE/GFX SPU time -26% on the walk), the RSX thread's per-draw work -21% (D-984 and f1's), the mixer's own
   DSP native in games/gta5/spu (D-979 to D-983: the synthesizer's biquads, the submix reverb, comb and delay, the voices'
-  rate converter, all exact on captured calls: about 10% of the mixer). Still running: the SPU translator (f2) and
-  EDGE's second round (f3); then every GTA V SPU program re-lifted and the phone build.
+  rate converter, all exact on captured calls: about 10% of the mixer). Then (afternoon): EDGE's second round (D-968/D-969:
+  the index decompression native, x2.5 to x3 a call; the unlisted rest has no hot loop, its driver's spills around calls
+  are the translator's), the SPU translator (D-958 to D-964: -5.4% SPU time, mixer -12%, its compile -48%; translator
+  generation 4), every GTA V SPU program lifted again (gate all passes: 150 programs no difference, 29.8 fps), the cost
+  model refitted (D-986), ios.sh perftrace (D-985). Every item is built except EDGE in Metal compute ("later"). Estimate
+  for the phone's busy scenes: some 55 to 60 ms of the 277 ms a frame saved, 24 to 27 fps from 18 to 21; the phone
+  playtest decides. Next levers: EDGE in Metal compute, the lifted code's spills around calls, calls out of a program
+  without the run loop.
 
 ## SPU and SPURS: the biggest cost in play
 
