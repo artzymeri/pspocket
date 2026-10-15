@@ -1,6 +1,6 @@
 // edge-gpu-check: EDGE geometry's GPU path against the SPU, on states of the game's jobs (D-988).
 //
-//   edge-gpu-check PROBE_DIR [--spu-rounding] [--max N] [--verbose]
+//   edge-gpu-check PROBE_DIR [--max N] [--verbose]
 //
 // PROBE_DIR holds the states spu-job-replay saved at the entry and return of the EDGE stages of GTA V's EDGE build
 // (--probe 0daf0 --probe 07a10 --probe 0eff8 --probe 0f5b8). For each job the stages' stand-ins (spu/edge_gpu.hpp)
@@ -8,9 +8,8 @@
 // the stage left (the context's words, the return value). Then the work item runs through the GPU kernels' code on the
 // CPU (pspocket/core/edge_kernels.inc, the same source the Metal backend compiles) and its results are compared
 // with the SPU's: the output vertices (bytes), the screen-space vertices the culling used, and the kept indices.
-// --spu-rounding runs the kernels' code in the SPU's floating-point environment (round toward zero, denormals flushed):
-// the arithmetic then agrees with the SPU's but for its estimates (1/w, the square root), which shows the semantics
-// are the same; without it the rounding is the GPU's (to nearest), which shows how far the GPU's results are.
+// The kernels' code emulates the SPU's arithmetic on rounding to nearest (as the GPU's): it runs in the default
+// floating-point environment, and its results are the SPU's bit for bit but for rare fused products (D-988).
 // The probes hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1).
 
 #include <algorithm>
@@ -105,21 +104,20 @@ std::string compare_leave(const State& in, const State& out, void (*leave)(const
 int main(int argc, char** argv)
 {
     std::string dir;
-    bool spu_rounding = false, verbose = false;
+    bool verbose = false;
     uint64_t max = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
-        if (a == "--spu-rounding") spu_rounding = true;
-        else if (a == "--verbose") verbose = true;
+        if (a == "--verbose") verbose = true;
         else if (a == "--max" && i + 1 < argc) max = std::strtoull(argv[++i], nullptr, 0);
         else if (dir.empty()) dir = a;
         else {
-            std::fprintf(stderr, "usage: edge-gpu-check PROBE_DIR [--spu-rounding] [--max N] [--verbose]\n");
+            std::fprintf(stderr, "usage: edge-gpu-check PROBE_DIR [--max N] [--verbose]\n");
             return 64;
         }
     }
     if (dir.empty()) {
-        std::fprintf(stderr, "usage: edge-gpu-check PROBE_DIR [--spu-rounding] [--max N] [--verbose]\n");
+        std::fprintf(stderr, "usage: edge-gpu-check PROBE_DIR [--max N] [--verbose]\n");
         return 64;
     }
     std::map<uint64_t, bool> seqs;
@@ -170,7 +168,6 @@ int main(int argc, char** argv)
         const ps_edge_job& j = *reinterpret_cast<const ps_edge_job*>(r.blob.data());
 
         // The kernels' code over the work item.
-        const uint64_t token2 = spu_rounding ? ps_spu_fpenv_enter() : 0;
         std::vector<uint8_t> out(j.num_vertexes * j.out_stride + 16, 0);
         std::vector<ek_screen> scr(j.num_vertexes);
         for (uint32_t v = 0; v < j.num_vertexes; v++) scr[v] = ek_vertex(r.blob.data(), &j, v, out.data() + v * j.out_stride);
@@ -184,14 +181,12 @@ int main(int argc, char** argv)
                 kept.push_back(static_cast<uint16_t>(c));
             }
         }
-        if (spu_rounding) ps_spu_fpenv_leave(token2);
 
         // --verbose: the skinned normals and tangents against the tables the skinning left (without its state, the
         // decompressed ones against the decompression's).
         if (verbose && j.uv_data) {
             const bool decode_only = !skin_out.ok; // without the skinning's state: the decompression's
             const State& tabs = skin && skin_out.ok && !decode_only ? skin_out : dec_out;
-            const uint64_t tok = spu_rounding ? ps_spu_fpenv_enter() : 0;
             uint32_t bad = 0, worst = 0;
             for (uint32_t v = 0; v < j.num_vertexes; v++) {
                 for (uint32_t which = 0; which < 2; which++) {
@@ -212,7 +207,6 @@ int main(int argc, char** argv)
                     }
                 }
             }
-            if (spu_rounding) ps_spu_fpenv_leave(tok);
             if (bad) std::printf("job %llu: %u normal and tangent components differ (at most %u ulps), skinning %u\n",
                 static_cast<unsigned long long>(seq), bad, worst, j.skin);
         }

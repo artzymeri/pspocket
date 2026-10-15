@@ -8,7 +8,9 @@
 //
 // PSPOCKET_EDGE_GPU: unset or 0 off; 1 or gpu the GPU path; cpu the work item's kernels run on the SPU's thread at
 // once, their output written into the allocation as the job would have (a check of the recording, no GPU); ab the GPU
-// path in the "on" half of PSPOCKET_GPU_AB's frames (set_ab_half), the SPUs' path in the other.
+// path in every other PSPOCKET_EDGE_AB frames (set_ab_half, by the backend), the SPUs' path in the others; verify the
+// SPUs' path, with each job's work item recorded too and run on the GPU beside it, its output compared with what the
+// job put (the backend's "EDGE verify" lines).
 
 #include <atomic>
 #include <cstdint>
@@ -17,7 +19,7 @@
 
 namespace pspocket::edge {
 
-enum class Mode : uint8_t { off, gpu, cpu, ab };
+enum class Mode : uint8_t { off, gpu, cpu, ab, verify };
 Mode mode();
 // Whether a job starting now takes the GPU path (mode cpu; mode gpu, or ab in the "on" half, once a consumer, the RSX
 // backend's EDGE kernels, is ready).
@@ -32,6 +34,9 @@ struct WorkItem {
     uint32_t alloc_ea = 0;     // the ring allocation in RSX local memory (guest address)
     uint32_t alloc_size = 0;
     uint32_t index_bytes = 0;  // the index area at its start (the full count, 16-byte aligned); the vertices follow
+    // verify: the job ran on its SPU, the allocation holds its own output: its kept indices' area (the first PUT), its
+    // vertices after it
+    uint32_t guest_index_bytes = 0;
 };
 
 // Work items made once and used again (no allocation a job): acquire one to fill, recycle it once used.

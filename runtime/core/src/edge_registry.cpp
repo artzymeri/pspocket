@@ -19,8 +19,12 @@ Mode read_mode()
     Mode m = Mode::gpu;
     if (std::strcmp(v, "cpu") == 0) m = Mode::cpu;
     else if (std::strcmp(v, "ab") == 0) m = Mode::ab;
+    else if (std::strcmp(v, "verify") == 0) m = Mode::verify;
     PS_LOG_INFO("edge", "EDGE geometry on the GPU (PSPOCKET_EDGE_GPU={}): {}", v,
-        m == Mode::cpu ? "recorded, its kernels run on the SPU's thread" : m == Mode::ab ? "in the on half of PSPOCKET_GPU_AB" : "on");
+        m == Mode::cpu      ? "recorded, its kernels run on the SPU's thread"
+        : m == Mode::ab     ? "in every other PSPOCKET_EDGE_AB frames"
+        : m == Mode::verify ? "the SPUs' path, the GPU's beside it and compared"
+                            : "on");
     return m;
 }
 

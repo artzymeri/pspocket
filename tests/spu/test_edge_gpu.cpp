@@ -1,6 +1,8 @@
 // EDGE geometry on the GPU, the CPU side (D-988): the kernels' code (pspocket/core/edge_kernels.h, the same source the
 // Metal backend compiles) on a synthetic mesh against a straightforward reference; its screen transform against the
-// SPU native one (0x0ECF8 of GTA V's EDGE build, edge_dad4.c) bit for bit in the SPU's arithmetic; the culling rules;
+// SPU native one (0x0ECF8 of GTA V's EDGE build, edge_dad4.c) bit for bit (the kernels' emulation of the SPU's
+// arithmetic on rounding to nearest against the SPU's own, in its environment); its rounding against the SPU's on
+// random operands; the culling rules;
 // and the stages' recorders (pspocket/spu/edge_gpu.hpp) over a synthetic EDGE context in local store. No game data:
 // every input is made here (the transform's shuffle constants are the ones edge_dad4.c checks for).
 
@@ -8,6 +10,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <vector>
 
 #include "../rsx/edge_synthetic.hpp"
@@ -17,6 +20,7 @@
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/edge_gpu.hpp"
 #include "pspocket/spu/fp.h"
+#include "pspocket/spu/lifted.h"
 #include "pspocket/spu/runtime.h"
 
 using namespace pspocket;
@@ -111,6 +115,40 @@ TEST_CASE("edge gpu: the kernels decode, skin and compress as EDGE does (synthet
         CHECK(worst_pos < 1e-5);
         CHECK(worst_vec < 4e-3); // two quantizations: 10 bits in, 10 or 11 out
     }
+}
+
+TEST_CASE("edge gpu: the kernels' fm, fa, fs and fma are the SPU's, on random operands")
+{
+    // the SPU's own (lifted.h, in its environment) against the kernels' emulation (rounding to nearest)
+    std::mt19937 rng(988);
+    std::uniform_int_distribution<int> expo(-20, 20);
+    std::uniform_real_distribution<float> mant(-2.0f, 2.0f);
+    const auto any = [&] { return std::ldexp(mant(rng), expo(rng)); };
+    constexpr int n = 200000;
+    std::vector<std::array<float, 3>> in(n);
+    for (auto& v : in) v = {any(), any(), any()};
+    for (int i = 0; i < n; i += 97) in[i][1] = 0.0f; // a zero factor
+    std::vector<std::array<uint32_t, 5>> spu(n);
+    const uint64_t token = ps_spu_fpenv_enter();
+    for (int i = 0; i < n; i++) {
+        const ps_spu_vec a = psl_splat32(u32(in[i][0])), b = psl_splat32(u32(in[i][1])), c = psl_splat32(u32(in[i][2]));
+        spu[i] = {psl_fm(a, b)[0], psl_fa(a, b)[0], psl_fs(a, b)[0], psl_fma(a, b, c)[0], psl_fnms(a, b, c)[0]};
+    }
+    ps_spu_fpenv_leave(token);
+    int same[5] = {};
+    for (int i = 0; i < n; i++) {
+        const float a = in[i][0], b = in[i][1], c = in[i][2];
+        same[0] += u32(ek_fm(a, b)) == spu[i][0];
+        same[1] += u32(ek_fa(a, b)) == spu[i][1];
+        same[2] += u32(ek_fs(a, b)) == spu[i][2];
+        same[3] += u32(ek_fma(a, b, c)) == spu[i][3];
+        same[4] += u32(ek_fmaf(-a, b, c)) == spu[i][4];
+    }
+    CHECK(same[0] == n);
+    CHECK(same[1] == n);
+    CHECK(same[2] == n);
+    CHECK(same[3] >= n - n / 100000); // a fused product whose error sum rounds the wrong way: rare
+    CHECK(same[4] >= n - n / 100000);
 }
 
 TEST_CASE("edge gpu: the culling rules")
@@ -252,6 +290,7 @@ TEST_CASE("edge gpu: the kernels' screen transform is the SPU native 0x0ECF8's, 
     nc.gpr[3].u32[3] = s;
     nc.gpr[4].u32[3] = EdgeLs::kAttr;
     REQUIRE(ps_edge_dad4_0ecf8(&nc, e.ls.data()) == 1);
+    ps_spu_fpenv_leave(token); // the kernels emulate the SPU's rounding on the default one
     uint32_t same = 0;
     for (uint32_t v = 0; v < n; v++) {
         float p[4];
@@ -261,7 +300,6 @@ TEST_CASE("edge gpu: the kernels' screen transform is the SPU native 0x0ECF8's, 
         same += u32(g.x) == ps_ld32(w) && u32(g.y) == ps_ld32(w + 4) && g.code == (ps_ld32(w + 8) & 0xFC000000u) &&
                 g.packed == ps_ld32(w + 12);
     }
-    ps_spu_fpenv_leave(token);
     CHECK(same == n);
 }
 

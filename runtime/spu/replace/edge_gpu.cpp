@@ -381,6 +381,7 @@ void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx)
 #include "pspocket/core/edge_registry.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/timebase.h"
+#include "pspocket/spu/fp.h"
 #include "pspocket/spu/runtime.h"
 #include "native.h"
 
@@ -395,6 +396,8 @@ struct JobState {
     bool recorded = false;  // its decompression was recorded: the later stages are skipped too
     bool finished = false;  // its work item went out
     uint32_t lo = ~0u, hi = 0, dropped = 0; // the PUTs into its ring allocation, dropped
+    uint32_t first_put = 0;                 // verify: the first one's size (the kept indices)
+    bool verify = false;                    // the stages run too; nothing dropped
     uint64_t start_ns = 0;
 };
 thread_local JobState t_job;
@@ -403,6 +406,15 @@ thread_local JobState t_job;
 // kept indices, then (to keep the hole's full count) degenerate triangles, then the vertices.
 void run_here(const edge::WorkItem& item, uint8_t* membase)
 {
+    // The kernels emulate the SPU's rounding on hardware that rounds to nearest: out of the SPU's environment for them.
+#if defined(__aarch64__)
+    const uint64_t saved = ps_spu_fpcr_read();
+    ps_spu_fpcr_write(saved & ~(PS_SPU_FPCR_RMODE | PS_SPU_FPCR_FZ | PS_SPU_FPCR_DN));
+    struct Restore {
+        uint64_t v;
+        ~Restore() { ps_spu_fpcr_write(v); }
+    } restore{saved};
+#endif
     const ps_edge_job& j = *reinterpret_cast<const ps_edge_job*>(item.blob.data());
     uint8_t* alloc = membase + item.alloc_ea;
     std::vector<ek_screen> scr(j.num_vertexes);
@@ -434,7 +446,8 @@ void finalize(SPUContext* ctx)
     item->alloc_ea = s.lo;
     item->alloc_size = s.hi - s.lo;
     item->index_bytes = (2 * j.num_indexes + 15) & ~15u;
-    if (item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
+    item->guest_index_bytes = s.verify ? s.first_put : 0;
+    if (!s.verify && item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
         note(std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
             item->index_bytes, j.num_vertexes, j.out_stride));
     std::swap(item->blob, r.blob); // the recording goes on with the old blob's room
@@ -457,16 +470,19 @@ int filter(void*, SPUContext* ctx, uint32_t, uint32_t cmd, uint32_t, uint32_t ea
     if (!s.recorded || s.finished || (s.rec.stages & 4) == 0) return 0; // from the culling on: the indices go out next
     if ((cmd & 0xF0) != 0x20) return 0; // PUTs only
     if (ea - PS_MEM_RSX_LOCAL_BASE < PS_MEM_RSX_LOCAL_SIZE) {
+        if (!s.dropped) s.first_put = size;
         s.lo = std::min(s.lo, ea);
         s.hi = std::max(s.hi, ea + size);
         s.dropped++;
-        return 1;
+        return s.verify ? 0 : 1; // verify: the job's own output goes out, to be compared
     }
     if (s.dropped) finalize(ctx);
     return 0;
 }
 
 bool skipping() { return t_job.active && t_job.recorded; }
+// verify: the stages record, then run as ever (the stand-ins decline)
+bool verifying() { return t_job.verify; }
 
 } // namespace
 
@@ -475,7 +491,9 @@ bool job_begin(uint64_t key)
     if (key != kDad4 || edge::mode() == edge::Mode::off) return false;
     JobState& s = t_job;
     s.active = edge::deferred_now();
+    s.verify = edge::mode() == edge::Mode::verify;
     s.recorded = s.finished = false;
+    s.first_put = 0;
     s.lo = ~0u;
     s.hi = s.dropped = 0;
     s.start_ns = ps_host_now_ns();
@@ -487,7 +505,7 @@ void job_end()
 {
     JobState& s = t_job;
     ps_spu_set_mfc_filter(nullptr, nullptr);
-    const bool deferred = s.active && s.recorded;
+    const bool deferred = s.active && s.recorded && !s.verify;
     if (deferred && !s.finished && s.dropped) note("a job's PUTs dropped but no command buffer hole after them");
     edge::count_job(deferred, ps_host_now_ns() - s.start_ns);
     s.active = false;
@@ -511,8 +529,9 @@ extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
         ps_spu_set_mfc_filter(nullptr, nullptr);
         return 0;
     }
-    leave_decompress(s.rec, ls, *ctx);
     s.recorded = true;
+    if (verifying()) return 0;
+    leave_decompress(s.rec, ls, *ctx);
     return 1;
 }
 
@@ -521,6 +540,7 @@ extern "C" int ps_edge_dad4_gpu_07a10(SPUContext* ctx, uint8_t* ls)
     if (!skipping()) return 0;
     if ((ls[(ctx->gpr[3].u32[3] + 6) & PS_SPU_LS_MASK] & 15u) == 0) return 0; // no skinning: the function does nothing
     on_skin(t_job.rec, ls, *ctx);
+    if (verifying()) return 0;
     leave_skin(t_job.rec, ls, *ctx);
     return 1;
 }
@@ -529,6 +549,7 @@ extern "C" int ps_edge_dad4_gpu_0eff8(SPUContext* ctx, uint8_t* ls)
 {
     if (!skipping()) return 0;
     on_cull(t_job.rec, ls, *ctx);
+    if (verifying()) return 0;
     leave_cull(t_job.rec, ls, *ctx);
     return 1;
 }
@@ -537,6 +558,7 @@ extern "C" int ps_edge_dad4_gpu_0f5b8(SPUContext* ctx, uint8_t* ls)
 {
     if (!skipping()) return 0;
     on_compress(t_job.rec, ls, *ctx);
+    if (verifying()) return 0;
     leave_compress(t_job.rec, ls, *ctx);
     return 1;
 }

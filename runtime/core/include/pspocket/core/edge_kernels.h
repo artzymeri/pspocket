@@ -1,10 +1,9 @@
 #pragma once
 
 // EDGE geometry's GPU kernels as C++ (D-988): pspocket/core/edge_kernels.inc with the C++ meanings of its words. The
-// Metal backend compiles the same code (runtime/rsx/metal/src/edge_kernels.mm); here it runs on the CPU (the deferred
-// path's CPU mode, the tests, edge-gpu-check). The floats round as the calling thread's environment says: to nearest
-// as the GPU does, or toward zero in the SPU's (ps_spu_fpenv_enter), where every operation but the estimates gives
-// the SPU's bits.
+// Metal backend compiles the same code (runtime/rsx/metal/src/edge_geometry.mm); here it runs on the CPU (the deferred
+// path's CPU mode, the tests, edge-gpu-check). It emulates the SPU's rounding on hardware that rounds to nearest: run it
+// in the default floating-point environment (not the SPU's, ps_spu_fpenv_enter).
 
 #include <cmath>
 #include <cstdint>
@@ -32,12 +31,8 @@ static inline float ek_as_f32(ek_u32 u)
     std::memcpy(&f, &u, 4);
     return f;
 }
-#define ek_fma(a, b, c) std::fma(a, b, c)
+#define ek_hfma(a, b, c) std::fma(a, b, c) // the hardware's fused product (rounded as the environment says)
 #define ek_min(a, b) ((a) < (b) ? (a) : (b))
-/* A product rounded once and never fused into a following add by the compiler (the SPU's fm): fma with -0 adds
- * nothing (a product of +0 stays +0, of -0 stays -0). Every product below that the SPU makes with fm goes through it,
- * so neither compiler (C++ with fp-contract, Metal) changes the arithmetic. */
-#define ek_mul(a, b) ek_fma(a, b, -0.0f)
 
 #define EK_CODE(...) __VA_ARGS__
 #include "pspocket/core/edge_kernels.inc"

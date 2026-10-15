@@ -40,8 +40,7 @@ typedef int ek_s32;
 typedef uchar ek_u8;
 #define ek_as_u32(f) as_type<uint>(f)
 #define ek_as_f32(u) as_type<float>(u)
-#define ek_fma(a, b, c) fma(a, b, c)
-#define ek_mul(a, b) fma(a, b, -0.0f)
+#define ek_hfma(a, b, c) fma(a, b, c)
 #define ek_min(a, b) min(a, b)
 )MSL";
 
@@ -199,6 +198,108 @@ void MetalBackend::Impl::edge_queue(const edge::WorkItem& item, const TransientA
     stats_edge.blob_bytes += item.blob.size();
 }
 
+// verify: the item's job queued in an allocation of its own, the job's own output copied for the comparison.
+void MetalBackend::Impl::edge_verify(std::unique_ptr<edge::WorkItem> item, u32 drawn)
+{
+    EdgeDraw e;
+    const u32 size = edge_layout(*item, 0, e);
+    const TransientAllocator::Allocation a = transient.alloc(size, 16);
+    edge_queue(*item, a, e);
+    EdgeCheck c;
+    c.buffer = a.buffer;
+    c.base = a.offset;
+    c.e = e;
+    c.drawn = drawn;
+    c.guest_index_bytes = item->guest_index_bytes;
+    c.guest.assign(mem.host(item->alloc_ea), mem.host(item->alloc_ea) + item->alloc_size);
+    std::memcpy(&c.job, item->blob.data(), sizeof c.job);
+    edge_checks.push_back(std::move(c));
+    edge::recycle(std::move(item));
+}
+
+namespace {
+
+u64 ulps_apart(float a, float b)
+{
+    s32 ia, ib;
+    std::memcpy(&ia, &a, 4);
+    std::memcpy(&ib, &b, 4);
+    if (ia < 0) ia = static_cast<s32>(0x80000000u - static_cast<u32>(ia));
+    if (ib < 0) ib = static_cast<s32>(0x80000000u - static_cast<u32>(ib));
+    const s64 d = static_cast<s64>(ia) - ib;
+    return static_cast<u64>(d < 0 ? -d : d);
+}
+
+void atomic_max(std::atomic<u64>& a, u64 v)
+{
+    u64 cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+} // namespace
+
+// One job's GPU output against what its SPU put (verify).
+void MetalBackend::Impl::edge_check(const EdgeCheck& c, EdgeVerify& v)
+{
+    const u8* gpu = static_cast<const u8*>(c.buffer.contents) + c.base;
+    const ps_edge_job& j = c.job;
+    u32 args[5];
+    std::memcpy(args, gpu + c.e.args, sizeof args);
+    v.jobs.fetch_add(1, std::memory_order_relaxed);
+    v.kept_gpu.fetch_add(args[0] / 3, std::memory_order_relaxed);
+    v.kept_spu.fetch_add(c.drawn / 3, std::memory_order_relaxed);
+    if (args[0] == c.drawn) {
+        v.counts_same.fetch_add(1, std::memory_order_relaxed);
+        if (2 * c.drawn <= c.guest.size() && std::memcmp(gpu + c.e.shadow, c.guest.data(), 2 * c.drawn) == 0)
+            v.lists_same.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u8* gv = gpu + c.e.shadow + c.e.index_bytes;
+    if (c.guest_index_bytes + j.num_vertexes * j.out_stride > c.guest.size()) return;
+    const u8* sv = c.guest.data() + c.guest_index_bytes;
+    u64 same = 0, worst_ulps = 0, worst_rel = 0, worst_int = 0;
+    for (u32 n = 0; n < j.num_vertexes; n++) {
+        const u8* a = gv + n * j.out_stride;
+        const u8* b = sv + n * j.out_stride;
+        if (std::memcmp(a, b, j.out_stride) == 0) {
+            same++;
+            continue;
+        }
+        for (u32 k = 0; k < j.out_count; k++) {
+            const ps_edge_out_attr& o = j.out[k];
+            if (o.format == PS_EDGE_FMT_F32) {
+                for (u32 i = 0; i < o.components; i++) {
+                    float x, y;
+                    const u32 ux = ps_ld32(a + o.offset + 4 * i), uy = ps_ld32(b + o.offset + 4 * i);
+                    std::memcpy(&x, &ux, 4);
+                    std::memcpy(&y, &uy, 4);
+                    if (std::fabs(y) >= 0x1p-10f) worst_ulps = std::max(worst_ulps, ulps_apart(x, y)); // not near zero
+                    const double mag = std::max(std::fabs(static_cast<double>(y)), 1.0);
+                    worst_rel = std::max(worst_rel, static_cast<u64>(std::fabs(static_cast<double>(x) - static_cast<double>(y)) / mag * 1e9));
+                }
+            } else if (o.format == PS_EDGE_FMT_X11Y11Z10N) {
+                const u32 x = ps_ld32(a + o.offset), y = ps_ld32(b + o.offset);
+                const u32 bits[3] = {11, 11, 10};
+                for (u32 i = 0, sh = 0; i < 3; sh += bits[i], i++) { // the steps, as unsigned (the top bit flipped)
+                    const u32 top = 1u << (bits[i] - 1);
+                    const s64 dx = ((x >> sh) & ((1u << bits[i]) - 1)) ^ top, dy = ((y >> sh) & ((1u << bits[i]) - 1)) ^ top;
+                    worst_int = std::max<u64>(worst_int, static_cast<u64>(dx > dy ? dx - dy : dy - dx));
+                }
+            } else if (o.format == PS_EDGE_FMT_I16N) {
+                for (u32 i = 0; i < o.components; i++) {
+                    const s64 dx = ps_ld16(a + o.offset + 2 * i) ^ 0x8000u, dy = ps_ld16(b + o.offset + 2 * i) ^ 0x8000u;
+                    worst_int = std::max<u64>(worst_int, static_cast<u64>(dx > dy ? dx - dy : dy - dx));
+                }
+            }
+        }
+    }
+    v.vertices.fetch_add(j.num_vertexes, std::memory_order_relaxed);
+    v.vertices_same.fetch_add(same, std::memory_order_relaxed);
+    atomic_max(v.f32_ulps, worst_ulps);
+    atomic_max(v.f32_rel_e9, worst_rel);
+    atomic_max(v.int_diff, worst_int);
+}
+
 // The queued jobs, one dispatch per buffer, into a command buffer committed now: before the render buffer (submit).
 void MetalBackend::Impl::edge_flush()
 {
@@ -239,6 +340,14 @@ void MetalBackend::Impl::edge_flush()
     auto edge_ab = edge_ab_period ? edge_ab_gpu_ns : nullptr;
     const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_half();
     const usize edge_half = edge_ab_half;
+    if (!edge_checks.empty()) {
+        auto checks = std::make_shared<std::vector<EdgeCheck>>(std::move(edge_checks));
+        edge_checks.clear();
+        auto verify = edge_verify_stats;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+            for (const EdgeCheck& c : *checks) edge_check(c, *verify);
+        }];
+    }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         const double s = done.GPUEndTime - done.GPUStartTime;
         if (s <= 0) return;

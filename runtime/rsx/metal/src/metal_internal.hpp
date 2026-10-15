@@ -442,6 +442,27 @@ struct MetalBackend::Impl {
     std::array<u64, 2> edge_ab_frames{}, edge_ab_cpu_ns{}, edge_ab_spu_ns{}, edge_ab_jobs{}, edge_ab_draws{};
     u64 edge_ab_cpu_last = 0, edge_ab_spu_last = 0, edge_ab_jobs_last = 0, edge_ab_draws_last = 0;
     void edge_ab_flip();
+    // PSPOCKET_EDGE_GPU=verify: each draw's job ran on its SPU; its work item runs on the GPU beside it and the outputs
+    // are compared once the GPU is done (the job's own output copied at the draw).
+    struct EdgeCheck {
+        __strong id<MTLBuffer> buffer;
+        u32 base = 0; // the job's region in it
+        EdgeDraw e;
+        u32 drawn = 0; // the indices the job's hole draws (its kept ones)
+        u32 guest_index_bytes = 0;
+        std::vector<u8> guest; // its allocation as the job put it
+        ps_edge_job job{};
+    };
+    std::vector<EdgeCheck> edge_checks;
+    struct EdgeVerify {
+        std::atomic<u64> jobs{0}, counts_same{0}, lists_same{0}, vertices{0}, vertices_same{0}, int_diff{0};
+        std::atomic<u64> f32_ulps{0};          // the largest F32 difference in ulps
+        std::atomic<u64> f32_rel_e9{0};        // ... against the value's magnitude, times 1e9
+        std::atomic<u64> kept_gpu{0}, kept_spu{0};
+    };
+    std::shared_ptr<EdgeVerify> edge_verify_stats = std::make_shared<EdgeVerify>();
+    void edge_verify(std::unique_ptr<edge::WorkItem> item, u32 drawn);
+    static void edge_check(const EdgeCheck& c, EdgeVerify& v); // one job's GPU output against what its SPU put
     bool edge_init();
     std::unique_ptr<edge::WorkItem> edge_take(u32 index_ea);
     u32 edge_layout(const edge::WorkItem& item, u32 at, EdgeDraw& out);

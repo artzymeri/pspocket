@@ -1824,6 +1824,12 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (edge_pipeline && ia.u16_indices && !d.ranges.empty() && d.ranges[0].first == 0) {
             if (const auto ea = rsx->translate(ia.offset, ia.location, 2)) edge_item = edge_take(*ea);
         }
+        if (edge_item && edge_item->guest_index_bytes) {
+            // verify: the job's own output is drawn; the GPU's is made beside it and compared (D-988)
+            u32 drawn = 0;
+            for (const DrawRange& r : d.ranges) drawn += r.count;
+            edge_verify(std::move(edge_item), drawn);
+        }
         if (edge_item) {
             // The job's hole draws every index from the first (the culling's stand-in kept them all): one range, its
             // count the kernels', the vertices all of the job's.
@@ -2793,6 +2799,16 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             m.report_edge = m.stats_edge;
             m.report_edge_gpu_ns = edge_ns;
             m.report_edge_stats = es;
+            if (edge::mode() == edge::Mode::verify) {
+                const auto& v = *m.edge_verify_stats;
+                PS_LOG_INFO(kChan, "EDGE verify (so far): {} jobs, {} the same count of kept indices and {} the same "
+                                   "list, {} of {} vertices the same bytes; F32 at most {} ulps apart (of 2^-10 or more; {:.3g} "
+                                   "of the value or 1), the packed formats {} steps; triangles kept {} by the GPU, {} by "
+                                   "the SPUs",
+                    v.jobs.load(), v.counts_same.load(), v.lists_same.load(), v.vertices_same.load(), v.vertices.load(),
+                    v.f32_ulps.load(), static_cast<double>(v.f32_rel_e9.load()) / 1e9, v.int_diff.load(), v.kept_gpu.load(),
+                    v.kept_spu.load());
+            }
         }
         m.feedback_sources.clear();
         m.report_feedback_reused = m.stats.feedback_reused;
