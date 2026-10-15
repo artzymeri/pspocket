@@ -47,15 +47,19 @@ inline float f32(uint32_t u)
 
 // A condition the GPU path goes on through (the job's stages already skipped), said once each as a warning; a job
 // left to the SPU (expected: a configuration the path does not make), said once each as information.
+// Once a kind: the text with its numbers taken out (run 331 logged 134,527 lines of one kind, a lookup in a growing list
+// each under one lock: the EDGE jobs waited on it).
 void note(const std::string& what, bool expected = false)
 {
+    std::string kind;
+    for (const char ch : what) kind += (ch >= '0' && ch <= '9') ? '#' : ch;
     static std::mutex m;
     static std::vector<std::string> said;
     std::lock_guard lock(m);
-    if (std::find(said.begin(), said.end(), what) != said.end()) return;
-    said.push_back(what);
-    if (expected) PS_LOG_INFO("edge", "EDGE on the GPU: {}", what);
-    else PS_LOG_WARN("edge", "EDGE on the GPU: {}", what);
+    if (std::find(said.begin(), said.end(), kind) != said.end() || said.size() >= 64) return;
+    said.push_back(kind);
+    if (expected) PS_LOG_INFO("edge", "EDGE on the GPU: {} (said once)", what);
+    else PS_LOG_WARN("edge", "EDGE on the GPU: {} (said once)", what);
 }
 
 bool fail(Recording& r, std::string why)
@@ -148,6 +152,7 @@ void Recording::clear()
     reject.clear();
     stages = 0;
     ctx = 0;
+    told = 0;
 }
 
 uint32_t Recording::append(const uint8_t* ls, uint32_t at, uint32_t n)
@@ -190,6 +195,24 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
         return fail(r, std::format("vertex-output callback {:#x}", ld32(ls, c + 0x174)));
     if (ld8(ls, ld32(ls, c + 0x178) + 183) == 3) return fail(r, "the callback's projecting path");
     if (nv == 0 || nv > 0x4000 || ni > 0x10000) return fail(r, std::format("{} vertices, {} indices", nv, ni));
+    // The job's own steps around EDGE's that read or change what the stages make (GTA V's job driver; its descriptor
+    // from + 0xF0 is in $85 from before the decompression on): a position offset added to every vertex after the
+    // decompression ($83), a triangle filter by the vertices' table words before the culling (descriptor + 0x1A6:
+    // 0x06808), per-vertex passes after the skinning (+ 0x1B0 on), the blend-shape-like path (+ 0x1A4 bit 2), the
+    // modes of + 0x190 on and + 0x1A7. The GPU path takes only jobs with every one of them off, as every job of the
+    // gate's walk (D-990); the phone's city has jobs with the filter on (run 331).
+    {
+        for (int k = 0; k < 4; k++)
+            if (ctx.gpr[83].u32[k] & 0x7FFFFFFFu) return fail(r, "a position offset after the decompression");
+        const uint32_t p = pref(ctx, 85);
+        for (uint32_t o = 0xA0; o < 0xB0; o++)
+            if (ld8(ls, p + o)) return fail(r, std::format("job descriptor byte {:#x} set", o + 0xF0));
+        if (ld8(ls, p + 0xB4) & 0x1C) return fail(r, std::format("job descriptor byte 0x1a4 {:#x}", ld8(ls, p + 0xB4)));
+        if (ld8(ls, p + 0xB6)) return fail(r, "the triangle filter before the culling (job descriptor byte 0x1a6)");
+        if (ld8(ls, p + 0xB7)) return fail(r, std::format("job descriptor byte 0x1a7 {:#x}", ld8(ls, p + 0xB7)));
+        for (uint32_t o = 0xC0; o < 0xE0; o++)
+            if (ld8(ls, p + o)) return fail(r, std::format("job descriptor byte {:#x} set", o + 0xF0));
+    }
     ps_edge_job& j = r.job;
     j.num_vertexes = nv;
     j.num_indexes = ni;
@@ -348,10 +371,12 @@ bool on_cull(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 
 void leave_cull(const Recording& r, uint8_t* ls, SPUContext& ctx)
 {
-    // Every index kept: the count stays, the buffer's aligned end follows it.
-    const uint32_t s = pref(ctx, 3);
-    st32(ls, s + 0x58, (ld32(ls, s + 0x50) + 2 * r.job.num_indexes + 15) & ~15u);
-    ctx.gpr[3].u32[3] = r.job.num_indexes;
+    // The count told (every index, or one triangle: Recording::told) to the halfword at +0x17E and as the result, the
+    // buffer's aligned end after it.
+    const uint32_t s = pref(ctx, 3), n = r.told ? r.told : r.job.num_indexes;
+    st32(ls, s + 0x58, (ld32(ls, s + 0x50) + 2 * n + 15) & ~15u);
+    ps_st16(ls + ((s + 0x17E) & PS_SPU_LS_MASK), n);
+    ctx.gpr[3].u32[3] = n;
     leave(ls, ctx);
 }
 
@@ -399,6 +424,8 @@ struct JobState {
     bool finished = false;  // its work item went out
     uint32_t lo = ~0u, hi = 0, dropped = 0; // the PUTs into its ring allocation, dropped
     uint32_t first_put = 0;                 // verify: the first one's size (the kept indices)
+    uint32_t label_gets = 0;                // GETs of an RSX label: the ring full, its allocator waiting for the RSX
+    uint32_t second_ea = 0;                 // the second PUT into the allocation: its vertices
     bool verify = false;                    // the stages run too; nothing dropped
     uint64_t start_ns = 0;
 };
@@ -448,7 +475,10 @@ void finalize(SPUContext* ctx)
     std::unique_ptr<edge::WorkItem> item = edge::acquire(); // a used one, its blob's room kept
     item->alloc_ea = s.lo;
     item->alloc_size = s.hi - s.lo;
-    item->index_bytes = (2 * j.num_indexes + 15) & ~15u;
+    item->index_bytes = (2 * (r.told ? r.told : j.num_indexes) + 15) & ~15u; // where the job put its vertices
+    item->out_index_bytes = (2 * j.num_indexes + 15) & ~15u;
+    if (!s.verify && s.second_ea && s.second_ea != s.lo + item->index_bytes)
+        note(std::format("the vertices put at {:#x} in the allocation, not {:#x}", s.second_ea - s.lo, item->index_bytes));
     item->guest_index_bytes = s.verify ? s.first_put : 0;
     if (!s.verify && item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
         note(std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
@@ -470,10 +500,12 @@ void finalize(SPUContext* ctx)
 int filter(void*, SPUContext* ctx, uint32_t, uint32_t cmd, uint32_t, uint32_t ea, uint32_t size)
 {
     JobState& s = t_job;
-    if (!s.recorded || s.finished || (s.rec.stages & 4) == 0) return 0; // from the culling on: the indices go out next
+    if ((cmd & 0xF0) == 0x40 && ea - 0x40300000u < 0x100000u) s.label_gets++; // the RSX's labels (rsx/context.hpp)
+    if (!s.active || !s.recorded || s.finished || (s.rec.stages & 4) == 0) return 0; // from the culling on: the indices
     if ((cmd & 0xF0) != 0x20) return 0; // PUTs only
     if (ea - PS_MEM_RSX_LOCAL_BASE < PS_MEM_RSX_LOCAL_SIZE) {
         if (!s.dropped) s.first_put = size;
+        else if (s.dropped == 1) s.second_ea = ea;
         s.lo = std::min(s.lo, ea);
         s.hi = std::max(s.hi, ea + size);
         s.dropped++;
@@ -496,11 +528,11 @@ bool job_begin(uint64_t key)
     s.active = edge::deferred_now();
     s.verify = edge::mode() == edge::Mode::verify;
     s.recorded = s.finished = false;
-    s.first_put = 0;
+    s.first_put = s.label_gets = 0;
     s.lo = ~0u;
     s.hi = s.dropped = 0;
     s.start_ns = ps_host_now_ns();
-    if (s.active) ps_spu_set_mfc_filter(filter, nullptr);
+    ps_spu_set_mfc_filter(filter, nullptr); // every EDGE job: its ring waits counted
     return true;
 }
 
@@ -510,7 +542,7 @@ void job_end()
     ps_spu_set_mfc_filter(nullptr, nullptr);
     const bool deferred = s.active && s.recorded && !s.verify;
     if (deferred && !s.finished && s.dropped) note("a job's PUTs dropped but no command buffer hole after them");
-    edge::count_job(deferred, ps_host_now_ns() - s.start_ns);
+    edge::count_job(deferred, ps_host_now_ns() - s.start_ns, s.label_gets);
     s.active = false;
 }
 
@@ -525,11 +557,11 @@ extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
     JobState& s = t_job;
     if (!s.active || s.recorded) return 0;
     s.rec.clear();
+    s.second_ea = 0;
     if (!on_decompress(s.rec, ls, *ctx)) {
         note("jobs left to the SPU: " + s.rec.reject, true);
         pspocket::edge::count_rejected();
         s.active = false;
-        ps_spu_set_mfc_filter(nullptr, nullptr);
         return 0;
     }
     s.recorded = true;
@@ -553,6 +585,8 @@ extern "C" int ps_edge_dad4_gpu_0eff8(SPUContext* ctx, uint8_t* ls)
     if (!skipping()) return 0;
     on_cull(t_job.rec, ls, *ctx);
     if (verifying()) return 0;
+    // One triangle told: the GPU's count draws (the CPU mode writes every index into the allocation: all of them).
+    t_job.rec.told = pspocket::edge::mode() == pspocket::edge::Mode::cpu || t_job.rec.job.num_indexes < 3 ? 0u : 3u;
     leave_cull(t_job.rec, ls, *ctx);
     return 1;
 }

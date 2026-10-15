@@ -29,6 +29,10 @@ struct Recording {
     std::string reject;        // why the GPU path cannot take the job ("" while it can)
     uint32_t stages = 0;       // bit per stage recorded: 1 decompression, 2 skinning, 4 culling, 8 compression
     uint32_t ctx = 0;          // the job's EDGE context in local store
+    // The kept count the culling's stand-in tells the job (0: every index). The GPU culls and draws indirectly, so the
+    // job needs room for its indices in its ring allocation only for its hole's sake: told one triangle, it allocates
+    // no more than its vertices (D-990; told every index, the rings filled in the phone's city, run 331).
+    uint32_t told = 0;
 
     void clear();
     // Appends n bytes of local store from `at` (wrapping) 16-aligned with 16 bytes of padding; returns their offset.

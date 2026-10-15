@@ -46,10 +46,10 @@ typedef uchar ek_u8;
 )MSL";
 
 constexpr const char* kEdgeKernel = R"MSL(
-// One job: its blob, the shadow of its ring allocation (indices at 0, vertices at index_bytes), the screen-space
-// vertices' scratch and the indirect draw's arguments, as offsets into the buffer.
+// One job: its blob, the shadow of its ring allocation (its vertices at index_bytes, as the job laid them out), the
+// screen-space vertices' scratch, the indirect draw's arguments and the kept indices, as offsets into the buffer.
 struct ek_dispatch {
-    uint blob, shadow, index_bytes, scratch, args, pad0, pad1, pad2;
+    uint blob, shadow, index_bytes, scratch, args, indices, pad1, pad2;
 };
 
 kernel void edge_jobs(device uchar* buf [[buffer(0)]], constant ek_dispatch* jobs [[buffer(1)]],
@@ -61,6 +61,7 @@ kernel void edge_jobs(device uchar* buf [[buffer(0)]], constant ek_dispatch* job
     device const uchar* blob = buf + d.blob;
     device const ps_edge_job* j = (device const ps_edge_job*)blob;
     device uchar* shadow = buf + d.shadow;
+    device uchar* kept = buf + d.indices;
     device ek_screen* scr = (device ek_screen*)(buf + d.scratch);
     const uint nv = j->num_vertexes;
     // the bones' matrices once, as floats (at most 256 bones)
@@ -101,12 +102,12 @@ kernel void edge_jobs(device uchar* buf [[buffer(0)]], constant ek_dispatch* job
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (keep) {
             const uint at = 6 * (base + sums[sg] + before);
-            shadow[at] = uchar(a >> 8);
-            shadow[at + 1] = uchar(a);
-            shadow[at + 2] = uchar(b >> 8);
-            shadow[at + 3] = uchar(b);
-            shadow[at + 4] = uchar(c >> 8);
-            shadow[at + 5] = uchar(c);
+            kept[at] = uchar(a >> 8);
+            kept[at + 1] = uchar(a);
+            kept[at + 2] = uchar(b >> 8);
+            kept[at + 3] = uchar(b);
+            kept[at + 4] = uchar(c >> 8);
+            kept[at + 5] = uchar(c);
         }
         base += total;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -123,7 +124,7 @@ kernel void edge_jobs(device uchar* buf [[buffer(0)]], constant ek_dispatch* job
 )MSL";
 
 struct Dispatch {
-    u32 blob, shadow, index_bytes, scratch, args, pad0, pad1, pad2;
+    u32 blob, shadow, index_bytes, scratch, args, indices, pad1, pad2;
 };
 static_assert(sizeof(Dispatch) == 32);
 
@@ -175,6 +176,7 @@ EdgeKernelRun edge_run_kernel(const std::vector<std::vector<uint8_t>>& blobs, ui
         at = align(at + static_cast<u32>(b.size()));
         d.shadow = at;
         d.index_bytes = align(2 * j.num_indexes);
+        d.indices = at; // here the indices take the allocation's start, as with the job's full count
         at = align(at + d.index_bytes + j.num_vertexes * j.out_stride);
         d.scratch = at;
         at = align(at + 16 * j.num_vertexes);
@@ -208,7 +210,7 @@ EdgeKernelRun edge_run_kernel(const std::vector<std::vector<uint8_t>>& blobs, ui
         u32 count = 0;
         std::memcpy(&count, out + list[k].args, 4);
         run.counts.push_back(count);
-        run.indices.emplace_back(out + list[k].shadow, out + list[k].shadow + 2 * std::min(count, j.num_indexes));
+        run.indices.emplace_back(out + list[k].indices, out + list[k].indices + 2 * std::min(count, j.num_indexes));
         const u8* v = out + list[k].shadow + list[k].index_bytes;
         run.vertices.emplace_back(v, v + j.num_vertexes * j.out_stride);
     }
@@ -253,6 +255,8 @@ u32 MetalBackend::Impl::edge_layout(const edge::WorkItem& item, u32 at, EdgeDraw
     out.shadow = align(at);
     out.index_bytes = item.index_bytes;
     at = out.shadow + align(std::max(item.alloc_size, item.index_bytes + j.num_vertexes * j.out_stride));
+    out.indices = at; // the kept indices: room for every one
+    at += align(std::max(item.out_index_bytes, 2 * j.num_indexes));
     out.blob = align(at);
     at = out.blob + align(static_cast<u32>(item.blob.size()));
     out.scratch = at;
@@ -268,7 +272,8 @@ void MetalBackend::Impl::edge_queue(const edge::WorkItem& item, const TransientA
     // Until the kernel runs, the arguments draw nothing (a dispatch that never ran must not draw garbage).
     std::memset(a.data + e.args, 0, 20);
     const u32 base = a.offset;
-    edge_jobs.push_back({a.buffer, {base + e.blob, base + e.shadow, e.index_bytes, base + e.scratch, base + e.args}});
+    edge_jobs.push_back({a.buffer, {base + e.blob, base + e.shadow, e.index_bytes, base + e.scratch, base + e.args,
+        base + e.indices}});
     stats_edge.jobs++;
     stats_edge.blob_bytes += item.blob.size();
 }
@@ -326,7 +331,7 @@ void MetalBackend::Impl::edge_check(const EdgeCheck& c, EdgeVerify& v)
     v.kept_spu.fetch_add(c.drawn / 3, std::memory_order_relaxed);
     if (args[0] == c.drawn) {
         v.counts_same.fetch_add(1, std::memory_order_relaxed);
-        if (2 * c.drawn <= c.guest.size() && std::memcmp(gpu + c.e.shadow, c.guest.data(), 2 * c.drawn) == 0)
+        if (2 * c.drawn <= c.guest.size() && std::memcmp(gpu + c.e.indices, c.guest.data(), 2 * c.drawn) == 0)
             v.lists_same.fetch_add(1, std::memory_order_relaxed);
     }
     const u8* gv = gpu + c.e.shadow + c.e.index_bytes;
@@ -393,7 +398,7 @@ void MetalBackend::Impl::edge_flush()
         list.clear();
         for (; i < edge_jobs.size() && edge_jobs[i].buffer == buffer; i++) {
             const EdgeJob& job = edge_jobs[i];
-            list.push_back({job.d[0], job.d[1], job.d[2], job.d[3], job.d[4], 0, 0, 0});
+            list.push_back({job.d[0], job.d[1], job.d[2], job.d[3], job.d[4], job.d[5], 0, 0});
         }
         [enc setBuffer:buffer offset:0 atIndex:0];
         const usize bytes = list.size() * sizeof(Dispatch);

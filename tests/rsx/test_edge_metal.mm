@@ -21,7 +21,7 @@ namespace et = pspocket::edge_test;
 namespace {
 
 struct Dispatch {
-    uint32_t blob, shadow, index_bytes, scratch, args, pad0, pad1, pad2;
+    uint32_t blob, shadow, index_bytes, scratch, args, indices, pad1, pad2;
 };
 
 struct CpuResult {
@@ -86,6 +86,7 @@ TEST_CASE("edge gpu: the Metal kernel makes what the CPU makes of synthetic mesh
         at = align(at + static_cast<uint32_t>(b.size()));
         d.shadow = at;
         d.index_bytes = align(2 * j.num_indexes);
+        d.indices = at;
         at = align(at + d.index_bytes + j.num_vertexes * j.out_stride);
         d.scratch = at;
         at = align(at + 16 * j.num_vertexes);

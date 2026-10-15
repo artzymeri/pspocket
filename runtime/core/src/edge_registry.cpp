@@ -36,7 +36,7 @@ std::atomic<uint32_t> g_waiting{0};
 std::mutex g_pool_mutex;
 std::vector<std::unique_ptr<WorkItem>> g_pool;
 std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0}, g_rejected{0};
-std::atomic<uint64_t> g_jobs[2], g_ns[2]; // [0] run whole by the SPU, [1] deferred
+std::atomic<uint64_t> g_jobs[2], g_ns[2], g_label_gets[2]; // [0] run whole by the SPU, [1] deferred
 
 } // namespace
 
@@ -116,11 +116,12 @@ bool any_waiting() { return g_waiting.load(std::memory_order_acquire) != 0; }
 Stats stats()
 {
     return {g_published.load(), g_taken.load(), g_replaced.load(), g_jobs[1].load(), g_ns[1].load(), g_jobs[0].load(),
-        g_ns[0].load(), g_rejected.load()};
+        g_ns[0].load(), g_rejected.load(), {g_label_gets[0].load(), g_label_gets[1].load()}};
 }
 
-void count_job(bool deferred, uint64_t ns)
+void count_job(bool deferred, uint64_t ns, uint64_t label_gets)
 {
+    g_label_gets[deferred].fetch_add(label_gets, std::memory_order_relaxed);
     g_jobs[deferred].fetch_add(1, std::memory_order_relaxed);
     g_ns[deferred].fetch_add(ns, std::memory_order_relaxed);
 }

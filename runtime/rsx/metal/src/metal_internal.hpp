@@ -418,11 +418,11 @@ struct MetalBackend::Impl {
     // EDGE geometry on the GPU (edge_geometry.mm, D-988): the draws' work items run by one compute dispatch per
     // transient buffer in a command buffer committed before the render buffer (submit).
     struct EdgeDraw {
-        u32 shadow = 0, index_bytes = 0, blob = 0, scratch = 0, args = 0; // in the draw's transient allocation
+        u32 shadow = 0, index_bytes = 0, blob = 0, scratch = 0, args = 0, indices = 0; // in the draw's allocation
     };
     struct EdgeJob {
         __strong id<MTLBuffer> buffer;
-        u32 d[5]; // blob, shadow (in the buffer), index_bytes, scratch, args (in the buffer)
+        u32 d[6]; // blob, shadow (in the buffer), index_bytes, scratch, args, indices (in the buffer)
     };
     id<MTLComputePipelineState> edge_pipeline = nil;
     u32 edge_threads = 128;

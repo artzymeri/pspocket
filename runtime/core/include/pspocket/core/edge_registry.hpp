@@ -33,7 +33,8 @@ struct WorkItem {
     std::vector<uint8_t> blob; // ps_edge_job and its data (pspocket/core/edge_job.h)
     uint32_t alloc_ea = 0;     // the ring allocation in RSX local memory (guest address)
     uint32_t alloc_size = 0;
-    uint32_t index_bytes = 0;  // the index area at its start (the full count, 16-byte aligned); the vertices follow
+    uint32_t index_bytes = 0;  // the index area at its start, as the job made it (16-byte aligned); the vertices follow
+    uint32_t out_index_bytes = 0; // room for every index (16-byte aligned): where the GPU puts the kept ones
     // verify: the job ran on its SPU, the allocation holds its own output: its kept indices' area (the first PUT), its
     // vertices after it
     uint32_t guest_index_bytes = 0;
@@ -53,9 +54,10 @@ bool any_waiting();
 // SPU threads' host time; the work items published and taken; jobs a stage left to the SPU.
 struct Stats {
     uint64_t published, taken, replaced, jobs_deferred, ns_deferred, jobs_spu, ns_spu, rejected;
+    uint64_t label_gets[2]; // GETs of an RSX label in jobs run whole [0] and deferred [1]: the ring full, waiting
 };
 Stats stats();
-void count_job(bool deferred, uint64_t ns);
+void count_job(bool deferred, uint64_t ns, uint64_t label_gets);
 void count_rejected();
 
 } // namespace pspocket::edge
