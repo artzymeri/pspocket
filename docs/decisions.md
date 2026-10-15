@@ -15547,6 +15547,24 @@ already does at about one host instruction an SPU one; 0x0AC10, 3.5 s, tried, D-
 functions (the job's own loop, its DMA and the fragments' dispatch). A native 0x0A098 is the next piece by size, then a
 profile of the unlisted part.
 
+Round 2 (2026-10-15). 0x0A098, the index decompression, natively (D-968: 0x0A56C and 0x0A720, its two big loops, x2.5
+and x2.8 on 3000 captured entries each, all exact); 0x0ECF8's frest planes loaded once a call (1.5%). The unlisted part
+profiled (xctrace's Time Profiler, 20 s of the walk, the EDGE job's samples sorted by where they were): 46% in the
+native pieces (0x0F008 with its callback 37%), 41% in lifted code, 11% in the runtime under it (DMA: the job's transfer
+loop 0x12148 copying, 7%). The lifted 41% has no hot loop left: its largest piece is the job's driver 0x04C00 (12%),
+mostly the lifted code's register spills and reloads around its calls (every live register to the context and back,
+a lifter matter), then 0x10D48, 0x0C460, 0x0AC10 (D-968, tried), 0x0FA60 and some 200 places of 1% or less. Nothing
+there pays as a native region; the spills are a lifter change (call summaries) for the SPU translator's owner.
+
+On against off on this Mac with other agents' runs beside it: separate walks are not comparable (off 42.1 s, on 47.6 s,
+on with the scramble 33.5 s of EDGE/GFX time, in that order, as the load moved). Within one walk (PSPOCKET_SPU_NATIVE=ab,
+PSPOCKET_SPU_NATIVE_TIME=1, runs ab5 and ab6): EDGE/GFX SPU time a 5 s window 2.42 s native against 3.92 s lifted (ab5,
+-38%) and 2.19 s against 2.73 s (ab6, -20%; other halves, other scenes); the native pieces' own time over all their
+calls 17.0 s native against 33.2 s lifted (ab5) and 15.8 s against 27.0 s (ab6), 0x0F008's callback counted once.
+In game a call (ab6): 0x080F8 x2.0, 0x0A720 x2.5, 0x0B850 x2.1, 0x0A56C x1.75, 0x0F008 x1.54, 0x084AC x1.5, 0x0ECF8
+x1.38, 0x07EF4 x1.29. The scramble walk with every piece on: 3784 flips, RSX failures 0, SPU code interpreted 0. scripts/gate.sh quick (24 of 24) and game
+(29.8 fps median, 2 frame jumps, no dark frame) pass.
+
 ## D-953 · 2026-10-14 · The RSX thread's CPU a draw measured in one session; its lookups by index and hash
 
 The plan for a steady 30 fps (docs/improve.md): on the iPhone 18 Pro Max the RSX thread (the FIFO reader and the Metal
