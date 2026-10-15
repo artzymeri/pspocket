@@ -16319,3 +16319,41 @@ SPU's thread (a check of the recording without the GPU).
   frame jumps, no dark frame). With PSPOCKET_EDGE_GPU=1: pass on every check but the slowest 5 s window in two of three
   walks taken while the Mac was loaded by other work (load average 20 to 58: 22.8 and 9.0 fps, every SPU workload's
   time inflated in that window), 29.4 in the one walk on a quieter Mac.
+
+## D-990 · 2026-10-15 · EDGE on the GPU after the phone's city (run 331): the job told one triangle, the driver's own steps, notes once a kind
+
+Run 331 (iPhone 18 Pro Max, the city, PSPOCKET_EDGE_GPU=1): worse than off (16 to 20 fps, the EDGE SPU threads
+blocked, a deferred job 9.5 us growing to 78 us), shadows flickering, 134,527 warning lines. Three causes, none
+reachable in the gate's prologue walk:
+
+- **The log.** About 3% of the city's jobs reached the culling with fewer indices than configured; note() said each
+  distinct text once, finding it in a list of every text said so far under one lock: the list grew to some 100,000 and
+  the three EDGE threads queued on it. note() now says a kind once (its numbers left out), at most 64 kinds.
+- **The flicker.** Those jobs' counts were cut by GTA V's job driver itself: between EDGE's index decompression and its
+  culling it runs a triangle filter of its own (0x06808, on when job descriptor byte 0x1A6 is set) that drops
+  triangles by words of the vertices' position table, a table the GPU path never makes on the SPU: it filtered on
+  stale local store. The driver has more steps of its own that read or change the stages' tables, each on a field of
+  its descriptor (from + 0xF0 in $85 from before the decompression): a position offset added after the decompression
+  ($83), the path of descriptor byte 0x1A4 bit 2, the modes of 0x190 to 0x19F and 0x1A7, per-vertex passes after the
+  skinning (0x1B0 on). The decompression's stand-in now leaves a job to the SPU unless every one of them is off, as in
+  every job of the gate's walk (and the same 716 of 721 saved jobs take the path as before).
+- **The rings.** The culling's stand-in told the job every index kept, so its ring allocation held every index: with
+  three times the prologue's draws the city filled the rings and the jobs waited for the RSX's label. It now tells one
+  triangle (3 indices; the full count when fewer): the allocation is 16 bytes of indices and the vertices, smaller
+  than the SPU path's, and the hole draws 3 indices at the allocation's start. The backend takes the draw by that
+  address as before, puts the kept indices in an area of their own in the draw's transient allocation (room for every
+  index) and the vertices at the offsets the hole gives, and draws indirectly with the kernels' count. The jobs' GETs
+  of RSX labels (the ring-full waits) are counted in the window line: on the Mac walk 10.8 a frame with every index
+  told, 1.6 to 1.9 with one triangle (the SPU path's jobs: 0.4% of jobs, about 3 a frame, in D-987's trace).
+- Checked on the Mac walk with it on: gate game pass (29.8 fps median, slowest 29.4, 2 frame jumps, no dark frame,
+  RSX failures 0, no new message shape); frames against two walks with it off at the noise of off against off (frames
+  1950 to 2700: mean 0.5 to 1.2); edge-gpu-check and the tests as before. The phone's city has to show the stall and
+  the flicker gone (the walk cannot reach it). The kernels' GPU time in the city (2.8 to 4.3 ms a frame on the phone
+  for some 2,200 jobs) is next: the SPU's rounding emulated costs about half the kernels' time on the Mac.
+- **PSPOCKET_EDGE_GPU_EXACT=0** builds the kernels without the emulation (the GPU's rounding to nearest, no zero class):
+  the 716 saved jobs' kernels 0.25 to 0.32 ms on the Mac GPU against 0.58 to 0.66 ms (A/B in one session, alternated),
+  711 of 716 kept index lists the same as the SPU's and 378 of 716 jobs' vertices the same bytes (the rest a last bit
+  apart). Default exact (1); for the phone to measure whether the kernels' time is what the city's frame waits on.
+- The notes' kind: first the digits each as '#', so numbers of different lengths made kinds of their own; now each
+  number (decimal or hex) is one '#'. Tests: the driver's steps leave a job to the SPU, leave_cull told one
+  triangle (the count, the halfword, the buffer's end), the kinds.
