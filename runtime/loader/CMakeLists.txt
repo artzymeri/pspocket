@@ -122,6 +122,12 @@ if(APPLE)
     target_link_options(spu-job-replay PRIVATE -Wl,-no_warn_duplicate_libraries)
 endif()
 pspocket_set_warnings(spu-job-replay)
+# edge-gpu-check PROBE_DIR: EDGE geometry's GPU path (the stages' stand-ins and the kernels' code on the CPU) against
+# the SPU, on states of the game's jobs saved by spu-job-replay --probe (D-988).
+add_executable(edge-gpu-check tools/edge_gpu_check.cpp)
+target_link_libraries(edge-gpu-check PRIVATE pspocket::spu pspocket::core)
+target_include_directories(edge-gpu-check PRIVATE ${PROJECT_SOURCE_DIR}/runtime/rsx/metal/src)
+pspocket_set_warnings(edge-gpu-check)
 
 # Programs lifted again alone (a lifter change that touches a few programs, D-965), compiled into pspocket-boot,
 # spu-check and spu-native-check ahead of the game's other lifted programs: each overrides the copy in

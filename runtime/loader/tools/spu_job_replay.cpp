@@ -1,6 +1,6 @@
 // spu-job-replay: SPURS jobs replayed from a job trace (PSPOCKET_JOB_TRACE with PSPOCKET_JOB_TRACE_LS, D-987).
 //
-//   spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--max N] [--show] [--library FILE]
+//   spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--probe ADDR --probe-dir DIR] [--max N] [--show] [--library FILE]
 //
 // Each ls-<pid>-<seq>.bin of the directory holds a job's local store and registers as it was entered; trace-<pid>.txt
 // holds what the job read from and wrote to guest memory then (its "M" lines). The job runs again from that state (its
@@ -9,7 +9,10 @@
 // oracle a reimplementation of the job (EDGE on the GPU) is checked against. HASH and BYTES: the job's program key
 // and code size, its binary loaded at a job page from LS 0x4C00 (the job chain's). --coverage FILE interprets the jobs
 // instead and writes how many times each instruction ran ("address count" lines, the program's own addresses): the
-// paths the game's jobs take. --show prints each replayed write.
+// paths the game's jobs take. --probe ADDR (repeatable) with --probe-dir DIR interprets the jobs too and saves the
+// state at each entry of the function at ADDR and at its return (DIR/<seq>-<addr>-<n>-in.bin and -out.bin: local
+// store, the 128 registers, the pc): the states a reimplementation of one stage is checked on. --show prints each
+// replayed write.
 //
 // The trace and the dumps hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1).
 
@@ -111,7 +114,8 @@ void observe(void*, const SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 ea, u32
 
 int main(int argc, char** argv)
 {
-    std::string dir, coverage_path, library;
+    std::string dir, coverage_path, library, probe_dir;
+    std::vector<u32> probes;
     u64 max = 0, key = 0;
     u32 code_size = 0;
     bool show = false;
@@ -121,17 +125,19 @@ int main(int argc, char** argv)
         if (a == "--coverage") coverage_path = value();
         else if (a == "--max") max = std::strtoull(value().c_str(), nullptr, 0);
         else if (a == "--show") show = true;
+        else if (a == "--probe") probes.push_back(static_cast<u32>(std::strtoul(value().c_str(), nullptr, 16)));
+        else if (a == "--probe-dir") probe_dir = value();
         else if (a == "--key") key = std::strtoull(value().c_str(), nullptr, 16);
         else if (a == "--size") code_size = static_cast<u32>(std::strtoul(value().c_str(), nullptr, 0));
         else if (a == "--library") library = value();
         else if (dir.empty()) dir = a;
         else {
-            std::fprintf(stderr, "usage: spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--max N] [--show] [--library FILE]\n");
+            std::fprintf(stderr, "usage: spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--probe ADDR --probe-dir DIR] [--max N] [--show] [--library FILE]\n");
             return 64;
         }
     }
     if (dir.empty()) {
-        std::fprintf(stderr, "usage: spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--max N] [--show] [--library FILE]\n");
+        std::fprintf(stderr, "usage: spu-job-replay TRACE_DIR --key HASH --size BYTES [--coverage FILE] [--probe ADDR --probe-dir DIR] [--max N] [--show] [--library FILE]\n");
         return 64;
     }
     static GuestMemory memory;
@@ -208,9 +214,36 @@ int main(int argc, char** argv)
         std::vector<Mfc> writes;
         g_writes = &writes;
         ps_spu_set_mfc_observer(observe, nullptr);
-        if (!coverage_path.empty()) {
+        if (!coverage_path.empty() || !probes.empty()) {
+            // Probes: a call's return is where its $0 pointed with the stack pointer back where it was.
+            struct Open {
+                u32 addr, ret, sp, n;
+            };
+            std::vector<Open> open;
+            std::map<u32, u32> calls;
+            const auto save = [&](u32 addr, u32 n, const char* what) {
+                const std::string out = std::format("{}/{}-{:05x}-{}-{}.bin", probe_dir, seq, addr, n, what);
+                if (FILE* pf = std::fopen(out.c_str(), "wb")) {
+                    std::fwrite(ls, 1, PS_SPU_LS_SIZE, pf);
+                    std::fwrite(ctx.gpr, 1, sizeof ctx.gpr, pf);
+                    std::fwrite(&ctx.pc, 1, 4, pf);
+                    std::fclose(pf);
+                }
+            };
             for (u64 steps = 0; steps < 200'000'000; steps++) {
-                coverage[(ctx.pc - job.binary_ls + 0x4C00) & PS_SPU_LS_MASK]++;
+                const u32 at = (ctx.pc - job.binary_ls + 0x4C00) & PS_SPU_LS_MASK;
+                coverage[at]++;
+                for (size_t k = open.size(); k-- > 0;) {
+                    if (ctx.pc == open[k].ret && ctx.gpr[1].u32[3] == open[k].sp) {
+                        save(open[k].addr, open[k].n, "out");
+                        open.erase(open.begin() + static_cast<std::ptrdiff_t>(k));
+                    }
+                }
+                if (std::find(probes.begin(), probes.end(), at) != probes.end()) {
+                    const u32 n = calls[at]++;
+                    save(at, n, "in");
+                    open.push_back({at, ctx.gpr[0].u32[3], ctx.gpr[1].u32[3], n});
+                }
                 if (ps_spu_interpret(&ctx, 1) != PS_SPU_STOP_LIMIT) break;
             }
         } else {

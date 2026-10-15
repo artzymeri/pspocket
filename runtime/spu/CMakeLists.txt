@@ -14,6 +14,7 @@ add_library(pspocket_spu STATIC
     # Native replacements for known builds of SPU middleware (plan section 6, D-965).
     replace/replace.cpp
     replace/edge_dad4.c
+    replace/edge_gpu.cpp
     replace/flashmp3.c
     replace/zinflate.c)
 target_include_directories(pspocket_spu PUBLIC include)
