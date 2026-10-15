@@ -16240,3 +16240,57 @@ and the kept indices with their count, in a compute pass in a command buffer enq
 buffer (no render pass is broken), and draws indirectly with the GPU's count. A configuration the GPU path does not
 handle runs on the CPU as today (logged once). Behind `PSPOCKET_EDGE_GPU` (off until shown right; `=ab` alternating).
 The design's steps and numbers follow in D-988 on.
+
+## D-988 · 2026-10-15 · EDGE geometry on the GPU: the jobs record, the RSX backend computes (PSPOCKET_EDGE_GPU)
+
+D-987's design, built. Off by default; `PSPOCKET_EDGE_GPU=1` (read once, at the first EDGE job or the backend's start)
+turns it on, `=ab` alternates it with the SPU path every `PSPOCKET_EDGE_AB` frames (default 30) and logs each half,
+`=verify` keeps the SPU path and runs the GPU's beside it, comparing their outputs, `=cpu` runs the GPU's code on the
+SPU's thread (a check of the recording without the GPU).
+
+- **What stays on the SPU.** The job runs as before but for its four heavy stages, EDGE's edgeGeomDecompressVertexes,
+  edgeGeomSkinVertexes, edgeGeomCullTriangles and edgeGeomCompressVertexes (0x0DAF0, 0x07A10, 0x0EFF8, 0x0F5B8 of GTA
+  V's build), now listed in the build's table (replace.cpp) with stand-ins (runtime/spu/replace/edge_gpu.cpp). A
+  stand-in copies what its stage would read (the vertex streams and their fixed offsets and descriptions, the bones'
+  matrices and weights, the decompressed indices and the EDGE context's view, the output format) into a work item, does
+  to the context what the rest of the job reads (scratch pointers, the table of each attribute, the count, the return
+  value; checked against the stage's own on 721 of the walk's jobs) and returns. The culling's stand-in keeps every
+  index, so the allocation, the PUTs and the hole are the job's own for the full count. The index decompression stays
+  (native, D-968). The decision is taken at the first stage, from the configuration: input streams custom (0xff),
+  positions bit-packed fixed point, normals and tangents unit vectors, skinning none, four bones or one, matrix format
+  0, output 0, 2 or a custom description of F32 and X11Y11Z10N, the vertex-output callback 0x0ECF8, no blend shapes,
+  no custom decompression; anything else runs on the SPU as before (5 of 721 jobs: an attribute of id 9, format 4).
+- **The PUTs and the hole.** While a job takes the path its thread has an MFC filter (`ps_spu_set_mfc_filter`, a veto
+  before each transfer): from its culling on, its PUTs into RSX local memory (the indices, the vertices) are dropped
+  and their range kept; at its first PUT elsewhere, its command buffer hole, the work item is published under the
+  allocation's address (pspocket/core/edge_registry.hpp) before the hole goes out.
+- **The GPU.** The Metal backend, at an indexed draw whose index array starts at a published allocation, takes the
+  item; its blob goes into the draw's transient allocation with room for the allocation's shadow (indices at 0,
+  vertices after them, at the offsets of the hole), the screen-space scratch and the indirect draw's arguments. The
+  draw's EDGE attributes point into the shadow; the others (static streams) are copied from guest memory as ever. At
+  submit the command buffer's jobs run in one compute dispatch per transient buffer (one threadgroup of 256 threads a
+  job, the bones' matrices in threadgroup memory) in a command buffer committed before the render buffer: no render
+  pass is broken. The draw is `drawIndexedPrimitives` with the indirect buffer, its count the kernels' (big-endian u16
+  indices, as the vertex shader pulls them, D-271).
+- **The kernels** (pspocket/core/edge_kernels.inc): EDGE's stages per vertex (decode, skin, compress into the output
+  vertex, transform to the screen with the outcodes) and per triangle (EDGE's culling rules, the kept indices packed in
+  order by prefix sums). One source for Metal and C++: the code is the argument of a macro, which C++ expands and the
+  backend stringifies (no generated file: the iOS app compiles the runtime's sources as they are, D-014); the
+  kernels compile at the backend's start from that text with IEEE arithmetic (MTLMathModeSafe). **The SPU's arithmetic,
+  bit for bit:** every product, sum and fused product rounds toward zero, denormals are zeros and a zero factor gives
+  +0 or the addend, as the SPU (and the CPU path's lifted code) does, emulated on rounding to nearest by error-free
+  transforms (a product's error by fma, a sum's by TwoSum); the SPU's estimates (frest, frsqest, fi) from RPCS3's
+  tables. The culling's mode arithmetic is the CPU path's: its masks are NaNs as floats, and the lifted code's default
+  NaN keeps a triangle all of whose vertices are past one frustum edge (real hardware would cull it; the image is the
+  same).
+- **Tools.** `edge-gpu-check PROBE_DIR [--metal]`: the stand-ins and the kernels (C++, and with --metal the Metal
+  kernel on this GPU, timed) against the SPU on states saved by `spu-job-replay --probe` (D-987). Tests (synthetic
+  meshes, tests/rsx/edge_synthetic.hpp): the kernels against a double-precision reference, the transform against the
+  SPU native 0x0ECF8 bit for bit, the emulated operations against the SPU's on 200,000 random operands, the culling
+  rules, the stand-ins over a synthetic EDGE context, and the Metal kernel against the C++ code bit for bit.
+- **The translation.** The four functions must be called through the program's table (D-966): the EDGE program is
+  lifted again with the new table (here: spu-lift into inventory/edge/relift, linked by PSPOCKET_GAME_SPU_EXTRA; it
+  differs from before at those four calls only). A translation made before does not reach the stand-ins: with the
+  switch on, its jobs simply run on the SPU (nothing breaks, nothing is gained) until the game's SPU programs are
+  translated again (scripts/lift-spu.sh; on the phone a new preparation, which kTranslatorGeneration or a narrower
+  rule must ask for).
