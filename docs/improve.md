@@ -7,6 +7,48 @@ and is struck through. Rule 8 holds: an optimization starts from a measurement a
 Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA V, D-144 and D-145 installed;
 2 performance and 4 efficiency cores, a GPU budget of 33 ms a frame at 30 fps).
 
+## The last 10% to a steady 30 (research, 2026-10-15 evening)
+
+After run 332 (EDGE on the GPU, D-990: busy city 27.1 fps, 159 ms of CPU a frame), two research tracks over the phone
+logs of runs 329 to 332 and Mac profiles with PSPOCKET_EDGE_GPU=1:
+
+- **Power, not cores.** Every session starts at 5.4 to 8 W and 29.8 to 29.9 fps in the city, then within 40 to 90 s
+  steps down to about 3.3 W (heat still nominal or fair) and every thread does its work 1.5 to 1.9 times slower: the
+  RSX thread 11 to 20 ms a frame, the PPU's main thread 6 to 9.6, GraphicsMain 18 to 25. fps follows the watts; 30 needs
+  about 3.6 to 3.7 W at today's efficiency, so the frame has to cost about 10% less CPU energy. No thread is at 100%
+  (RSX 54%, PPU main 26%, the EDGE workers 73%); about 40,000 block and wake cycles a second (200 us timed waits on the
+  RSX thread, 100 us empty polls on the SPU workers). GTA V paces itself on vblanks: a frame that misses 33 ms takes 50,
+  so 27.1 fps is about 78% of frames at 33 ms and 22% at 50; small savings count double.
+- **EDGE's jobs sent back to the SPU.** D-990's checks in on_decompress (descriptor bytes 0x190 to 0x19F, 0x1B0 to
+  0x1CF, 0x1A4 & 0x1C, 0x1A6, 0x1A7) send about 1,270 of 2,140 jobs a frame in the city back to the SPU (30.8 us each,
+  39 of EDGE's 47 ms); run 331 (before D-990) deferred about 2,200. Only 0x1A6 (the triangle filter: the flicker) and
+  0x1A7 == 2 change what the GPU path would make, by the driver's code: word 0x198 is copied and never read, 0x194
+  matters only with 0x1A7 == 2, bit 2 of 0x1A4 fetches extra data, word 0x1BC recomputes normals after skinning.
+- **Ranked:**
+  1. Narrow D-990's checks to the fields that change the output, with counters per reason and a phone verify run:
+     about 21 ms a frame (GPU +2.5 ms, half with PSPOCKET_EDGE_GPU_EXACT=0).
+  2. Fixed point wider than 24 bits (13.12 to 15.12: csflt/cuflt at 2^-32 then fa) and the U8N colour attribute (id 9)
+     in the kernels: about 6 ms.
+  3. The rejected jobs' string formatting and mutex: an enum and atomic counters, about 1 ms.
+  4. A deferred job's remaining 9.3 us: the registry's lock and map (2 ms), index decompression on the GPU (3.5 ms), the
+     EDGE driver resumed in its -O1 twin after calls out (2 to 3 ms).
+  5. SPU runtime: images in read-only memory (the EBOOT's segment 0) not hashed again at every load (1.59 M program and
+     0.72 M module loads a walk, 2.5 to 3.4% of the SPU threads): about 3 ms; the module tracker on every GET (6 to 7%):
+     3 to 5 ms; clock reads in the DMA write log and the decrementer: 1.5 to 2 ms.
+  6. Waiting on writes instead of timed polls (the RSX thread on put and semaphores through D-972's notification, the
+     SPU workers' empty polls), with a 1 to 2 ms safety timeout: 0.5 to 1 ms of RSX latency and 3 to 5% CPU energy.
+  7. The translator's register spills around calls (D-247: 10.6% of the main SPU threads, 17% of dependency_spu): 5 to
+     6 ms, large.
+  8. Metal: command buffers without retained references and an untracked heap (5 to 7% of the RSX thread); later Metal
+     4 (argument tables, residency sets) or a second encoding thread (large).
+  9. QoS: D-973's serial QoS only on the 5-SPU instance (not the mixer's): GraphicsMain -3.5 ms without the RSX and PPU
+     slowing; run 329's A/B showed no fps change, so measure, low value.
+  10. Measuring: a histogram of flip intervals (33/50/67 ms); a System Trace from the phone in the city.
+- **Habits for sessions:** not straight after a preparation (run 331 started hot at 2.4 W), not charging (run 328);
+  check whether Adaptive Power is on (Settings > Battery > Power Mode).
+- GraphicsMain is spu_65a53be2ddaf5dd4 (RAGE's drawablespu, scalar code, no hot loop) and not on the critical path
+  (its QoS A/B moved no fps): ordinary CPU savings only.
+
 ## A steady 30 fps on the phone (research, 2026-10-14)
 
 The user's ask in run 327: "it should go 30 fps static always", with iOS's own facilities wherever they help. Four
