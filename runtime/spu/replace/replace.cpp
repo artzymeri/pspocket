@@ -72,7 +72,13 @@ constexpr Function kEdgeDad4[] = {
         nullptr, 0x088F8},
     {0x088F8, nullptr, {}},
     {0x0A098, nullptr, {}},
-    // one of its index formats (53% of its instructions in one loop): to the code after it, which reads these
+    // its control halfwords made from a bit stream (34%), then the format below (53%): each to the code after it, which
+    // reads these
+    {0x0A56C, ps_edge_dad4_0a56c,
+        regs({0, 1, 13, 28, 48, 53, 58, 62, 63, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,
+            98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
+            121, 122, 123, 124, 125, 126, 127}),
+        nullptr, 0x0A720},
     {0x0A720, ps_edge_dad4_0a720,
         regs({0, 1, 17, 63, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
             103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124,

@@ -1041,3 +1041,125 @@ int ps_edge_dad4_0a720(SPUContext* ctx, uint8_t* ls)
     ctx->pc = (0x0A894u + rel) & PS_SPU_PC_MASK;
     return 1;
 }
+
+/* ===================================================================================================================
+ * 0x0A56C of 0x0A098 (to 0x0A720, the format above): the control halfwords that format reads, made from a bit stream.
+ * Each halfword h of the stream at $48 + 8 on (($59 + 15) / 16 + 1 of them) gives 16 indices, 8 from its high byte
+ * and 8 from its low one: a set bit takes the next index from the literal stream (at $28 on, halfwords), a clear one
+ * the next of a running sequence (eight halfwords from the image's 0, 1, ... 7 on). The job forms the shuffle controls
+ * from h: prefix counts of set and clear bits by byte (cntb of h masked by the image's prefixes, the image's positions
+ * less them, + 8), chosen by fsmb(h); out of the literals' 16 bytes or the sequence's. Its loop is a stage deep (an
+ * iteration stores the halfword before's 32 bytes; the first, made of zeros, the second overwrites). Then the literals
+ * left ($61 bytes at $48 + $60) are moved after them, 16 bytes at a time (the same one-stage pipeline). After it the
+ * job reads $28 (where the literal stream ends, rounded up to 16) and $13 (where the halfwords made end), nothing else
+ * written here (spu-live). Vectors in local store's byte order; the job's word and halfword adds as such (byte-swapped
+ * lanes).
+ * =================================================================================================================== */
+
+static inline uint8x16_t add32_b(uint8x16_t a, uint8x16_t b) /* word add on byte-order vectors */
+{
+    return vrev32q_u8(vreinterpretq_u8_u32(vaddq_u32(vreinterpretq_u32_u8(vrev32q_u8(a)), vreinterpretq_u32_u8(vrev32q_u8(b)))));
+}
+static inline uint8x16_t sub32_b(uint8x16_t a, uint8x16_t b) /* word a - b on byte-order vectors */
+{
+    return vrev32q_u8(vreinterpretq_u8_u32(vsubq_u32(vreinterpretq_u32_u8(vrev32q_u8(a)), vreinterpretq_u32_u8(vrev32q_u8(b)))));
+}
+static inline uint8x16_t add16_b(uint8x16_t a, uint16_t k) /* halfword add of a constant on byte-order vectors */
+{
+    return vrev16q_u8(vreinterpretq_u8_u16(vaddq_u16(vreinterpretq_u16_u8(vrev16q_u8(a)), vdupq_n_u16(k))));
+}
+static inline uint8x16_t shufb_b8(uint8x16_t a, uint8x16_t b, uint8x16_t c)
+{
+    return vreinterpretq_u8_u32(psn_shufb_b(vreinterpretq_u32_u8(a), vreinterpretq_u32_u8(b), vreinterpretq_u32_u8(c)));
+}
+static inline uint32_t be32(const uint8x16_t v) /* word 0 of a byte-order vector */
+{
+    uint8_t b[16];
+    vst1q_u8(b, v);
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+}
+/* 16 bytes of local store at p as the job reads them: two quadwords, a shufb by p's offset (its controls 0-15) */
+static inline uint8x16_t ls16(const uint8_t* ls, uint32_t p)
+{
+    const uint8x16x2_t t = {{vld1q_u8(ls + (p & PS_SPU_QW_MASK)), vld1q_u8(ls + ((p + 16u) & PS_SPU_QW_MASK))}};
+    const uint8x16_t bytes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    return vqtbl2q_u8(t, vaddq_u8(bytes, vdupq_n_u8((uint8_t)(p & 15))));
+}
+
+int ps_edge_dad4_0a56c(SPUContext* ctx, uint8_t* ls)
+{
+    static const uint32_t iota[4] = {0x00010203u, 0x04050607u, 0x08090A0Bu, 0x0C0D0E0Fu};
+    for (int w = 0; w < 4; w++)
+        if (ctx->gpr[58].u32[3 - w] != 0x03030303u || ctx->gpr[53].u32[3 - w] != iota[w]) return 0;
+    const uint32_t n = ((pref(ctx, 59) + 15u) >> 4) + 1, rest = pref(ctx, 61);
+    if (n > 0x10000u || rest > PS_SPU_LS_SIZE) return 0;
+    const uint32_t rel = ctx->reloc;
+    const uint8x16_t k21 = vld1q_u8(ls + ((0x127D0u + rel) & PS_SPU_QW_MASK)); /* the sequence's start */
+    const uint8x16_t k31 = vld1q_u8(ls + ((0x127E0u + rel) & PS_SPU_QW_MASK)); /* prefix masks */
+    const uint8x16_t k30 = vld1q_u8(ls + ((0x127F0u + rel) & PS_SPU_QW_MASK)); /* positions */
+    const uint8x16_t k33 = vld1q_u8(ls + ((0x12A10u + rel) & PS_SPU_QW_MASK)); /* the high byte's count to word 0 */
+    const uint8x16_t k29 = vld1q_u8(ls + ((0x12AC0u + rel) & PS_SPU_QW_MASK)); /* even bytes */
+    const uint8x16_t k34 = vld1q_u8(ls + ((0x12B40u + rel) & PS_SPU_QW_MASK)); /* the two bytes' masks interleaved */
+    const uint8x16_t k27 = vorrq_u8(k29, vreinterpretq_u8_u16(vdupq_n_u16(0x0101))); /* odd bytes */
+    const uint8x16_t k22 = vreinterpretq_u8_u16(vdupq_n_u16(0x0302));                /* h in every halfword */
+    const uint8x16_t bit = {0x80, 0x40, 0x20, 0x10, 8, 4, 2, 1, 0x80, 0x40, 0x20, 0x10, 8, 4, 2, 1};
+    const uint8x16_t hi_lo = {2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+    /* where the literal stream ends and the halfwords made start: $28 = $48 + (6 $47 + 15 & ~15), as words */
+    const uint8x16_t r47 = vreinterpretq_u8_u32(psn_rev16((uint32x4_t)psl_ld(ctx, 47)));
+    const uint8x16_t r48 = vreinterpretq_u8_u32(psn_rev16((uint32x4_t)psl_ld(ctx, 48)));
+    uint8x16_t six = add32_b(add32_b(add32_b(r47, r47), r47), add32_b(add32_b(r47, r47), r47));
+    six = add32_b(six, vrev32q_u8(vreinterpretq_u8_u32(vdupq_n_u32(15))));
+    const uint8x16_t r28 = add32_b(r48, vandq_u8(six, vrev32q_u8(vreinterpretq_u8_u32(vdupq_n_u32(0xFFFFFFF0u)))));
+    const uint32_t hs = pref(ctx, 48) + 2u;
+    uint32_t p = pref(ctx, 28), out = be32(r28);
+    /* the stage before (zeros at first) */
+    uint8x16_t s11 = vdupq_n_u8(0), s18 = vdupq_n_u8(0), s24 = vdupq_n_u8(0), seq = k21;
+    uint32_t hi_count = 0, w5 = 0, w9 = 0, w20 = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t at = 6u + 2u * i;
+        const uint8_t* q = ls + ((hs + at) & PS_SPU_QW_MASK);
+        const uint8x16_t bytes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+        const uint8x16_t rq = vqtbl1q_u8(vld1q_u8(q), vandq_u8(vaddq_u8(bytes, vdupq_n_u8((uint8_t)at)), vdupq_n_u8(15)));
+        const uint32_t p73 = p + 2u * hi_count;
+        const uint8x16_t wa = ls16(ls, p), wb = ls16(ls, p73);
+        /* the halfword before's indices */
+        const uint8x16_t pick = vbslq_u8(s24, s18, s11);
+        const uint8x16_t twice = add32_b(pick, pick);
+        const uint8x16_t c_lo = add16_b(shufb_b8(twice, twice, k27), 1), c_hi = add16_b(shufb_b8(twice, twice, k29), 1);
+        const uint8x16_t s69 = add32_b(seq, vreinterpretq_u8_u16(vdupq_n_u16(__builtin_bswap16((uint16_t)w5))));
+        const uint8x16_t o0 = shufb_b8(wa, seq, c_hi), o1 = shufb_b8(wb, s69, c_lo);
+        seq = add32_b(s69, vreinterpretq_u8_u16(vdupq_n_u16(__builtin_bswap16((uint16_t)w9))));
+        vst1q_u8(ls + (out & PS_SPU_QW_MASK), o0);
+        vst1q_u8(ls + ((out + 16u) & PS_SPU_QW_MASK), o1);
+        if (i) out += 32;
+        p = p73 + w20;
+        /* this halfword's stage */
+        const uint8x16_t counts = vcntq_u8(rq);
+        hi_count = be32(shufb_b8(counts, counts, k33));
+        const uint32_t lo_count = be32(counts) & 15u;
+        s18 = vcntq_u8(vandq_u8(shufb_b8(rq, rq, k22), k31));
+        s11 = add16_b(sub32_b(k30, s18), 0x0808);
+        const uint8x16_t mask = vtstq_u8(vqtbl1q_u8(rq, hi_lo), bit); /* fsmb */
+        s24 = shufb_b8(mask, mask, k34);
+        w20 = 2u * lo_count;
+        w5 = 8u - hi_count;
+        w9 = 8u - lo_count;
+    }
+    /* the literals left, after the halfwords made: a 16-byte pipeline from $48 + $60 */
+    {
+        uint32_t src = pref(ctx, 48) + pref(ctx, 60), dst = out;
+        uint8x16_t carry = vdupq_n_u8(0);
+        for (uint32_t j = 0;; j++) {
+            vst1q_u8(ls + (dst & PS_SPU_QW_MASK), carry);
+            if (j) dst += 16;
+            carry = ls16(ls, src);
+            if (!(rest > 16u * j)) break;
+            src += 16;
+        }
+    }
+    const ps_spu_vec r28v = (ps_spu_vec)psn_rev16(vreinterpretq_u32_u8(r28));
+    psl_st(ctx, 28, r28v);
+    psl_st(ctx, 13, psl_a(r28v, psl_splat32(32u * (n - 1))));
+    ctx->pc = (0x0A720u + rel) & PS_SPU_PC_MASK;
+    return 1;
+}

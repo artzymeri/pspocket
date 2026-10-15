@@ -20,6 +20,7 @@ int ps_edge_dad4_0f008(SPUContext* ctx, uint8_t* ls);
 int ps_edge_dad4_07ef4(SPUContext* ctx, uint8_t* ls); /* of 0x07A38: one-bone skinning, to 0x082E8 */
 int ps_edge_dad4_080f8(SPUContext* ctx, uint8_t* ls); /* a loop of 0x07A38: head 0x080F8, exit 0x082E8 */
 int ps_edge_dad4_084ac(SPUContext* ctx, uint8_t* ls); /* of 0x07A38: normals and tangents, to 0x088F8 */
+int ps_edge_dad4_0a56c(SPUContext* ctx, uint8_t* ls); /* of 0x0A098: control halfwords made, to 0x0A720 */
 int ps_edge_dad4_0a720(SPUContext* ctx, uint8_t* ls); /* of 0x0A098: index decompression, to 0x0A894 */
 int ps_edge_dad4_0b850(SPUContext* ctx, uint8_t* ls); /* a loop of 0x0B778: head 0x0B850, exit 0x0B9B0 */
 

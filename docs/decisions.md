@@ -15453,6 +15453,7 @@ checked by spu-native-check on 400 calls captured over a whole walk (every 1000t
 | loop 0x080F8 of 0x07A38 | four-bone skinning, two vertices an iteration | 398 of 400 (2 declined) | 2.54 µs | 0.95 µs | x2.68 |
 | loop 0x0B850 of 0x0B778 | fixed-point attributes to floats, four streams | 3000 of 3000 | 1.40 µs | 0.40 µs | x3.50 |
 | 0x0A720 of 0x0A098 (to 0x0A894) | index decompression, four triangles a control halfword | 3000 of 3000 | 0.80 µs | 0.29 µs | x2.76 |
+| 0x0A56C of 0x0A098 (to 0x0A720) | the control halfwords made from a bit stream | 3000 of 3000 | 0.55 µs | 0.22 µs | x2.50 |
 | 0x07EF4 of 0x07A38 (to 0x082E8) | one-bone skinning, two vertices an iteration | 3000 of 3000 | 0.62 µs | 0.42 µs | x1.47 |
 | 0x084AC of 0x07A38 (to 0x088F8) | normals and tangents through the skinning rows | 2607 of 2607 | 0.40 µs | 0.22 µs | x1.79 |
 
@@ -15508,6 +15509,12 @@ PSPOCKET_SPU_NATIVE=ab, 10 s halves, the dispatcher's host time a call, contenti
   overwrites): kept as it is, with the job's order of reads and writes. Natively the vectors stay in local store's byte
   order, where a shufb is one table lookup (psn_shufb_b, psn_shufb_key_b: tested against psl_shufb), and the tables
   are made lookups once a call; it declines when an output could reach them.
+- 0x0A56C of 0x0A098, the stage before (34% of its instructions): 16 indices per halfword of a bit stream, a set bit
+  taking the next literal index of the stream and a clear one the next of a running sequence; the shuffle controls
+  from prefix counts of set and clear bits by byte (cntb of masked copies) chosen by fsmb, then the literals left moved
+  after the halfwords. Both pipelines (a stage deep) and their order of reads and writes kept; the job's word and
+  halfword adds on byte-order vectors through byte-swapped lanes. With 0x0A720 it leaves only 0x0A098's setup and two
+  short loops lifted.
 - Tried and dropped: 0x0AC10, a decompression fragment, from its entry to where its blocks are done (0x0BF60): unit
   normals from two stored components, the third as sqrt(1 - a^2 - b^2) by fm, fa, fs, frsqest, fi and fm, put in
   place by a shuffle from a table the streams index. Exact on all 2639 captured entries, but x1.04 to x1.19 on them and
