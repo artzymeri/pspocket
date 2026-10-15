@@ -44,6 +44,13 @@ logs of runs 329 to 332 and Mac profiles with PSPOCKET_EDGE_GPU=1:
   9. QoS: D-973's serial QoS only on the 5-SPU instance (not the mixer's): GraphicsMain -3.5 ms without the RSX and PPU
      slowing; run 329's A/B showed no fps change, so measure, low value.
   10. Measuring: a histogram of flip intervals (33/50/67 ms); a System Trace from the phone in the city.
+- **Done for items 1 to 4 (D-1005 to D-1008, Mac only so far):** the jobs counted by route and reason in the window
+  line; the driver's steps decide where the GPU's work starts (from the decompression, the skinning or the culling)
+  instead of sending the job back (only a missing output table does now); U8N out, the packed formats in EDGE's own
+  fused arithmetic, fixed point over 24 bits; the registry without a lock; one clock read a job. Verify over the walk:
+  every vertex the SPU's bytes in each route. Next: the phone's city with PSPOCKET_EDGE_GPU=verify and
+  PSPOCKET_EDGE_VERIFY_EVERY=16 (the per-kind lines), then =1 for the frame rate and the routes a frame; item 4's index
+  decompression on the GPU (a third of a deferred job) not started.
 - **Habits for sessions:** not straight after a preparation (run 331 started hot at 2.4 W), not charging (run 328);
   check whether Adaptive Power is on (Settings > Battery > Power Mode).
 - GraphicsMain is spu_65a53be2ddaf5dd4 (RAGE's drawablespu, scalar code, no hot loop) and not on the critical path

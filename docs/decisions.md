@@ -16449,9 +16449,9 @@ own refusals (input formats, streams, an output attribute it does not decode) mo
   any differs). `PSPOCKET_EDGE_VERIFY_EVERY=N` verifies the first 64 jobs of each route and reason, then every Nth; the
   others take the GPU path: verify cheap enough for the phone's city.
 - Checked: the walk's 657 saved jobs (spu-job-replay probes of the gate's walk) in all three routes: the same output
-  bytes, screen vertices and index lists as the SPU's (657 of 657 with D-1007's formats, which the 10 with the colour pass put out), the Metal
-  kernel the same as the CPU's; tests on synthetic meshes (the tables against the streams in both later routes, the
-  routes each descriptor field gives).
+  bytes, screen vertices and index lists as the SPU's (657 of 657 with D-1007's formats, which the 10 with the colour
+  pass put out), the Metal kernel the same as the CPU's; tests on synthetic meshes (the tables against the streams in
+  both later routes, the routes each descriptor field gives).
 
 ## D-1007 · 2026-10-15 · EDGE on the GPU: U8N out, the packed formats' own arithmetic, fixed point over 24 bits in
 
