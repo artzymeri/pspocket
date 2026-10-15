@@ -4,11 +4,12 @@
 // item (pspocket/core/edge_job.h) instead of computing them. The code is in runtime/spu/replace/edge_gpu.cpp.
 //
 // A Recording is the work item being made for the job running on this host thread. Each stage's stand-in (a native
-// implementation of the stage's function in the build's table) reads what the stage would read from local store at
-// its entry, copies it into the blob, does to local store and the registers what the rest of the job reads after the
-// stage (the context's pointers, the counts), and returns without the stage's work. The culling stage's stand-in keeps
-// every index, so the job allocates, puts and draws the full count; the GPU culls. Whether a job can go to the GPU is
-// decided at its first stage (the vertex decompression), from its configuration: anything not handled leaves the
+// implementation of the stage's function in the build's table) reads what the stage would read from local store at its
+// entry, copies it into the blob, does to local store and the registers what the rest of the job reads after the stage
+// (the context's pointers, the counts), and returns without the stage's work. The culling stage's stand-in tells the
+// job one triangle kept (D-990), so the job's ring allocation holds little more than its vertices; the GPU culls, keeps
+// the indices in an area of its own and draws indirectly. Whether a job can go to the GPU is decided at its first stage
+// (the vertex decompression), from its configuration and the job driver's own steps: anything not handled leaves the
 // whole job to the SPU.
 //
 // The same functions build work items from captured states (spu-job-replay's probes): edge-gpu-check runs the kernels
@@ -16,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "pspocket/core/edge_job.h"
@@ -59,6 +61,9 @@ void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx);
 // is a build with a GPU path and PSPOCKET_EDGE_GPU takes it now (returns whether the key has one), job_end() after it.
 bool job_begin(uint64_t key);
 void job_end();
+
+// What the notes are said once by: the text with each number in it (decimal or hex) as one '#' (D-990).
+std::string note_kind(std::string_view what);
 // (Their counts and host time: pspocket::edge::stats().)
 
 } // namespace pspocket::spu::edge_gpu

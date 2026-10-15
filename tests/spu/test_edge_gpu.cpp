@@ -344,6 +344,33 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
     dc.gpr[5].u32[3] = fo1;
     dc.gpr[6].u32[3] = v2;
     dc.gpr[7].u32[3] = 0;
+    // the job driver's own steps (D-990): a job with any of them on is left to the SPU (run 331's flickering shadows:
+    // the triangle filter before the culling read tables the GPU path never made)
+    {
+        const uint32_t desc = 0x3A000; // descriptor + 0xF0, in $85
+        SPUContext jc = dc;
+        jc.gpr[85].u32[3] = desc;
+        eg::Recording x;
+        x.clear();
+        CHECK(eg::on_decompress(x, e.ls.data(), jc));
+        for (const uint32_t o : {0xA0u, 0xB6u, 0xB7u, 0xC0u, 0xDFu}) {
+            e.ls[desc + o] = 1;
+            x.clear();
+            CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
+            CHECK_FALSE(x.reject.empty());
+            e.ls[desc + o] = 0;
+        }
+        e.ls[desc + 0xB4] = 0x04;
+        x.clear();
+        CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
+        e.ls[desc + 0xB4] = 0;
+        jc.gpr[83].u32[1] = 0x3F800000u; // a position offset
+        x.clear();
+        CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
+        jc.gpr[83].u32[1] = 0x80000000u; // -0: none
+        x.clear();
+        CHECK(eg::on_decompress(x, e.ls.data(), jc));
+    }
     REQUIRE(eg::on_decompress(r, e.ls.data(), dc));
     eg::leave_decompress(r, e.ls.data(), dc);
     CHECK(ps_ld32(e.ls.data() + c + 0x54) == v1);
@@ -375,6 +402,20 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
     eg::leave_cull(r, e.ls.data(), cc);
     CHECK(cc.gpr[3].u32[3] == ni); // every index kept: the GPU culls
     CHECK(ps_ld32(e.ls.data() + c + 0x58) == ((EdgeLs::kIndices + 2 * ni + 15) & ~15u));
+    {
+        // told one triangle (the stand-in's way, D-990: the ring allocation no bigger than the vertices' need; told
+        // every index, run 331's city filled the rings)
+        eg::Recording t = r;
+        t.told = 3;
+        std::vector<uint8_t> ls = e.ls;
+        SPUContext tc = sc;
+        tc.gpr[4].u32[3] = 2;
+        tc.gpr[5].u32[3] = 0;
+        eg::leave_cull(t, ls.data(), tc);
+        CHECK(tc.gpr[3].u32[3] == 3);
+        CHECK(ps_ld16(ls.data() + c + 0x17E) == 3);
+        CHECK(ps_ld32(ls.data() + c + 0x58) == ((EdgeLs::kIndices + 6 + 15) & ~15u));
+    }
     // compression: the output vertex after the indices
     SPUContext oc = cc;
     oc.gpr[3].u32[3] = c;
@@ -396,4 +437,12 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
     // the same vertices as the work item made directly (the view aside: compare the outputs)
     const Run a = run(r.blob), b = run(want);
     CHECK(a.out == b.out);
+}
+
+TEST_CASE("edge gpu: notes are said once a kind, their numbers left out")
+{
+    // run 331: 134,527 notes of one kind, each a different text, each looked up in a growing list under one lock
+    CHECK(eg::note_kind("1234 indices to cull, 1236 configured") == eg::note_kind("7 indices to cull, 9 configured"));
+    CHECK(eg::note_kind("job descriptor byte 0x1a7 0x2") == "job descriptor byte # #");
+    CHECK(eg::note_kind("culling from vertex 3 (taken as 0)") != eg::note_kind("7 indices to cull, 9 configured"));
 }

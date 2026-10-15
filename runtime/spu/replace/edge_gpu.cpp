@@ -21,6 +21,7 @@
 #include "pspocket/spu/edge_gpu.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <format>
 #include <mutex>
@@ -51,8 +52,7 @@ inline float f32(uint32_t u)
 // each under one lock: the EDGE jobs waited on it).
 void note(const std::string& what, bool expected = false)
 {
-    std::string kind;
-    for (const char ch : what) kind += (ch >= '0' && ch <= '9') ? '#' : ch;
+    const std::string kind = note_kind(what);
     static std::mutex m;
     static std::vector<std::string> said;
     std::lock_guard lock(m);
@@ -61,6 +61,25 @@ void note(const std::string& what, bool expected = false)
     if (expected) PS_LOG_INFO("edge", "EDGE on the GPU: {} (said once)", what);
     else PS_LOG_WARN("edge", "EDGE on the GPU: {} (said once)", what);
 }
+
+} // namespace
+
+std::string note_kind(std::string_view what)
+{
+    // each number (a token from a digit on through digits, hex digits and the x of 0x) one '#'
+    std::string kind;
+    for (size_t i = 0; i < what.size();) {
+        if (what[i] >= '0' && what[i] <= '9') {
+            while (i < what.size() && (std::isxdigit(static_cast<unsigned char>(what[i])) || what[i] == 'x')) i++;
+            kind += '#';
+        } else {
+            kind += what[i++];
+        }
+    }
+    return kind;
+}
+
+namespace {
 
 bool fail(Recording& r, std::string why)
 {
