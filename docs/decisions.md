@@ -15905,3 +15905,50 @@ listed as a region (head and exit, D-966): the lifted code leaves at the head, t
   inside a function is a label and an entry of the program", not yet in main when this was written): without it the
   head is no entry, the derived program leaves the region out with a warning, and the lifted code falling into the
   head is run by the interpreter there (correct, slow). Lift the voice job again once both are in.
+
+## D-983 · 2026-10-15 · The mixer's DSP natives together: what they save, how it was measured, what was left and why
+
+D-979 to D-982 made six of the sound mixer's (SPURS "Secondary") hottest DSP functions native, every one exact
+against the translated job on captured calls (150 to 300 each) and on synthetic oracles (tests/games). Together:
+
+| Job | Function | What | Lifted | Native | Calls a 128 s walk | Saved |
+|---|---|---|---|---|---|---|
+| synthesizer 012bf135 | 0x05B20 | two biquad sections | 2.72 us | 1.20 us | 519,000 | 0.79 s |
+| synthesizer 012bf135 | 0x062C8 | biquad | 2.04 us | 0.83 us | 405,000 | 0.49 s |
+| submixes 28281614 | 0x0A920 | reverb (all-passes, 18 int16 lines, 12 filters) | 16.9 us | 5.05 us | 95,000 | 1.13 s |
+| submixes 28281614 | 0x06048 | comb and all-pass reverb | 2.03 us | 0.92 us | 190,000 | 0.21 s |
+| submixes 28281614 | 0x08748 | delay with feedback | 0.65 us | 0.17 us | 186,000 | 0.09 s |
+| voices bb12970d | 0x08000 loop | sample-rate converter | 0.87 us | 0.41 us | 706,000 | 0.32 s |
+
+About 3.0 s of the gate walk's 27.3 s of Secondary time: some 10% of the mixer's CPU, on the phone (where Secondary was
+32 ms a frame in run 327's busy windows) about 3 ms a frame. Profiles of the walk (xctrace, leaf PCs mapped through
+the lifted C's line table, the MP3 job as the yardstick since nothing of it changed): the three jobs with natives
+fell from 2.02 to 1.49 times the MP3 job's time (-26%); the synthesizer job without natives (54e79c9f) moved -9%
+between the two profiles, the noise of such a comparison.
+
+- Measuring: PSPOCKET_SPU_NATIVE=ab with 10 s halves gave Secondary's 5 s windows A/B 0.96 in one 300 s walk with sound
+  (load 20-30) and 1.02 in another (load 5 rising to 27): the effect (5-10%) is under the windows' spread on this shared
+  Mac. cellAudio's sound lines in the first: 769 periods skipped in half A against 863 in half B, the pace 0.96
+  against 0.95; in the second 114 against 82 (both halves keeping pace). The per-call times (spu-native-check --time,
+  the fastest of 7 runs) times the walk's call counts are the measure that holds; the phone's own A/B is for a
+  session there.
+- Exact, not Accelerate: the jobs keep their filters' state in local store in their own forms (transposed direct form
+  II, a state variable filter run four times a sample, int16 delay lines with clamped conversions) and every operation
+  rounds toward zero with the SPU's zero rules. vDSP's biquads keep direct-form-I histories (no exact mapping from the
+  jobs' states) and round to nearest; vDSP_vrampmuladd and the like compute their ramps their own way. Bit-exact NEON
+  in the jobs' order came out as fast where measured (a biquad without its zero tests, its result checked after, was no
+  faster than with them: the tests become branches the host predicts), so nothing here differs from the translated
+  job by even a bit, and spu-native-check's exact comparison stays the check.
+- Tried and left: 0x05370 of the synthesizer job 54e79c9f (a voice into four buffers with ramping gains, 2.0 million
+  calls a walk) was exact on 300 captured calls but only 291 to 181 ns: a listed function's caller leaves for the run
+  loop and is entered again, storing and reloading the registers it uses (115 for that caller, 0x1A450), which costs
+  about what native code saves; its one-pole loop (0x1A71C in the same function) is latency-bound in either form and
+  leaves 17 temporaries live. The synthesizer's smaller modules (0x09138, 0x0B878, 0x069A8, 0x0C088, 0x097C0, under
+  0.1 s a walk each) and the submix job's buffer cache (0x054F0, DMA and an LRU search) were not done.
+- Left for the main session: the voice job's loop region (D-982) needs the EDGE track's ad69fe2 in the lifter; the
+  three re-lifted jobs (012bf135, 28281614, bb12970d) must be lifted again for the game library (scripts/lift-spu.sh)
+  for their listed calls to reach the natives; the translator hash does not cover the tables of listed functions
+  (D-979); the dispatcher's config() takes a mutex on every call of a listed function.
+- Gates (this clone at 8898662 with ad69fe2's lifter change applied, the three jobs re-lifted ahead of the game
+  library): quick PASS (23 suites), spu PASS (150 programs, no difference), game PASS (fps 29.8 median, RSX failures 0;
+  checked against the main repository's message baseline: this clone has none of its own).
