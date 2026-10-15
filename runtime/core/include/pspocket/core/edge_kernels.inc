@@ -151,6 +151,26 @@ EK_INLINE float ek_fixed(ek_u32 raw, ek_s32 bias, ek_u32 frac)
     return float(ek_s32(raw) + bias) * ek_as_f32((127u - frac) << 23);
 }
 
+/* Up to 32 bits from `bit` on (big-endian, most significant first). */
+EK_INLINE ek_u32 ek_bits32(EK_IN ek_u8* p, ek_u32 bit, ek_u32 n)
+{
+    const ek_u32 o = bit >> 3, s = bit & 7u;
+    ek_u32 w = ek_ld32(p, o);
+    if (s) w = (w << s) | (ek_u32(p[o + 4u]) >> (8u - s));
+    return n >= 32u ? w : w >> (32u - n);
+}
+
+/* Fixed point of more than 24 bits a component (0x0B9B4, D-1007): v = raw + bias in 32 bits, its integer part
+ * (v >> frac, arithmetic) by csflt, its fraction (v << (32 - frac)) by cuflt at 2^-32, the two added by fa. With 8 to
+ * 24 fraction bits both conversions are exact: the sum is the one rounding (toward zero, as the SPU's). */
+EK_INLINE float ek_fixed_wide(ek_u32 raw, ek_s32 bias, ek_u32 frac)
+{
+    const ek_u32 v = raw + ek_u32(bias);
+    const float ip = float(ek_s32(v) >> frac);
+    const float fp = float(v << (32u - frac)) * ek_as_f32(0x2F800000u); /* 2^-32 */
+    return ek_fa(ip, fp);
+}
+
 /* A unit vector in 24 bits: two components of 10 bits (the lower-numbered first) as fma(A, k, -0.70703125), the index
  * of the one left out (bits 3-2), its sign (bit 0: positive) and, for a tangent, w's sign (bit 1); the one left out
  * is sqrt(1 - (a a + b b)) as the job makes it, x fi(x, frsqest(x)) times x (checked bit for bit on the game's, D-988). */
@@ -238,15 +258,40 @@ EK_INLINE void ek_skin_vector(EK_THR float* n, ek_rows r)
 
 /* ---- output formats ---- */
 
-/* X11Y11Z10N and I16N as EDGE makes them: u = trunc(f * (2^(n-1) - 0.5) + (2^(n-1) - 0.5)) (two roundings), saturated to n bits, then stored as
- * u - 2^(n-1) (the top bit flipped). */
-EK_INLINE ek_u32 ek_snorm(float f, ek_u32 n)
+/* cflts(x, 173): truncated to a signed integer, saturated. */
+EK_INLINE ek_s32 ek_cflts(float f)
 {
-    const float h = float((1u << (n - 1u))) - 0.5f; /* "half" is a type in Metal */
-    const float s = ek_fa(ek_fm(f, h), h);
-    const ek_u32 top = (1u << n) - 1u;
-    const ek_u32 u = s > 0.0f ? (s >= float(top) ? top : ek_u32(s)) : 0u;
-    return u ^ (1u << (n - 1u));
+    if (!(f == f)) return 0;
+    if (f >= 2147483520.0f) return 0x7FFFFFFF;
+    if (f <= -2147483648.0f) return ek_s32(0x80000000u);
+    return ek_s32(f);
+}
+
+/* U8N as EDGE makes it (0x0997C): t = x * 255 + 0.5 (one fused rounding), cfltu(t, 2^24) and its top byte: floor(t),
+ * 0 below 0, 255 from 256 on. */
+EK_INLINE ek_u32 ek_u8n(float f)
+{
+    const float t = ek_fma(f, 255.0f, 0.5f);
+    return t > 0.0f ? (t >= 256.0f ? 255u : ek_u32(t)) : 0u;
+}
+
+/* I16N as EDGE makes it (predefined format 2's tangent, 0x0FA60; a description's format 1, 0x09B90): t = x * 32767.5 -
+ * 0.5 (one fused rounding), cflts(t, 2^16) and its top half (two's complement: the integer part rounded down, of t
+ * truncated to 16 fraction bits). */
+EK_INLINE ek_u32 ek_i16n(float f)
+{
+    const float t = ek_fma(f, 32767.5f, -0.5f);
+    return (ek_u32(ek_cflts(t * 65536.0f)) >> 16) & 0xFFFFu;
+}
+
+/* X11Y11Z10N as EDGE makes it (predefined format 2's normal, 0x0FA60; a description's format 6, 0x09DA4): t = x *
+ * (1 - 2^-n) - 2^-n (one fused rounding), cflts(t, 2^31), its top n bits (11, 11, 10; x in the low bits): the integer
+ * part of x (2^(n-1) - 0.5) - 0.5 rounded down, as two's complement. (D-988's two roundings, x h + h, agree but at rare
+ * boundaries: D-1007.) */
+EK_INLINE ek_u32 ek_x11y11z10n_field(float f, ek_u32 n)
+{
+    const float m = ek_as_f32(n == 11u ? 0x3F7FE000u : 0x3F7FC000u), c = ek_as_f32(n == 11u ? 0xBA000000u : 0xBA800000u);
+    return ek_u32(ek_cflts(ek_fma(f, m, c) * 2147483648.0f)) >> (32u - n);
 }
 
 EK_INLINE void ek_store_attr(EK_DEV ek_u8* out, ek_u32 at, ek_u32 format, ek_u32 comps, EK_THR float* v)
@@ -254,9 +299,11 @@ EK_INLINE void ek_store_attr(EK_DEV ek_u8* out, ek_u32 at, ek_u32 format, ek_u32
     if (format == PS_EDGE_FMT_F32) {
         for (ek_u32 k = 0; k < comps; k++) ek_st32(out, at + 4u * k, ek_as_u32(v[k]));
     } else if (format == PS_EDGE_FMT_X11Y11Z10N) {
-        ek_st32(out, at, ek_snorm(v[0], 11u) | (ek_snorm(v[1], 11u) << 11) | (ek_snorm(v[2], 10u) << 22));
+        ek_st32(out, at, ek_x11y11z10n_field(v[0], 11u) | (ek_x11y11z10n_field(v[1], 11u) << 11) | (ek_x11y11z10n_field(v[2], 10u) << 22));
     } else if (format == PS_EDGE_FMT_I16N) {
-        for (ek_u32 k = 0; k < comps; k++) ek_st16(out, at + 2u * k, ek_snorm(v[k], 16u));
+        for (ek_u32 k = 0; k < comps; k++) ek_st16(out, at + 2u * k, ek_i16n(v[k]));
+    } else if (format == PS_EDGE_FMT_U8N) {
+        for (ek_u32 k = 0; k < comps; k++) out[at + k] = ek_u8(ek_u8n(v[k]));
     }
 }
 
@@ -268,14 +315,6 @@ struct ek_screen {
     ek_u32 packed; /* integer x << 16 | integer y & 0xFFFF, bit 31: w > 0 */
 };
 
-/* cflts(x, 173): truncated to a signed integer, saturated. */
-EK_INLINE ek_s32 ek_cflts(float f)
-{
-    if (!(f == f)) return 0;
-    if (f >= 2147483520.0f) return 0x7FFFFFFF;
-    if (f <= -2147483648.0f) return ek_s32(0x80000000u);
-    return ek_s32(f);
-}
 
 EK_INLINE ek_screen ek_transform(EK_IN ps_edge_job* j, EK_THR float* p)
 {
@@ -331,7 +370,8 @@ EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, EK_PAL fl
             EK_IN ek_u8* s = blob + j->pos_data + v * j->pos_stride;
             ek_u32 bit = j->pos_bit;
             for (ek_u32 k = 0; k < 3u; k++) {
-                pos[k] = ek_fixed(ek_bits(s, bit, j->pos_bits[k]), j->pos_bias[k], j->pos_frac[k]);
+                pos[k] = j->pos_bits[k] > 24u ? ek_fixed_wide(ek_bits32(s, bit, j->pos_bits[k]), j->pos_bias[k], j->pos_frac[k])
+                                              : ek_fixed(ek_bits(s, bit, j->pos_bits[k]), j->pos_bias[k], j->pos_frac[k]);
                 bit += j->pos_bits[k];
             }
             pos[3] = 1.0f;

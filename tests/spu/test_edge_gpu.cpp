@@ -466,6 +466,42 @@ TEST_CASE("edge gpu: jobs counted by route and reason, no text on the way (D-100
     CHECK(line.find("left to the SPU 1.0 (triangle filter 1.0)") != std::string::npos);
 }
 
+TEST_CASE("edge gpu: U8N, I16N and X11Y11Z10N as the SPU's compression makes them (D-1007)")
+{
+    // 0x0997C: cfltu(fma(x, 255, 0.5), 149), the top byte; 0x09B90 and 0x0FA60: cflts(fma(x, 32767.5, -0.5), 157), the
+    // top half
+    std::mt19937 rng(1007);
+    std::uniform_real_distribution<float> any(-1.25f, 1.25f);
+    std::vector<float> in;
+    for (int i = 0; i < 100000; i++) in.push_back(any(rng));
+    for (int k = 0; k <= 255; k++) {
+        const float x = static_cast<float>(k) / 255.0f; // the bytes' own values, and their neighbours
+        in.insert(in.end(), {x, std::nextafter(x, 2.0f), std::nextafter(x, -2.0f), -x});
+    }
+    in.insert(in.end(), {0.0f, -0.0f, 1.0f, -1.0f, 2.0f, -2.0f, 1e-30f, 300.0f, -300.0f});
+    std::vector<std::array<uint32_t, 4>> spu(in.size());
+    const uint64_t token = ps_spu_fpenv_enter();
+    for (size_t i = 0; i < in.size(); i++) {
+        const ps_spu_vec x = psl_splat32(u32(in[i]));
+        const ps_spu_vec u = psl_cfltu(psl_fma(x, psl_splat32(0x437F0000u), psl_splat32(0x3F000000u)), 149);
+        const ps_spu_vec s = psl_cflts(psl_fma(x, psl_splat32(0x46FFFF00u), psl_splat32(0xBF000000u)), 157);
+        // 0x09DA4 and 0x0FA60: X11Y11Z10N, cflts(fma(x, 1 - 2^-n, -2^-n), 142), the top n bits
+        const ps_spu_vec c11 = psl_cflts(psl_fma(x, psl_splat32(0x3F7FE000u), psl_splat32(0xBA000000u)), 142);
+        const ps_spu_vec c10 = psl_cflts(psl_fma(x, psl_splat32(0x3F7FC000u), psl_splat32(0xBA800000u)), 142);
+        spu[i] = {u[0] >> 24, s[0] >> 16, c11[0] >> 21, c10[0] >> 22};
+    }
+    ps_spu_fpenv_leave(token);
+    size_t same_u = 0, same_s = 0, same_c = 0;
+    for (size_t i = 0; i < in.size(); i++) {
+        same_u += ek_u8n(in[i]) == spu[i][0];
+        same_s += ek_i16n(in[i]) == spu[i][1];
+        same_c += ek_x11y11z10n_field(in[i], 11) == spu[i][2] && ek_x11y11z10n_field(in[i], 10) == spu[i][3];
+    }
+    CHECK(same_u == in.size());
+    CHECK(same_s == in.size());
+    CHECK(same_c == in.size());
+}
+
 TEST_CASE("edge gpu: from the SPU's tables the kernels make what they make from the streams (D-1006)")
 {
     // The later routes start from the tables the SPU's stages made: here the streams' own values, decoded (the
@@ -529,5 +565,51 @@ TEST_CASE("edge gpu: from the SPU's tables the kernels make what they make from 
             CHECK(got.out == want.out);
             CHECK(got.kept == want.kept);
         }
+    }
+}
+
+TEST_CASE("edge gpu: fixed point over 24 bits as the SPU's wide path decodes it (D-1007)")
+{
+    // 0x0B9B4: csflt(v >> frac, 155) + cuflt(v << (32 - frac), 123) by fa, v = raw + bias
+    std::mt19937 rng(1007);
+    for (const uint32_t frac : {8u, 12u, 16u, 24u}) {
+        for (const uint32_t bits : {25u, 26u, 27u, 32u}) {
+            std::vector<std::array<uint32_t, 2>> in; // raw, bias
+            for (int i = 0; i < 20000; i++) {
+                const uint32_t raw = bits == 32 ? static_cast<uint32_t>(rng()) : static_cast<uint32_t>(rng()) & ((1u << bits) - 1);
+                const uint32_t bias = i % 3 == 0 ? 0u : static_cast<uint32_t>(-(int32_t{1} << (bits - 2)));
+                in.push_back({raw, bias});
+            }
+            in.push_back({0, 0});
+            in.push_back({(1u << (bits % 32)) - 1, 0});
+            std::vector<uint32_t> spu(in.size());
+            const uint64_t token = ps_spu_fpenv_enter();
+            for (size_t i = 0; i < in.size(); i++) {
+                const uint32_t v = in[i][0] + in[i][1];
+                const ps_spu_vec ip = psl_csflt(psl_splat32(static_cast<uint32_t>(static_cast<int32_t>(v) >> frac)), 155, 0);
+                const ps_spu_vec fp = psl_cuflt(psl_splat32(v << (32 - frac)), 123, 0);
+                spu[i] = psl_fa(ip, fp)[0];
+            }
+            ps_spu_fpenv_leave(token);
+            size_t same = 0;
+            for (size_t i = 0; i < in.size(); i++)
+                same += u32(ek_fixed_wide(in[i][0], static_cast<int32_t>(in[i][1]), frac)) == spu[i];
+            INFO(bits << " bits, " << frac << " of them fraction");
+            CHECK(same == in.size());
+        }
+    }
+    // and from the stream: 13.12 components packed back to back, read across byte boundaries
+    std::vector<uint8_t> s(16, 0);
+    const uint32_t raw[3] = {0x1ABCDEFu & 0x1FFFFFFu, 0x0123456u, 0x1FFFFFFu};
+    uint32_t bit = 3;
+    for (const uint32_t r : raw) {
+        for (uint32_t b = 0; b < 25; b++)
+            if (r >> (24 - b) & 1u) s[(bit + b) >> 3] |= static_cast<uint8_t>(0x80u >> ((bit + b) & 7u));
+        bit += 25;
+    }
+    bit = 3;
+    for (const uint32_t r : raw) {
+        CHECK(ek_bits32(s.data(), bit, 25) == r);
+        bit += 25;
     }
 }

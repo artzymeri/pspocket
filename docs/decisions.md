@@ -16452,3 +16452,36 @@ own refusals (input formats, streams, an output attribute it does not decode) mo
   bytes, screen vertices and index lists as the SPU's (657 of 657 with D-1007's formats, which the 10 with the colour pass put out), the Metal
   kernel the same as the CPU's; tests on synthetic meshes (the tables against the streams in both later routes, the
   routes each descriptor field gives).
+
+## D-1007 · 2026-10-15 · EDGE on the GPU: U8N out, the packed formats' own arithmetic, fixed point over 24 bits in
+
+The formats run 332's jobs were left to the SPU for, and the packed formats' arithmetic, as GTA V's EDGE build
+computes them (the compression's jump tables: predefined formats at 0x0F6A4 by format, 2 at 0x0FA60; a description's
+attributes at 0x0909C by format - 1: 1 at 0x09B90, 2 F32, 4 at 0x0997C, 6 at 0x09DA4):
+
+- **U8N out** (format 4): t = x * 255 + 0.5 in one fused rounding (toward zero), cfltu(t, scale 2^24), its top byte:
+  floor(t), 0 below 0, 255 from 256 on.
+- **I16N** (predefined format 2's tangent; format 1 in a description, now taken): t = x * 32767.5 - 0.5 (fused),
+  cflts(t, scale 2^16), its top half (two's complement). **X11Y11Z10N** (format 2's normal; format 6 in a description):
+  t = x * (1 - 2^-n) - 2^-n (fused), cflts(t, scale 2^31), the top 11, 11 and 10 bits (x lowest). Both one fused
+  rounding with the constants in the caller (0x0F63C on); D-988's x h + h in two roundings agrees but at rare
+  boundaries: they were D-989's 38 vertices one step apart in 713 million (not the emulated fused products). Now the
+  same bytes as the SPU's in every walk (below).
+- **Fixed point over 24 bits** (13.12 to 15.12 in the city; the decompression's wide path 0x0B9B4, taken when any
+  component has 24 bits or more): v = raw + bias in 32 bits; csflt(v >> frac, arithmetic) + cuflt(v << (32 - frac),
+  scale 2^-32) by fa. With 8 to 24 fraction bits both conversions are exact and fa is the one rounding (the kernels'
+  emulated fa); fewer or more fraction bits go to the skinning's route. For 24 bits or fewer the narrow formula gives
+  the same value (|v| < 2^24): the kernels take the wide one for components over 24 bits only (ek_bits32 reads up to
+  32 bits across bytes). Jobs taking it are counted (and verified) under "fixed point over 24 bits" of the
+  decompression's route.
+- Tests against the SPU's own instructions in its environment (lifted.h's fma, cfltu, cflts, csflt, cuflt, fa): U8N,
+  I16N and X11Y11Z10N on 100,000 random values and every byte's neighbourhood; the wide decode on 20,000 values for
+  each of 25, 26, 27 and 32 bits with 8, 12, 16 and 24 fraction bits: all the same. The walk has no wide fixed point
+  (the phone's verify by kind checks it on the game's); its 10 colour-pass jobs put out U8N and I16N: the same bytes as
+  the SPU's in edge-gpu-check.
+- A U8N colour as input (secondary attribute 9) stays a reason for the skinning's route: the walk's such jobs put out
+  attribute 19 without a table (D-1006), and the colour-pass jobs need the SPU's tables anyway.
+- Verify over the gate's walk (PSPOCKET_EDGE_GPU=verify, every job): from the decompression, 1,433,707 jobs (17,959
+  of them from the skinning for the colour pass): every index list and all 717,145,826 output vertices the same bytes
+  as the SPU's; with PSPOCKET_EDGE_GPU_ROUTE=cull, 1,471,560 jobs from the culling: all lists and all 736,110,498
+  vertices the same.

@@ -21,11 +21,12 @@
      * predefined output format 2's tangent) and attribute sources (EDGE's attribute ids). */                        \
     enum {                                                                                                          \
         PS_EDGE_JOB_MAGIC = 0x45444731, /* "EDG1" */                                                               \
+        PS_EDGE_FMT_I16N = 1,        /* two bytes a component, -1 to 1 */                                           \
         PS_EDGE_FMT_F32 = 2,                                                                                        \
+        PS_EDGE_FMT_U8N = 4,         /* a byte a component, 0 to 1 */                                               \
         PS_EDGE_FMT_X11Y11Z10N = 6,                                                                                 \
         PS_EDGE_FMT_FIXED = 8,       /* input: bit-packed fixed point */                                            \
         PS_EDGE_FMT_UNIT_VECTOR = 9, /* input: two components of 10 bits, the third from them, signs, selector */   \
-        PS_EDGE_FMT_I16N = 0x104,                                                                                   \
         PS_EDGE_ATTR_POSITION = 1,                                                                                  \
         PS_EDGE_ATTR_NORMAL = 2,                                                                                    \
         PS_EDGE_ATTR_TANGENT = 3,                                                                                   \

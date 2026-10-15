@@ -172,6 +172,10 @@ bool output_layout(Recording& r, const uint8_t* ls, uint32_t c, ps_edge_job& j, 
             fmt = PS_EDGE_FMT_F32;
         else if (x.format == PS_EDGE_FMT_X11Y11Z10N && x.size == 4)
             fmt = PS_EDGE_FMT_X11Y11Z10N, comps = 3;
+        else if (x.format == PS_EDGE_FMT_U8N && x.size == x.components && x.components >= 1 && x.components <= 4)
+            fmt = PS_EDGE_FMT_U8N;
+        else if (x.format == PS_EDGE_FMT_I16N && x.size == 2 * x.components && x.components >= 1 && x.components <= 4)
+            fmt = PS_EDGE_FMT_I16N;
         else
             return fail(r, edge::Reason::output_format, 0x100 | x.format << 8 | x.size);
         if (x.offset + x.size > stride) return fail(r, edge::Reason::output_stride, stride);
@@ -349,7 +353,9 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     uint32_t bits = 0;
     for (uint32_t k = 0; k < 3; k++) {
         const uint32_t ib = ld8(ls, a1[0].fixed_at + 2 * k), fb = ld8(ls, a1[0].fixed_at + 2 * k + 1);
-        if (ib + fb == 0 || ib + fb > 24 || fb > 24) return fail(r, edge::Reason::fixed_point_wide, ib << 8 | fb);
+        // over 24 bits: the wide path's, with 8 to 24 fraction bits (its conversions exact, D-1007)
+        if (ib + fb == 0 || ib + fb > 32 || fb > 24 || (ib + fb > 24 && fb < 8)) return fail(r, edge::Reason::fixed_point_wide, ib << 8 | fb);
+        if (ib + fb > 24) r.why = edge::Reason::fixed_point_wide;
         j.pos_bits[k] = ib + fb;
         j.pos_frac[k] = fb;
         j.pos_bias[k] = static_cast<int32_t>(ld32(ls, fo1 + 4 * k));
