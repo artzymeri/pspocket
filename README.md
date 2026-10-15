@@ -14,13 +14,13 @@ signs and loads it, and plays it flawlessly. Driving title: GTA V (BLES01807); s
 
 ![engine](docs/progress/badge-0.svg) ![system libraries](docs/progress/badge-1.svg) ![kernel calls](docs/progress/badge-2.svg) ![PPU instructions](docs/progress/badge-3.svg) ![SPU instructions](docs/progress/badge-4.svg) ![games flawless](docs/progress/badge-5.svg)
 
-_2026-10-14._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: on the iPhone 18 Pro Max (run 327) GTA V's heavy scenes went from 4-12 fps to 15-28 (D-947), its shadows and blending are right (D-948, D-949) its fight scene no longer goes black (D-951), and the first steady-30 work took busy scenes from 18 to 21 fps (run 328). Nothing is Flawless yet: the iPhone is too slow in heavy scenes, and a plan for a steady 30 fps is in docs/improve.md.
+_2026-10-15._ Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: the plan for a steady 30 fps is built (D-952 to D-986): native EDGE geometry, MP3, zlib and GTA V's sound effects, a faster SPU translator and RSX thread, frames paced by the screen. On the iPhone 18 Pro Max (run 329) GTA V's busy scenes went from 18.6 fps (run 327) to 24.7, lighter scenes hold 29.9 and the sound keeps pace (0.13% of periods late, from 7.8%). City driving is still 17 to 23 fps: EDGE geometry on the GPU (Metal compute, D-987) is in progress. Nothing is Flawless yet.
 
 ![The engine, part by part](docs/progress/engine.svg)
 
 ![Games](docs/progress/games.svg)
 
-![GTA V on the Mac: CPU of the main SPU threads per 5 s (lower is faster)](docs/progress/speed-gta5.svg)
+![GTA V on the iPhone: busy scenes](docs/progress/speed-gta5.svg)
 ![Assassin's Creed's crowd on the Mac: CPU per 5 s and fps](docs/progress/speed-ac1.svg)
 ![Assassin's Creed's first session: SPU code interpreted (D-236)](docs/progress/interpreted-ac1.svg)
 

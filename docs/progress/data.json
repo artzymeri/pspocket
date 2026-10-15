@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-10-14",
-  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: on the iPhone 18 Pro Max (run 327) GTA V's heavy scenes went from 4-12 fps to 15-28 (D-947), its shadows and blending are right (D-948, D-949) its fight scene no longer goes black (D-951), and the first steady-30 work took busy scenes from 18 to 21 fps (run 328). Nothing is Flawless yet: the iPhone is too slow in heavy scenes, and a plan for a steady 30 fps is in docs/improve.md.",
+  "as_of": "2026-10-15",
+  "headline": "Route B (D-147): the iPhone alone prepares any PS3 disc image and runs it as native ARM64 code, no emulation. GTA V plays (Playable), Assassin's Creed plays into its training on the Mac with no PPU code interpreted (D-255). New: the plan for a steady 30 fps is built (D-952 to D-986): native EDGE geometry, MP3, zlib and GTA V's sound effects, a faster SPU translator and RSX thread, frames paced by the screen. On the iPhone 18 Pro Max (run 329) GTA V's busy scenes went from 18.6 fps (run 327) to 24.7, lighter scenes hold 29.9 and the sound keeps pace (0.13% of periods late, from 7.8%). City driving is still 17 to 23 fps: EDGE geometry on the GPU (Metal compute, D-987) is in progress. Nothing is Flawless yet.",
   "checklist": [
     {
       "area": "Reading any PS3 disc on the iPhone",
@@ -153,7 +153,12 @@
         {
           "name": "Translated SPU code fast enough for the iPhone's heavy scenes",
           "state": "partial",
-          "ref": "D-215 to D-220"
+          "ref": "D-958 to D-964 (the translator: -5.4% SPU time, -12% mixer), D-965 to D-983 (native middleware); city driving still CPU-bound (run 329)"
+        },
+        {
+          "name": "Known SPU middleware run as native code, exact (EDGE geometry, Sony's MP3 decoder, zlib, RAGE's audio DSP)",
+          "state": "done",
+          "ref": "D-965 to D-983"
         }
       ]
     },
@@ -211,9 +216,9 @@
           "ref": "D-143, D-158"
         },
         {
-          "name": "Per-draw CPU cost (9.2 us a draw)",
-          "state": "partial",
-          "ref": "D-210, D-211, D-214"
+          "name": "Per-draw CPU cost (-21% a draw: lookups, encoder state, FIFO runs, no allocation, NEON index scan, pooled targets)",
+          "state": "done",
+          "ref": "D-953 to D-957, D-984"
         },
         {
           "name": "Primitive restart in indexed draws",
@@ -254,6 +259,11 @@
           "name": "A target sampled while drawn to, read through the texture cache (no copy per draw)",
           "state": "done",
           "ref": "D-947"
+        },
+        {
+          "name": "EDGE geometry on the GPU (Metal compute, indirect draws)",
+          "state": "partial",
+          "ref": "D-987: phase 1 go, kernels and the draw hookup written; images and measurement next"
         }
       ]
     },
@@ -277,8 +287,8 @@
         },
         {
           "name": "Sound at full pace when the iPhone's cores are full",
-          "state": "todo",
-          "ref": "improve.md Audio"
+          "state": "done",
+          "ref": "D-974 to D-983, run 329: 0.13% of periods late in busy scenes, the game's pace 1.03"
         }
       ]
     },
@@ -356,9 +366,9 @@
           "ref": "run 100"
         },
         {
-          "name": "GTA V at 30 fps in heavy scenes (busy scenes 21.4 fps on the iPhone 18 Pro Max, run 328; 18 in run 327)",
+          "name": "GTA V at 30 fps in heavy scenes (busy scenes 24.7 fps on the iPhone 18 Pro Max, run 329; 21.4 in run 328, 18.6 in run 327; city driving 17-23)",
           "state": "partial",
-          "ref": "D-947, D-952, D-970 to D-973, runs 327-328"
+          "ref": "D-952 to D-987, runs 327-329"
         },
         {
           "name": "Memory under iOS's limit for a whole session",
@@ -369,6 +379,11 @@
           "name": "An hour without a crash",
           "state": "partial",
           "ref": "D-225 fixed the EDGE stop; D-584 to D-587 the data races; an hour on the phone not yet tried"
+        },
+        {
+          "name": "Frames paced by the screen's refreshes, each held 1/30 s",
+          "state": "done",
+          "ref": "D-971"
         }
       ]
     }
@@ -393,70 +408,42 @@
   "charts": [
     {
       "file": "speed-gta5.svg",
-      "title": "GTA V on the Mac: CPU of the main SPU threads per 5 s (lower is faster)",
-      "ylabel": "CPU seconds per 5 s",
+      "title": "GTA V on the iPhone: busy scenes",
+      "ylabel": "fps / % of sound periods late",
       "series": [
         {
-          "name": "main SPU threads",
-          "colour": "#0969da",
+          "name": "fps in busy scenes",
+          "colour": "#2da44e",
           "points": [
             [
-              134,
-              7.93
+              327,
+              18.6
             ],
             [
-              135,
-              7.62
+              328,
+              21.4
             ],
             [
-              136,
-              7.33
-            ],
-            [
-              137,
-              6.98
-            ],
-            [
-              140,
-              6.91
-            ],
-            [
-              141,
-              6.56
-            ],
-            [
-              170,
-              6.4
+              329,
+              24.7
             ]
           ]
         },
         {
-          "name": "audio SPU",
-          "colour": "#bf3989",
+          "name": "sound periods late (%)",
+          "colour": "#cf222e",
           "points": [
             [
-              135,
-              1.88
+              327,
+              7.82
             ],
             [
-              136,
-              1.73
+              328,
+              3.0
             ],
             [
-              137,
-              1.57
-            ],
-            [
-              140,
-              1.55
-            ],
-            [
-              141,
-              1.39
-            ],
-            [
-              170,
-              1.36
+              329,
+              0.13
             ]
           ]
         }

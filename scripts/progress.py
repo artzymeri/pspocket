@@ -259,7 +259,7 @@ def bars_svg(title, rows, width=900):
              f'font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">',
              f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
              f'<text x="4" y="20" font-size="15" font-weight="600" fill="#24292f">{html.escape(title)}</text>']
-    bw = width - lw - 70
+    bw = width - lw - 140  # room for "93%  (13/15 done)" after the bar
     for i, (label, frac, text) in enumerate(rows):
         y = 32 + i * rh
         parts.append(f'<text x="4" y="{y + 15}" font-size="12.5" fill="#24292f">{html.escape(label)}</text>')

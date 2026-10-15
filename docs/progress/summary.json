@@ -1,5 +1,5 @@
 {
-  "engine_percent": 93.0,
+  "engine_percent": 95.3,
   "libraries": {
     "own": 6625,
     "answered_as_rpcs3": 0,
@@ -22,13 +22,13 @@
     "Reading any PS3 disc on the iPhone": 100,
     "Translating on the iPhone (route B)": 89,
     "PPU code (the main processor)": 100,
-    "SPU code (the six co-processors)": 86,
+    "SPU code (the six co-processors)": 88,
     "SPURS and the kernel": 100,
     "Graphics (RSX to Metal)": 93,
-    "Sound": 75,
+    "Sound": 100,
     "Video and images": 90,
     "System services": 100,
-    "Speed and stability on the iPhone": 70
+    "Speed and stability on the iPhone": 75
   },
   "games": {
     "BLES01807": "Playable",
