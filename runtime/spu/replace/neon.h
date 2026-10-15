@@ -29,20 +29,35 @@ extern const uint8_t ps_spu_frsqest_planes[3][64];
 /* frest (psl_frest): the fraction from RPCS3's 32-entry table by bits 18-22, the exponent by its closed form (fp.cpp:
  * exponent 0 -> 0x7F800000, else max(253 - e, 0) << 23), the sign kept. The table lookup is two TBLs on the byte
  * planes: byte k of a lane reads plane k at the lane's index. */
-PSN uint32x4_t psn_frest(uint32x4_t x)
+typedef struct {
+    uint8x16x4_t p01; /* planes 0 and 1: bytes 0-63 */
+    uint8x16x2_t p2;
+} psn_frest_tables;
+/* The planes in registers: a loop loads them once (stores to local store may alias the tables for the compiler). */
+PSN psn_frest_tables psn_frest_load(void)
 {
-    const uint8x16x4_t p01 = vld1q_u8_x4(&ps_spu_frest_planes[0][0]); /* planes 0 and 1: bytes 0-63 */
-    const uint8x16x2_t p2 = vld1q_u8_x2(&ps_spu_frest_planes[2][0]);
+    psn_frest_tables t;
+    t.p01 = vld1q_u8_x4(&ps_spu_frest_planes[0][0]);
+    t.p2 = vld1q_u8_x2(&ps_spu_frest_planes[2][0]);
+    return t;
+}
+PSN uint32x4_t psn_frest_t(uint32x4_t x, const psn_frest_tables* t)
+{
     const uint32x4_t idx = vandq_u32(vshrq_n_u32(x, 18), vdupq_n_u32(0x1F));
     const uint32x4_t spread = vmulq_u32(idx, vdupq_n_u32(0x01010101u)); /* the index in each byte */
     /* byte 0: plane 0 (idx), byte 1: plane 1 (idx + 32), bytes 2, 3: out of range (0) */
     const uint8x16_t i01 = vreinterpretq_u8_u32(vaddq_u32(spread, vdupq_n_u32(0xC0C02000u)));
     /* byte 2: plane 2 (idx), the others out of range */
     const uint8x16_t i2 = vreinterpretq_u8_u32(vorrq_u32(spread, vdupq_n_u32(0xC000C0C0u)));
-    const uint32x4_t frac = vorrq_u32(vreinterpretq_u32_u8(vqtbl4q_u8(p01, i01)), vreinterpretq_u32_u8(vqtbl2q_u8(p2, i2)));
+    const uint32x4_t frac = vorrq_u32(vreinterpretq_u32_u8(vqtbl4q_u8(t->p01, i01)), vreinterpretq_u32_u8(vqtbl2q_u8(t->p2, i2)));
     const uint32x4_t e = vandq_u32(vshrq_n_u32(x, 23), vdupq_n_u32(0xFF));
     const uint32x4_t expo = vbslq_u32(vceqzq_u32(e), vdupq_n_u32(0x7F800000u), vshlq_n_u32(vqsubq_u32(vdupq_n_u32(253), e), 23));
     return vorrq_u32(vorrq_u32(frac, expo), vandq_u32(x, vdupq_n_u32(0x80000000u)));
+}
+PSN uint32x4_t psn_frest(uint32x4_t x)
+{
+    const psn_frest_tables t = psn_frest_load();
+    return psn_frest_t(x, &t);
 }
 
 /* frsqest (psl_frsqest): the fraction from RPCS3's 64-entry table by bits 18-23, the exponent by its closed form
@@ -158,6 +173,35 @@ PSN uint32x4_t psn_shufb_k(uint32x4_t a, uint32x4_t b, psn_shufb_key_t k)
 {
     const uint8x16x2_t t = {{vreinterpretq_u8_u32(a), vreinterpretq_u8_u32(b)}};
     return vreinterpretq_u32_u8(vorrq_u8(vqtbl2q_u8(t, k.idx), k.orr));
+}
+
+/* shufb on vectors in local store's byte order (guest byte i in byte i, as vld1q reads a quadword): control byte c
+ * picks byte c & 31 of {a, b}; the special controls as psl_shufb makes them. psn_shufb_key_b makes a control known
+ * ahead a lookup and the special bytes; psn_shufb_k applies it (its table is {a, b} in either order's own layout). */
+PSN uint32x4_t psn_shufb_b(uint32x4_t a, uint32x4_t b, uint32x4_t c)
+{
+    const uint8x16_t cc = vreinterpretq_u8_u32(c);
+    const uint8x16x2_t t = {{vreinterpretq_u8_u32(a), vreinterpretq_u8_u32(b)}};
+    const uint8x16_t picked = vqtbl2q_u8(t, vandq_u8(cc, vdupq_n_u8(0x1F)));
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    return vreinterpretq_u32_u8(vqtbx1q_u8(picked, special, vshrq_n_u8(veorq_u8(cc, vdupq_n_u8(0x80)), 3)));
+}
+PSN psn_shufb_key_t psn_shufb_key_b(uint32x4_t c)
+{
+    const uint8x16_t cc = vreinterpretq_u8_u32(c);
+    const uint8x16_t sel = vcltq_u8(cc, vdupq_n_u8(0x80));
+    const uint8x16_t special = {0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    psn_shufb_key_t k;
+    k.idx = vorrq_u8(vandq_u8(cc, vdupq_n_u8(0x1F)), vmvnq_u8(sel));
+    k.orr = vbicq_u8(vqtbl1q_u8(special, vshrq_n_u8(veorq_u8(cc, vdupq_n_u8(0x80)), 3)), sel);
+    return k;
+}
+
+/* A register's value in local store's byte order and back (D-004: the full reverse). */
+PSN uint32x4_t psn_rev16(uint32x4_t v)
+{
+    const uint8x16_t r = vrev64q_u8(vreinterpretq_u8_u32(v));
+    return vreinterpretq_u32_u8(vextq_u8(r, r, 8));
 }
 
 /* What fs and the like read of a float operand (psl_clamp): exponent 255 (a large number on the SPU) to the largest

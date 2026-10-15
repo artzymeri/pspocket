@@ -93,6 +93,7 @@ typedef struct {
     int live_sx, live_sy, live_sz;
     uint32x4_t sc_x, sc_y, sc_z, of_x, of_y, of_z;
     int32x4_t k_xmin, k_ymin, k_zmin, k_xmax, k_ymax, k_zmax;
+    psn_frest_tables rcp;
 } xform_0ecf8;
 
 /* t = fma(v, C[i][j], t) as the SPU does it, with v's "not a zero" mask nv (the lane of row i's column j) */
@@ -115,7 +116,7 @@ static inline __attribute__((always_inline)) uint32x4x4_t xform_group_0ecf8(cons
     CLIP(ca, 0);
     CLIP(cb, 1);
     CLIP(cc, 2);
-    const uint32x4_t est = (uint32x4_t)psl_fi((ps_spu_vec)w, (ps_spu_vec)psn_frest(w));
+    const uint32x4_t est = (uint32x4_t)psl_fi((ps_spu_vec)w, (ps_spu_vec)psn_frest_t(w, &x->rcp));
     const uint32x4_t err = (uint32x4_t)psl_fnms((ps_spu_vec)est, (ps_spu_vec)w, (ps_spu_vec)one);
     const uint32x4_t inv = psn_fma(err, est, est);
     const uint32x4_t ninv = psn_nz(inv), wsign = vandq_u32(w, sign);
@@ -220,6 +221,7 @@ int ps_edge_dad4_0ecf8(SPUContext* ctx, uint8_t* ls)
     t.sc_x = sc_x, t.sc_y = sc_y, t.sc_z = sc_z, t.of_x = of_x, t.of_y = of_y, t.of_z = of_z;
     t.k_xmin = psn_fkey(xmin), t.k_ymin = psn_fkey(ymin), t.k_zmin = psn_fkey(zmin);
     t.k_xmax = psn_fkey(xmax), t.k_ymax = psn_fkey(ymax), t.k_zmax = psn_fkey(zmax);
+    t.rcp = psn_frest_load();
 
     /* Two groups at a time: their chains are independent (the SPU code overlaps four, software-pipelined). */
     uint32_t g = 0;
@@ -944,5 +946,98 @@ int ps_edge_dad4_07ef4(SPUContext* ctx, uint8_t* ls)
     psl_st(ctx, 72, psl_a(psl_ld(ctx, 83), psl_ld(ctx, 64)));
     psl_st(ctx, 86, psl_a(psl_ld(ctx, 86), psl_splat32(16u * count)));
     ctx->pc = (0x082E8u + ctx->reloc) & PS_SPU_PC_MASK;
+    return 1;
+}
+
+/* ===================================================================================================================
+ * 0x0A720 of 0x0A098 (to 0x0A894): one of the index decompression's formats, four triangles a control halfword. The
+ * halfwords are at $13 on; the stream of new indices at $28; tables of shuffle controls (16 bytes an entry, 16 entries)
+ * A at 0xE440 + $79 and B at 0xE540 + $79; three controls from the image (0x125B0, 0x12800, 0x12810). For each halfword h
+ * (($62 >> 3) + 1 of them; nibbles n3..n0 from the top), with U0-U2 the stream's next 48 bytes and c the carried
+ * quadword (the last triangle's indices):
+ *   t39 = shufb(c, U0, A[n3]); t30 = shufb(U0, U1, B[n3]); t25 = shufb(U1, U2, B[n3]); t74 = shufb(U2, U2, B[n3])
+ *   t5 = shufb(t30, t25, B[n2]); t67 = shufb(t39, t30, A[n2]); t40 = shufb(t25, t74, B[n2])
+ *   t50 = shufb(t67, t5, A[n1]); t9 = shufb(t5, t40, B[n1]); c' = shufb(t50, t9, A[n0])
+ *   out = shufb(t39, t67, K0), shufb(t67, t50, K1), shufb(t50, c', K2)          48 bytes
+ * and the stream moves on by 6 k + 2 (8 - k) bytes, k the pairs of set bits in h (popcount(h & h << 1 & 0xAAAA)).
+ * The job's loop is a stage deep: each iteration stores the outputs of the halfword before, read with the stream at
+ * the pointer it had, so its first iteration stores a quadword triple made of zeros and the tables' first entries
+ * (n3's controls zero), which the second overwrites. Kept here as it is, in the job's order of reads and writes.
+ * Vectors are in local store's byte order (shufb is one lookup there). After it the job reads $17, the output pointer
+ * advanced (spu-live). It declines when an output could reach the tables (they are made lookups once) or the counts
+ * are out of bounds.
+ * =================================================================================================================== */
+
+int ps_edge_dad4_0a720(SPUContext* ctx, uint8_t* ls)
+{
+    /* the controls the code before sets: byte 3 into every byte ($58), bytes 0-15 ($53) */
+    static const uint32_t iota[4] = {0x00010203u, 0x04050607u, 0x08090A0Bu, 0x0C0D0E0Fu};
+    for (int w = 0; w < 4; w++)
+        if (ctx->gpr[58].u32[3 - w] != 0x03030303u || ctx->gpr[53].u32[3 - w] != iota[w]) return 0;
+    const uint32_t n = (pref(ctx, 62) >> 3) + 1;
+    if (n > 0x10000u) return 0;
+    const uint32_t out0 = pref(ctx, 48), base = pref(ctx, 79), rel = ctx->reloc;
+    const uint32_t ta = (0xE440u + base) & PS_SPU_QW_MASK, tb = (0xE540u + base) & PS_SPU_QW_MASK;
+    {
+        const uint32_t o = out0 & PS_SPU_QW_MASK, len = 48u * n; /* the outputs' quadwords */
+        if (!in_ls(o, len) || !in_ls(ta, 256) || !in_ls(tb, 256)) return 0;
+        if ((o < ta + 256 && ta < o + len) || (o < tb + 256 && tb < o + len)) return 0;
+    }
+    psn_shufb_key_t ka[16], kb[16];
+    for (int e = 0; e < 16; e++) {
+        ka[e] = psn_shufb_key_b(vreinterpretq_u32_u8(vld1q_u8(ls + ta + 16u * (uint32_t)e)));
+        kb[e] = psn_shufb_key_b(vreinterpretq_u32_u8(vld1q_u8(ls + tb + 16u * (uint32_t)e)));
+    }
+    const psn_shufb_key_t k0 = psn_shufb_key_b(vreinterpretq_u32_u8(vld1q_u8(ls + ((0x125B0u + rel) & PS_SPU_QW_MASK))));
+    const psn_shufb_key_t k1 = psn_shufb_key_b(vreinterpretq_u32_u8(vld1q_u8(ls + ((0x12800u + rel) & PS_SPU_QW_MASK))));
+    const psn_shufb_key_t k2 = psn_shufb_key_b(vreinterpretq_u32_u8(vld1q_u8(ls + ((0x12810u + rel) & PS_SPU_QW_MASK))));
+    const psn_shufb_key_t zero_key = psn_shufb_key_b(vdupq_n_u32(0));
+    const uint8x16_t bytes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    const uint32_t hs = pref(ctx, 13);
+    uint32_t p = pref(ctx, 28), out = out0;
+    /* the stage before: the halfword's four tables (n3's controls zero at first), the stream's window and offset */
+    psn_shufb_key_t a3 = zero_key, b3 = zero_key;
+    unsigned n2 = 0, n1 = 0, n0 = 0, k = 0;
+    uint8x16x2_t w01 = {{vdupq_n_u8(0), vdupq_n_u8(0)}}, w23 = {{vdupq_n_u8(0), vdupq_n_u8(0)}};
+    uint8x16_t pat = vdupq_n_u8(0);
+    uint32x4_t c = vdupq_n_u32(0);
+    for (uint32_t i = 0; i < n; i++) {
+        /* this iteration's halfword */
+        const uint32_t at = 2u * i - 2u;
+        const uint8_t* q = ls + ((hs + 2u + at) & PS_SPU_QW_MASK);
+        const unsigned r = at & 15;
+        const unsigned h = ((unsigned)q[(r + 2) & 15] << 8) | q[(r + 3) & 15];
+        /* the stage before's outputs */
+        const uint8x16x2_t w12 = {{w01.val[1], w23.val[0]}};
+        const uint32x4_t u0 = vreinterpretq_u32_u8(vqtbl2q_u8(w01, pat));
+        const uint32x4_t u1 = vreinterpretq_u32_u8(vqtbl2q_u8(w12, pat));
+        const uint32x4_t u2 = vreinterpretq_u32_u8(vqtbl2q_u8(w23, pat));
+        const uint32x4_t t39 = psn_shufb_k(c, u0, a3);
+        const uint32x4_t t30 = psn_shufb_k(u0, u1, b3), t25 = psn_shufb_k(u1, u2, b3), t74 = psn_shufb_k(u2, u2, b3);
+        const uint32x4_t t5 = psn_shufb_k(t30, t25, kb[n2]), t67 = psn_shufb_k(t39, t30, ka[n2]);
+        const uint32x4_t t40 = psn_shufb_k(t25, t74, kb[n2]);
+        const uint32x4_t t50 = psn_shufb_k(t67, t5, ka[n1]), t9 = psn_shufb_k(t5, t40, kb[n1]);
+        c = psn_shufb_k(t50, t9, ka[n0]);
+        /* the stream's window for this halfword, read before the stores */
+        if (i) p += 6u * k + 2u * (8u - k); /* the counts start at zero */
+        w01.val[0] = vld1q_u8(ls + (p & PS_SPU_QW_MASK));
+        w01.val[1] = vld1q_u8(ls + ((p + 16u) & PS_SPU_QW_MASK));
+        w23.val[0] = vld1q_u8(ls + ((p + 32u) & PS_SPU_QW_MASK));
+        w23.val[1] = vld1q_u8(ls + ((p + 48u) & PS_SPU_QW_MASK));
+        pat = vaddq_u8(bytes, vdupq_n_u8((uint8_t)(p & 15)));
+        vst1q_u8(ls + (out & PS_SPU_QW_MASK), vreinterpretq_u8_u32(psn_shufb_k(t39, t67, k0)));
+        vst1q_u8(ls + ((out + 16u) & PS_SPU_QW_MASK), vreinterpretq_u8_u32(psn_shufb_k(t67, t50, k1)));
+        vst1q_u8(ls + ((out + 32u) & PS_SPU_QW_MASK), vreinterpretq_u8_u32(psn_shufb_k(t50, c, k2)));
+        if (i) out += 48;
+        /* this halfword's stage */
+        a3 = ka[h >> 12];
+        b3 = kb[h >> 12];
+        n2 = (h >> 8) & 15;
+        n1 = (h >> 4) & 15;
+        n0 = h & 15;
+        k = (unsigned)__builtin_popcount(h & (h << 1) & 0xAAAAu);
+    }
+    psl_st(ctx, 17, psl_a(psl_ld(ctx, 48), psl_splat32(48u * (n - 1))));
+    ctx->pc = (0x0A894u + rel) & PS_SPU_PC_MASK;
     return 1;
 }

@@ -89,8 +89,8 @@ unsigned ps_test_replace_arith(uint32_t rounds)
     return bad;
 }
 
-/* shufb on vectors in local-store word order against psl_shufb on the registers' order (D-004), every control byte
- * value in turn; and fs's clamp. */
+/* shufb on vectors in local-store word order and byte order against psl_shufb on the registers' order (D-004), every
+ * control byte value in turn; and fs's clamp. */
 unsigned ps_test_replace_shufb(uint32_t rounds)
 {
     unsigned bad = 0;
@@ -106,6 +106,9 @@ unsigned ps_test_replace_shufb(uint32_t rounds)
         bad += differ(psn_rev4(psn_shufb_w(aw, bw, cw)), want);
         bad += differ(psn_rev4(psn_shufb_k(aw, bw, psn_shufb_key(cw))), want);
         bad += differ(psn_clamp((uint32x4_t)a), psl_clamp(a));
+        const uint32x4_t ab = psn_rev16((uint32x4_t)a), bb = psn_rev16((uint32x4_t)b), cb = psn_rev16((uint32x4_t)c);
+        bad += differ(psn_rev16(psn_shufb_b(ab, bb, cb)), want);
+        bad += differ(psn_rev16(psn_shufb_k(ab, bb, psn_shufb_key_b(cb))), want);
     }
     return bad;
 }
