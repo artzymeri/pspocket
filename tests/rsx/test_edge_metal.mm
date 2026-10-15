@@ -35,7 +35,8 @@ CpuResult on_cpu(const std::vector<uint8_t>& blob)
     CpuResult r;
     r.vertices.assign(j.num_vertexes * j.out_stride, 0);
     std::vector<ek_screen> scr(j.num_vertexes);
-    for (uint32_t v = 0; v < j.num_vertexes; v++) scr[v] = ek_vertex(blob.data(), &j, v, r.vertices.data() + v * j.out_stride);
+    const std::vector<float> pal = ek_palette(blob.data());
+    for (uint32_t v = 0; v < j.num_vertexes; v++) scr[v] = ek_vertex(blob.data(), &j, pal.data(), v, r.vertices.data() + v * j.out_stride);
     const uint8_t* idx = blob.data() + j.indices;
     for (uint32_t i = 0; i + 2 < j.num_indexes; i += 3) {
         const uint32_t a = ps_ld16(idx + 2 * i), b = ps_ld16(idx + 2 * i + 2), c = ps_ld16(idx + 2 * i + 4);
@@ -101,7 +102,7 @@ TEST_CASE("edge gpu: the Metal kernel makes what the CPU makes of synthetic mesh
     [enc setComputePipelineState:pipeline];
     [enc setBuffer:buf offset:0 atIndex:0];
     [enc setBytes:list.data() length:list.size() * sizeof(Dispatch) atIndex:1];
-    const NSUInteger threads = std::min<NSUInteger>(128, pipeline.maxTotalThreadsPerThreadgroup);
+    const NSUInteger threads = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
     [enc dispatchThreadgroups:MTLSizeMake(list.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
     [enc endEncoding];
     [cb commit];

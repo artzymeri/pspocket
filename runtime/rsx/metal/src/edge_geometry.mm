@@ -33,6 +33,7 @@ using namespace metal;
 #define EK_DEV device
 #define EK_IN device const
 #define EK_THR thread
+#define EK_PAL threadgroup const
 #define EK_TABLE constant
 #define EK_INLINE static inline
 typedef uint ek_u32;
@@ -62,7 +63,12 @@ kernel void edge_jobs(device uchar* buf [[buffer(0)]], constant ek_dispatch* job
     device uchar* shadow = buf + d.shadow;
     device ek_screen* scr = (device ek_screen*)(buf + d.scratch);
     const uint nv = j->num_vertexes;
-    for (uint v = tid; v < nv; v += tcount) scr[v] = ek_vertex(blob, j, v, shadow + d.index_bytes + v * j->out_stride);
+    // the bones' matrices once, as floats (at most 256 bones)
+    threadgroup float pal[256 * 12];
+    const uint words = 12 * min(j->matrix_count, 256u);
+    for (uint i = tid; i < words; i += tcount) pal[i] = ek_palette_word(blob, j, i);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint v = tid; v < nv; v += tcount) scr[v] = ek_vertex(blob, j, pal, v, shadow + d.index_bytes + v * j->out_stride);
     threadgroup_barrier(mem_flags::mem_device);
 
     // The triangles, culled; the kept ones' indices packed in their order (EDGE's), big-endian.
@@ -140,6 +146,75 @@ void* edge_kernel_options()
     return (__bridge_retained void*)options;
 }
 
+EdgeKernelRun edge_run_kernel(const std::vector<std::vector<uint8_t>>& blobs, uint32_t threads, int repeat)
+{
+    EdgeKernelRun run;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        run.error = "no Metal device";
+        return run;
+    }
+    NSError* error = nil;
+    MTLCompileOptions* options = (__bridge_transfer MTLCompileOptions*)edge_kernel_options();
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:edge_kernel_source().c_str()]
+                                              options:options
+                                                error:&error];
+    id<MTLComputePipelineState> pipeline =
+        lib ? [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"edge_jobs"] error:&error] : nil;
+    if (!pipeline) {
+        run.error = error ? error.localizedDescription.UTF8String : "the kernel did not compile";
+        return run;
+    }
+    std::vector<Dispatch> list;
+    u32 at = 0;
+    const auto align = [](u32 v) { return (v + 15u) & ~15u; };
+    for (const auto& b : blobs) {
+        const auto& j = *reinterpret_cast<const ps_edge_job*>(b.data());
+        Dispatch d{};
+        d.blob = at;
+        at = align(at + static_cast<u32>(b.size()));
+        d.shadow = at;
+        d.index_bytes = align(2 * j.num_indexes);
+        at = align(at + d.index_bytes + j.num_vertexes * j.out_stride);
+        d.scratch = at;
+        at = align(at + 16 * j.num_vertexes);
+        d.args = at;
+        at += 32;
+        list.push_back(d);
+    }
+    id<MTLBuffer> buf = [device newBufferWithLength:std::max<u32>(at, 16) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> jobs = [device newBufferWithBytes:list.data() length:std::max<size_t>(list.size() * sizeof(Dispatch), 16)
+                                            options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    run.gpu_ms = 1e30;
+    for (int r = 0; r < std::max(repeat, 1); r++) {
+        for (size_t k = 0; k < blobs.size(); k++)
+            std::memcpy(static_cast<u8*>(buf.contents) + list[k].blob, blobs[k].data(), blobs[k].size());
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:buf offset:0 atIndex:0];
+        [enc setBuffer:jobs offset:0 atIndex:1];
+        const NSUInteger t = std::min<NSUInteger>(threads, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake(list.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(t, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        run.gpu_ms = std::min(run.gpu_ms, (cb.GPUEndTime - cb.GPUStartTime) * 1e3);
+    }
+    const u8* out = static_cast<const u8*>(buf.contents);
+    for (size_t k = 0; k < blobs.size(); k++) {
+        const auto& j = *reinterpret_cast<const ps_edge_job*>(blobs[k].data());
+        u32 count = 0;
+        std::memcpy(&count, out + list[k].args, 4);
+        run.counts.push_back(count);
+        run.indices.emplace_back(out + list[k].shadow, out + list[k].shadow + 2 * std::min(count, j.num_indexes));
+        const u8* v = out + list[k].shadow + list[k].index_bytes;
+        run.vertices.emplace_back(v, v + j.num_vertexes * j.out_stride);
+    }
+    return run;
+}
+
 bool MetalBackend::Impl::edge_init()
 {
     if (edge::mode() == edge::Mode::off) return true;
@@ -156,7 +231,7 @@ bool MetalBackend::Impl::edge_init()
         PS_LOG_ERROR(kChan, "EDGE kernel pipeline failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
-    edge_threads = std::min<u32>(128, static_cast<u32>(edge_pipeline.maxTotalThreadsPerThreadgroup));
+    edge_threads = std::min<u32>(256, static_cast<u32>(edge_pipeline.maxTotalThreadsPerThreadgroup));
     PS_LOG_INFO(kChan, "EDGE geometry kernels ready ({} threads a job, {} bytes of source)", edge_threads, source.size());
     edge::set_consumer(true); // from now on the SPU jobs may leave their work to the GPU
     return true;

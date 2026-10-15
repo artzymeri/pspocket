@@ -53,7 +53,8 @@ Run run(const std::vector<uint8_t>& blob)
     const auto& j = *reinterpret_cast<const ps_edge_job*>(blob.data());
     Run r;
     r.out.assign(j.num_vertexes * j.out_stride + 16, 0);
-    for (uint32_t v = 0; v < j.num_vertexes; v++) r.scr.push_back(ek_vertex(blob.data(), &j, v, r.out.data() + v * j.out_stride));
+    const std::vector<float> pal = ek_palette(blob.data());
+    for (uint32_t v = 0; v < j.num_vertexes; v++) r.scr.push_back(ek_vertex(blob.data(), &j, pal.data(), v, r.out.data() + v * j.out_stride));
     const uint8_t* idx = blob.data() + j.indices;
     for (uint32_t i = 0; i + 2 < j.num_indexes; i += 3) {
         const uint16_t a = static_cast<uint16_t>(ps_ld16(idx + 2 * i)), b = static_cast<uint16_t>(ps_ld16(idx + 2 * i + 2));

@@ -418,8 +418,9 @@ void run_here(const edge::WorkItem& item, uint8_t* membase)
     const ps_edge_job& j = *reinterpret_cast<const ps_edge_job*>(item.blob.data());
     uint8_t* alloc = membase + item.alloc_ea;
     std::vector<ek_screen> scr(j.num_vertexes);
+    const std::vector<float> pal = ek_palette(item.blob.data());
     for (uint32_t v = 0; v < j.num_vertexes; v++)
-        scr[v] = ek_vertex(item.blob.data(), &j, v, alloc + item.index_bytes + v * j.out_stride);
+        scr[v] = ek_vertex(item.blob.data(), &j, pal.data(), v, alloc + item.index_bytes + v * j.out_stride);
     const uint8_t* idx = item.blob.data() + j.indices;
     uint32_t out = 0, fill = 0;
     for (uint32_t i = 0; i + 2 < j.num_indexes; i += 3) {

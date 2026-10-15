@@ -178,15 +178,19 @@ struct ek_rows {
 
 EK_INLINE float ek_weight(ek_u32 byte) { return ek_fm(float(byte), ek_as_f32(0x3B808080u)); /* fm(cuflt(b), 1/255) */ }
 
-EK_INLINE ek_rows ek_skin_rows(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v)
+/* The bones' matrices as the skinning reads them: host-order floats, 12 a bone (the kernel loads them once a job into
+ * threadgroup memory; C++ callers make them with ek_palette). */
+EK_INLINE float ek_palette_word(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 i) { return ek_ldf(blob, j->matrices + 4u * i); }
+
+EK_INLINE ek_rows ek_skin_rows(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, EK_PAL float* pal, ek_u32 v)
 {
     ek_rows r;
     /* A bone past the palette (which the SPU would read from whatever local store holds after it; nothing in the walk
-     * names one) is the palette's last here, so the kernels stay in the blob. */
+     * names one) is the palette's last here. */
     const ek_u32 last = j->matrix_count ? j->matrix_count - 1u : 0u;
     if (j->skin == 4u) {
         const ek_u32 b = ek_min(ek_u32(blob[j->weights + v]), last);
-        for (ek_u32 i = 0; i < 12u; i++) r.m[i] = ek_ldf(blob, j->matrices + 48u * b + 4u * i);
+        for (ek_u32 i = 0; i < 12u; i++) r.m[i] = pal[12u * b + i];
         return r;
     }
     EK_IN ek_u8* q = blob + j->weights + 8u * v;
@@ -203,11 +207,11 @@ EK_INLINE ek_rows ek_skin_rows(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v
         w[1] = w[2] = w[3] = 0u;
     }
     const float w0 = ek_weight(w[0]);
-    for (ek_u32 i = 0; i < 12u; i++) r.m[i] = w[0] ? ek_fm(w0, ek_ldf(blob, j->matrices + 48u * bone[0] + 4u * i)) : 0.0f;
+    for (ek_u32 i = 0; i < 12u; i++) r.m[i] = w[0] ? ek_fm(w0, pal[12u * bone[0] + i]) : 0.0f;
     for (ek_u32 k = 1; k < 4u; k++) {
         if (!w[k]) continue;
         const float wk = ek_weight(w[k]);
-        for (ek_u32 i = 0; i < 12u; i++) r.m[i] = ek_fma(wk, ek_ldf(blob, j->matrices + 48u * bone[k] + 4u * i), r.m[i]);
+        for (ek_u32 i = 0; i < 12u; i++) r.m[i] = ek_fma(wk, pal[12u * bone[k] + i], r.m[i]);
     }
     return r;
 }
@@ -310,7 +314,7 @@ EK_INLINE ek_screen ek_transform(EK_IN ps_edge_job* j, EK_THR float* p)
 
 /* ---- one vertex: decompress, skin, compress into the output, transform ---- */
 
-EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v, EK_DEV ek_u8* out_vertex)
+EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, EK_PAL float* pal, ek_u32 v, EK_DEV ek_u8* out_vertex)
 {
     float pos[4], nrm[4], tan[4];
     {
@@ -333,7 +337,7 @@ EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v,
         ek_unit_vector((ek_u32(s[0]) << 16) | (ek_u32(s[1]) << 8) | s[2], tan);
     }
     if (j->skin) {
-        const ek_rows r = ek_skin_rows(blob, j, v);
+        const ek_rows r = ek_skin_rows(blob, j, pal, v);
         ek_skin_position(pos, r);
         if (has_nrm) ek_skin_vector(nrm, r);
         if (has_tan) ek_skin_vector(tan, r);

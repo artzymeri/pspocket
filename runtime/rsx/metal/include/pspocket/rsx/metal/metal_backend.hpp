@@ -281,4 +281,15 @@ private:
 std::string edge_kernel_source();
 void* edge_kernel_options();
 
+// The EDGE kernel over work items on this machine's GPU, apart from any backend (edge-gpu-check --metal, D-988): each
+// job's output (its kept indices, big-endian, then its vertices) and the indirect count; the GPU time of the fastest
+// of `repeat` dispatches of them all. Empty outputs: no Metal device or the kernel failed (error says why).
+struct EdgeKernelRun {
+    std::vector<std::vector<uint8_t>> indices, vertices;
+    std::vector<uint32_t> counts;
+    double gpu_ms = 0;
+    std::string error;
+};
+EdgeKernelRun edge_run_kernel(const std::vector<std::vector<uint8_t>>& blobs, uint32_t threads, int repeat);
+
 } // namespace pspocket::rsx::metal
