@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "pspocket/core/immutable_memory.hpp"
 #include "pspocket/core/log.hpp"
 
 namespace pspocket {
@@ -47,6 +48,7 @@ bool GuestMemory::reserve()
     if (const uintptr_t tail = raw + padded - (aligned + total); tail > 0)
         munmap(reinterpret_cast<void*>(aligned + total), tail);
     base_ = reinterpret_cast<u8*>(aligned);
+    clear_immutable_ranges(); // a new guest address space: nothing is read-only in it yet (D-1013)
     committed_.assign((kGuestSize / page_size_ + 63) / 64, 0);
     committed_pages_ = 0;
     PS_LOG_DEBUG(kChan, "guest memory reserved at {} ({} KB host pages)", static_cast<void*>(base_), page_size_ >> 10);
@@ -57,6 +59,7 @@ void GuestMemory::release()
 {
     std::lock_guard lock(mutex_);
     if (!base_) return;
+    clear_immutable_ranges(); // its ranges go with it (tests make one guest memory after another, D-1013)
     munmap(base_, kGuestSize + kGuardSize);
     base_ = nullptr;
     committed_.clear();

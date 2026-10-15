@@ -16374,6 +16374,9 @@ there faults, so the bytes are the same at every load.
 - Measured (the gate's walk, xctrace 20 s on the SPURS threads): content_check 0.00% of the main instance's samples,
   identify 0.87% in all. The gate passes (29.8 fps median, slowest 5 s window 29.2). Test: tests/core
   test_immutable_memory.cpp.
+- The ranges go with the guest memory they belong to: cleared when one is reserved or released. tests/hle runs one
+  fixture's guest memory after another in one process, and a range an earlier test's executable marked made a later
+  test's different SPU image at the same address look known (test_hle ended in a bus error in the quick gate once).
 
 ## D-1014 · 2026-10-15 · The RSX thread's waits by kind in the log; waiting on a semaphore's line measured and left
 
