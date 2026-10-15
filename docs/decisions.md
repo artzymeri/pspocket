@@ -16406,3 +16406,49 @@ rejection formatted a text and took D-990's once-a-kind lock on its way out (abo
   (a bit per reason, one relaxed load after the first). The warnings for conditions the GPU path goes on through
   (culling from a vertex offset, another index count, the output vertex changed, the PUTs' places) are a bit each
   too: no lock, no text unless said.
+
+## D-1006 · 2026-10-15 · EDGE on the GPU from a later stage: the job driver's steps on the SPU, the GPU from its tables
+
+D-990 left every job to the SPU when any of GTA V's job driver's own steps around EDGE's was on (descriptor bytes
+0x190 to 0x19F and 0x1B0 to 0x1DF, 0x1A4 & 0x1C, 0x1A6, 0x1A7, $83): about 1,270 of the city's 2,140 jobs a frame in
+run 332. The driver's code (the job binary from 0x110B0 on; its descriptor from + 0xF0 in $85), read field by field:
+
+- **Never read** by its code: words 0x190 and 0x19C; 0x198 is copied into the EDGE context's +0x17C (read by nothing:
+  the stages read the halfword at +0x17E) and read by the triangle filter; 0x1A5; 0x1A7 other than 0 and 2; 0x1B0 to
+  0x1BB and 0x1C0 on but in the paths below. 0x1A4 bits 5 to 7 are the culling's mode (already the culling's $4).
+- **Before the skinning** (after the decompression): $83 added to every position (0x11338); 0x1A4 bit 2, extra data
+  fetched (0x074C8) and applied by 0x04C30 or 0x0DBA8 (0x11398); 0x1A4 bits 3 and 4, 0x0E398's mode (0x115DC);
+  0x1A7 == 2, the output format made 4 (with word 0x194) or the output description changed (0x11488), and more of the
+  driver's after the hole.
+- **After the skinning, before the culling**: 0x1A6, the triangle filter 0x06808 (by words of the positions' table and
+  0x198, 0x1D0 on: run 331's flicker); word 0x1BC with the skinning on, positions and normals changed from extra data
+  (0x11658 to 0x119C4).
+- **After the culling**: word 0x194 with 0x1A7 0, a palette (from extra data, U8 colours) looked up per vertex from
+  attribute 9's table into attribute 19's (0x08A38, called with $85), which the compression puts out.
+
+So a job's route (`choose_route`, pspocket::edge::Route): **from the decompression** when no step reads or changes the
+stages' tables (as before); **from the skinning** when a step runs before the skinning (and for the colour pass): the
+SPU decompresses and runs the steps, the skinning's stand-in records the SPU's tables (positions, normals, tangents:
+four floats a vertex) and the GPU skins, transforms, culls and compresses from them; **from the culling** when a step
+runs after the skinning, or the skinning is one the GPU does not make (flavour, matrix format): the SPU skins too, the
+culling's stand-in records the skinned positions. In the later routes an output attribute the GPU does not compute
+(PS_EDGE_ATTR_TABLE) is the SPU's table as the compression finds it (the colour pass's attribute 19 among them), looked
+up as the compression does (0x09008: the first of the 16 id bytes at +0x150 that matches, whatever the count). A job
+whose output needs a table that is not there when its route starts is left to the SPU (reason "tables"): the SPU's
+compression then puts out what the index buffer's address holds, the culling's compacted list (seen: 284 jobs of the
+walk with a U8N colour input, attribute 9, and attribute 19 in their output but no colour pass). The decompression's
+own refusals (input formats, streams, an output attribute it does not decode) move a job to the skinning's route.
+
+- The work item (pspocket/core/edge_job.h): `tables`, `nrm_table`, `tan_table` (positions at pos_data), and an output
+  attribute's `table`; the kernels read the tables instead of decoding (the culling's route: skin 0). Up to 8 output
+  attributes (some descriptions have 5).
+- Counted by route and reason (D-1005); `PSPOCKET_EDGE_GPU_ROUTE=skin|cull` starts every job no earlier than that stage
+  (the later routes checked on every job); `edge-gpu-check --route skin|cull` the same on saved states.
+- **Verify by kind, sampled**: each work item carries its kinds (the route, the reason it was taken for); verify counts
+  jobs, the same index lists and the same vertices per kind ("EDGE verify by kind" in the window line, "MISMATCH" where
+  any differs). `PSPOCKET_EDGE_VERIFY_EVERY=N` verifies the first 64 jobs of each route and reason, then every Nth; the
+  others take the GPU path: verify cheap enough for the phone's city.
+- Checked: the walk's 657 saved jobs (spu-job-replay probes of the gate's walk) in all three routes: the same output
+  bytes, screen vertices and index lists as the SPU's (657 of 657 with D-1007's formats, which the 10 with the colour pass put out), the Metal
+  kernel the same as the CPU's; tests on synthetic meshes (the tables against the streams in both later routes, the
+  routes each descriptor field gives).

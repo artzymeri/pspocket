@@ -29,13 +29,15 @@
         PS_EDGE_ATTR_POSITION = 1,                                                                                  \
         PS_EDGE_ATTR_NORMAL = 2,                                                                                    \
         PS_EDGE_ATTR_TANGENT = 3,                                                                                   \
-        PS_EDGE_MAX_OUT = 4                                                                                         \
+        PS_EDGE_ATTR_TABLE = 0x100, /* the values of a table the SPU made (`table`), D-1006 */                      \
+        PS_EDGE_MAX_OUT = 8                                                                                         \
     };                                                                                                              \
     typedef struct ps_edge_out_attr {                                                                               \
         U32 source; /* PS_EDGE_ATTR_* (0: unused) */                                                                \
         U32 format; /* PS_EDGE_FMT_* */                                                                             \
         U32 components;                                                                                             \
         U32 offset; /* bytes into the output vertex */                                                              \
+        U32 table;  /* PS_EDGE_ATTR_TABLE: its four floats a vertex in the blob (big-endian, 16 bytes a vertex) */  \
     } ps_edge_out_attr;                                                                                             \
     typedef struct ps_edge_job {                                                                                    \
         U32 magic;                                                                                                  \
@@ -57,6 +59,12 @@
         U32 uv_stride;                                                                                              \
         U32 nrm_offset;                                                                                             \
         U32 tan_offset;                                                                                             \
+        /* tables (D-1006): the job's stages before the GPU's ran on the SPU; positions, normals and tangents are   \
+         * its tables of four floats a vertex (16 bytes a vertex, big-endian) at pos_data, nrm_table, tan_table     \
+         * (normals and tangents there when nrm_offset and tan_offset are not ~0). */                               \
+        U32 tables;                                                                                                 \
+        U32 nrm_table;                                                                                              \
+        U32 tan_table;                                                                                              \
         /* Skinning: 0 none, 1 four bones ((weight, bone) x 4 a vertex), 4 one bone (a byte a vertex); the matrices \
          * 3x4 floats, rows, big-endian. */                                                                        \
         U32 skin;                                                                                                   \
@@ -83,7 +91,7 @@
         U32 out_stride;                                                                                             \
         U32 out_count;                                                                                              \
         U32 pad0;                                                                                                   \
-        ps_edge_out_attr out[4];                                                                                    \
+        ps_edge_out_attr out[8];                                                                                    \
     } ps_edge_job;
 
 #ifndef __METAL_VERSION__

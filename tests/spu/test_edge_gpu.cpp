@@ -344,30 +344,42 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
     dc.gpr[5].u32[3] = fo1;
     dc.gpr[6].u32[3] = v2;
     dc.gpr[7].u32[3] = 0;
-    // the job driver's own steps (D-990): a job with any of them on is left to the SPU (run 331's flickering shadows:
-    // the triangle filter before the culling read tables the GPU path never made)
+    // the job driver's own steps (D-1006): where the GPU's work starts with each of them on (run 331's flickering
+    // shadows: the triangle filter before the culling read tables the GPU path never made; now its route starts at
+    // the culling, from the SPU's tables)
     {
+        using edge::Reason;
+        using edge::Route;
         const uint32_t desc = 0x3A000; // descriptor + 0xF0, in $85
         SPUContext jc = dc;
         jc.gpr[85].u32[3] = desc;
         eg::Recording x;
-        x.clear();
-        CHECK(eg::on_decompress(x, e.ls.data(), jc));
-        for (const uint32_t o : {0xA0u, 0xB6u, 0xB7u, 0xC0u, 0xDFu}) {
-            e.ls[desc + o] = 1;
+        const auto route = [&](uint32_t at, uint32_t word, Route want, Reason why) {
+            ps_st32(e.ls.data() + desc + at, word);
             x.clear();
-            CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
-            CHECK(x.reject != edge::Reason::none);
-            e.ls[desc + o] = 0;
-        }
-        e.ls[desc + 0xB4] = 0x04;
-        x.clear();
-        CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
-        e.ls[desc + 0xB4] = 0;
+            eg::choose_route(x, e.ls.data(), jc);
+            ps_st32(e.ls.data() + desc + at, 0);
+            INFO("descriptor " << std::hex << at + 0xF0 << " = " << word);
+            CHECK(x.route == want);
+            CHECK(x.why == why);
+        };
+        route(0xA0, 0, Route::decompress, Reason::none);
+        route(0xA0, 0xFFFFFFFFu, Route::decompress, Reason::none); // 0x190: never read
+        route(0xA8, 0xFFFFFFFFu, Route::decompress, Reason::none); // 0x198: copied, read by the filter only
+        route(0xA4, 1, Route::skin, Reason::colour_pass);         // 0x194 with 0x1A7 0: the palette pass
+        route(0xB4, 0x04000000u, Route::skin, Reason::blend_path); // 0x1A4 bit 2
+        route(0xB4, 0x18000000u, Route::skin, Reason::matrix_path);
+        route(0xB4, 0xE0000000u, Route::decompress, Reason::none); // 0x1A4 bits 5 to 7: the culling's mode
+        route(0xB4, 0x00000002u, Route::skin, Reason::output_mode); // 0x1A7 2
+        route(0xB4, 0x00000001u, Route::decompress, Reason::none);  // 0x1A7 1: nothing of the stages'
+        route(0xB4, 0x00000100u, Route::cull, Reason::triangle_filter); // 0x1A6
+        route(0xCC, 1, Route::cull, Reason::normal_pass);           // 0x1BC, the job skinned
+        route(0xC0, 0xFFFFFFFFu, Route::decompress, Reason::none);  // 0x1B0: in the paths above only
+        route(0xD0, 0xFFFFFFFFu, Route::decompress, Reason::none);
         jc.gpr[83].u32[1] = 0x3F800000u; // a position offset
-        x.clear();
-        CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
+        route(0xA0, 0, Route::skin, Reason::position_offset);
         jc.gpr[83].u32[1] = 0x80000000u; // -0: none
+        route(0xA0, 0, Route::decompress, Reason::none);
         x.clear();
         CHECK(eg::on_decompress(x, e.ls.data(), jc));
     }
@@ -452,4 +464,70 @@ TEST_CASE("edge gpu: jobs counted by route and reason, no text on the way (D-100
     const std::string line = edge::describe_routes(now, before, 2.0);
     CHECK(line.find("from the decompression 0.5") != std::string::npos);
     CHECK(line.find("left to the SPU 1.0 (triangle filter 1.0)") != std::string::npos);
+}
+
+TEST_CASE("edge gpu: from the SPU's tables the kernels make what they make from the streams (D-1006)")
+{
+    // The later routes start from the tables the SPU's stages made: here the streams' own values, decoded (the
+    // skinning's route) or decoded and skinned (the culling's), in tables of four floats a vertex.
+    for (const uint32_t skin : {0u, 1u, 4u}) {
+        const et::Mesh m = et::grid(skin, 2);
+        const std::vector<uint8_t> blob = et::make_blob(m);
+        const auto& j = *reinterpret_cast<const ps_edge_job*>(blob.data());
+        const Run want = run(blob);
+        const std::vector<float> pal = ek_palette(blob.data());
+        for (const bool skinned_by_spu : {false, true}) {
+            std::vector<uint8_t> t = blob;
+            ps_edge_job tj = j;
+            const auto table = [&](auto&& value) {
+                const uint32_t at = static_cast<uint32_t>(t.size());
+                t.resize(at + 16 * j.num_vertexes + 16, 0);
+                for (uint32_t v = 0; v < j.num_vertexes; v++) {
+                    float f[4];
+                    value(v, f);
+                    for (uint32_t k = 0; k < 4; k++) ps_st32(t.data() + at + 16 * v + 4 * k, u32(f[k]));
+                }
+                return at;
+            };
+            const auto decoded = [&](uint32_t v, float* pos, float* nrm, float* tan) {
+                const uint8_t* s = blob.data() + j.pos_data + v * j.pos_stride;
+                uint32_t bit = j.pos_bit;
+                for (uint32_t k = 0; k < 3; k++) {
+                    pos[k] = ek_fixed(ek_bits(s, bit, j.pos_bits[k]), j.pos_bias[k], j.pos_frac[k]);
+                    bit += j.pos_bits[k];
+                }
+                pos[3] = 1.0f;
+                const uint8_t* q = blob.data() + j.uv_data + v * j.uv_stride;
+                ek_unit_vector((uint32_t(q[j.nrm_offset]) << 16) | (uint32_t(q[j.nrm_offset + 1]) << 8) | q[j.nrm_offset + 2], nrm);
+                nrm[3] = 1.0f;
+                ek_unit_vector((uint32_t(q[j.tan_offset]) << 16) | (uint32_t(q[j.tan_offset + 1]) << 8) | q[j.tan_offset + 2], tan);
+                if (skinned_by_spu && j.skin) {
+                    const ek_rows r = ek_skin_rows(blob.data(), &j, pal.data(), v);
+                    ek_skin_position(pos, r);
+                    ek_skin_vector(nrm, r);
+                    ek_skin_vector(tan, r);
+                }
+            };
+            float scratch[8];
+            tj.pos_data = table([&](uint32_t v, float* f) { decoded(v, f, scratch, scratch + 4); });
+            tj.nrm_table = table([&](uint32_t v, float* f) { float p[4], n[4]; decoded(v, p, f, n); });
+            tj.tan_table = table([&](uint32_t v, float* f) { float p[4], n[4]; decoded(v, p, n, f); });
+            tj.nrm_offset = tj.tan_offset = 0;
+            tj.tables = 1;
+            if (skinned_by_spu) tj.skin = 0;
+            if (skinned_by_spu) {
+                // the culling's route: every output a table (the normals' and tangents' here)
+                tj.out[1].source = PS_EDGE_ATTR_TABLE;
+                tj.out[1].table = tj.nrm_table;
+                tj.out[2].source = PS_EDGE_ATTR_TABLE;
+                tj.out[2].table = tj.tan_table;
+            }
+            tj.size = static_cast<uint32_t>(t.size());
+            std::memcpy(t.data(), &tj, sizeof tj);
+            const Run got = run(t);
+            INFO("skinning " << skin << (skinned_by_spu ? ", the culling's route" : ", the skinning's route"));
+            CHECK(got.out == want.out);
+            CHECK(got.kept == want.kept);
+        }
+    }
 }

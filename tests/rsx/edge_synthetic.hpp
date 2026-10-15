@@ -154,13 +154,13 @@ inline std::vector<uint8_t> make_blob(const Mesh& m)
     j.nopix = m.nopix;
     // the output vertex
     if (m.out_format == 2) {
-        j.out[0] = {PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0};
-        j.out[1] = {PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12};
-        j.out[2] = {PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16};
+        j.out[0] = {PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0, 0};
+        j.out[1] = {PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12, 0};
+        j.out[2] = {PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16, 0};
         j.out_count = 3;
         j.out_stride = 24;
     } else {
-        j.out[0] = {PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0};
+        j.out[0] = {PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0, 0};
         j.out_count = 1;
         j.out_stride = 12;
     }

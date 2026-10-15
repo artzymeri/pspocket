@@ -317,25 +317,34 @@ EK_INLINE ek_screen ek_transform(EK_IN ps_edge_job* j, EK_THR float* p)
 
 EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, EK_PAL float* pal, ek_u32 v, EK_DEV ek_u8* out_vertex)
 {
-    float pos[4], nrm[4], tan[4];
-    {
-        EK_IN ek_u8* s = blob + j->pos_data + v * j->pos_stride;
-        ek_u32 bit = j->pos_bit;
-        for (ek_u32 k = 0; k < 3u; k++) {
-            pos[k] = ek_fixed(ek_bits(s, bit, j->pos_bits[k]), j->pos_bias[k], j->pos_frac[k]);
-            bit += j->pos_bits[k];
-        }
-        pos[3] = 1.0f;
-    }
+    float pos[4], nrm[4], tan[4], tab[4];
     const bool has_nrm = j->nrm_offset != 0xFFFFFFFFu, has_tan = j->tan_offset != 0xFFFFFFFFu;
-    if (has_nrm) {
-        EK_IN ek_u8* s = blob + j->uv_data + v * j->uv_stride + j->nrm_offset;
-        ek_unit_vector((ek_u32(s[0]) << 16) | (ek_u32(s[1]) << 8) | s[2], nrm);
-        nrm[3] = 1.0f;
-    }
-    if (has_tan) {
-        EK_IN ek_u8* s = blob + j->uv_data + v * j->uv_stride + j->tan_offset;
-        ek_unit_vector((ek_u32(s[0]) << 16) | (ek_u32(s[1]) << 8) | s[2], tan);
+    if (j->tables) {
+        /* the SPU's own tables (D-1006): the stages before ran there */
+        for (ek_u32 k = 0; k < 4u; k++) {
+            pos[k] = ek_ldf(blob, j->pos_data + 16u * v + 4u * k);
+            nrm[k] = has_nrm ? ek_ldf(blob, j->nrm_table + 16u * v + 4u * k) : 0.0f;
+            tan[k] = has_tan ? ek_ldf(blob, j->tan_table + 16u * v + 4u * k) : 0.0f;
+        }
+    } else {
+        {
+            EK_IN ek_u8* s = blob + j->pos_data + v * j->pos_stride;
+            ek_u32 bit = j->pos_bit;
+            for (ek_u32 k = 0; k < 3u; k++) {
+                pos[k] = ek_fixed(ek_bits(s, bit, j->pos_bits[k]), j->pos_bias[k], j->pos_frac[k]);
+                bit += j->pos_bits[k];
+            }
+            pos[3] = 1.0f;
+        }
+        if (has_nrm) {
+            EK_IN ek_u8* s = blob + j->uv_data + v * j->uv_stride + j->nrm_offset;
+            ek_unit_vector((ek_u32(s[0]) << 16) | (ek_u32(s[1]) << 8) | s[2], nrm);
+            nrm[3] = 1.0f;
+        }
+        if (has_tan) {
+            EK_IN ek_u8* s = blob + j->uv_data + v * j->uv_stride + j->tan_offset;
+            ek_unit_vector((ek_u32(s[0]) << 16) | (ek_u32(s[1]) << 8) | s[2], tan);
+        }
     }
     if (j->skin) {
         const ek_rows r = ek_skin_rows(blob, j, pal, v);
@@ -345,6 +354,11 @@ EK_INLINE ek_screen ek_vertex(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, EK_PAL fl
     }
     for (ek_u32 a = 0; a < j->out_count; a++) {
         EK_IN ps_edge_out_attr* o = &j->out[a];
+        if (o->source == PS_EDGE_ATTR_TABLE) {
+            for (ek_u32 k = 0; k < 4u; k++) tab[k] = ek_ldf(blob, o->table + 16u * v + 4u * k);
+            ek_store_attr(out_vertex, o->offset, o->format, o->components, tab);
+            continue;
+        }
         EK_THR float* src = o->source == PS_EDGE_ATTR_POSITION ? pos : o->source == PS_EDGE_ATTR_NORMAL ? nrm : tan;
         ek_store_attr(out_vertex, o->offset, o->format, o->components, src);
     }

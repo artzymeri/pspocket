@@ -305,6 +305,7 @@ void MetalBackend::Impl::edge_verify(std::unique_ptr<edge::WorkItem> item, u32 d
     c.guest_index_bytes = item->guest_index_bytes;
     c.guest.assign(mem.host(item->alloc_ea), mem.host(item->alloc_ea) + item->alloc_size);
     std::memcpy(&c.job, item->blob.data(), sizeof c.job);
+    c.kinds = item->kinds;
     edge_checks.push_back(std::move(c));
     edge::recycle(std::move(item));
 }
@@ -341,11 +342,17 @@ void MetalBackend::Impl::edge_check(const EdgeCheck& c, EdgeVerify& v)
     v.jobs.fetch_add(1, std::memory_order_relaxed);
     v.kept_gpu.fetch_add(args[0] / 3, std::memory_order_relaxed);
     v.kept_spu.fetch_add(c.drawn / 3, std::memory_order_relaxed);
+    bool list_same = false;
     if (args[0] == c.drawn) {
         v.counts_same.fetch_add(1, std::memory_order_relaxed);
-        if (2 * c.drawn <= c.guest.size() && std::memcmp(gpu + c.e.indices, c.guest.data(), 2 * c.drawn) == 0)
-            v.lists_same.fetch_add(1, std::memory_order_relaxed);
+        list_same = 2 * c.drawn <= c.guest.size() && std::memcmp(gpu + c.e.indices, c.guest.data(), 2 * c.drawn) == 0;
+        if (list_same) v.lists_same.fetch_add(1, std::memory_order_relaxed);
     }
+    const auto by_kind = [&](std::array<std::atomic<u64>, 64>& a, u64 n) {
+        for (u64 k = c.kinds; k; k &= k - 1) a[static_cast<usize>(__builtin_ctzll(k))].fetch_add(n, std::memory_order_relaxed);
+    };
+    by_kind(v.kind_jobs, 1);
+    by_kind(v.kind_lists_same, list_same ? 1 : 0);
     const u8* gv = gpu + c.e.shadow + c.e.index_bytes;
     if (c.guest_index_bytes + j.num_vertexes * j.out_stride > c.guest.size()) return;
     const u8* sv = c.guest.data() + c.guest_index_bytes;
@@ -387,6 +394,8 @@ void MetalBackend::Impl::edge_check(const EdgeCheck& c, EdgeVerify& v)
     }
     v.vertices.fetch_add(j.num_vertexes, std::memory_order_relaxed);
     v.vertices_same.fetch_add(same, std::memory_order_relaxed);
+    by_kind(v.kind_vertices, j.num_vertexes);
+    by_kind(v.kind_vertices_same, same);
     atomic_max(v.f32_ulps, worst_ulps);
     atomic_max(v.f32_rel_e9, worst_rel);
     atomic_max(v.int_diff, worst_int);

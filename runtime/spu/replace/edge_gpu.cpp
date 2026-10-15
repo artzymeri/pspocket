@@ -99,7 +99,7 @@ bool parse_description(Recording& r, const uint8_t* ls, uint32_t d, uint32_t& st
 {
     const uint32_t attrs = ld8(ls, d), blocks = ld8(ls, d + 2);
     stride = ld8(ls, d + 1);
-    if (attrs == 0 || attrs > 4 || blocks > 8 || blocks < attrs) return fail(r, edge::Reason::stream_description, attrs);
+    if (attrs == 0 || attrs > 8 || blocks > 16 || blocks < attrs) return fail(r, edge::Reason::stream_description, attrs);
     uint32_t b = d + 8;
     for (uint32_t k = 0; k < attrs; k++) {
         Attr a{ld8(ls, b), ld8(ls, b + 1), ld8(ls, b + 2), ld8(ls, b + 3), ld8(ls, b + 4), 0};
@@ -114,47 +114,123 @@ bool parse_description(Recording& r, const uint8_t* ls, uint32_t d, uint32_t& st
     return true;
 }
 
+// The table of attribute `id` as the job's EDGE context lists it (0x07470 and 0x074C8): the tables are words at +0x10,
+// their attribute ids a byte each at +0x150, as many as the low nibble of byte 0 and one more with its top bit (the
+// vertex-output callback's table); 0: none.
+uint32_t table_of_id(const uint8_t* ls, uint32_t c, uint32_t id)
+{
+    const uint32_t b0 = ld8(ls, c), n = std::min<uint32_t>((b0 & 15u) + (b0 >> 7), 16u);
+    for (uint32_t k = 0; k < n; k++)
+        if (ld8(ls, c + 0x150 + k) == id) return ld32(ls, c + 0x10 + 4 * k);
+    return 0;
+}
+
+// The table the compression (0x08E20, at 0x09008) puts out for attribute `id`: the first of the 16 id bytes at +0x150
+// that matches, whatever the count (stale bytes past it too), its table word at +0x10; none matching: index 16, the word
+// at +0x50 (the index buffer's address: the SPU puts out what is there, and so does the GPU path).
+uint32_t compress_table_of_id(const uint8_t* ls, uint32_t c, uint32_t id)
+{
+    uint32_t k = 0;
+    while (k < 16 && ld8(ls, c + 0x150 + k) != id) k++;
+    return ld32(ls, c + 0x10 + 4 * k);
+}
+
 // The output vertex as the configuration (byte 4 of the context: predefined 0 or 2, or 0xFF: the description at +0x74)
-// lays it out, into j.out / out_count / out_stride; false (with r.reject) when the GPU path does not make it.
-bool output_layout(Recording& r, const uint8_t* ls, uint32_t c, ps_edge_job& j)
+// lays it out, into j.out / out_count / out_stride; false (with r.reject) when the GPU path does not make it. What
+// the GPU computes: from the decompression, the positions, normals and tangents it decodes; from the skinning, the same
+// from the SPU's tables, skinned; from the culling, nothing: every output attribute is a table the SPU made (its
+// attribute id in `table` until the compression records it, D-1006).
+bool output_layout(Recording& r, const uint8_t* ls, uint32_t c, ps_edge_job& j, edge::Route route)
 {
     const uint32_t format = ld8(ls, c + 4);
     const bool has_nrm = j.nrm_offset != ~0u, has_tan = j.tan_offset != ~0u;
     j.out_count = 0;
-    const auto add = [&](uint32_t source, uint32_t fmt, uint32_t comps, uint32_t offset) {
-        j.out[j.out_count++] = ps_edge_out_attr{source, fmt, comps, offset};
+    const auto add = [&](uint32_t id, uint32_t fmt, uint32_t comps, uint32_t offset) {
+        const bool computed = route != edge::Route::cull &&
+                              (id == PS_EDGE_ATTR_POSITION || (id == PS_EDGE_ATTR_NORMAL && has_nrm) || (id == PS_EDGE_ATTR_TANGENT && has_tan));
+        if ((!computed && route == edge::Route::decompress) || j.out_count == PS_EDGE_MAX_OUT)
+            return fail(r, edge::Reason::output_attribute, id);
+        j.out[j.out_count++] = ps_edge_out_attr{computed ? id : uint32_t{PS_EDGE_ATTR_TABLE}, fmt, comps, offset, id};
+        return true;
     };
     if (format == 0) {
-        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
         j.out_stride = 12;
-        return true;
+        return add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
     }
     if (format == 2) {
-        if (!has_nrm || !has_tan) return fail(r, edge::Reason::output_attribute, 2);
-        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
-        add(PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12);
-        add(PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16);
         j.out_stride = 24;
-        return true;
+        return add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0) && add(PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12) &&
+               add(PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16);
     }
     if (format != 0xFF) return fail(r, edge::Reason::output_format, format);
     uint32_t stride = 0;
     std::vector<Attr> a;
     if (!parse_description(r, ls, ld32(ls, c + 0x74), stride, a)) return false;
     for (const Attr& x : a) {
-        const bool there = x.id == PS_EDGE_ATTR_POSITION || (x.id == PS_EDGE_ATTR_NORMAL && has_nrm) ||
-                           (x.id == PS_EDGE_ATTR_TANGENT && has_tan);
-        if (!there || j.out_count == PS_EDGE_MAX_OUT) return fail(r, edge::Reason::output_attribute, x.id);
+        uint32_t fmt = 0, comps = x.components;
         if (x.format == PS_EDGE_FMT_F32 && x.size == 4 * x.components && x.components >= 1 && x.components <= 4)
-            add(x.id, PS_EDGE_FMT_F32, x.components, x.offset);
+            fmt = PS_EDGE_FMT_F32;
         else if (x.format == PS_EDGE_FMT_X11Y11Z10N && x.size == 4)
-            add(x.id, PS_EDGE_FMT_X11Y11Z10N, 3, x.offset);
+            fmt = PS_EDGE_FMT_X11Y11Z10N, comps = 3;
         else
-            return fail(r, edge::Reason::output_attribute, x.format << 8 | x.size);
+            return fail(r, edge::Reason::output_format, 0x100 | x.format << 8 | x.size);
         if (x.offset + x.size > stride) return fail(r, edge::Reason::output_stride, stride);
+        if (!add(x.id, fmt, comps, x.offset)) return false;
     }
     j.out_stride = stride;
     return stride != 0 || fail(r, edge::Reason::output_stride, 0);
+}
+
+// GTA V's job driver's own steps around EDGE's (D-1006, from its code: its descriptor from + 0xF0 is in $85 from
+// before the decompression on, the fields named by their descriptor offsets): those that read or change the stages'
+// tables, by where they run.
+struct DriverSteps {
+    edge::Reason before_skin = edge::Reason::none; // after the decompression, before the skinning
+    edge::Reason after_skin = edge::Reason::none;  // after the skinning, before the culling
+    uint32_t detail = 0;
+};
+
+DriverSteps driver_steps(const uint8_t* ls, const SPUContext& ctx, uint32_t skin)
+{
+    DriverSteps d;
+    const uint32_t p = pref(ctx, 85);
+    const uint32_t b1a4 = ld8(ls, p + 0xB4), b1a6 = ld8(ls, p + 0xB6), b1a7 = ld8(ls, p + 0xB7);
+    // 0x119D4: 0x06808 filters the triangles by words of the positions' table (and 0x198, 0x1D0 on) before the culling
+    if (b1a6) {
+        d.after_skin = edge::Reason::triangle_filter;
+        d.detail = b1a6;
+    } else if (skin && ld32(ls, p + 0xCC)) {
+        // 0x11658 to 0x119C4 (word 0x1BC, the skinning on, more of the descriptor and the job): positions and normals
+        // changed from extra data after the skinning
+        d.after_skin = edge::Reason::normal_pass;
+        d.detail = ld32(ls, p + 0xCC);
+    }
+    // 0x11338: $83 added to every position after the decompression
+    for (int k = 0; k < 4; k++)
+        if (ctx.gpr[83].u32[k] & 0x7FFFFFFFu) d.before_skin = edge::Reason::position_offset;
+    if (d.before_skin != edge::Reason::none) return d;
+    if (b1a4 & 4) {
+        // 0x11398: extra data fetched (0x074C8) and applied by 0x04C30, or 0x0DBA8
+        d.before_skin = edge::Reason::blend_path;
+        d.detail = b1a4;
+    } else if (b1a4 & 0x18) {
+        // 0x115DC: 0x0E398's mode (bits 3 and 4; it runs with mode 0 in the walk's jobs too, its work read at the
+        // skinning's entry)
+        d.before_skin = edge::Reason::matrix_path;
+        d.detail = b1a4;
+    } else if (b1a7 == 2) {
+        // 0x11488: the output format made 4 (word 0x194) or the output description changed; more after the hole
+        d.before_skin = edge::Reason::output_mode;
+        d.detail = b1a7;
+    } else if (b1a7 == 0 && ld32(ls, p + 0xA4)) {
+        // 0x08A38, after the culling: a palette from extra data looked up per vertex into a table the compression puts
+        // out (word 0x194, 0x1A7 0); the tables it reads are the decompression's
+        d.before_skin = edge::Reason::colour_pass;
+        d.detail = ld32(ls, p + 0xA4);
+    }
+    // never read by the driver's code: words 0x190, 0x19C; word 0x198 goes to the context's +0x17C (read by nothing)
+    // and to the filter; 0x1A5; 0x1B0 to 0x1BB and 0x1C0 on but in the paths above
+    return d;
 }
 
 } // namespace
@@ -163,6 +239,8 @@ void Recording::clear()
 {
     blob.assign(sizeof(ps_edge_job), 0);
     job = ps_edge_job{};
+    route = edge::Route::spu;
+    why = edge::Reason::none;
     reject = edge::Reason::none;
     detail = 0;
     stages = 0;
@@ -189,6 +267,62 @@ void Recording::finish()
     std::memcpy(blob.data(), &job, sizeof job);
 }
 
+
+bool reroutable(edge::Reason why)
+{
+    switch (why) {
+    case edge::Reason::input_format:
+    case edge::Reason::blend_shapes:
+    case edge::Reason::custom_decompress:
+    case edge::Reason::primary_stream:
+    case edge::Reason::fixed_point_wide:
+    case edge::Reason::secondary_attribute:
+    case edge::Reason::stream_description:
+    case edge::Reason::output_attribute: return true;
+    default: return false;
+    }
+}
+
+void choose_route(Recording& r, const uint8_t* ls, const SPUContext& ctx)
+{
+    const uint32_t c = pref(ctx, 3);
+    r.ctx = c;
+    r.route = edge::Route::spu;
+    const auto spu = [&](edge::Reason why, uint32_t detail) {
+        r.reject = why;
+        r.detail = detail;
+    };
+    const uint32_t nv = ld16(ls, c + 8), ni = ld16(ls, c + 10);
+    // what no route makes: another vertex-output callback (the GPU makes the screen transform), counts out of range
+    if (((ld32(ls, c + 0x174) - ctx.reloc) & PS_SPU_PC_MASK) != 0x0ECF8) return spu(edge::Reason::callback, ld32(ls, c + 0x174));
+    if (ld8(ls, ld32(ls, c + 0x178) + 183) == 3) return spu(edge::Reason::projecting, 3);
+    if (nv == 0 || nv > 0x4000 || ni > 0x10000) return spu(edge::Reason::counts, nv);
+    if (!(ld8(ls, c) & 0x80)) return spu(edge::Reason::context_flag, ld8(ls, c));
+    const uint32_t skin = ld8(ls, c + 6) & 15u, matrix_format = ld8(ls, c + 7);
+    const DriverSteps d = driver_steps(ls, ctx, skin);
+    r.detail = d.detail;
+    if (d.after_skin != edge::Reason::none) {
+        r.route = edge::Route::cull;
+        r.why = d.after_skin;
+        return;
+    }
+    if (skin != 0 && skin != 1 && skin != 4) {
+        r.route = edge::Route::cull;
+        r.why = edge::Reason::skin_flavour;
+        r.detail = skin;
+        return;
+    }
+    if (matrix_format != 0) {
+        r.route = edge::Route::cull;
+        r.why = edge::Reason::matrix_format;
+        r.detail = matrix_format;
+        return;
+    }
+    r.route = d.before_skin != edge::Reason::none ? edge::Route::skin : edge::Route::decompress;
+    r.why = d.before_skin;
+    if (static_cast<int>(r.route) < static_cast<int>(edge::earliest_route())) r.route = edge::earliest_route();
+}
+
 // ---- the vertex decompression (0x0DAF0: $3 context, $4 and $5 the primary stream and its fixed offsets, $6 and $7
 // the secondary's) ----
 
@@ -197,37 +331,11 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     const uint32_t c = pref(ctx, 3), v1 = pref(ctx, 4), fo1 = pref(ctx, 5), v2 = pref(ctx, 6), fo2 = pref(ctx, 7);
     r.ctx = c;
     const uint32_t in1 = ld8(ls, c + 2), in2 = ld8(ls, c + 3), out = ld8(ls, c + 4), delta = ld8(ls, c + 5);
-    const uint32_t skin = ld8(ls, c + 6) & 15u, matrix_format = ld8(ls, c + 7);
     const uint32_t nv = ld16(ls, c + 8), ni = ld16(ls, c + 10);
+    if (out != 0 && out != 2 && out != 0xFF) return fail(r, edge::Reason::output_format, out);
     if (in1 != 0xFF || (v2 && in2 != 0xFF)) return fail(r, edge::Reason::input_format, in1 << 8 | in2);
     if (delta != 0xFF) return fail(r, edge::Reason::blend_shapes, delta);
-    if (skin != 0 && skin != 1 && skin != 4) return fail(r, edge::Reason::skin_flavour, skin);
-    if (matrix_format != 0) return fail(r, edge::Reason::matrix_format, matrix_format);
-    if (out != 0 && out != 2 && out != 0xFF) return fail(r, edge::Reason::output_format, out);
     if (ld32(ls, c + 0x7C) || ld32(ls, c + 0x80)) return fail(r, edge::Reason::custom_decompress);
-    if (!(ld8(ls, c) & 0x80)) return fail(r, edge::Reason::context_flag, ld8(ls, c));
-    if (((ld32(ls, c + 0x174) - ctx.reloc) & PS_SPU_PC_MASK) != 0x0ECF8)
-        return fail(r, edge::Reason::callback, ld32(ls, c + 0x174));
-    if (ld8(ls, ld32(ls, c + 0x178) + 183) == 3) return fail(r, edge::Reason::projecting);
-    if (nv == 0 || nv > 0x4000 || ni > 0x10000) return fail(r, edge::Reason::counts, nv);
-    // The job's own steps around EDGE's that read or change what the stages make (GTA V's job driver; its descriptor
-    // from + 0xF0 is in $85 from before the decompression on): a position offset added to every vertex after the
-    // decompression ($83), a triangle filter by the vertices' table words before the culling (descriptor + 0x1A6:
-    // 0x06808), per-vertex passes after the skinning (+ 0x1B0 on), the blend-shape-like path (+ 0x1A4 bit 2), the
-    // modes of + 0x190 on and + 0x1A7. The GPU path takes only jobs with every one of them off, as every job of the
-    // gate's walk (D-990); the phone's city has jobs with the filter on (run 331).
-    {
-        for (int k = 0; k < 4; k++)
-            if (ctx.gpr[83].u32[k] & 0x7FFFFFFFu) return fail(r, edge::Reason::position_offset);
-        const uint32_t p = pref(ctx, 85);
-        for (uint32_t o = 0xA0; o < 0xB0; o++)
-            if (ld8(ls, p + o)) return fail(r, edge::Reason::colour_pass, o + 0xF0);
-        if (ld8(ls, p + 0xB4) & 0x1C) return fail(r, edge::Reason::blend_path, ld8(ls, p + 0xB4));
-        if (ld8(ls, p + 0xB6)) return fail(r, edge::Reason::triangle_filter, ld8(ls, p + 0xB6));
-        if (ld8(ls, p + 0xB7)) return fail(r, edge::Reason::output_mode, ld8(ls, p + 0xB7));
-        for (uint32_t o = 0xC0; o < 0xE0; o++)
-            if (ld8(ls, p + o)) return fail(r, edge::Reason::normal_pass, o + 0xF0);
-    }
     ps_edge_job& j = r.job;
     j.num_vertexes = nv;
     j.num_indexes = ni;
@@ -271,8 +379,81 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     }
     // The output vertex now (the later stages cannot turn the job back to the SPU: this one skipped its work).
     ps_edge_job probe = j;
-    if (!output_layout(r, ls, c, probe)) return false;
+    if (!output_layout(r, ls, c, probe, edge::Route::decompress)) return false;
     r.stages |= 1;
+    return true;
+}
+
+// ---- the later routes' tables (D-1006) ----
+
+namespace {
+
+// The positions, normals and tangents the SPU's stages made, as they stand at this stage's entry.
+bool record_tables(Recording& r, const uint8_t* ls, uint32_t c, bool vectors)
+{
+    ps_edge_job& j = r.job;
+    const uint32_t nv = ld16(ls, c + 8), tp = table_of_id(ls, c, PS_EDGE_ATTR_POSITION);
+    if (!tp) return fail(r, edge::Reason::tables, PS_EDGE_ATTR_POSITION);
+    j.num_vertexes = nv;
+    j.num_indexes = ld16(ls, c + 10);
+    j.tables = 1;
+    j.pos_data = r.append(ls, tp, 16 * nv);
+    j.nrm_offset = j.tan_offset = ~0u;
+    if (!vectors) return true;
+    if (const uint32_t t = table_of_id(ls, c, PS_EDGE_ATTR_NORMAL)) {
+        j.nrm_offset = 0;
+        j.nrm_table = r.append(ls, t, 16 * nv);
+    }
+    if (const uint32_t t = table_of_id(ls, c, PS_EDGE_ATTR_TANGENT)) {
+        j.tan_offset = 0;
+        j.tan_table = r.append(ls, t, 16 * nv);
+    }
+    return true;
+}
+
+} // namespace
+
+namespace {
+
+// Each output attribute the GPU does not compute has a table to put out by the compression (D-1006): without one the
+// SPU's compression puts out what the index buffer's address holds then (the culling's compacted list): left to the
+// SPU. The colour pass makes its table (attribute 19) after the culling.
+bool output_tables(Recording& r, const uint8_t* ls, uint32_t c, const ps_edge_job& probe)
+{
+    for (uint32_t a = 0; a < probe.out_count; a++) {
+        const ps_edge_out_attr& o = probe.out[a];
+        if (o.source != PS_EDGE_ATTR_TABLE || r.why == edge::Reason::colour_pass) continue;
+        uint32_t k = 0;
+        while (k < 16 && ld8(ls, c + 0x150 + k) != o.table) k++;
+        if (k == 16) return fail(r, edge::Reason::tables, o.table);
+    }
+    return true;
+}
+
+} // namespace
+
+bool on_skin_tables(Recording& r, const uint8_t* ls, const SPUContext& ctx)
+{
+    const uint32_t c = pref(ctx, 3);
+    r.ctx = c;
+    // a binormal table: the SPU's skinning would turn it too (the GPU skins positions, normals and tangents)
+    if (table_of_id(ls, c, 4)) return fail(r, edge::Reason::tables, 4);
+    if (!record_tables(r, ls, c, true)) return false;
+    ps_edge_job probe = r.job;
+    if (!output_layout(r, ls, c, probe, edge::Route::skin) || !output_tables(r, ls, c, probe)) return false;
+    r.stages |= 1;
+    return true;
+}
+
+bool on_cull_tables(Recording& r, const uint8_t* ls, const SPUContext& ctx)
+{
+    const uint32_t c = pref(ctx, 3);
+    r.ctx = c;
+    if (!record_tables(r, ls, c, false)) return false;
+    r.job.skin = 0; // skinned by the SPU
+    ps_edge_job probe = r.job;
+    if (!output_layout(r, ls, c, probe, edge::Route::cull) || !output_tables(r, ls, c, probe)) return false;
+    r.stages |= 3;
     return true;
 }
 
@@ -329,7 +510,7 @@ bool on_cull(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     // Not seen in the walk (one batch from vertex 0, the configured count): said once if a job does.
     if (voff != 0) warn_once(Warn::cull_offset, [&] { return std::format("culling from vertex {} (taken as 0)", voff); });
     const uint32_t ni = ld16(ls, s + 0x17E);
-    if (ni != j.num_indexes) warn_once(Warn::cull_count, [&] { return std::format("{} indices to cull, {} configured", ni, j.num_indexes); });
+    if (ni != j.num_indexes && r.route != edge::Route::cull) warn_once(Warn::cull_count, [&] { return std::format("{} indices to cull, {} configured", ni, j.num_indexes); });
     j.num_indexes = ni - ni % 3;
     j.indices = r.append(ls, ld32(ls, s + 0x50), 2 * ni);
 
@@ -398,8 +579,20 @@ void leave_cull(const Recording& r, uint8_t* ls, SPUContext& ctx)
 
 bool on_compress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 {
-    if (!output_layout(r, ls, pref(ctx, 3), r.job))
+    const uint32_t c = pref(ctx, 3);
+    ps_edge_job& j = r.job;
+    if (!output_layout(r, ls, c, j, r.route))
         warn_once(Warn::output_changed, [&] { return std::format("the output vertex changed after the decompression ({}, {:#x})", edge::reason_name(r.reject), r.detail); });
+    // The later routes' output attributes the GPU does not compute: the SPU's tables as they stand now (after the
+    // driver's steps since the route's stage, such as the colour pass, D-1006).
+    for (uint32_t a = 0; a < j.out_count; a++) {
+        ps_edge_out_attr& o = j.out[a];
+        if (o.source != PS_EDGE_ATTR_TABLE) continue;
+        const uint32_t id = o.table;
+        if (!table_of_id(ls, c, id))
+            warn_once(Warn::missing_table, [&] { return std::format("no table of attribute {} at the compression: what the SPU's compression reads instead", id); });
+        o.table = r.append(ls, compress_table_of_id(ls, c, id), 16 * j.num_vertexes);
+    }
     r.stages |= 8;
     return true;
 }
@@ -495,6 +688,7 @@ void finalize(SPUContext* ctx)
     if (!s.verify && s.second_ea && s.second_ea != s.lo + item->index_bytes)
         warn_once(Warn::vertices_put, [&] { return std::format("the vertices put at {:#x} in the allocation, not {:#x}", s.second_ea - s.lo, item->index_bytes); });
     item->guest_index_bytes = s.verify ? s.first_put : 0;
+    item->kinds = (uint64_t{1} << static_cast<int>(r.why)) | (uint64_t{1} << edge::kind_route(r.route));
     if (!s.verify && item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
         warn_once(Warn::allocation, [&] { return std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
             item->index_bytes, j.num_vertexes, j.out_stride); });
@@ -541,7 +735,7 @@ bool job_begin(uint64_t key)
     if (key != kDad4 || edge::mode() == edge::Mode::off) return false;
     JobState& s = t_job;
     s.active = edge::deferred_now();
-    s.verify = edge::mode() == edge::Mode::verify;
+    s.verify = false; // decided as the job's route starts (verify_this)
     s.recorded = s.finished = false;
     s.first_put = s.label_gets = 0;
     s.lo = ~0u;
@@ -567,20 +761,51 @@ void job_end()
 // job takes the deferred path.
 using namespace pspocket::spu::edge_gpu;
 
+namespace {
+
+// The job goes to the SPU from here (its earlier stages ran there as ever): counted, said once.
+int to_spu(JobState& s, pspocket::edge::Reason why, uint32_t detail)
+{
+    say_once(pspocket::edge::Route::spu, why, detail);
+    pspocket::edge::count_route(pspocket::edge::Route::spu, why);
+    s.active = false;
+    return 0;
+}
+
+// The job's route starts at this stage: counted; the stages from here on record instead of computing (verify: they
+// record, then run).
+void start(JobState& s)
+{
+    s.recorded = true;
+    s.verify = pspocket::edge::mode() == pspocket::edge::Mode::verify && pspocket::edge::verify_this(s.rec.route, s.rec.why);
+    say_once(s.rec.route, s.rec.why, s.rec.detail);
+    pspocket::edge::count_route(s.rec.route, s.rec.why);
+}
+
+} // namespace
+
 extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
 {
+    using pspocket::edge::Route;
     JobState& s = t_job;
     if (!s.active || s.recorded) return 0;
     s.rec.clear();
     s.second_ea = 0;
+    choose_route(s.rec, ls, *ctx);
+    if (s.rec.route == Route::spu) return to_spu(s, s.rec.reject, s.rec.detail);
+    if (s.rec.route != Route::decompress) return 0; // the decompression (and what follows it) on the SPU
     if (!on_decompress(s.rec, ls, *ctx)) {
-        say_once(pspocket::edge::Route::spu, s.rec.reject, s.rec.detail);
-        pspocket::edge::count_route(pspocket::edge::Route::spu, s.rec.reject);
-        s.active = false;
+        if (!reroutable(s.rec.reject)) return to_spu(s, s.rec.reject, s.rec.detail);
+        // the SPU decompresses; the GPU starts from its tables at the skinning
+        const pspocket::edge::Reason why = s.rec.reject;
+        const uint32_t detail = s.rec.detail;
+        s.rec.clear();
+        s.rec.route = Route::skin;
+        s.rec.why = why;
+        s.rec.detail = detail;
         return 0;
     }
-    s.recorded = true;
-    pspocket::edge::count_route(pspocket::edge::Route::decompress, pspocket::edge::Reason::none);
+    start(s);
     if (verifying()) return 0;
     leave_decompress(s.rec, ls, *ctx);
     return 1;
@@ -588,22 +813,47 @@ extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
 
 extern "C" int ps_edge_dad4_gpu_07a10(SPUContext* ctx, uint8_t* ls)
 {
-    if (!skipping()) return 0;
-    if ((ls[(ctx->gpr[3].u32[3] + 6) & PS_SPU_LS_MASK] & 15u) == 0) return 0; // no skinning: the function does nothing
-    on_skin(t_job.rec, ls, *ctx);
+    using pspocket::edge::Route;
+    JobState& s = t_job;
+    if (!s.active) return 0;
+    const bool skinned = (ls[(ctx->gpr[3].u32[3] + 6) & PS_SPU_LS_MASK] & 15u) != 0;
+    if (!s.recorded && s.rec.route == Route::skin) {
+        if (!on_skin_tables(s.rec, ls, *ctx)) {
+            if (s.rec.reject != pspocket::edge::Reason::tables) return to_spu(s, s.rec.reject, s.rec.detail);
+            // the SPU skins too; the GPU starts from its tables at the culling
+            const pspocket::edge::Reason why = s.rec.reject;
+            const uint32_t detail = s.rec.detail;
+            s.rec.clear();
+            s.rec.route = Route::cull;
+            s.rec.why = why;
+            s.rec.detail = detail;
+            return 0;
+        }
+        start(s);
+    }
+    if (!s.recorded || s.rec.route == Route::cull) return 0;
+    if (!skinned) return 0; // no skinning: the function does nothing
+    on_skin(s.rec, ls, *ctx);
     if (verifying()) return 0;
-    leave_skin(t_job.rec, ls, *ctx);
+    leave_skin(s.rec, ls, *ctx);
     return 1;
 }
 
 extern "C" int ps_edge_dad4_gpu_0eff8(SPUContext* ctx, uint8_t* ls)
 {
-    if (!skipping()) return 0;
-    on_cull(t_job.rec, ls, *ctx);
+    using pspocket::edge::Route;
+    JobState& s = t_job;
+    if (!s.active) return 0;
+    if (!s.recorded && s.rec.route == Route::cull) {
+        if (!on_cull_tables(s.rec, ls, *ctx)) return to_spu(s, s.rec.reject, s.rec.detail);
+        start(s);
+    }
+    if (!s.recorded) return 0;
+    on_cull(s.rec, ls, *ctx);
     if (verifying()) return 0;
     // One triangle told: the GPU's count draws (the CPU mode writes every index into the allocation: all of them).
-    t_job.rec.told = pspocket::edge::mode() == pspocket::edge::Mode::cpu || t_job.rec.job.num_indexes < 3 ? 0u : 3u;
-    leave_cull(t_job.rec, ls, *ctx);
+    s.rec.told = pspocket::edge::mode() == pspocket::edge::Mode::cpu || s.rec.job.num_indexes < 3 ? 0u : 3u;
+    leave_cull(s.rec, ls, *ctx);
     return 1;
 }
 

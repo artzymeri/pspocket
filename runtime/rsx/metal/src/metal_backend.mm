@@ -2812,6 +2812,21 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                     v.jobs.load(), v.counts_same.load(), v.lists_same.load(), v.vertices_same.load(), v.vertices.load(),
                     v.f32_ulps.load(), static_cast<double>(v.f32_rel_e9.load()) / 1e9, v.int_diff.load(), v.kept_gpu.load(),
                     v.kept_spu.load());
+                // by kind: each route, and each reason a route was taken for (D-1006)
+                std::string kinds;
+                for (int k = 0; k < 64; k++) {
+                    const u64 jobs = v.kind_jobs[static_cast<usize>(k)].load();
+                    if (!jobs) continue;
+                    const bool route = k >= edge::kind_route(edge::Route::spu);
+                    const char* name = route ? edge::route_name(static_cast<edge::Route>(k - edge::kind_route(edge::Route::spu)))
+                                             : edge::reason_name(static_cast<edge::Reason>(k));
+                    if (!route && k == 0) continue; // no reason: the routes say it
+                    const u64 lists = v.kind_lists_same[static_cast<usize>(k)].load(), verts = v.kind_vertices[static_cast<usize>(k)].load();
+                    const u64 vsame = v.kind_vertices_same[static_cast<usize>(k)].load();
+                    kinds += std::format("{}{}: {} jobs, {} lists{}, {} of {} vertices{}", kinds.empty() ? "" : "; ", name, jobs,
+                        lists, lists == jobs ? " (all)" : " (MISMATCH)", vsame, verts, vsame == verts ? "" : " (MISMATCH)");
+                }
+                PS_LOG_INFO(kChan, "EDGE verify by kind (so far): {}", kinds);
             }
         }
         m.feedback_sources.clear();

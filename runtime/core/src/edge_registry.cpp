@@ -2,6 +2,7 @@
 
 #include "pspocket/core/edge_registry.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -124,6 +125,30 @@ Stats stats()
     return s;
 }
 
+bool verify_this(Route route, Reason why)
+{
+    static std::atomic<uint64_t> seen[static_cast<int>(Route::count)][static_cast<int>(Reason::count)];
+    static const uint64_t every = [] {
+        const char* v = std::getenv("PSPOCKET_EDGE_VERIFY_EVERY");
+        const uint64_t n = v ? std::strtoull(v, nullptr, 0) : 1;
+        if (n > 1) PS_LOG_INFO("edge", "EDGE verify: the first 64 jobs of each route and reason, then every {}th", n);
+        return n ? n : 1;
+    }();
+    const uint64_t n = seen[static_cast<int>(route)][static_cast<int>(why)].fetch_add(1, std::memory_order_relaxed);
+    return n < 64 || n % every == 0;
+}
+
+Route earliest_route()
+{
+    static const Route r = [] {
+        const char* v = std::getenv("PSPOCKET_EDGE_GPU_ROUTE");
+        const Route e = !v ? Route::decompress : std::strcmp(v, "cull") == 0 ? Route::cull : std::strcmp(v, "skin") == 0 ? Route::skin : Route::decompress;
+        if (e != Route::decompress) PS_LOG_INFO("edge", "EDGE on the GPU: every job {} on (PSPOCKET_EDGE_GPU_ROUTE={})", route_name(e), v);
+        return e;
+    }();
+    return r;
+}
+
 void count_route(Route route, Reason why)
 {
     g_routes[static_cast<int>(route)][static_cast<int>(why)].fetch_add(1, std::memory_order_relaxed);
@@ -137,7 +162,7 @@ const char* reason_name(Reason r)
     case Reason::blend_shapes: return "blend shapes";
     case Reason::skin_flavour: return "skinning flavour";
     case Reason::matrix_format: return "matrix format";
-    case Reason::output_format: return "predefined output format";
+    case Reason::output_format: return "output format";
     case Reason::custom_decompress: return "custom decompression";
     case Reason::context_flag: return "context byte 0";
     case Reason::callback: return "vertex-output callback";

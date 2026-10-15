@@ -28,6 +28,8 @@ namespace pspocket::spu::edge_gpu {
 struct Recording {
     std::vector<uint8_t> blob; // the header's room, then the data
     ps_edge_job job{};
+    edge::Route route = edge::Route::spu;     // the job's route (choose_route, D-1006)
+    edge::Reason why = edge::Reason::none;    // why it starts at a later stage than the decompression
     edge::Reason reject = edge::Reason::none; // why the GPU path cannot take the job (none while it can)
     uint32_t detail = 0;                      // the configuration value behind it (said once)
     uint32_t stages = 0;       // bit per stage recorded: 1 decompression, 2 skinning, 4 culling, 8 compression
@@ -44,9 +46,23 @@ struct Recording {
     void finish();
 };
 
+// The job's route, from the state at the decompression's entry (D-1006): r.route and r.why, or the SPU and r.reject.
+// The GPU makes the screen transform, the culling and the output in every route; the job's own steps between EDGE's
+// stages (GTA V's driver) decide from which stage on: the decompression when none of them reads or changes the stages'
+// tables (the GPU decodes the streams), the skinning when one runs before it (the GPU starts from the SPU's
+// decompressed tables), the culling when one runs between the skinning and the culling (from the skinned tables).
+void choose_route(Recording& r, const uint8_t* ls, const SPUContext& ctx);
+// Whether a job the decompression's recorder turned down (r.reject) can start at the skinning instead: its streams are
+// what the SPU's decompression makes, not the GPU's.
+bool reroutable(edge::Reason why);
+
 // The stages of GTA V's EDGE build's job (spu_dad457863220b1cc), from the state at each function's entry. Each returns
 // false (and sets r.reject) when the job is not one the GPU path handles.
 bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx); // 0x0DAF0
+// The later routes, at the skinning's or the culling's entry: the SPU's tables (positions, and from the skinning normals
+// and tangents) instead of the streams, and the output vertex as it stands then.
+bool on_skin_tables(Recording& r, const uint8_t* ls, const SPUContext& ctx); // 0x07A10
+bool on_cull_tables(Recording& r, const uint8_t* ls, const SPUContext& ctx); // 0x0EFF8
 bool on_skin(Recording& r, const uint8_t* ls, const SPUContext& ctx);       // 0x07A10
 bool on_cull(Recording& r, const uint8_t* ls, const SPUContext& ctx);       // 0x0EFF8
 bool on_compress(Recording& r, const uint8_t* ls, const SPUContext& ctx);   // 0x0F5B8

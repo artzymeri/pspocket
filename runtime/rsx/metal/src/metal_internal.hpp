@@ -452,6 +452,7 @@ struct MetalBackend::Impl {
         u32 guest_index_bytes = 0;
         std::vector<u8> guest; // its allocation as the job put it
         ps_edge_job job{};
+        u64 kinds = 0;
     };
     std::vector<EdgeCheck> edge_checks;
     struct EdgeVerify {
@@ -459,6 +460,8 @@ struct MetalBackend::Impl {
         std::atomic<u64> f32_ulps{0};          // the largest F32 difference in ulps
         std::atomic<u64> f32_rel_e9{0};        // ... against the value's magnitude, times 1e9
         std::atomic<u64> kept_gpu{0}, kept_spu{0};
+        // by kind (WorkItem::kinds' bits: the reasons, and edge::kind_route of the routes)
+        std::array<std::atomic<u64>, 64> kind_jobs{}, kind_lists_same{}, kind_vertices{}, kind_vertices_same{};
     };
     std::shared_ptr<EdgeVerify> edge_verify_stats = std::make_shared<EdgeVerify>();
     void edge_verify(std::unique_ptr<edge::WorkItem> item, u32 drawn);

@@ -20,37 +20,6 @@
 
 namespace pspocket::edge {
 
-enum class Mode : uint8_t { off, gpu, cpu, ab, verify };
-Mode mode();
-// Whether a job starting now takes the GPU path (mode cpu; mode gpu, or ab in the "on" half, once a consumer, the RSX
-// backend's EDGE kernels, is ready).
-bool deferred_now();
-void set_consumer(bool ready);
-// The backend's PSPOCKET_GPU_AB half, for mode ab.
-void set_ab_half(bool on);
-bool ab_half();
-
-struct WorkItem {
-    std::vector<uint8_t> blob; // ps_edge_job and its data (pspocket/core/edge_job.h)
-    uint32_t alloc_ea = 0;     // the ring allocation in RSX local memory (guest address)
-    uint32_t alloc_size = 0;
-    uint32_t index_bytes = 0;  // the index area at its start, as the job made it (16-byte aligned); the vertices follow
-    uint32_t out_index_bytes = 0; // room for every index (16-byte aligned): where the GPU puts the kept ones
-    // verify: the job ran on its SPU, the allocation holds its own output: its kept indices' area (the first PUT), its
-    // vertices after it
-    uint32_t guest_index_bytes = 0;
-};
-
-// Work items made once and used again (no allocation a job): acquire one to fill, recycle it once used.
-std::unique_ptr<WorkItem> acquire();
-void recycle(std::unique_ptr<WorkItem> item);
-
-void publish(std::unique_ptr<WorkItem> item);
-// The item published for the allocation at `ea`, removed; nullptr when there is none.
-std::unique_ptr<WorkItem> take(uint32_t ea);
-// Whether any item is waiting (a cheap test for a draw that may not be EDGE's).
-bool any_waiting();
-
 // How a job's work goes (D-1005): on the SPU whole, or on the GPU from one of its stages on, the stages before it run by
 // the SPU as ever. From the decompression: the GPU decodes the vertex streams. From the skinning: it starts from the
 // tables the SPU's decompression made (and whatever the job did to them before the skinning). From the culling: from
@@ -93,6 +62,47 @@ enum class Reason : uint8_t {
     count
 };
 const char* reason_name(Reason r);
+// PSPOCKET_EDGE_GPU_ROUTE=skin or cull: every job's GPU work starts no earlier than that stage (a check of the later
+// routes on every job; default the decompression).
+Route earliest_route();
+
+enum class Mode : uint8_t { off, gpu, cpu, ab, verify };
+Mode mode();
+// Whether a job starting now takes the GPU path (mode cpu; mode gpu, or ab in the "on" half, once a consumer, the RSX
+// backend's EDGE kernels, is ready).
+bool deferred_now();
+void set_consumer(bool ready);
+// The backend's PSPOCKET_GPU_AB half, for mode ab.
+void set_ab_half(bool on);
+bool ab_half();
+
+struct WorkItem {
+    std::vector<uint8_t> blob; // ps_edge_job and its data (pspocket/core/edge_job.h)
+    uint32_t alloc_ea = 0;     // the ring allocation in RSX local memory (guest address)
+    uint32_t alloc_size = 0;
+    uint32_t index_bytes = 0;  // the index area at its start, as the job made it (16-byte aligned); the vertices follow
+    uint32_t out_index_bytes = 0; // room for every index (16-byte aligned): where the GPU puts the kept ones
+    // verify: the job ran on its SPU, the allocation holds its own output: its kept indices' area (the first PUT), its
+    // vertices after it
+    uint32_t guest_index_bytes = 0;
+    uint64_t kinds = 0; // bit per Reason its route was taken for, and kind_route(route): verify's counts by kind
+};
+constexpr int kind_route(Route r) { return 48 + static_cast<int>(r); }
+// mode verify: whether the job of this route and reason starting now is verified (its SPU's work kept and compared),
+// or takes the GPU path: the first 64 of each kind, then every PSPOCKET_EDGE_VERIFY_EVERY-th (default 1: every job;
+// on the phone 16 or so keeps the frame rate near the GPU path's, D-1006).
+bool verify_this(Route route, Reason why);
+
+// Work items made once and used again (no allocation a job): acquire one to fill, recycle it once used.
+std::unique_ptr<WorkItem> acquire();
+void recycle(std::unique_ptr<WorkItem> item);
+
+void publish(std::unique_ptr<WorkItem> item);
+// The item published for the allocation at `ea`, removed; nullptr when there is none.
+std::unique_ptr<WorkItem> take(uint32_t ea);
+// Whether any item is waiting (a cheap test for a draw that may not be EDGE's).
+bool any_waiting();
+
 const char* route_name(Route r);
 
 // EDGE jobs so far (of builds with a GPU path): deferred (their stages recorded) or run whole by their SPU, with their

@@ -1,6 +1,6 @@
 // edge-gpu-check: EDGE geometry's GPU path against the SPU, on states of the game's jobs (D-988).
 //
-//   edge-gpu-check PROBE_DIR [--max N] [--verbose] [--metal [--threads N] [--repeat N]]
+//   edge-gpu-check PROBE_DIR [--max N] [--verbose] [--route skin|cull] [--metal [--threads N] [--repeat N]]
 //
 // PROBE_DIR holds the states spu-job-replay saved at the entry and return of the EDGE stages of GTA V's EDGE build
 // (--probe 0daf0 --probe 07a10 --probe 0eff8 --probe 0f5b8). For each job the stages' stand-ins (spu/edge_gpu.hpp)
@@ -13,6 +13,8 @@
 // --metal runs the work items on this machine's GPU too (the Metal kernel, as the backend compiles it) and compares its
 // output with the CPU's, and times the dispatch of them all (the fastest of --repeat, default 5; --threads a job,
 // default 256).
+// --route skin or cull starts every job's GPU work no earlier than that stage (D-1006), from the SPU's own tables in the
+// saved states: the later routes checked on every job, not only the ones whose driver steps choose them.
 // The probes hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1).
 
 #include <algorithm>
@@ -84,7 +86,7 @@ struct Totals {
     uint32_t screen_ulps = 0, out_f32_ulps = 0, out_int_diff = 0;
     double out_f32_abs = 0, out_f32_rel = 0, screen_px = 0; // the largest differences: absolute, against |value|, pixels
     uint64_t tri = 0, kept_spu = 0, kept_gpu = 0, lists_same = 0, cull_jobs = 0;
-    std::map<std::string, uint64_t> reasons;
+    std::map<std::string, uint64_t> reasons, routes;
 };
 
 // What a stage's stand-in leaves against what the stage left: the context's words, the link slot, $3.
@@ -115,6 +117,7 @@ int main(int argc, char** argv)
     uint32_t threads = 256;
     int repeat = 5;
     uint64_t max = 0;
+    pspocket::edge::Route force = pspocket::edge::Route::decompress; // --route skin|cull: no earlier than that
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--verbose") verbose = true;
@@ -122,6 +125,10 @@ int main(int argc, char** argv)
         else if (a == "--threads" && i + 1 < argc) threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
         else if (a == "--repeat" && i + 1 < argc) repeat = std::atoi(argv[++i]);
         else if (a == "--max" && i + 1 < argc) max = std::strtoull(argv[++i], nullptr, 0);
+        else if (a == "--route" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            force = v == "cull" ? pspocket::edge::Route::cull : v == "skin" ? pspocket::edge::Route::skin : pspocket::edge::Route::decompress;
+        }
         else if (dir.empty()) dir = a;
         else {
             std::fprintf(stderr, "usage: edge-gpu-check PROBE_DIR [--max N] [--verbose]\n");
@@ -154,23 +161,46 @@ int main(int argc, char** argv)
         t.jobs++;
         eg::Recording r;
         r.clear();
-        // The stand-ins run in the SPU's environment, as in the game.
+        // The stand-ins run in the SPU's environment, as in the game; the route as the stand-ins take it (D-1006), or
+        // a later one when --route asks (every saved state holds the SPU's own tables: any route can start there).
         const uint64_t token = ps_spu_fpenv_enter();
-        bool ok = eg::on_decompress(r, dec_in.ls.data(), dec_in.ctx);
+        using pspocket::edge::Route;
+        eg::choose_route(r, dec_in.ls.data(), dec_in.ctx);
+        if (r.route != Route::spu && static_cast<int>(r.route) < static_cast<int>(force)) r.route = force;
+        const auto reroute = [&](Route to) {
+            const pspocket::edge::Reason why = r.reject;
+            const uint32_t detail = r.detail;
+            r.clear();
+            r.route = to;
+            r.why = why;
+            r.detail = detail;
+        };
+        bool ok = r.route != Route::spu;
         std::string leaves;
-        if (ok) leaves += compare_leave(dec_in, dec_out, eg::leave_decompress, r);
+        if (ok && r.route == Route::decompress) {
+            ok = eg::on_decompress(r, dec_in.ls.data(), dec_in.ctx);
+            if (ok) leaves += compare_leave(dec_in, dec_out, eg::leave_decompress, r);
+            else if (eg::reroutable(r.reject)) ok = true, reroute(Route::skin);
+        }
+        if (ok && r.route == Route::skin) {
+            ok = skin_in.ok && eg::on_skin_tables(r, skin_in.ls.data(), skin_in.ctx);
+            if (!ok && r.reject == pspocket::edge::Reason::tables) ok = true, reroute(Route::cull);
+        }
         const uint32_t skin = dec_in.ls[r.ctx + 6] & 15u;
-        if (ok && skin && skin_in.ok) {
+        if (ok && r.route != Route::cull && skin && skin_in.ok) {
             ok = eg::on_skin(r, skin_in.ls.data(), skin_in.ctx);
             if (ok) leaves += compare_leave(skin_in, skin_out, eg::leave_skin, r);
         }
+        if (ok && r.route == Route::cull) ok = eg::on_cull_tables(r, cull_in.ls.data(), cull_in.ctx);
         if (ok) ok = eg::on_cull(r, cull_in.ls.data(), cull_in.ctx);
         if (ok) ok = eg::on_compress(r, comp_in.ls.data(), comp_in.ctx);
+        if (ok) t.routes[std::format("{} ({})", pspocket::edge::route_name(r.route), pspocket::edge::reason_name(r.why))]++;
         if (ok) leaves += compare_leave(comp_in, comp_out, eg::leave_compress, r);
         ps_spu_fpenv_leave(token);
         if (!ok) {
             t.rejected++;
-            t.reasons[std::format("{} ({:#x})", pspocket::edge::reason_name(r.reject), r.detail)]++;
+            const pspocket::edge::Reason why = r.reject;
+            t.reasons[std::format("{} ({:#x})", pspocket::edge::reason_name(why), r.detail)]++;
             if (verbose)
                 std::printf("job %llu: not for the GPU: %s %#x\n", static_cast<unsigned long long>(seq), pspocket::edge::reason_name(r.reject), r.detail);
             continue;
@@ -200,7 +230,7 @@ int main(int argc, char** argv)
 
         // --verbose: the skinned normals and tangents against the tables the skinning left (without its state, the
         // decompressed ones against the decompression's).
-        if (verbose && j.uv_data) {
+        if (verbose && j.uv_data && !j.tables) {
             const bool decode_only = !skin_out.ok; // without the skinning's state: the decompression's
             const State& tabs = skin && skin_out.ok && !decode_only ? skin_out : dec_out;
             uint32_t bad = 0, worst = 0;
@@ -343,6 +373,7 @@ int main(int argc, char** argv)
     std::printf("%llu jobs: %llu not for the GPU, %llu with stand-ins leaving another state\n",
         static_cast<unsigned long long>(t.jobs), static_cast<unsigned long long>(t.rejected), static_cast<unsigned long long>(t.leave_bad));
     for (const auto& [why, n] : t.reasons) std::printf("  not for the GPU (%llu): %s\n", static_cast<unsigned long long>(n), why.c_str());
+    for (const auto& [route, n] : t.routes) std::printf("  %s: %llu\n", route.c_str(), static_cast<unsigned long long>(n));
     std::printf("output vertices: %llu of %llu the same bytes; F32 at most %u ulps apart (%.3g absolute, %.3g of the value), the "
                 "integer formats %u\n", static_cast<unsigned long long>(t.out_verts_same), static_cast<unsigned long long>(t.verts),
         t.out_f32_ulps, t.out_f32_abs, t.out_f32_rel, t.out_int_diff);
