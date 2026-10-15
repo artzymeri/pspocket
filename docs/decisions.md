@@ -15659,6 +15659,13 @@ walk 12 to 15 targets made a frame: a new Metal texture each (newTextureWithDesc
 - Measured (GTA V's walk, PSPOCKET_RSX_CPU_AB=10:32, the pool alone switched every 10 frames, ten windows): the RSX
   thread's CPU a draw -2.1 to -9.6%, -5.1% on average; with the pool on every target made took a pooled texture. With
   D-953 to D-957: about -21% a draw.
+- Measured, not done (2026-10-15): a cache of vertex copies kept while guest memory is unchanged (the texture cache's
+  WriteTracker). Xcode's Time Profiler on the walk: the copies are 9.5% of the RSX thread (memmove from do_draw), the
+  encoders 8% (65 to 81 passes a frame), the FIFO 14%. Hashing each copied span against its last use (a temporary
+  switch): 3 to 8 MB a frame copied, 40 to 58% of the bytes as the same span held them last time, 11 to 21% of the draws
+  with every span unchanged, and 200 new spans a frame (EDGE's output goes to new places in its rings). A draw's
+  attributes come from one buffer, so a partly cached draw would need a second buffer in the shaders: at most about 5%
+  of the thread, with the risk of stale geometry; left.
 
 ## D-974 · 2026-10-15 · Sony's MP3 decoder module (flashMP3.pic) native; regions a native function may leave equivalent
 
