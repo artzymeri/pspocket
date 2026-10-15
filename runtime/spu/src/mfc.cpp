@@ -234,7 +234,27 @@ const SpuWatch& spu_watch()
     return w;
 }
 
+// The calling thread's MFC observer (ps_spu_set_mfc_observer): a process-wide count of observers set, so a transfer
+// with none reads one global.
+std::atomic<u32> g_observers{0};
+thread_local ps_spu_mfc_observer t_observer = nullptr;
+thread_local void* t_observer_user = nullptr;
+
+inline void observe(const SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 ea, u32 size)
+{
+    if (g_observers.load(std::memory_order_relaxed) && t_observer) t_observer(t_observer_user, ctx, pc, cmd, lsa, ea, size);
+}
+
+int transfer_unobserved(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size);
+
 int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
+{
+    const int r = transfer_unobserved(ctx, pc, cmd, lsa, eal, size);
+    if (!r && size) observe(ctx, pc, cmd, lsa, eal, size);
+    return r;
+}
+
+int transfer_unobserved(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
     if (const SpuWatch& w = spu_watch(); w.hi && !is_get(cmd) && eal < w.hi && eal + size > w.lo) {
         PS_LOG_WARN("spu", "SPU write into the watched range: cmd {:#x} at SPU pc {:#07x}, LSA {:#07x} -> EA {:#010x}, size {:#x}",
@@ -366,6 +386,7 @@ int putlluc(SPUContext* ctx, u32 pc, u32 eal, u32 lsa)
     ps_res_store_line_unconditional(ctx->membase, addr, ctx->ls + (lsa & 0x3FF80u));
     ctx->mem_writes++;
     log_write(PS_MFC_PUTLLUC, pc, addr, 128);
+    observe(ctx, pc, PS_MFC_PUTLLUC, lsa & 0x3FF80u, addr, 128);
     return 0;
 }
 
@@ -470,6 +491,7 @@ int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
         ch.res_valid = 1;
         ch.atomic_stat = PS_MFC_GETLLAR_SUCCESS;
         ch.atomic_stat_count = 1;
+        observe(ctx, pc, PS_MFC_GETLLAR, c.lsa & 0x3FF80u, addr, 128);
         return 0;
     }
     case PS_MFC_PUTLLC: {
@@ -489,6 +511,7 @@ int mfc_command(SPUContext* ctx, u32 pc, u32 cmd)
         }
         ch.atomic_stat = ok ? PS_MFC_PUTLLC_SUCCESS : PS_MFC_PUTLLC_FAILURE;
         ch.atomic_stat_count = 1;
+        observe(ctx, pc, PS_MFC_PUTLLC, c.lsa & 0x3FF80u, addr, ok ? 1 : 0);
         return 0;
     }
     case PS_MFC_PUTLLUC:
@@ -551,6 +574,13 @@ extern "C" uint64_t ps_spu_video_dma(uint32_t mb, int put)
 }
 
 extern "C" void ps_spu_set_dma_tag(uint64_t tag) { dma_ring().tag = tag; }
+
+extern "C" void ps_spu_set_mfc_observer(ps_spu_mfc_observer fn, void* user)
+{
+    if (!t_observer != !fn) g_observers.fetch_add(fn ? 1u : ~0u, std::memory_order_relaxed);
+    t_observer = fn;
+    t_observer_user = user;
+}
 
 extern "C" uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dma_write* out, uint32_t n)
 {

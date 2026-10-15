@@ -86,6 +86,7 @@ add_library(pspocket_hle STATIC
     src/spu_programs.cpp
     src/spurs_custom.cpp
     src/spurs_jobchain.cpp
+    src/spurs_jobtrace.cpp
     src/spurs_scheduler.cpp
     src/spurs_taskset.cpp
     src/lv2_heap.cpp

@@ -158,6 +158,14 @@ void ps_spu_set_dma_tag(uint64_t tag);
 /* The recorded writes that overlap [ea, ea + size), newest first, at most n; returns how many. */
 uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dma_write* out, uint32_t n);
 
+/* An observer of the calling host thread's MFC traffic, for diagnostics (a job's reads and writes, D-987): called
+ * after each transfer (a list's elements one by one, SDCRZ, sndsig) and each atomic command (GETLLAR, PUTLLC with
+ * size 1 when it succeeded and 0 when it failed, PUTLLUC) the thread's SPU makes, with the SPU's pc and the command's
+ * LS and guest addresses. NULL: none (the default; one relaxed load a transfer). */
+typedef void (*ps_spu_mfc_observer)(void* user, const SPUContext* ctx, uint32_t pc, uint32_t cmd, uint32_t lsa,
+    uint32_t ea, uint32_t size);
+void ps_spu_set_mfc_observer(ps_spu_mfc_observer fn, void* user);
+
 /* ---------------------------------------------------------------------------------------------------------------
  * Run loop.
  * ------------------------------------------------------------------------------------------------------------- */

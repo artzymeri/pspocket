@@ -213,4 +213,18 @@ void run_jobchain(Worker& w, u32 wid, u32 job_chain);
 // as libsre's policy module does).
 void add_ready_count(Worker& w, u32 wid, s32 n);
 
+// PSPOCKET_JOB_TRACE=HASH (spurs_jobtrace.cpp, D-987): the MFC traffic of the jobs of one program, a diagnostic.
+struct JobTraceInfo {
+    u32 spu;
+    u64 job_ea;
+    u32 binary_ea, binary_ls;
+    const u8* ls;
+    u32 desc_ls, desc_size, dma_list_size;
+    u32 in_ls, size_in, out_ls, size_out;
+    const SPUContext* ctx; // its registers at entry
+};
+bool job_trace_wanted(u64 hash);
+void job_trace_begin(const JobTraceInfo& job);
+void job_trace_end(const SPUContext& ctx);
+
 } // namespace pspocket::hle::spurs

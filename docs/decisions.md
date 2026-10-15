@@ -16181,3 +16181,62 @@ reset of iOS's media services had the same gap.
   session's first line names the route.
 - Checked on the Mac (a scratch program against the platform library, volume 0): the engine plays, a rebuild with the
   stretcher on keeps it playing (23,040 frames, then 49,501). A real AirPlay switch is for the phone.
+## D-987 · 2026-10-15 · EDGE geometry on the GPU, phase 1: what GTA V's EDGE job reads and writes, the hole, go
+
+The steady-30 plan's last item (docs/improve.md, item 4, "later Metal compute"; the user: "do the edge on gpu too").
+Before building: what one job of GTA V's EDGE build (spu_dad457863220b1cc) does to the world outside its local store,
+and whether its work can wait for the GPU. Measured on the gate's 128 s prologue walk with two diagnostics (kept):
+
+- `PSPOCKET_JOB_TRACE=HASH` (runtime/hle/src/spurs_jobtrace.cpp): every job of one program counted (jobs, GETs, PUTs,
+  atomics, bytes) and every `PSPOCKET_JOB_TRACE_EVERY`-th written out (descriptor, DMA list, each MFC command with its
+  pc and data; `PSPOCKET_JOB_TRACE_LS=N`: local store and registers at entry), through a new per-thread MFC observer
+  (`ps_spu_set_mfc_observer`, one relaxed load a transfer when none is set). Into inventory/ (game data).
+- `spu-job-replay TRACE_DIR --key HASH --size BYTES`: each dumped job run again from its entry state with the guest
+  memory it read filled in; its writes against the game's. 728 jobs of the walk (every 2500th): all 728 write what
+  they wrote in the game. `--coverage` interprets them and counts instructions. The oracle for what follows.
+
+Findings:
+
+- **Volume.** 1.515 M EDGE jobs in the walk, 600 to 700 a frame in play (20,000 a second at 30 fps), 16.7 µs of SPU
+  thread time each on the Mac with D-968's natives. A job: 485 vertices, 1573 indices (524 triangles) and 72% of the
+  triangles kept on average (the 728 replayed); input 15.8 KB (at most 40 KB) gathered by the job chain from its 17
+  element DMA list into an in/out buffer; about 10 KB out. So some 315,000 vertices and 340,000 triangles a frame.
+- **Every MFC command a job makes** (3,039 traced): GETLLAR and PUTLLC on its SPU's ring allocator line (three rings of
+  3 MB in RSX local memory, one an SPU); two or three PUTs into the allocation (the kept indices, then the vertex
+  streams in 16 KB pieces); a 4-byte GET from the allocation as a fence; the command hole PUT (368 to 480 bytes) into
+  the FIFO in main memory; and in 13 of 3,039 jobs a GET of an RSX label (the ring was full). Nothing else: no other
+  reads, no other writes. The allocation's size is the kept indices (16-byte aligned) plus the vertex streams, in 128
+  bytes: it depends on the culling's count.
+- **The hole** (decoded from every traced job): SET_VERTEX_DATA_ARRAY_OFFSET for 1 to 6 attributes (0, 2, 3, 4, 8, 14)
+  into the allocation, INVALIDATE_VERTEX_FILE, SET_INDEX_ARRAY_ADDRESS and DMA (16-bit, local), BEGIN triangles,
+  DRAW_INDEX_ARRAY (the count as arguments of up to 256 indices each), END, SET_SEMAPHORE_OFFSET and
+  TEXTURE_READ_SEMAPHORE_RELEASE with the ring position (how the allocator learns the RSX has passed), then a
+  non-incrementing NOP over the rest: 64 to 99 words free. The vertex formats are not in it (the PPU's command buffer
+  sets them). 1.5% of jobs keep nothing: the hole is all NOP. The hole is sized (EdgeGeomSpuConfigInfo's
+  commandBufferHoleSize) for every index kept.
+- **Who reads the outputs:** the RSX only. The allocation is in RSX local memory; the SPU reads in those megabytes are
+  the jobs' own fences; the hole is FIFO. The job keeps no state between jobs that its outputs depend on (the replays
+  start from each job's own entry state and agree).
+- **What the job is:** Sony's EDGE geometry, standard. The EdgeGeomSpuConfigInfo is copied into the job's context
+  (binary + 0xE700): in the walk the index flavour is 3 (compressed, counter-clockwise) in every job, skinning 0 (none),
+  1 (four bones, no scaling) or 4 (one bone, no scaling), matrix format 0, the primary input a custom stream
+  description (0xff), the secondary none or predefined 6, the output predefined 0 or 2 or custom, one to six uniform
+  tables; culling flavour 2 in 722 of 728 jobs, 1 in 6; four viewports (1280x720, and 256, 128 and 256x384 squares:
+  the shadow maps). Where the instructions go (interpreted, 83,000 a job): the culling stage 25%, skinning 25%, vertex
+  decompression 17.8%, the screen transform 12.5%, index decompression 9.4%, 0x0FA60 and 0x0F6C8 (output) 5.3%, all the
+  rest (the driver, setup, allocation, the hole) about 5%; 6,023 distinct instructions run.
+- **The GPU's budget:** a few hundred operations a vertex and fifty a triangle: about 0.1 GFLOP and 25 MB of traffic a
+  frame, well under a millisecond of the phone's GPU by estimate (the Mac walk's GPU is 6 to 8 ms a frame).
+
+**Go**, deferred: the job keeps running on its SPU for what the CPU-visible world needs (its control code: the
+configuration, the ring allocation, the order of its PUTs, the hole), with its heavy stages (vertex and index
+decompression, skinning, the transform and culling, the output compression) recording instead of computing. The
+culling's stand-in keeps every index, so the hole draws the full count and the allocation holds every index (the ring
+fills somewhat faster; the hole is sized for it); the job's PUTs into the allocation are dropped. Its input buffer (an
+in/out buffer, so taken at its entry) and the stages' parameters go into a work item registered under the
+allocation's address. The Metal backend, at a draw whose index array lies in a registered allocation, has the GPU make
+what the job would have put there (the same bytes at the same offsets, big-endian, as the vertex shader pulls them)
+and the kept indices with their count, in a compute pass in a command buffer enqueued ahead of the render command
+buffer (no render pass is broken), and draws indirectly with the GPU's count. A configuration the GPU path does not
+handle runs on the CPU as today (logged once). Behind `PSPOCKET_EDGE_GPU` (off until shown right; `=ab` alternating).
+The design's steps and numbers follow in D-988 on.

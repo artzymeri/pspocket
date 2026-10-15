@@ -1186,14 +1186,20 @@ bool JobChainPolicy::run_job(const Job& job)
         cached->program = spu::find_program_checked(cached->hash, binary, size_binary, true, ls_);
         if (cached->program) count_reidentified();
     }
+    u64 binary_hash = 0;
     if (cached) {
         ps_spu_attach_program_at(&ctx, cached->program, binary); // relocatable (D-081)
+        binary_hash = cached->hash;
     } else {
         // Not in the cache: a program registered while it runs is taken at its next taken branch (D-233).
         const u64 additions = spu::registry_additions();
-        u64 hash = 0;
-        const ps_spu_program* program = identify_program(base_, image, &hash);
-        attach_identified(ctx, program, image, hash, additions);
+        const ps_spu_program* program = identify_program(base_, image, &binary_hash);
+        attach_identified(ctx, program, image, binary_hash, additions);
+    }
+    const bool traced = job_trace_wanted(binary_hash);
+    if (traced) {
+        job_trace_begin({w_.spu_num, job.ea, binary_ea, binary, ls_, desc, job.size, size_dma_list, in_page * kPage,
+            size_in, out_page * kPage, size_out, &ctx});
     }
 
     ps_spu_set_dma_tag((u64{binary_ea} << 32) | job.ea); // the job's DMA writes carry it (D-138)
@@ -1207,6 +1213,7 @@ bool JobChainPolicy::run_job(const Job& job)
             ctx.exception, ctx.pc));
     }
     ps_spu_set_dma_tag(policy_tag());
+    if (traced) job_trace_end(ctx);
     // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
     if (cached && cached->program && !ctx.home) {
         cached->program = nullptr;

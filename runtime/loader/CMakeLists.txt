@@ -110,6 +110,18 @@ if(APPLE)
     target_link_options(spu-native-check PRIVATE -Wl,-no_warn_duplicate_libraries)
 endif()
 pspocket_set_warnings(spu-native-check)
+# spu-job-replay TRACE_DIR: SPURS jobs replayed from a job trace (PSPOCKET_JOB_TRACE, D-987), their writes against the
+# game's; --coverage: the instructions they run.
+add_executable(spu-job-replay tools/spu_job_replay.cpp)
+target_link_libraries(spu-job-replay PRIVATE pspocket::game pspocket::spu pspocket::core)
+if(PSPOCKET_GAME_SPU)
+    target_link_libraries(spu-job-replay PRIVATE pspocket_game_spu)
+    target_compile_definitions(spu-job-replay PRIVATE PSPOCKET_HAVE_GAME_SPU=1)
+endif()
+if(APPLE)
+    target_link_options(spu-job-replay PRIVATE -Wl,-no_warn_duplicate_libraries)
+endif()
+pspocket_set_warnings(spu-job-replay)
 
 # Programs lifted again alone (a lifter change that touches a few programs, D-965), compiled into pspocket-boot,
 # spu-check and spu-native-check ahead of the game's other lifted programs: each overrides the copy in
@@ -121,7 +133,7 @@ if(PSPOCKET_GAME_SPU_EXTRA AND PSPOCKET_GAME_SPU)
     target_link_libraries(pspocket_game_spu_extra PRIVATE pspocket::spu)
     pspocket_set_warnings(pspocket_game_spu_extra)
     pspocket_set_generated_warnings(pspocket_game_spu_extra)
-    foreach(t pspocket-boot spu-check spu-native-check)
+    foreach(t pspocket-boot spu-check spu-native-check spu-job-replay)
         target_link_libraries(${t} PRIVATE pspocket_game_spu_extra)
     endforeach()
 endif()
