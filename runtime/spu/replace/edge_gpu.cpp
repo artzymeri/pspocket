@@ -642,6 +642,7 @@ struct JobState {
     uint32_t second_ea = 0;                 // the second PUT into the allocation: its vertices
     bool verify = false;                    // the stages run too; nothing dropped
     uint64_t start_ns = 0;
+    uint64_t last_end_ns = 0; // this thread's previous EDGE job's end
 };
 thread_local JobState t_job;
 
@@ -736,7 +737,7 @@ bool verifying() { return t_job.verify; }
 
 } // namespace
 
-bool job_begin(uint64_t key)
+bool job_begin(uint64_t key, uint64_t start_ns)
 {
     if (key != kDad4 || edge::mode() == edge::Mode::off) return false;
     JobState& s = t_job;
@@ -746,7 +747,9 @@ bool job_begin(uint64_t key)
     s.first_put = s.label_gets = 0;
     s.lo = ~0u;
     s.hi = s.dropped = 0;
-    s.start_ns = ps_host_now_ns();
+    // a batch's jobs share their grab's time: the later of it and this thread's previous job's end (one clock read a
+    // job, at its end)
+    s.start_ns = std::max(start_ns, s.last_end_ns);
     ps_spu_set_mfc_filter(filter, nullptr); // every EDGE job: its ring waits counted
     return true;
 }
@@ -757,7 +760,9 @@ void job_end()
     ps_spu_set_mfc_filter(nullptr, nullptr);
     const bool deferred = s.active && s.recorded && !s.verify;
     if (deferred && !s.finished && s.dropped) warn_once(Warn::no_hole, [] { return std::string("a job's PUTs dropped but no command buffer hole after them"); });
-    edge::count_job(deferred, ps_host_now_ns() - s.start_ns, s.label_gets);
+    const uint64_t now = ps_host_now_ns();
+    edge::count_job(deferred, now - s.start_ns, s.label_gets);
+    s.last_end_ns = now;
     s.active = false;
 }
 

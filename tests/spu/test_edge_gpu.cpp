@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "../rsx/edge_synthetic.hpp"
@@ -612,4 +613,52 @@ TEST_CASE("edge gpu: fixed point over 24 bits as the SPU's wide path decodes it 
         CHECK(ek_bits32(s.data(), bit, 25) == r);
         bit += 25;
     }
+}
+
+TEST_CASE("edge gpu: work items published by several threads, taken by one, without a lock (D-1008)")
+{
+    constexpr uint32_t kThreads = 3, kEach = 20000, kBase = 0xC0000000u;
+    const edge::Stats before = edge::stats();
+    std::vector<std::thread> producers;
+    for (uint32_t t = 0; t < kThreads; t++) {
+        producers.emplace_back([t] {
+            for (uint32_t i = 0; i < kEach; i++) {
+                std::unique_ptr<edge::WorkItem> item = edge::acquire();
+                item->alloc_ea = kBase + 16 * (t * kEach + i);
+                item->blob.assign(4, static_cast<uint8_t>(t));
+                edge::publish(std::move(item));
+            }
+        });
+    }
+    // the consumer takes each allocation's item as its draw comes; some before they are published
+    std::vector<uint8_t> taken(kThreads * kEach, 0);
+    uint32_t left = kThreads * kEach;
+    while (left) {
+        for (uint32_t n = 0; n < kThreads * kEach; n++) {
+            if (taken[n]) continue;
+            std::unique_ptr<edge::WorkItem> item = edge::take(kBase + 16 * n);
+            if (!item) continue;
+            CHECK(item->blob.size() == 4);
+            CHECK(item->blob[0] == n / kEach);
+            taken[n] = 1;
+            left--;
+            edge::recycle(std::move(item));
+        }
+    }
+    for (auto& p : producers) p.join();
+    // an allocation published again before its draw: the later item, the earlier one counted as replaced
+    for (uint8_t k = 1; k <= 2; k++) {
+        std::unique_ptr<edge::WorkItem> item = edge::acquire();
+        item->alloc_ea = kBase - 16;
+        item->blob.assign(1, k);
+        edge::publish(std::move(item));
+    }
+    std::unique_ptr<edge::WorkItem> last = edge::take(kBase - 16);
+    REQUIRE(last);
+    CHECK(last->blob[0] == 2);
+    CHECK_FALSE(edge::take(kBase - 16));
+    const edge::Stats now = edge::stats();
+    CHECK(now.taken - before.taken == kThreads * kEach + 1);
+    CHECK(now.replaced - before.replaced == 1);
+    CHECK_FALSE(edge::any_waiting());
 }

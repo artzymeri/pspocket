@@ -7,6 +7,7 @@
 #include <cstring>
 #include <format>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "pspocket/core/log.hpp"
@@ -32,11 +33,44 @@ Mode read_mode()
 
 std::atomic<bool> g_half{false};
 std::atomic<bool> g_consumer{false};
-std::mutex g_mutex;
-std::unordered_map<uint32_t, std::unique_ptr<WorkItem>> g_items;
 std::atomic<uint32_t> g_waiting{0};
+
+// Publishing (D-1008): each publishing thread (an SPU worker) has a ring of its own, one producer and one consumer (the
+// RSX thread, taking): a slot's pointer stored, then the ring's tail released; the consumer moves what the rings hold
+// into a map only it touches. No lock, no shared map; a full ring (the RSX more than its size behind) waits for room.
+struct Ring {
+    static constexpr uint32_t kSize = 8192;
+    std::atomic<uint32_t> head{0}, tail{0}; // head: the consumer's next; tail: the producer's next
+    std::atomic<WorkItem*> slots[kSize];
+};
+constexpr uint32_t kRings = 32;
+Ring g_rings[kRings];
+std::atomic<uint32_t> g_ring_count{0};
+std::mutex g_overflow_mutex; // more publishing threads than rings: theirs under this lock
+std::vector<std::unique_ptr<WorkItem>> g_overflow;
+std::atomic<uint32_t> g_overflow_count{0};
+
+Ring* my_ring()
+{
+    thread_local Ring* ring = [] {
+        const uint32_t n = g_ring_count.fetch_add(1, std::memory_order_relaxed);
+        return n < kRings ? &g_rings[n] : nullptr;
+    }();
+    return ring;
+}
+
+// The consumer's own: the items by allocation, moved out of the rings as it takes.
+std::unordered_map<uint32_t, std::unique_ptr<WorkItem>>& consumer_items()
+{
+    static std::unordered_map<uint32_t, std::unique_ptr<WorkItem>> items;
+    return items;
+}
+
+// The pool of used items: each thread keeps a few of its own, the rest shared in batches (a lock every 32 items).
 std::mutex g_pool_mutex;
 std::vector<std::unique_ptr<WorkItem>> g_pool;
+constexpr size_t kBatch = 32;
+thread_local std::vector<std::unique_ptr<WorkItem>> t_pool;
 std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0};
 std::atomic<uint64_t> g_routes[static_cast<int>(Route::count)][static_cast<int>(Reason::count)];
 std::atomic<uint64_t> g_jobs[2], g_ns[2], g_label_gets[2]; // [0] run whole by the SPU, [1] deferred
@@ -65,50 +99,97 @@ bool ab_half() { return g_half.load(std::memory_order_relaxed); }
 
 std::unique_ptr<WorkItem> acquire()
 {
-    {
+    if (t_pool.empty()) {
         std::lock_guard lock(g_pool_mutex);
-        if (!g_pool.empty()) {
-            std::unique_ptr<WorkItem> item = std::move(g_pool.back());
+        const size_t n = std::min(kBatch, g_pool.size());
+        for (size_t i = 0; i < n; i++) {
+            t_pool.push_back(std::move(g_pool.back()));
             g_pool.pop_back();
-            return item;
         }
     }
-    return std::make_unique<WorkItem>();
+    if (t_pool.empty()) return std::make_unique<WorkItem>();
+    std::unique_ptr<WorkItem> item = std::move(t_pool.back());
+    t_pool.pop_back();
+    return item;
 }
 
 void recycle(std::unique_ptr<WorkItem> item)
 {
     if (!item) return;
     item->blob.clear();
+    t_pool.push_back(std::move(item));
+    if (t_pool.size() < 2 * kBatch) return;
     std::lock_guard lock(g_pool_mutex);
-    if (g_pool.size() < 4096) g_pool.push_back(std::move(item));
+    while (t_pool.size() > kBatch) {
+        if (g_pool.size() < 4096) g_pool.push_back(std::move(t_pool.back()));
+        t_pool.pop_back();
+    }
 }
 
 void publish(std::unique_ptr<WorkItem> item)
 {
-    const uint32_t ea = item->alloc_ea;
-    std::lock_guard lock(g_mutex);
-    auto& slot = g_items[ea];
-    std::unique_ptr<WorkItem> old = std::move(slot);
-    if (old) g_replaced.fetch_add(1, std::memory_order_relaxed);
-    else g_waiting.fetch_add(1, std::memory_order_relaxed);
-    slot = std::move(item);
     g_published.fetch_add(1, std::memory_order_relaxed);
-    if (old) {
-        old->blob.clear();
-        std::lock_guard pool(g_pool_mutex);
-        if (g_pool.size() < 4096) g_pool.push_back(std::move(old));
+    Ring* ring = my_ring();
+    if (!ring) {
+        std::lock_guard lock(g_overflow_mutex);
+        g_overflow.push_back(std::move(item));
+        g_overflow_count.store(static_cast<uint32_t>(g_overflow.size()), std::memory_order_release);
+        g_waiting.fetch_add(1, std::memory_order_release);
+        return;
+    }
+    const uint32_t tail = ring->tail.load(std::memory_order_relaxed);
+    while (tail - ring->head.load(std::memory_order_acquire) >= Ring::kSize) std::this_thread::yield();
+    ring->slots[tail % Ring::kSize].store(item.release(), std::memory_order_relaxed);
+    ring->tail.store(tail + 1, std::memory_order_release);
+    g_waiting.fetch_add(1, std::memory_order_release);
+}
+
+namespace {
+
+// The consumer: what the rings hold into its map (an item published again for the same allocation replaces the
+// earlier one, as a job's later output does).
+void drain()
+{
+    auto& items = consumer_items();
+    const auto put = [&](std::unique_ptr<WorkItem> item) {
+        auto& slot = items[item->alloc_ea];
+        if (slot) {
+            g_replaced.fetch_add(1, std::memory_order_relaxed);
+            g_waiting.fetch_sub(1, std::memory_order_relaxed);
+            recycle(std::move(slot));
+        }
+        slot = std::move(item);
+    };
+    const uint32_t rings = std::min(g_ring_count.load(std::memory_order_acquire), kRings);
+    for (uint32_t r = 0; r < rings; r++) {
+        Ring& ring = g_rings[r];
+        const uint32_t tail = ring.tail.load(std::memory_order_acquire);
+        uint32_t head = ring.head.load(std::memory_order_relaxed);
+        for (; head != tail; head++) put(std::unique_ptr<WorkItem>(ring.slots[head % Ring::kSize].load(std::memory_order_relaxed)));
+        ring.head.store(head, std::memory_order_release);
+    }
+    if (g_overflow_count.load(std::memory_order_acquire)) {
+        std::vector<std::unique_ptr<WorkItem>> more;
+        {
+            std::lock_guard lock(g_overflow_mutex);
+            more.swap(g_overflow);
+            g_overflow_count.store(0, std::memory_order_relaxed);
+        }
+        for (auto& item : more) put(std::move(item));
     }
 }
+
+} // namespace
 
 std::unique_ptr<WorkItem> take(uint32_t ea)
 {
     if (!g_waiting.load(std::memory_order_acquire)) return nullptr;
-    std::lock_guard lock(g_mutex);
-    const auto it = g_items.find(ea);
-    if (it == g_items.end()) return nullptr;
+    drain();
+    auto& items = consumer_items();
+    const auto it = items.find(ea);
+    if (it == items.end()) return nullptr;
     std::unique_ptr<WorkItem> item = std::move(it->second);
-    g_items.erase(it);
+    items.erase(it);
     g_waiting.fetch_sub(1, std::memory_order_relaxed);
     g_taken.fetch_add(1, std::memory_order_relaxed);
     return item;

@@ -16485,3 +16485,17 @@ attributes at 0x0909C by format - 1: 1 at 0x09B90, 2 F32, 4 at 0x0997C, 6 at 0x0
   of them from the skinning for the colour pass): every index list and all 717,145,826 output vertices the same bytes
   as the SPU's; with PSPOCKET_EDGE_GPU_ROUTE=cull, 1,471,560 jobs from the culling: all lists and all 736,110,498
   vertices the same.
+
+## D-1008 · 2026-10-15 · EDGE work items published without a lock; one clock read a job
+
+- **Publishing** (pspocket/core/edge_registry.cpp): each publishing thread (an SPU worker) has a ring of its own, one
+  producer and one consumer (8,192 items): the item stored, the tail released. The RSX thread, taking, moves what the
+  rings hold into a map only it touches (an item published again for the same allocation replaces the earlier one,
+  counted). No lock and no shared map on either side; a full ring (the RSX 8,192 items behind) waits for room; more
+  than 32 publishing threads share a locked overflow list. Before: one global mutex and an unordered_map for every
+  publish and take (about 2 ms a frame of the city's EDGE time by the research).
+- **The pool of used items**: each thread keeps up to 64, the rest shared in batches of 32 (a lock every 32 items).
+- **One clock read a job**: job_begin takes the job chain's grab time (its own clock read), and a batch's later jobs
+  start at the thread's previous EDGE job's end; job_end reads the clock once.
+- Test: three threads publish 20,000 items each while one takes them by allocation as they come; every item taken
+  once, an allocation published twice gives the later item and one replacement counted.

@@ -76,7 +76,8 @@ void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx);
 
 // The job chain, around each job (D-988): job_begin(key) for the job's program key starts its recording when the key
 // is a build with a GPU path and PSPOCKET_EDGE_GPU takes it now (returns whether the key has one), job_end() after it.
-bool job_begin(uint64_t key);
+// `start_ns`: when the job chain took the job (its one clock read; job_end reads the other).
+bool job_begin(uint64_t key, uint64_t start_ns);
 void job_end();
 // (Their counts and host time: pspocket::edge::stats().)
 

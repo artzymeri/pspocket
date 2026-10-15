@@ -1197,7 +1197,7 @@ bool JobChainPolicy::run_job(const Job& job)
         const ps_spu_program* program = identify_program(base_, image, &binary_hash);
         attach_identified(ctx, program, image, binary_hash, additions);
     }
-    const bool edge = spu::edge_gpu::job_begin(binary_hash); // EDGE on the GPU (D-988)
+    const bool edge = spu::edge_gpu::job_begin(binary_hash, job.grabbed_ns); // EDGE on the GPU (D-988, D-1008)
     const bool traced = job_trace_wanted(binary_hash);
     if (traced) {
         job_trace_begin({w_.spu_num, job.ea, binary_ea, binary, ls_, desc, job.size, size_dma_list, in_page * kPage,

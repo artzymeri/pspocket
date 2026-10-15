@@ -97,6 +97,8 @@ bool verify_this(Route route, Reason why);
 std::unique_ptr<WorkItem> acquire();
 void recycle(std::unique_ptr<WorkItem> item);
 
+// Publishing threads (the SPU workers) each have a ring of their own; one thread at a time takes (the RSX thread):
+// no lock on either side (D-1008).
 void publish(std::unique_ptr<WorkItem> item);
 // The item published for the allocation at `ea`, removed; nullptr when there is none.
 std::unique_ptr<WorkItem> take(uint32_t ea);
