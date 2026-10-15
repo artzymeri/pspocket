@@ -362,6 +362,9 @@ private:
     std::mutex wake_mutex_;
     std::condition_variable wake_cv_;
     bool wake_pending_ = false;
+    // Waits by kind (idle, semaphore, jump to self) and how long: logged every 5 s (RSX thread only, D-1014).
+    std::array<u64, 3> waits_{}, wait_ns_{};
+    u64 waits_since_ns_ = 0;
     std::atomic<bool> idle_{true};
     std::mutex idle_mutex_;
     std::condition_variable idle_cv_;

@@ -16374,3 +16374,18 @@ there faults, so the bytes are the same at every load.
 - Measured (the gate's walk, xctrace 20 s on the SPURS threads): content_check 0.00% of the main instance's samples,
   identify 0.87% in all. The gate passes (29.8 fps median, slowest 5 s window 29.2). Test: tests/core
   test_immutable_memory.cpp.
+
+## D-1014 · 2026-10-15 · The RSX thread's waits by kind in the log; waiting on a semaphore's line measured and left
+
+The research after run 332 found the RSX thread blocking about 125 times a frame in timed sleeps (10 us doubling to
+200 us), each ending up to 200 us after what it waited for. Tried: a semaphore acquire waiting on the semaphore's line
+through the reservation system (ps_res_version, ps_res_wait_change: every SPU PUT and atomic, HLE writes and notify()
+end it at once), the backoff kept for PPU stores.
+
+- Measured on the gate's walk (two walks, PSPOCKET_RSX_SEM_WAIT=0 against on): the thread waits on a semaphore 0 to 75
+  times in 5 s (under once a frame) and a write to its line ended none of those waits (the PPU releases them with plain
+  stores, which say nothing). Its waits are a jump to itself 450 to 3,000 times in 5 s (10 to 20 a frame, 76 to 707 ms;
+  the PPU patches the word when it has more commands) and idle between frames (about 300 in 5 s). Nothing to gain on
+  the walk: the line wait was left out.
+- Kept: a line every 5 s from the RSX thread, "rsx: waits in 5.0 s: idle N (ms), semaphore N (ms), jump to self N
+  (ms)", for the phone's city, where the research's numbers came from.

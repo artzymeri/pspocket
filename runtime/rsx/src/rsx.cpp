@@ -818,6 +818,8 @@ bool Rsx::blocked_condition_cleared()
 void Rsx::wait_for_work(RunStatus why)
 {
     if (why == RunStatus::Idle) block_reason_ = BlockReason::None;
+    const BlockReason reason = block_reason_.load(std::memory_order_acquire);
+    const u64 t0 = ps_host_now_ns();
     // Sleep with exponential backoff; never spin (plan section 6 "Threading": busy waits waste a core).
     auto backoff = std::chrono::microseconds(config_.min_wait_us);
     const auto max_backoff = std::chrono::microseconds(config_.max_wait_us);
@@ -828,6 +830,22 @@ void Rsx::wait_for_work(RunStatus why)
         wake_pending_ = false;
         lock.unlock();
         backoff = std::min(backoff * 2, max_backoff);
+    }
+    // The waits by kind every 5 s (D-1014): GTA V's walk parks on a jump to itself 10 to 20 times a frame (the PPU
+    // patches the word when it has more), on a semaphore under once a frame (released by PPU stores: a wait on the
+    // semaphore's line through the reservation system ended none of them, measured and left out).
+    const u64 t1 = ps_host_now_ns();
+    const usize kind = reason == BlockReason::Semaphore ? 1 : reason == BlockReason::JumpToSelf ? 2 : 0;
+    waits_[kind]++;
+    wait_ns_[kind] += t1 - t0;
+    if (!waits_since_ns_) waits_since_ns_ = t1;
+    if (t1 - waits_since_ns_ >= 5'000'000'000ull) {
+        PS_LOG_INFO(kChan, "waits in {:.1f} s: idle {} ({:.0f} ms), semaphore {} ({:.0f} ms), jump to self {} ({:.0f} ms)",
+            static_cast<double>(t1 - waits_since_ns_) / 1e9, waits_[0], static_cast<double>(wait_ns_[0]) / 1e6, waits_[1],
+            static_cast<double>(wait_ns_[1]) / 1e6, waits_[2], static_cast<double>(wait_ns_[2]) / 1e6);
+        waits_ = {};
+        wait_ns_ = {};
+        waits_since_ns_ = t1;
     }
 }
 
