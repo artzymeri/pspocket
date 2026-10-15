@@ -466,7 +466,13 @@ EOF
     mkdir -p "$dir"
     out="$dir/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$template" | tr ' ' '-').trace"
     say "recording $seconds s of $template from ${APP_NAME%.app} on $udid into $out"
-    xcrun xctrace record --device "$udid" --template "$template" --attach "${APP_NAME%.app}" \
+    # xctrace does not always find the app by name on a phone whose developer disk image will not mount (iOS 27 with
+    # this Xcode): its process ID, from a few seconds of the device log, works (run 331).
+    local target="${APP_NAME%.app}" pid
+    pid="$( (perl -e 'alarm 6; exec @ARGV' idevicesyslog -u "$udid" -p "$target" 2>/dev/null || true) \
+        | grep -o -m1 "$target[^[]*\[[0-9]*\]" | grep -o '[0-9]*\]$' | tr -d ']')"
+    [ -n "$pid" ] && target="$pid"
+    xcrun xctrace record --device "$udid" --template "$template" --attach "$target" \
         --time-limit "${seconds}s" --output "$out" >&2 || die "xctrace could not record (is the game running?)"
     if [ "$template" = "Time Profiler" ]; then
         "$PYTHON" "$ROOT/scripts/trace_profile.py" "$out" | head -20
