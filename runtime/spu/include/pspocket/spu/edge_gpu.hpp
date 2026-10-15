@@ -17,10 +17,10 @@
 
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "pspocket/core/edge_job.h"
+#include "pspocket/core/edge_registry.hpp"
 #include "pspocket/spu/context.h"
 
 namespace pspocket::spu::edge_gpu {
@@ -28,7 +28,8 @@ namespace pspocket::spu::edge_gpu {
 struct Recording {
     std::vector<uint8_t> blob; // the header's room, then the data
     ps_edge_job job{};
-    std::string reject;        // why the GPU path cannot take the job ("" while it can)
+    edge::Reason reject = edge::Reason::none; // why the GPU path cannot take the job (none while it can)
+    uint32_t detail = 0;                      // the configuration value behind it (said once)
     uint32_t stages = 0;       // bit per stage recorded: 1 decompression, 2 skinning, 4 culling, 8 compression
     uint32_t ctx = 0;          // the job's EDGE context in local store
     // The kept count the culling's stand-in tells the job (0: every index). The GPU culls and draws indirectly, so the
@@ -61,9 +62,6 @@ void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx);
 // is a build with a GPU path and PSPOCKET_EDGE_GPU takes it now (returns whether the key has one), job_end() after it.
 bool job_begin(uint64_t key);
 void job_end();
-
-// What the notes are said once by: the text with each number in it (decimal or hex) as one '#' (D-990).
-std::string note_kind(std::string_view what);
 // (Their counts and host time: pspocket::edge::stats().)
 
 } // namespace pspocket::spu::edge_gpu

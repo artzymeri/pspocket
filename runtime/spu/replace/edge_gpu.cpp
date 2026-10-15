@@ -21,12 +21,12 @@
 #include "pspocket/spu/edge_gpu.hpp"
 
 #include <algorithm>
-#include <cctype>
+#include <atomic>
 #include <cstring>
 #include <format>
-#include <mutex>
 
 #include "pspocket/core/be.h"
+#include "pspocket/core/edge_registry.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/lifted.h"
 
@@ -46,44 +46,39 @@ inline float f32(uint32_t u)
     return f;
 }
 
-// A condition the GPU path goes on through (the job's stages already skipped), said once each as a warning; a job
-// left to the SPU (expected: a configuration the path does not make), said once each as information.
-// Once a kind: the text with its numbers taken out (run 331 logged 134,527 lines of one kind, a lookup in a growing list
-// each under one lock: the EDGE jobs waited on it).
-void note(const std::string& what, bool expected = false)
+// A condition the GPU path goes on through (the job's stages already skipped): a warning, said once a kind. Run 331
+// logged 134,527 lines of one kind, each looked up in a growing list under one lock, and the EDGE jobs waited on it:
+// now a bit a kind, tested with one relaxed load (D-1005).
+enum class Warn : uint8_t { cull_offset, cull_count, output_changed, vertices_put, allocation, no_hole, missing_table };
+std::atomic<uint64_t> g_warned{0};
+
+template <class F> void warn_once(Warn w, F&& text)
 {
-    const std::string kind = note_kind(what);
-    static std::mutex m;
-    static std::vector<std::string> said;
-    std::lock_guard lock(m);
-    if (std::find(said.begin(), said.end(), kind) != said.end() || said.size() >= 64) return;
-    said.push_back(kind);
-    if (expected) PS_LOG_INFO("edge", "EDGE on the GPU: {} (said once)", what);
-    else PS_LOG_WARN("edge", "EDGE on the GPU: {} (said once)", what);
+    const uint64_t bit = uint64_t{1} << static_cast<int>(w);
+    if ((g_warned.load(std::memory_order_relaxed) & bit) || (g_warned.fetch_or(bit) & bit)) return;
+    PS_LOG_WARN("edge", "EDGE on the GPU: {} (said once)", text());
+}
+
+// A route or a job left to the SPU, said once a reason (with the first job's detail) as information.
+std::atomic<uint64_t> g_said{0};
+void say_once(edge::Route route, edge::Reason why, uint32_t detail)
+{
+    const uint64_t bit = uint64_t{1} << (static_cast<int>(why) % 64);
+    if (why == edge::Reason::none || (g_said.load(std::memory_order_relaxed) & bit) || (g_said.fetch_or(bit) & bit)) return;
+    PS_LOG_INFO("edge", "EDGE on the GPU: jobs {} for the {} ({:#x} in the first) (said once)", edge::route_name(route),
+        edge::reason_name(why), detail);
 }
 
 } // namespace
 
-std::string note_kind(std::string_view what)
-{
-    // each number (a token from a digit on through digits, hex digits and the x of 0x) one '#'
-    std::string kind;
-    for (size_t i = 0; i < what.size();) {
-        if (what[i] >= '0' && what[i] <= '9') {
-            while (i < what.size() && (std::isxdigit(static_cast<unsigned char>(what[i])) || what[i] == 'x')) i++;
-            kind += '#';
-        } else {
-            kind += what[i++];
-        }
-    }
-    return kind;
-}
-
 namespace {
 
-bool fail(Recording& r, std::string why)
+bool fail(Recording& r, edge::Reason why, uint32_t detail = 0)
 {
-    if (r.reject.empty()) r.reject = std::move(why);
+    if (r.reject == edge::Reason::none) {
+        r.reject = why;
+        r.detail = detail;
+    }
     return false;
 }
 
@@ -104,7 +99,7 @@ bool parse_description(Recording& r, const uint8_t* ls, uint32_t d, uint32_t& st
 {
     const uint32_t attrs = ld8(ls, d), blocks = ld8(ls, d + 2);
     stride = ld8(ls, d + 1);
-    if (attrs == 0 || attrs > 4 || blocks > 8 || blocks < attrs) return fail(r, std::format("stream description {} attributes, {} blocks", attrs, blocks));
+    if (attrs == 0 || attrs > 4 || blocks > 8 || blocks < attrs) return fail(r, edge::Reason::stream_description, attrs);
     uint32_t b = d + 8;
     for (uint32_t k = 0; k < attrs; k++) {
         Attr a{ld8(ls, b), ld8(ls, b + 1), ld8(ls, b + 2), ld8(ls, b + 3), ld8(ls, b + 4), 0};
@@ -135,31 +130,31 @@ bool output_layout(Recording& r, const uint8_t* ls, uint32_t c, ps_edge_job& j)
         return true;
     }
     if (format == 2) {
-        if (!has_nrm || !has_tan) return fail(r, "output format 2 without normals and tangents");
+        if (!has_nrm || !has_tan) return fail(r, edge::Reason::output_attribute, 2);
         add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
         add(PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12);
         add(PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16);
         j.out_stride = 24;
         return true;
     }
-    if (format != 0xFF) return fail(r, std::format("output format {:#x}", format));
+    if (format != 0xFF) return fail(r, edge::Reason::output_format, format);
     uint32_t stride = 0;
     std::vector<Attr> a;
     if (!parse_description(r, ls, ld32(ls, c + 0x74), stride, a)) return false;
     for (const Attr& x : a) {
         const bool there = x.id == PS_EDGE_ATTR_POSITION || (x.id == PS_EDGE_ATTR_NORMAL && has_nrm) ||
                            (x.id == PS_EDGE_ATTR_TANGENT && has_tan);
-        if (!there || j.out_count == PS_EDGE_MAX_OUT) return fail(r, std::format("output attribute id {}", x.id));
+        if (!there || j.out_count == PS_EDGE_MAX_OUT) return fail(r, edge::Reason::output_attribute, x.id);
         if (x.format == PS_EDGE_FMT_F32 && x.size == 4 * x.components && x.components >= 1 && x.components <= 4)
             add(x.id, PS_EDGE_FMT_F32, x.components, x.offset);
         else if (x.format == PS_EDGE_FMT_X11Y11Z10N && x.size == 4)
             add(x.id, PS_EDGE_FMT_X11Y11Z10N, 3, x.offset);
         else
-            return fail(r, std::format("output attribute format {} size {}", x.format, x.size));
-        if (x.offset + x.size > stride) return fail(r, "output stride");
+            return fail(r, edge::Reason::output_attribute, x.format << 8 | x.size);
+        if (x.offset + x.size > stride) return fail(r, edge::Reason::output_stride, stride);
     }
     j.out_stride = stride;
-    return stride != 0 || fail(r, "output stride 0");
+    return stride != 0 || fail(r, edge::Reason::output_stride, 0);
 }
 
 } // namespace
@@ -168,7 +163,8 @@ void Recording::clear()
 {
     blob.assign(sizeof(ps_edge_job), 0);
     job = ps_edge_job{};
-    reject.clear();
+    reject = edge::Reason::none;
+    detail = 0;
     stages = 0;
     ctx = 0;
     told = 0;
@@ -203,17 +199,17 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     const uint32_t in1 = ld8(ls, c + 2), in2 = ld8(ls, c + 3), out = ld8(ls, c + 4), delta = ld8(ls, c + 5);
     const uint32_t skin = ld8(ls, c + 6) & 15u, matrix_format = ld8(ls, c + 7);
     const uint32_t nv = ld16(ls, c + 8), ni = ld16(ls, c + 10);
-    if (in1 != 0xFF || (v2 && in2 != 0xFF)) return fail(r, std::format("input formats {:#x} {:#x}", in1, in2));
-    if (delta != 0xFF) return fail(r, std::format("blend shapes (delta format {:#x})", delta));
-    if (skin != 0 && skin != 1 && skin != 4) return fail(r, std::format("skinning flavour {}", skin));
-    if (matrix_format != 0) return fail(r, std::format("matrix format {}", matrix_format));
-    if (out != 0 && out != 2 && out != 0xFF) return fail(r, std::format("output format {:#x}", out));
-    if (ld32(ls, c + 0x7C) || ld32(ls, c + 0x80)) return fail(r, "a custom decompression callback");
-    if (!(ld8(ls, c) & 0x80)) return fail(r, "context byte 0's top bit clear");
+    if (in1 != 0xFF || (v2 && in2 != 0xFF)) return fail(r, edge::Reason::input_format, in1 << 8 | in2);
+    if (delta != 0xFF) return fail(r, edge::Reason::blend_shapes, delta);
+    if (skin != 0 && skin != 1 && skin != 4) return fail(r, edge::Reason::skin_flavour, skin);
+    if (matrix_format != 0) return fail(r, edge::Reason::matrix_format, matrix_format);
+    if (out != 0 && out != 2 && out != 0xFF) return fail(r, edge::Reason::output_format, out);
+    if (ld32(ls, c + 0x7C) || ld32(ls, c + 0x80)) return fail(r, edge::Reason::custom_decompress);
+    if (!(ld8(ls, c) & 0x80)) return fail(r, edge::Reason::context_flag, ld8(ls, c));
     if (((ld32(ls, c + 0x174) - ctx.reloc) & PS_SPU_PC_MASK) != 0x0ECF8)
-        return fail(r, std::format("vertex-output callback {:#x}", ld32(ls, c + 0x174)));
-    if (ld8(ls, ld32(ls, c + 0x178) + 183) == 3) return fail(r, "the callback's projecting path");
-    if (nv == 0 || nv > 0x4000 || ni > 0x10000) return fail(r, std::format("{} vertices, {} indices", nv, ni));
+        return fail(r, edge::Reason::callback, ld32(ls, c + 0x174));
+    if (ld8(ls, ld32(ls, c + 0x178) + 183) == 3) return fail(r, edge::Reason::projecting);
+    if (nv == 0 || nv > 0x4000 || ni > 0x10000) return fail(r, edge::Reason::counts, nv);
     // The job's own steps around EDGE's that read or change what the stages make (GTA V's job driver; its descriptor
     // from + 0xF0 is in $85 from before the decompression on): a position offset added to every vertex after the
     // decompression ($83), a triangle filter by the vertices' table words before the culling (descriptor + 0x1A6:
@@ -222,15 +218,15 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     // gate's walk (D-990); the phone's city has jobs with the filter on (run 331).
     {
         for (int k = 0; k < 4; k++)
-            if (ctx.gpr[83].u32[k] & 0x7FFFFFFFu) return fail(r, "a position offset after the decompression");
+            if (ctx.gpr[83].u32[k] & 0x7FFFFFFFu) return fail(r, edge::Reason::position_offset);
         const uint32_t p = pref(ctx, 85);
         for (uint32_t o = 0xA0; o < 0xB0; o++)
-            if (ld8(ls, p + o)) return fail(r, std::format("job descriptor byte {:#x} set", o + 0xF0));
-        if (ld8(ls, p + 0xB4) & 0x1C) return fail(r, std::format("job descriptor byte 0x1a4 {:#x}", ld8(ls, p + 0xB4)));
-        if (ld8(ls, p + 0xB6)) return fail(r, "the triangle filter before the culling (job descriptor byte 0x1a6)");
-        if (ld8(ls, p + 0xB7)) return fail(r, std::format("job descriptor byte 0x1a7 {:#x}", ld8(ls, p + 0xB7)));
+            if (ld8(ls, p + o)) return fail(r, edge::Reason::colour_pass, o + 0xF0);
+        if (ld8(ls, p + 0xB4) & 0x1C) return fail(r, edge::Reason::blend_path, ld8(ls, p + 0xB4));
+        if (ld8(ls, p + 0xB6)) return fail(r, edge::Reason::triangle_filter, ld8(ls, p + 0xB6));
+        if (ld8(ls, p + 0xB7)) return fail(r, edge::Reason::output_mode, ld8(ls, p + 0xB7));
         for (uint32_t o = 0xC0; o < 0xE0; o++)
-            if (ld8(ls, p + o)) return fail(r, std::format("job descriptor byte {:#x} set", o + 0xF0));
+            if (ld8(ls, p + o)) return fail(r, edge::Reason::normal_pass, o + 0xF0);
     }
     ps_edge_job& j = r.job;
     j.num_vertexes = nv;
@@ -241,18 +237,17 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     std::vector<Attr> a1;
     if (!parse_description(r, ls, ld32(ls, c + 0x6C), stride1, a1)) return false;
     if (a1.size() != 1 || a1[0].id != PS_EDGE_ATTR_POSITION || a1[0].format != PS_EDGE_FMT_FIXED || a1[0].components != 3)
-        return fail(r, std::format("primary stream: {} attributes, the first id {} format {} with {} components", a1.size(),
-            a1[0].id, a1[0].format, a1[0].components));
+        return fail(r, edge::Reason::primary_stream, static_cast<uint32_t>(a1.size()) << 24 | a1[0].id << 16 | a1[0].format << 8 | a1[0].components);
     uint32_t bits = 0;
     for (uint32_t k = 0; k < 3; k++) {
         const uint32_t ib = ld8(ls, a1[0].fixed_at + 2 * k), fb = ld8(ls, a1[0].fixed_at + 2 * k + 1);
-        if (ib + fb == 0 || ib + fb > 24 || fb > 24) return fail(r, std::format("fixed point {}.{}", ib, fb));
+        if (ib + fb == 0 || ib + fb > 24 || fb > 24) return fail(r, edge::Reason::fixed_point_wide, ib << 8 | fb);
         j.pos_bits[k] = ib + fb;
         j.pos_frac[k] = fb;
         j.pos_bias[k] = static_cast<int32_t>(ld32(ls, fo1 + 4 * k));
         bits += ib + fb;
     }
-    if (stride1 == 0 || a1[0].offset * 8 + bits > stride1 * 8) return fail(r, "primary stream stride");
+    if (stride1 == 0 || a1[0].offset * 8 + bits > stride1 * 8) return fail(r, edge::Reason::primary_stream, stride1);
     j.pos_stride = stride1;
     j.pos_bit = a1[0].offset * 8;
     j.pos_data = r.append(ls, v1, nv * stride1);
@@ -265,10 +260,10 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
         if (!parse_description(r, ls, ld32(ls, c + 0x70), stride2, a2)) return false;
         for (const Attr& a : a2) {
             if (a.format != PS_EDGE_FMT_UNIT_VECTOR || a.size != 3 || a.offset + 3 > stride2)
-                return fail(r, std::format("secondary attribute id {} format {} size {}", a.id, a.format, a.size));
+                return fail(r, edge::Reason::secondary_attribute, a.id << 16 | a.format << 8 | a.size);
             if (a.id == PS_EDGE_ATTR_NORMAL && a.components == 3) j.nrm_offset = a.offset;
             else if (a.id == PS_EDGE_ATTR_TANGENT && a.components == 4) j.tan_offset = a.offset;
-            else return fail(r, std::format("secondary attribute id {} with {} components", a.id, a.components));
+            else return fail(r, edge::Reason::secondary_attribute, a.id << 16 | a.components);
         }
         j.uv_stride = stride2;
         j.uv_data = r.append(ls, v2, nv * stride2);
@@ -332,9 +327,9 @@ bool on_cull(Recording& r, const uint8_t* ls, const SPUContext& ctx)
     const uint32_t s = pref(ctx, 3), mode = pref(ctx, 4), voff = pref(ctx, 5);
     ps_edge_job& j = r.job;
     // Not seen in the walk (one batch from vertex 0, the configured count): said once if a job does.
-    if (voff != 0) note(std::format("culling from vertex {} (taken as 0)", voff));
+    if (voff != 0) warn_once(Warn::cull_offset, [&] { return std::format("culling from vertex {} (taken as 0)", voff); });
     const uint32_t ni = ld16(ls, s + 0x17E);
-    if (ni != j.num_indexes) note(std::format("{} indices to cull, {} configured", ni, j.num_indexes));
+    if (ni != j.num_indexes) warn_once(Warn::cull_count, [&] { return std::format("{} indices to cull, {} configured", ni, j.num_indexes); });
     j.num_indexes = ni - ni % 3;
     j.indices = r.append(ls, ld32(ls, s + 0x50), 2 * ni);
 
@@ -403,7 +398,8 @@ void leave_cull(const Recording& r, uint8_t* ls, SPUContext& ctx)
 
 bool on_compress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 {
-    if (!output_layout(r, ls, pref(ctx, 3), r.job)) note("the output vertex changed after the decompression: " + r.reject);
+    if (!output_layout(r, ls, pref(ctx, 3), r.job))
+        warn_once(Warn::output_changed, [&] { return std::format("the output vertex changed after the decompression ({}, {:#x})", edge::reason_name(r.reject), r.detail); });
     r.stages |= 8;
     return true;
 }
@@ -497,11 +493,11 @@ void finalize(SPUContext* ctx)
     item->index_bytes = (2 * (r.told ? r.told : j.num_indexes) + 15) & ~15u; // where the job put its vertices
     item->out_index_bytes = (2 * j.num_indexes + 15) & ~15u;
     if (!s.verify && s.second_ea && s.second_ea != s.lo + item->index_bytes)
-        note(std::format("the vertices put at {:#x} in the allocation, not {:#x}", s.second_ea - s.lo, item->index_bytes));
+        warn_once(Warn::vertices_put, [&] { return std::format("the vertices put at {:#x} in the allocation, not {:#x}", s.second_ea - s.lo, item->index_bytes); });
     item->guest_index_bytes = s.verify ? s.first_put : 0;
     if (!s.verify && item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
-        note(std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
-            item->index_bytes, j.num_vertexes, j.out_stride));
+        warn_once(Warn::allocation, [&] { return std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
+            item->index_bytes, j.num_vertexes, j.out_stride); });
     std::swap(item->blob, r.blob); // the recording goes on with the old blob's room
     if (edge::mode() == edge::Mode::cpu) {
         run_here(*item, ctx->membase);
@@ -560,7 +556,7 @@ void job_end()
     JobState& s = t_job;
     ps_spu_set_mfc_filter(nullptr, nullptr);
     const bool deferred = s.active && s.recorded && !s.verify;
-    if (deferred && !s.finished && s.dropped) note("a job's PUTs dropped but no command buffer hole after them");
+    if (deferred && !s.finished && s.dropped) warn_once(Warn::no_hole, [] { return std::string("a job's PUTs dropped but no command buffer hole after them"); });
     edge::count_job(deferred, ps_host_now_ns() - s.start_ns, s.label_gets);
     s.active = false;
 }
@@ -578,12 +574,13 @@ extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
     s.rec.clear();
     s.second_ea = 0;
     if (!on_decompress(s.rec, ls, *ctx)) {
-        note("jobs left to the SPU: " + s.rec.reject, true);
-        pspocket::edge::count_rejected();
+        say_once(pspocket::edge::Route::spu, s.rec.reject, s.rec.detail);
+        pspocket::edge::count_route(pspocket::edge::Route::spu, s.rec.reject);
         s.active = false;
         return 0;
     }
     s.recorded = true;
+    pspocket::edge::count_route(pspocket::edge::Route::decompress, pspocket::edge::Reason::none);
     if (verifying()) return 0;
     leave_decompress(s.rec, ls, *ctx);
     return 1;

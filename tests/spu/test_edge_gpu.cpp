@@ -357,7 +357,7 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
             e.ls[desc + o] = 1;
             x.clear();
             CHECK_FALSE(eg::on_decompress(x, e.ls.data(), jc));
-            CHECK_FALSE(x.reject.empty());
+            CHECK(x.reject != edge::Reason::none);
             e.ls[desc + o] = 0;
         }
         e.ls[desc + 0xB4] = 0x04;
@@ -439,10 +439,17 @@ TEST_CASE("edge gpu: the recorders read an EDGE context and its streams as the w
     CHECK(a.out == b.out);
 }
 
-TEST_CASE("edge gpu: notes are said once a kind, their numbers left out")
+TEST_CASE("edge gpu: jobs counted by route and reason, no text on the way (D-1005)")
 {
-    // run 331: 134,527 notes of one kind, each a different text, each looked up in a growing list under one lock
-    CHECK(eg::note_kind("1234 indices to cull, 1236 configured") == eg::note_kind("7 indices to cull, 9 configured"));
-    CHECK(eg::note_kind("job descriptor byte 0x1a7 0x2") == "job descriptor byte # #");
-    CHECK(eg::note_kind("culling from vertex 3 (taken as 0)") != eg::note_kind("7 indices to cull, 9 configured"));
+    // run 331's 134,527 notes: each rejection formatted a text and looked it up under one lock; now an atomic a reason
+    const edge::Stats before = edge::stats();
+    edge::count_route(edge::Route::spu, edge::Reason::triangle_filter);
+    edge::count_route(edge::Route::spu, edge::Reason::triangle_filter);
+    edge::count_route(edge::Route::decompress, edge::Reason::none);
+    const edge::Stats now = edge::stats();
+    CHECK(now.routes[static_cast<int>(edge::Route::spu)][static_cast<int>(edge::Reason::triangle_filter)] -
+              before.routes[static_cast<int>(edge::Route::spu)][static_cast<int>(edge::Reason::triangle_filter)] == 2);
+    const std::string line = edge::describe_routes(now, before, 2.0);
+    CHECK(line.find("from the decompression 0.5") != std::string::npos);
+    CHECK(line.find("left to the SPU 1.0 (triangle filter 1.0)") != std::string::npos);
 }

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace pspocket::edge {
@@ -50,14 +51,61 @@ std::unique_ptr<WorkItem> take(uint32_t ea);
 // Whether any item is waiting (a cheap test for a draw that may not be EDGE's).
 bool any_waiting();
 
+// How a job's work goes (D-1005): on the SPU whole, or on the GPU from one of its stages on, the stages before it run by
+// the SPU as ever. From the decompression: the GPU decodes the vertex streams. From the skinning: it starts from the
+// tables the SPU's decompression made (and whatever the job did to them before the skinning). From the culling: from
+// the skinned tables (and whatever the job did to them after the skinning).
+enum class Route : uint8_t { spu, decompress, skin, cull, count };
+
+// Why a job's work goes the way it does: why it is left to the SPU, or why it goes to the GPU from a later stage than
+// the decompression. Counted per route and reason (no text, no lock: the counters are atomics).
+enum class Reason : uint8_t {
+    none,
+    // the configuration (EdgeGeomSpuConfigInfo in the job's context)
+    input_format,       // a predefined input format (not a custom description)
+    blend_shapes,       // a delta (blend shape) format
+    skin_flavour,       // a skinning flavour other than none, four bones or one
+    matrix_format,      // a matrix format other than 0
+    output_format,      // a predefined output format the GPU path does not make
+    custom_decompress,  // a custom decompression callback
+    context_flag,       // the context's byte 0 top bit clear
+    callback,           // a vertex-output callback other than the screen transform 0x0ECF8
+    projecting,         // the callback's projecting path
+    counts,             // no vertices, or too many vertices or indices
+    // the vertex streams (custom descriptions)
+    primary_stream,     // not one attribute of three fixed-point components, positions
+    fixed_point_wide,   // fixed point of more than 24 bits a component
+    secondary_attribute,// a secondary attribute other than normals and tangents as unit vectors
+    stream_description, // a description out of range
+    // the output
+    output_attribute,   // an output attribute's format, size or source not made
+    output_stride,
+    // the job driver's own steps around EDGE's (GTA V's: its descriptor fields, D-1006)
+    position_offset,    // a position offset added after the decompression ($83)
+    colour_pass,        // a per-vertex palette pass after the culling (descriptor 0x194, with 0x1A7 0)
+    blend_path,         // descriptor 0x1A4 bit 2: extra data fetched and applied before the skinning
+    matrix_path,        // descriptor 0x1A4 bits 3 and 4: 0x0E398 before the skinning
+    output_mode,        // descriptor 0x1A7 == 2: the output format changed after the decompression
+    triangle_filter,    // descriptor 0x1A6: a triangle filter on the positions before the culling
+    normal_pass,        // descriptor 0x1BC: positions and normals changed after the skinning
+    // the later routes' own
+    tables,             // the stage's tables not as the GPU path reads them (a binormal table, no position table)
+    count
+};
+const char* reason_name(Reason r);
+const char* route_name(Route r);
+
 // EDGE jobs so far (of builds with a GPU path): deferred (their stages recorded) or run whole by their SPU, with their
-// SPU threads' host time; the work items published and taken; jobs a stage left to the SPU.
+// SPU threads' host time; the work items published and taken; the jobs by route and reason.
 struct Stats {
-    uint64_t published, taken, replaced, jobs_deferred, ns_deferred, jobs_spu, ns_spu, rejected;
+    uint64_t published, taken, replaced, jobs_deferred, ns_deferred, jobs_spu, ns_spu;
     uint64_t label_gets[2]; // GETs of an RSX label in jobs run whole [0] and deferred [1]: the ring full, waiting
+    uint64_t routes[static_cast<int>(Route::count)][static_cast<int>(Reason::count)];
 };
 Stats stats();
 void count_job(bool deferred, uint64_t ns, uint64_t label_gets);
-void count_rejected();
+void count_route(Route route, Reason why);
+// "decompress 640, skin 300 (colour pass 200, ...), ..., spu 12 (...)": the counts since `before`, per frame.
+std::string describe_routes(const Stats& now, const Stats& before, double frames);
 
 } // namespace pspocket::edge

@@ -2786,8 +2786,8 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             const auto us_a_job = [](u64 ns, u64 jobs) { return jobs ? static_cast<double>(ns) / 1e3 / static_cast<double>(jobs) : 0.0; };
             PS_LOG_INFO(kChan, "EDGE on the GPU (last {}): {:.0f} draws a frame, {:.1f} dispatches, kernels {:.3f} ms a frame, "
                                "{:.0f} KB of work items a frame; SPU jobs deferred {:.0f} a frame at {:.2f} us, run whole {:.0f} "
-                               "a frame at {:.2f} us; {} left to the SPU by a stage, {} items replaced before their draw; ring-full waits (label "
-                               "GETs) {:.1f} a frame in deferred jobs, {:.1f} in jobs run whole",
+                               "a frame at {:.2f} us; {} items replaced before their draw; ring-full waits (label "
+                               "GETs) {:.1f} a frame in deferred jobs, {:.1f} in jobs run whole; jobs a frame by route: {}",
                 w.flips, per_frame(m.stats_edge.draws, m.report_edge.draws),
                 per_frame(m.stats_edge.dispatches, m.report_edge.dispatches),
                 per_frame(edge_ns, m.report_edge_gpu_ns) / 1e6,
@@ -2796,9 +2796,10 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                 us_a_job(es.ns_deferred - m.report_edge_stats.ns_deferred, es.jobs_deferred - m.report_edge_stats.jobs_deferred),
                 per_frame(es.jobs_spu, m.report_edge_stats.jobs_spu),
                 us_a_job(es.ns_spu - m.report_edge_stats.ns_spu, es.jobs_spu - m.report_edge_stats.jobs_spu),
-                es.rejected - m.report_edge_stats.rejected, es.replaced - m.report_edge_stats.replaced,
+                es.replaced - m.report_edge_stats.replaced,
                 per_frame(es.label_gets[1], m.report_edge_stats.label_gets[1]),
-                per_frame(es.label_gets[0], m.report_edge_stats.label_gets[0]));
+                per_frame(es.label_gets[0], m.report_edge_stats.label_gets[0]),
+                edge::describe_routes(es, m.report_edge_stats, static_cast<double>(w.flips)));
             m.report_edge = m.stats_edge;
             m.report_edge_gpu_ns = edge_ns;
             m.report_edge_stats = es;

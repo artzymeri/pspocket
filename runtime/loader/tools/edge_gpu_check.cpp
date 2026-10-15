@@ -170,8 +170,9 @@ int main(int argc, char** argv)
         ps_spu_fpenv_leave(token);
         if (!ok) {
             t.rejected++;
-            t.reasons[r.reject]++;
-            if (verbose) std::printf("job %llu: not for the GPU: %s\n", static_cast<unsigned long long>(seq), r.reject.c_str());
+            t.reasons[std::format("{} ({:#x})", pspocket::edge::reason_name(r.reject), r.detail)]++;
+            if (verbose)
+                std::printf("job %llu: not for the GPU: %s %#x\n", static_cast<unsigned long long>(seq), pspocket::edge::reason_name(r.reject), r.detail);
             continue;
         }
         if (!leaves.empty()) {

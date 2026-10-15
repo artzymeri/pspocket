@@ -16392,3 +16392,17 @@ end it at once), the backoff kept for PPU stores.
   the walk: the line wait was left out.
 - Kept: a line every 5 s from the RSX thread, "rsx: waits in 5.0 s: idle N (ms), semaphore N (ms), jump to self N
   (ms)", for the phone's city, where the research's numbers came from.
+## D-1005 · 2026-10-15 · EDGE on the GPU: the jobs counted by route and reason, no text or lock on the way
+
+Run 332 (iPhone, the busy city, PSPOCKET_EDGE_GPU=1, 27.1 fps): about 1,270 of 2,140 EDGE jobs a frame went back to the
+SPU (30.8 us each, 39 of EDGE's 47 ms a frame), but the log said only the first job of each kind of reason, and each
+rejection formatted a text and took D-990's once-a-kind lock on its way out (about 1 ms a frame by the research).
+
+- `pspocket::edge::Route` (spu, from the decompression; D-1006 adds the later stages) and `Reason` (the configuration,
+  the vertex streams, the output, the job driver's own steps): every EDGE job is counted under its route and reason
+  in a table of relaxed atomics (`count_route`), and the backend's window line ends with the jobs a frame by route,
+  each with its reasons ("left to the SPU 12.0 (triangle filter 10.0, colour pass 2.0)").
+- A recorder's failure is a Reason and a number (the format, the byte); the first job of each reason is said once
+  (a bit per reason, one relaxed load after the first). The warnings for conditions the GPU path goes on through
+  (culling from a vertex offset, another index count, the output vertex changed, the PUTs' places) are a bit each
+  too: no lock, no text unless said.

@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <mutex>
 #include <unordered_map>
 
@@ -35,7 +36,8 @@ std::unordered_map<uint32_t, std::unique_ptr<WorkItem>> g_items;
 std::atomic<uint32_t> g_waiting{0};
 std::mutex g_pool_mutex;
 std::vector<std::unique_ptr<WorkItem>> g_pool;
-std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0}, g_rejected{0};
+std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0};
+std::atomic<uint64_t> g_routes[static_cast<int>(Route::count)][static_cast<int>(Reason::count)];
 std::atomic<uint64_t> g_jobs[2], g_ns[2], g_label_gets[2]; // [0] run whole by the SPU, [1] deferred
 
 } // namespace
@@ -115,8 +117,81 @@ bool any_waiting() { return g_waiting.load(std::memory_order_acquire) != 0; }
 
 Stats stats()
 {
-    return {g_published.load(), g_taken.load(), g_replaced.load(), g_jobs[1].load(), g_ns[1].load(), g_jobs[0].load(),
-        g_ns[0].load(), g_rejected.load(), {g_label_gets[0].load(), g_label_gets[1].load()}};
+    Stats s{g_published.load(), g_taken.load(), g_replaced.load(), g_jobs[1].load(), g_ns[1].load(), g_jobs[0].load(),
+        g_ns[0].load(), {g_label_gets[0].load(), g_label_gets[1].load()}, {}};
+    for (int r = 0; r < static_cast<int>(Route::count); r++)
+        for (int w = 0; w < static_cast<int>(Reason::count); w++) s.routes[r][w] = g_routes[r][w].load(std::memory_order_relaxed);
+    return s;
+}
+
+void count_route(Route route, Reason why)
+{
+    g_routes[static_cast<int>(route)][static_cast<int>(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* reason_name(Reason r)
+{
+    switch (r) {
+    case Reason::none: return "none";
+    case Reason::input_format: return "predefined input format";
+    case Reason::blend_shapes: return "blend shapes";
+    case Reason::skin_flavour: return "skinning flavour";
+    case Reason::matrix_format: return "matrix format";
+    case Reason::output_format: return "predefined output format";
+    case Reason::custom_decompress: return "custom decompression";
+    case Reason::context_flag: return "context byte 0";
+    case Reason::callback: return "vertex-output callback";
+    case Reason::projecting: return "projecting callback";
+    case Reason::counts: return "counts";
+    case Reason::primary_stream: return "primary stream";
+    case Reason::fixed_point_wide: return "fixed point over 24 bits";
+    case Reason::secondary_attribute: return "secondary attribute";
+    case Reason::stream_description: return "stream description";
+    case Reason::output_attribute: return "output attribute";
+    case Reason::output_stride: return "output stride";
+    case Reason::position_offset: return "position offset";
+    case Reason::colour_pass: return "colour pass";
+    case Reason::blend_path: return "0x1a4 bit 2 path";
+    case Reason::matrix_path: return "0x1a4 bits 3-4 path";
+    case Reason::output_mode: return "0x1a7 output mode";
+    case Reason::triangle_filter: return "triangle filter";
+    case Reason::normal_pass: return "normal pass";
+    case Reason::tables: return "tables";
+    case Reason::count: break;
+    }
+    return "?";
+}
+
+const char* route_name(Route r)
+{
+    switch (r) {
+    case Route::spu: return "left to the SPU";
+    case Route::decompress: return "from the decompression";
+    case Route::skin: return "from the skinning";
+    case Route::cull: return "from the culling";
+    case Route::count: break;
+    }
+    return "?";
+}
+
+std::string describe_routes(const Stats& now, const Stats& before, double frames)
+{
+    std::string out;
+    const auto per = [&](uint64_t v) { return frames > 0 ? static_cast<double>(v) / frames : static_cast<double>(v); };
+    for (int r = 1; r <= static_cast<int>(Route::count); r++) {
+        const int route = r % static_cast<int>(Route::count); // the GPU's routes first, the SPU's last
+        uint64_t total = 0;
+        std::string why;
+        for (int w = 0; w < static_cast<int>(Reason::count); w++) {
+            const uint64_t n = now.routes[route][w] - before.routes[route][w];
+            total += n;
+            if (n && w != static_cast<int>(Reason::none))
+                why += std::format("{}{} {:.1f}", why.empty() ? "" : ", ", reason_name(static_cast<Reason>(w)), per(n));
+        }
+        out += std::format("{}{} {:.1f}{}", out.empty() ? "" : "; ", route_name(static_cast<Route>(route)), per(total),
+            why.empty() ? "" : " (" + why + ")");
+    }
+    return out;
 }
 
 void count_job(bool deferred, uint64_t ns, uint64_t label_gets)
@@ -125,6 +200,5 @@ void count_job(bool deferred, uint64_t ns, uint64_t label_gets)
     g_jobs[deferred].fetch_add(1, std::memory_order_relaxed);
     g_ns[deferred].fetch_add(ns, std::memory_order_relaxed);
 }
-void count_rejected() { g_rejected.fetch_add(1, std::memory_order_relaxed); }
 
 } // namespace pspocket::edge
