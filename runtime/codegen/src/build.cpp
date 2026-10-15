@@ -65,7 +65,7 @@ const TranslatedCodeSettings& translated_code_settings()
     return settings;
 }
 
-CostEstimate estimate_cost(const std::string& text, FileKind kind)
+CostEstimate estimate_cost(const std::string& text, FileKind kind, bool cold)
 {
     // Per function: its lines times its block starts (labels "L_xxxxx:" at the start of a line). Functions start with
     // "void " at the start of a line (every translated function is void f(ctx, base or ls)).
@@ -91,7 +91,11 @@ CostEstimate estimate_cost(const std::string& text, FileKind kind)
     CostEstimate e;
     switch (kind) {
     case FileKind::SpuCode:
-        e.seconds = 6.767 * mb + 9.180 * lines_times_labels / 1e6;
+        // Fitted again for D-961's fast functions and cold twins (D-986): pspocket-prepare's per-file times of GTA V's
+        // 150 programs, three at a time on the M4, scaled by 1 / 0.33 (the lift before, measured alike, had a rate of
+        // 0.33 against run 094's fit) so the rates phones learned keep their meaning. Mean error per file 39% (fast
+        // functions) and 35% (twins).
+        e.seconds = cold ? 5.57 * mb : 4.39 * mb + 1.65 * lines_times_labels / 1e6;
         e.memory_mb = 200 + 100 * mb;
         break;
     case FileKind::PpuCode:

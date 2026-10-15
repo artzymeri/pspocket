@@ -48,7 +48,9 @@ struct CostEstimate {
     double seconds = 0;
     double memory_mb = 0;
 };
-CostEstimate estimate_cost(const std::string& source_text, FileKind kind);
+// `cold`: an SPU function's cold twin (spu-lift's N_resume_*.c, D-961), compiled at -O1: its cost follows its size,
+// not its shape (one function of many labels).
+CostEstimate estimate_cost(const std::string& source_text, FileKind kind, bool cold = false);
 
 // The time left of a build, from the predicted costs and what the files done so far really took (D-152, D-153). A
 // rate per kind of file (real seconds per predicted second: PPU and SPU predictions err differently, runs 093-095)

@@ -223,14 +223,15 @@ Result prepare_game(const Options& o)
     // GTA V: 28.6 MB of executable, 6 s to translate on the M4, about 2,400 cost-seconds of PPU code to compile, and
     // 1,900 of SPU code from 84 MB of lifted C (runs 094-095). Refined once the files are known.
     translate_estimate = 0.25 * exe_mb;
-    double spu_c_mb = 0; // lifted SPU C: given, or about 0.33 MB per saved image (GTA V: 84 MB from 265 images)
+    double spu_c_mb = 0; // lifted SPU C: given, or about 0.78 MB per saved image (GTA V: 208 MB from 265, D-961)
     if (!o.spu_dir.empty())
         for (const auto& e : fs::recursive_directory_iterator(o.spu_dir, ec))
             if (e.is_regular_file() && e.path().extension() == ".c") spu_c_mb += static_cast<double>(e.file_size()) / 1e6;
     if (o.spu_dir.empty() && !o.spu_images_dir.empty())
         for (const auto& e : fs::directory_iterator(o.spu_images_dir, ec))
-            if (e.path().extension() == ".bin") spu_c_mb += 0.33;
-    compile_estimate = (85 * exe_mb * o.prior_rates[0] + 23 * spu_c_mb * o.prior_rates[1]) / workers;
+            if (e.path().extension() == ".bin") spu_c_mb += 0.78;
+    // 4.6 predicted seconds a MB of SPU C since D-961's fast functions and cold twins (estimate_cost, D-986).
+    compile_estimate = (85 * exe_mb * o.prior_rates[0] + 4.6 * spu_c_mb * o.prior_rates[1]) / workers;
     auto left_after_translation = [&] { return compile_estimate + link_estimate + sign_estimate; };
     report(Progress::Phase::Translating, translate_estimate + left_after_translation(), 0, 0,
         "Translating the game's code");

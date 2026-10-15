@@ -73,8 +73,11 @@ double program_cost(const fs::path& dir)
         if (e.path().extension() != ".c") continue;
         std::string text;
         read_bytes(e.path(), text);
-        const bool table = e.path().filename().string().ends_with("_reg.c");
-        cost += codegen::estimate_cost(text, table ? codegen::FileKind::Table : codegen::FileKind::SpuCode).seconds;
+        const std::string name = e.path().filename().string();
+        const bool table = name.ends_with("_reg.c");
+        cost += codegen::estimate_cost(text, table ? codegen::FileKind::Table : codegen::FileKind::SpuCode,
+            !table && name.find("_resume_") != std::string::npos)
+                    .seconds;
     }
     return cost;
 }

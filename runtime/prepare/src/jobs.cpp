@@ -64,7 +64,8 @@ codegen::BuildJob job_for(const fs::path& source, bool spu, const std::string& h
     const codegen::FileKind kind = name.ends_with("_reg.c") || name == "game_spu.c" ? codegen::FileKind::Table
         : spu                                                                       ? codegen::FileKind::SpuCode
                                                                                     : codegen::FileKind::PpuCode;
-    const codegen::CostEstimate e = codegen::estimate_cost(text, kind);
+    const bool cold = kind == codegen::FileKind::SpuCode && name.find("_resume_") != std::string::npos;
+    const codegen::CostEstimate e = codegen::estimate_cost(text, kind, cold);
     codegen::BuildJob j;
     j.source = source.string();
     j.include_dirs = {source.parent_path().string()};
@@ -73,10 +74,7 @@ codegen::BuildJob job_for(const fs::path& source, bool spu, const std::string& h
     j.cost = e.seconds;
     // The cold twins of translated SPU functions (spu-lift's N_resume_*.c, D-961) at -O1: they run only when the run
     // loop resumes a function after a label, and compile in half the time (GTA V's EDGE job's: 7.6 s for 16.0 at -O2).
-    if (kind == codegen::FileKind::SpuCode && name.find("_resume_") != std::string::npos) {
-        j.extra_args.push_back("-O1");
-        j.cost *= 0.5;
-    }
+    if (cold) j.extra_args.push_back("-O1");
     j.memory_mb = e.memory_mb;
     j.group = static_cast<int>(kind);
     return j;

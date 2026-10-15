@@ -16138,3 +16138,19 @@ programs: rev64 and ext 312,177 to 12,390, TBL +150,519, host instructions 5,601
 +0.5% (the index takes a register). spu-check over a game library LLVM 22 built (pspocket-prepare with a stand-in
 PPU translation, `--library`): 150 programs, 68,836 trials, no difference (again after the rebase onto D-965 to
 D-969's replacements: 68,835 trials). Not measurable on the Mac (Apple clang).
+
+## D-986 · 2026-10-15 · The compile cost model fitted again for the fast functions and cold twins
+
+D-961's lift compiles in half the time, but estimate_cost still predicted the old shapes: pspocket-prepare's SPU rate
+(real seconds per predicted second) fell from 0.33 to 0.03, so a phone that learned its rate on the lift before would
+have said ten times the time left at its first preparation after translator generation 4.
+
+- Per-file times of GTA V's 150 programs (pspocket-prepare --events, three at a time on the M4, a stand-in PPU
+  translation): the fast functions 171 s against 1,268 predicted, the twins 168 s against 9,032 (one function of many
+  labels: lines times labels says nothing of a compile at -O1). Least squares: fast functions 1.45 s a MB plus 0.546
+  per million lines times labels, twins 1.84 s a MB; mean error per file 39% and 35%. Scaled by 1 / 0.33 so the rates
+  phones learned keep their meaning: 4.39 and 1.65, and 5.57 s a MB for a twin (estimate_cost's `cold`, for
+  N_resume_*.c, in the preparation's jobs and the in-session program cost; the "half of it" for twins goes).
+- The up-front estimate before anything is translated: 4.6 predicted seconds a MB of SPU C (23 before) and 0.78 MB a
+  saved image (0.33; GTA V's 265 images now give 208 MB of C).
+- Measured again: rate SPU 0.35 (0.33 for the lift before with the old model, measured alike).
