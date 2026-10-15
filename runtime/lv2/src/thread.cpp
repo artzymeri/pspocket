@@ -405,6 +405,7 @@ Result sys_ppu_thread_restart(PpuThread& t)
 Result _sys_ppu_thread_create(PpuThread& t, u32 thread_id, u32 param, u64 arg, u64 unk, s32 prio, u64 stacksize,
     u64 flags, u32 threadname)
 {
+    sender_barrier(t); // D-999: a thread that just signalled may still be leaving the object this one starts again
     Kernel& k = t.kernel;
     Guest& g = k.impl().guest;
     if (!g.valid(param, 8)) return err(CELL_EFAULT);

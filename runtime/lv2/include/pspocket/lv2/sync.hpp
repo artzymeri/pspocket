@@ -172,12 +172,19 @@ public:
 };
 
 // How often a PPU thread a PPU thread's event woke waited for that sender to go on first (D-999, event.cpp), and why
-// the wait ended: the sender began its next call, its host thread ran on, or 10 ms passed.
+// the wait ended: the sender waited in lv2 (or was gone), began its next call, or 10 ms passed; and how often a thread
+// let that sender finish before it destroyed an event queue or created a thread (sender_barrier).
 struct SenderDeferrals {
-    u64 deferred = 0, by_call = 0, by_run = 0, by_limit = 0;
+    u64 deferred = 0, by_wait = 0, by_calls = 0, by_limit = 0;
     u64 ns = 0; // time waited in all
+    u64 barriers = 0, barrier_limit = 0, barrier_ns = 0;
 };
 SenderDeferrals sender_deferrals();
+
+class PpuThread;
+// Before `t` destroys an event queue or creates a thread: the PPU thread whose event last woke it finishes what it
+// does next (D-999, event.cpp).
+void sender_barrier(PpuThread& t);
 
 // sys_event_port. Sending through a port to a destroyed queue gives CELL_ENOTCONN.
 class EventPort final : public Object {

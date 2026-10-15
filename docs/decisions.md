@@ -16211,42 +16211,58 @@ every SPU program interpreted. Found (agent f2):
   "hdd1" beside hdd0's folder) and remove each other's cache at the start ("was in use ... removed"); the Mac runs
   for this put each hdd0 in a folder of its own.
 
-## D-999 · 2026-10-15 · The PPU thread that sends an event goes on before the thread it wakes (Assassin's Creed's install-screen freeze)
+## D-999 · 2026-10-15 · The PPU thread that sends an event goes on before the thread it wakes (Assassin's Creed's install-screen freeze and registry crash)
 
 The iPhone's Assassin's Creed (fresh hdd0) stopped drawing at its "press START to install" screen (frame 178, every
 PPU thread waiting, its sound task busy as usual: run 331's Instruments trace showed that task at its usual 30%,
-not a spin). The Mac showed the same thread states, the same log and the same missing call in 2 of 17 runs side by
-side (and 0 of 14 alone). Found:
+not a spin). The Mac showed the same thread states, the same log and the same missing call in 2 of 36 fresh runs
+side by side, and a crash in the game's thread registry (SIGBUS reading 0x0b0000f8 at 0x70620, in the next thread's
+registration) in 5 more, and alone in 1 of 2 runs without the change below and in runs beside a compile. Found
+(events, thread creations and exits, queue destructions traced; the game's code read at the addresses given):
 
-- **The race (the game's).** Its main thread runs the save data work on a worker thread object ("SaveFileThread",
-  Gear's thread wrapper at 0x763c8): reset the "go" event, Start (0x6e1c0: create the thread only if the object's
-  state word +144 is idle, <= 1; otherwise nothing, no error), reset "done", set "go", wait "done" (0xd21a08, 10 ms
-  polls). The worker runs cellSaveDataAutoLoad2, sets "done" (sys_event_port_send), and only then stores its state
-  idle (0x764a4) and exits. Woken by "done", the main thread starts the same object again for cellSaveDataAutoSave2:
-  if it gets to Start before the worker's store, no thread is made and it waits for "done" forever. On the PS3 the
-  sender keeps running (lv2's scheduler: the receiver, of the same priority 1001, runs after it), and its store is a
-  few instructions against the main thread's three syscalls. Here each PPU thread is a host thread: when the host
-  does not run the sender for a moment (another thread takes its core; the phone's six cores, run side by side on the
-  Mac) the receiver wins. Shown with the events traced (sends, receives, drains, thread creation: the second
-  SaveFileThread never created, no AutoSave2 after AutoLoad2 in every frozen log, the phone's included) and made
-  certain with a 2 ms sleep after each send (PSPOCKET_LV2_SEND_DELAY_US=2000): 2 of 5 runs froze, 1 more crashed in
-  the game's cache index (the SIGBUS at 0x0b0000f8 that runs under load also met, garden runs at 300 s), 2 passed.
-- **The fix (lv2, event.cpp).** A PPU thread woken by a PPU thread's sys_event_port_send, of the same or a lower
-  priority (a more urgent one would preempt the sender on the PS3), or taking an event such a thread queued under
-  10 ms before, goes back to guest code only once the sender is past its call: the sender begins its next call into
-  lv2 or a library (PpuThread::lv2_calls, counted where calls begin and return, dbg_stop_point), or its host thread has
-  run 20 us since (thread_info / the thread's CPU clock: a sender spinning in guest code without calls is running, so
-  nothing to wait for), or it is gone, or 10 ms have passed. The receiver yields, then sleeps 20 us at a time. Event
-  queues only, where the race was found; other wake-ups are as before.
-- **Measured:** with the 2 ms sleep after every send, 6 of 6 runs pass the install screen (no freeze, no cache crash).
-  pspocket-boot prints the waits at the end of a run. GTA V's gate walk (128 s): 8,300 to 8,400 waits, 98% ended by
-  the sender's next call, none by the limit, 144 to 205 ms waited in all (about 20 us each); median 29.8 fps on, off
-  and on again, the slowest window 29.8, 29.8 and 23.0 (that one window as the day's earlier gates without the change:
-  22.8 to 23.8 in 5 of 20). PSPOCKET_LV2_SENDER_FIRST=0 turns it off for A/B.
-- Test: tests/lv2/test_event.cpp (a sender that "runs" 3 ms between its send and its next call, by sleeping: a
-  receiver of the same or a lower priority comes back after the next call, from a wake and from a queued event; a more
-  urgent one at once; a sender that makes no further call holds it 10 ms, not more). It fails with
-  PSPOCKET_LV2_SENDER_FIRST=0.
+- **The freeze (the game's race).** Its main thread runs the save data work on a worker thread object
+  ("SaveFileThread", Gear's thread wrapper at 0x763c8): reset the "go" event, Start (0x6e1c0: create the thread only
+  if the object's state word +144 is idle, <= 1; otherwise nothing, no error), reset "done", set "go", wait "done"
+  (0xd21a08, 10 ms polls). The worker runs cellSaveDataAutoLoad2, sets "done" (sys_event_port_send), and only then
+  stores its state idle (0x764a4), takes its node out of the game's thread registry (an AVL tree under an lwmutex,
+  0x4f5b0) and exits. Woken by "done", the main thread starts the object again for cellSaveDataAutoSave2: if it gets
+  to Start before the worker's store, no thread is made and it waits for "done" forever (no AutoSave2 after AutoLoad2
+  in every frozen log, the phone's included).
+- **The registry crash (the same race, later).** The main thread destroys the install's copy worker ("HDDCopyFile
+  Thread") right after its "done" (its event queues destroyed, traced) while the worker is still taking its node out
+  of the registry: the freed node is in the tree, and the next thread to register faults in it.
+- On the PS3 the sender keeps running (lv2's scheduler: the receiver, of the same priority 1001, runs after it), and
+  its few instructions come long before the main thread's syscalls. Here each PPU thread is a host thread: when the
+  host does not run the sender for a moment (another thread takes its core: the phone's six cores, runs side by side
+  on the Mac) the receiver wins. A 2 ms sleep after each send (PSPOCKET_LV2_SEND_DELAY_US=2000) makes it show: 2 of 5
+  runs froze, 1 crashed in the registry.
+- **The fix (lv2, event.cpp), in two parts.** (1) A PPU thread woken by a PPU thread's sys_event_port_send, of the
+  same or a lower priority (a more urgent one would preempt the sender on the PS3), or taking an event such a thread
+  queued under 10 ms before, goes back to guest code once the sender has begun its next call into lv2 or a library
+  (PpuThread::lv2_calls, counted where calls begin and return, dbg_stop_point), waits in lv2 for anything but a lock,
+  or is gone, or 10 ms have passed since it sent: the worker's state store comes before its next call. (2) Before that
+  receiver destroys an event queue or creates a thread, under 100 ms after the wake, the sender goes on until it waits
+  in lv2 (not for a lock) or is gone, 20 ms at most (sender_barrier): the registry removal is done by then. The
+  waiting thread yields for 50 us, then sleeps 20 us at a time. Event queues only, where the races were found.
+- **Tries on the way:** (1) alone fixed the freeze, not the registry crash (1 of 2 runs beside a compile). Holding the
+  receiver until the sender's second call held it 0.9 ms on average in GTA V (0.35 ms with a 200 us cap after the
+  first, sleeping); 30 us after the first was still too short under load (4 of 4 runs beside three others crashed:
+  the main thread destroyed the copy worker's queues 6 lines before the worker's exit). The sender's CPU time is no
+  measure: the host updates another thread's every 2 ms only (11 changes in 22 ms of a spinning thread, measured) and
+  all at once when it stops.
+- **Measured:** with the 2 ms sleep after every send, 4 of 4 runs pass the install screen (no freeze, no crash).
+  Two gardens (330 s) beside six busy host threads: no crash; 50,000 to 55,000 waits each, 56 to 81 us on average;
+  1 to 3 barrier waits (one ran 20 ms). GTA V's gate walk (128 s): pass, median 29.8 fps, slowest window 29.4,
+  8,727 waits, 89% ended by the sender's next call, none by the limit, 206 ms in all (24 us each), no barrier wait.
+  Assassin's Creed's garden walk (330 s) and training walk (600 s), fresh hdd0, side by side: both to their end, no
+  error; 68,000 and 114,000 waits, 597 and 847 ms in all (9 and 7 us each), 3 barrier waits each (1.1 and 0.5 ms);
+  the training at 57 to 60 fps. pspocket-boot prints the waits at the end of a run;
+  PSPOCKET_LV2_SENDER_FIRST=0 turns both parts off for A/B (one of its two garden runs crashed in the registry at
+  boot; the other ran as with the change: 40.8 to 51.4 fps in the garden's busy part against 44.0 to 54.6).
+- Test: tests/lv2/test_event.cpp (a sender the host does not run for 3 ms after its send: a receiver of the same or a
+  lower priority comes back after the sender's next call, from a wake and from a queued event; a more urgent one at
+  once; a queue destroyed after the wake waits for the sender to wait in lv2 even past its next call; a sender that
+  neither calls nor waits holds its receiver 10 ms, not more). It fails with PSPOCKET_LV2_SENDER_FIRST=0.
 - Not translated code: the phone needs the app rebuilt, not its translations (kTranslatorGeneration unchanged).
 
 ## D-987 · 2026-10-15 · EDGE geometry on the GPU, phase 1: what GTA V's EDGE job reads and writes, the hole, go

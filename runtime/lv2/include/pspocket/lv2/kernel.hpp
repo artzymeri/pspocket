@@ -162,8 +162,10 @@ public:
     std::atomic<u32> current_syscall{kNoSyscall};
 
     // The thread's calls into lv2 or a library, counted as each begins and as it returns (dbg_stop_point): another
-    // thread reads it to see this one get past a call (defer_to_sender, event.cpp, D-999). Written by the owning thread only.
+    // thread reads it to see this one get on (defer_to_sender, event.cpp, D-999). Written by the owning thread only.
     std::atomic<u64> lv2_calls{0};
+    // The PPU thread whose event last woke this one, for sender_barrier (D-999). The owning thread only.
+    WakerMark woken_by;
 
     // A debugger's stop (sys_dbg_stop_threads, D-937): once asked, the thread stops at its next call into lv2 or a
     // library, or as such a call returns (dbg_stop_point), and waits there until sys_dbg_continue_threads.

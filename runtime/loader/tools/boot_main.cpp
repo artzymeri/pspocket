@@ -1624,12 +1624,14 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(got), static_cast<unsigned long long>(put));
         }
     }
-    if (const lv2::SenderDeferrals d = lv2::sender_deferrals(); d.deferred) { // D-999
-        std::printf("events whose receiver let the sending PPU thread go on first: %llu (its next call %llu, it ran on "
-                    "%llu, the 10 ms limit %llu), %.1f ms waited\n",
-            static_cast<unsigned long long>(d.deferred), static_cast<unsigned long long>(d.by_call),
-            static_cast<unsigned long long>(d.by_run), static_cast<unsigned long long>(d.by_limit),
-            static_cast<double>(d.ns) / 1e6);
+    if (const lv2::SenderDeferrals d = lv2::sender_deferrals(); d.deferred || d.barriers) { // D-999
+        std::printf("events whose receiver let the sending PPU thread go on first: %llu (until it began its next call "
+                    "%llu, waited %llu, the 10 ms limit %llu), %.1f ms waited; queues destroyed and threads created after "
+                    "it finished: %llu (the 20 ms limit %llu), %.1f ms waited\n",
+            static_cast<unsigned long long>(d.deferred), static_cast<unsigned long long>(d.by_calls),
+            static_cast<unsigned long long>(d.by_wait), static_cast<unsigned long long>(d.by_limit),
+            static_cast<double>(d.ns) / 1e6, static_cast<unsigned long long>(d.barriers),
+            static_cast<unsigned long long>(d.barrier_limit), static_cast<double>(d.barrier_ns) / 1e6);
     }
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());

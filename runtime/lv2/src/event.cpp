@@ -5,16 +5,20 @@
 // emulation, which makes sys_event_port_disconnect return EBUSY meanwhile); there is no such window here.
 //
 // The sender goes on first (D-999). On the PS3, lv2's scheduler leaves a thread that sends an event running: the
-// receiver, of the same or a lower priority, runs after it, and games count on the few instructions the sender runs
-// next (Assassin's Creed signals "done" from a worker thread, then marks the worker's object idle; its main thread,
-// woken by the event, starts the worker again only if the object is idle, else not at all, and waits forever for it).
-// Here every PPU thread is a host thread: a sender the host does not run for a while (another thread takes its core)
-// lets the receiver get there first. So a PPU thread woken by another PPU thread's event, or taking one that thread
-// queued under 10 ms ago, and not more urgent than it (a more urgent receiver preempts the sender on the PS3), does not
-// go back to guest code until the sender has got past its call: until the sender begins another call into lv2 or a
-// library, or its host thread has run 20 us more, or it is gone, or 10 ms have passed since it sent.
+// receiver, of the same or a lower priority, runs after it, and games count on what the sender does next. Assassin's
+// Creed's worker threads signal "done", then mark their object idle, take it out of the game's thread registry and
+// exit; the thread woken by "done" starts the object again only if it is idle (else not at all, and waits forever),
+// or tears it down (freeing it while the registry still holds it), or starts it again (putting it in twice). Here
+// every PPU thread is a host thread: a sender the host does not run for a while (another thread takes its core) lets
+// the receiver get there first. So:
+// - a PPU thread woken by another PPU thread's event, or taking one that thread queued under 10 ms ago, and not more
+//   urgent than it (a more urgent receiver preempts the sender on the PS3), goes back to guest code once the sender
+//   has begun its next call into lv2 or a library, waits in lv2 (blocks or sleeps; not for a lock), or is gone, or
+//   10 ms have passed since it sent (defer_to_sender);
+// - before that receiver destroys an event queue or creates a thread, under 100 ms after, the sender goes on until
+//   it waits in lv2 or is gone, 20 ms at most (sender_barrier): what it does after its next call is done by then.
 // PSPOCKET_LV2_SEND_DELAY_US=N (debugging) has every sys_event_port_send sleep N us before it returns, which makes
-// the senders such races lose to their receivers show; PSPOCKET_LV2_SENDER_FIRST=0 turns the waiting off.
+// the senders such races lose to their receivers show; PSPOCKET_LV2_SENDER_FIRST=0 turns both off.
 
 #include <algorithm>
 #include <cstdlib>
@@ -43,9 +47,9 @@ u64 process_pid() { return 1; } // RPCS3 process_getpid()
 // ---- the sender goes on first (D-999)
 
 constexpr auto kDeferLimit = std::chrono::milliseconds(10);
-constexpr u64 kSenderRunNs = 20'000; // the sender's host thread run this long since it sent: it is past its call
+constexpr auto kSpinFor = std::chrono::microseconds(50); // yielding at first, then sleeping
 
-// The calling host thread, for host_thread_cpu_ns.
+// The calling host thread, for host_thread_alive.
 u64 host_thread_self()
 {
 #if defined(__APPLE__)
@@ -56,25 +60,17 @@ u64 host_thread_self()
 #endif
 }
 
-// The CPU time a host thread has run; false once it is gone.
-bool host_thread_cpu_ns(u64 thread, u64* ns)
+// Whether a host thread is still there.
+bool host_thread_alive(u64 thread)
 {
 #if defined(__APPLE__)
     thread_basic_info_data_t info{};
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-    if (thread_info(static_cast<thread_act_t>(thread), THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
-            &count) != KERN_SUCCESS) {
-        return false;
-    }
-    *ns = (static_cast<u64>(info.user_time.seconds) + static_cast<u64>(info.system_time.seconds)) * 1'000'000'000ull +
-        (static_cast<u64>(info.user_time.microseconds) + static_cast<u64>(info.system_time.microseconds)) * 1000ull;
-    return true;
+    return thread_info(static_cast<thread_act_t>(thread), THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
+               &count) == KERN_SUCCESS;
 #else
-    if (thread == ~u64{0}) return false;
     timespec ts{};
-    if (clock_gettime(static_cast<clockid_t>(thread), &ts) != 0) return false;
-    *ns = static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
-    return true;
+    return thread != ~u64{0} && clock_gettime(static_cast<clockid_t>(thread), &ts) == 0;
 #endif
 }
 
@@ -89,51 +85,100 @@ WakerMark mark_sender(PpuThread& t)
     return m;
 }
 
-std::atomic<u64> g_deferred{0}, g_by_call{0}, g_by_run{0}, g_by_limit{0}, g_deferred_ns{0};
+std::atomic<u64> g_deferred{0}, g_by_wait{0}, g_by_calls{0}, g_by_limit{0}, g_deferred_ns{0};
+std::atomic<u64> g_barriers{0}, g_barrier_limit{0}, g_barrier_ns{0};
 
-// Holds the receiving thread `t` until the sender of `m` is past the call that sent (see the top of the file).
-void defer_to_sender(PpuThread& t, const WakerMark& m)
+// Its next call into lv2 or a library has begun: the call that sent counts its return, the next one its beginning.
+constexpr u64 kSenderNextCall = 2;
+
+enum class SenderState { Turn, Waits, NextCall, Gone };
+
+// Where the sender of `m` is: still in its turn, waiting in lv2 (for anything but a lock: a lock it waits for is part
+// of its turn, as the worker's registry lwmutex above), past its next call's beginning, or gone.
+SenderState sender_state(Kernel& k, const WakerMark& m)
+{
+    const std::shared_ptr<PpuThread> sender = k.thread(m.thread);
+    if (!sender || !host_thread_alive(m.host_thread)) return SenderState::Gone;
+    const WaitKind waits = sender->waiter.waiting_on().kind;
+    if (waits != WaitKind::None && waits != WaitKind::LwMutex && waits != WaitKind::Mutex) return SenderState::Waits;
+    if (sender->lv2_calls.load(std::memory_order_acquire) - m.calls >= kSenderNextCall) return SenderState::NextCall;
+    return SenderState::Turn;
+}
+
+bool sender_first_on()
 {
     static const bool on = [] { // PSPOCKET_LV2_SENDER_FIRST=0: off, for A/B measurements
         const char* v = std::getenv("PSPOCKET_LV2_SENDER_FIRST");
         return !v || std::string_view(v) != "0";
     }();
-    if (!on || !m.thread || m.thread == t.id || t.priority() < m.prio) return; // none, itself, or a more urgent one
+    return on;
+}
+
+// Waits until `done(state)`, or `limit` has passed since `from`; yields at first, then sleeps 20 us at a time.
+// Returns whether it ended by `done`.
+template <class Done>
+bool wait_for_sender(Kernel& k, const WakerMark& m, std::chrono::steady_clock::time_point from,
+    std::chrono::steady_clock::duration limit, Done&& done)
+{
     const auto start = std::chrono::steady_clock::now();
-    if (start - m.at >= kDeferLimit) return;
-    // The sender's CPU time from here on (reading it in every send would cost each one a call into the host's kernel).
-    u64 cpu_at = 0;
-    if (!host_thread_cpu_ns(m.host_thread, &cpu_at)) return;
-    std::atomic<u64>* counter = &g_by_limit;
-    for (u32 i = 0;; i++) {
-        const std::shared_ptr<PpuThread> sender = t.kernel.thread(m.thread);
-        // Its call's return and its next call each count one.
-        if (!sender || sender->lv2_calls.load(std::memory_order_acquire) >= m.calls + 2) {
-            counter = &g_by_call;
-            break;
-        }
-        u64 ns = 0;
-        if (!host_thread_cpu_ns(m.host_thread, &ns) || ns >= cpu_at + kSenderRunNs) {
-            counter = &g_by_run;
-            break;
-        }
-        if (std::chrono::steady_clock::now() - m.at >= kDeferLimit) break;
-        if (i < 8) std::this_thread::yield();
+    for (;;) {
+        if (done(sender_state(k, m))) return true;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - from >= limit) return false;
+        if (now - start < kSpinFor) std::this_thread::yield();
         else std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
+}
+
+// Holds the receiving thread `t` until the sender of `m` is past its next call's beginning, waits or is gone (the top of
+// the file); notes the sender for sender_barrier.
+void defer_to_sender(PpuThread& t, const WakerMark& m)
+{
+    if (!sender_first_on() || !m.thread || m.thread == t.id) return; // none or itself
+    t.woken_by = m;
+    if (t.priority() < m.prio) return; // a more urgent receiver preempts its sender on the PS3
+    const auto start = std::chrono::steady_clock::now();
+    if (start - m.at >= kDeferLimit) return;
+    SenderState last = SenderState::Turn;
+    const bool ended = wait_for_sender(t.kernel, m, m.at, kDeferLimit, [&](SenderState st) {
+        last = st;
+        return st != SenderState::Turn;
+    });
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
     g_deferred.fetch_add(1, std::memory_order_relaxed);
-    counter->fetch_add(1, std::memory_order_relaxed);
+    (!ended ? g_by_limit : last == SenderState::NextCall ? g_by_calls : g_by_wait).fetch_add(1, std::memory_order_relaxed);
     g_deferred_ns.fetch_add(static_cast<u64>(waited.count()), std::memory_order_relaxed);
 }
 
 } // namespace
 
+// Before thread `t` destroys an event queue or creates a thread, the PPU thread whose event last woke it, if that was
+// under 100 ms ago, finishes what it does next: until it waits in lv2 (not for a lock) or is gone, 20 ms at most. A
+// thread that signalled "done" may still be taking its object out of the game's registry, and the object is what is
+// torn down or started again (the top of the file).
+void sender_barrier(PpuThread& t)
+{
+    const WakerMark m = t.woken_by;
+    if (!sender_first_on() || !m.thread) return;
+    const auto start = std::chrono::steady_clock::now();
+    if (start - m.at >= std::chrono::milliseconds(100)) return;
+    t.woken_by = {};
+    const auto finished = [](SenderState st) { return st == SenderState::Waits || st == SenderState::Gone; };
+    if (finished(sender_state(t.kernel, m))) return;
+    const bool ended = wait_for_sender(t.kernel, m, start, std::chrono::milliseconds(20), finished);
+    g_barriers.fetch_add(1, std::memory_order_relaxed);
+    if (!ended) g_barrier_limit.fetch_add(1, std::memory_order_relaxed);
+    g_barrier_ns.fetch_add(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+        std::memory_order_relaxed);
+}
+
 SenderDeferrals sender_deferrals()
 {
-    return {g_deferred.load(std::memory_order_relaxed), g_by_call.load(std::memory_order_relaxed),
-        g_by_run.load(std::memory_order_relaxed), g_by_limit.load(std::memory_order_relaxed),
-        g_deferred_ns.load(std::memory_order_relaxed)};
+    return {g_deferred.load(std::memory_order_relaxed), g_by_wait.load(std::memory_order_relaxed),
+        g_by_calls.load(std::memory_order_relaxed), g_by_limit.load(std::memory_order_relaxed),
+        g_deferred_ns.load(std::memory_order_relaxed), g_barriers.load(std::memory_order_relaxed),
+        g_barrier_limit.load(std::memory_order_relaxed), g_barrier_ns.load(std::memory_order_relaxed)};
 }
 
 // ------------------------------------------------------------------------------------------------- EventQueue
@@ -389,6 +434,7 @@ Result sys_event_queue_create(PpuThread& t, u32 equeue_id, u32 attr, u64 event_q
 
 Result sys_event_queue_destroy(PpuThread& t, u32 equeue_id, s32 mode)
 {
+    sender_barrier(t); // D-999
     if (mode != 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) return err(CELL_EINVAL);
     return destroy_object<EventQueue>(t.kernel, equeue_id, [&](EventQueue& q) -> Result {
         if (mode == 0 && !q.waiters.empty()) return err(CELL_EBUSY);
