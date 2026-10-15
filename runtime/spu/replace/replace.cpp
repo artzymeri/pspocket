@@ -57,7 +57,12 @@ constexpr Registers kFragmentState = regs({4, 35, 37, 39, 41, 42, 43, 44, 45, 46
 constexpr Registers kAfterSkinning = regs({1, 36, 39, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 81, 82,
     84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
     111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 127});
+// EDGE on the GPU (edge_gpu.cpp, D-988): the stages' functions themselves (edgeGeomDecompressVertexes,
+// edgeGeomSkinVertexes, edgeGeomCullTriangles, edgeGeomCompressVertexes), called from the job's driver (compiled C: its
+// callers read $3 after them, by the SPU ABI). Their stand-ins record the stage for the GPU when the job takes the
+// deferred path and decline otherwise.
 constexpr Function kEdgeDad4[] = {
+    {0x07A10, ps_edge_dad4_gpu_07a10, regs({3})},
     {0x07A38, nullptr, {}},
     // its one-bone skinning loop (8%) and four-bone one (78% of its instructions): heads and their exit; after the exit
     // the job reads these
@@ -95,8 +100,11 @@ constexpr Function kEdgeDad4[] = {
             114, 115, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127}),
         nullptr, 0x0B9B0},
     {0x0B9B0, nullptr, kFragmentState},
+    {0x0DAF0, ps_edge_dad4_gpu_0daf0, regs({3})},
     {0x0ECF8, ps_edge_dad4_0ecf8, {}},
+    {0x0EFF8, ps_edge_dad4_gpu_0eff8, regs({3})},
     {0x0F008, ps_edge_dad4_0f008, regs({3})},
+    {0x0F5B8, ps_edge_dad4_gpu_0f5b8, regs({3})},
 };
 
 // Sony's MP3 decoder module, dev_flash/sys/external/flashMP3.pic from offset 0x100 (the build every MultiStream game

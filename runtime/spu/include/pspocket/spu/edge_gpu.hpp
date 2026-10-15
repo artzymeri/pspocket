@@ -51,4 +51,15 @@ void leave_skin(const Recording& r, uint8_t* ls, SPUContext& ctx);
 void leave_cull(const Recording& r, uint8_t* ls, SPUContext& ctx);
 void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx);
 
+// The job chain, around each job (D-988): job_begin(key) for the job's program key starts its recording when the key
+// is a build with a GPU path and PSPOCKET_EDGE_GPU takes it now (returns whether the key has one), job_end() after it.
+bool job_begin(uint64_t key);
+void job_end();
+
+// EDGE jobs so far: those the SPU ran whole and those deferred, with their host time (the A/B's measure).
+struct JobTimes {
+    uint64_t spu_jobs, spu_ns, deferred_jobs, deferred_ns;
+};
+JobTimes job_times();
+
 } // namespace pspocket::spu::edge_gpu

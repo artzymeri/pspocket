@@ -46,6 +46,7 @@
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/timebase.h"
 #include "pspocket/lv2/kernel.hpp"
+#include "pspocket/spu/edge_gpu.hpp"
 #include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spu_programs.hpp"
@@ -1196,6 +1197,7 @@ bool JobChainPolicy::run_job(const Job& job)
         const ps_spu_program* program = identify_program(base_, image, &binary_hash);
         attach_identified(ctx, program, image, binary_hash, additions);
     }
+    const bool edge = spu::edge_gpu::job_begin(binary_hash); // EDGE on the GPU (D-988)
     const bool traced = job_trace_wanted(binary_hash);
     if (traced) {
         job_trace_begin({w_.spu_num, job.ea, binary_ea, binary, ls_, desc, job.size, size_dma_list, in_page * kPage,
@@ -1213,6 +1215,7 @@ bool JobChainPolicy::run_job(const Job& job)
             ctx.exception, ctx.pc));
     }
     ps_spu_set_dma_tag(policy_tag());
+    if (edge) spu::edge_gpu::job_end();
     if (traced) job_trace_end(ctx);
     // A DMA over the binary's code dropped its lifted program: the cached copy is interpreted from now on.
     if (cached && cached->program && !ctx.home) {

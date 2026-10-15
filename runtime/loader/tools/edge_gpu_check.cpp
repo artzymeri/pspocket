@@ -6,7 +6,7 @@
 // (--probe 0daf0 --probe 07a10 --probe 0eff8 --probe 0f5b8). For each job the stages' stand-ins (spu/edge_gpu.hpp)
 // record its GPU work item from the entry states, and what they leave for the rest of the job is compared with what
 // the stage left (the context's words, the return value). Then the work item runs through the GPU kernels' code on the
-// CPU (runtime/rsx/metal/src/edge_kernels.inc, the same source the Metal backend compiles) and its results are compared
+// CPU (pspocket/core/edge_kernels.inc, the same source the Metal backend compiles) and its results are compared
 // with the SPU's: the output vertices (bytes), the screen-space vertices the culling used, and the kept indices.
 // --spu-rounding runs the kernels' code in the SPU's floating-point environment (round toward zero, denormals flushed):
 // the arithmetic then agrees with the SPU's but for its estimates (1/w, the square root), which shows the semantics
@@ -31,7 +31,7 @@
 #include "pspocket/spu/edge_gpu.hpp"
 #include "pspocket/spu/fp.h"
 
-#include "edge_kernels.inc"
+#include "pspocket/core/edge_kernels.h"
 
 namespace eg = pspocket::spu::edge_gpu;
 

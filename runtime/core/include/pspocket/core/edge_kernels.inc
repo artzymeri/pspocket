@@ -1,7 +1,9 @@
 /*
- * EDGE geometry's work on the GPU (D-988): one source for the Metal compute kernel (the backend compiles it with
- * pspocket/core/edge_job.h in front of it, kEdgeKernelSource) and for C++ (the tests and the checker run the same
- * functions on the CPU). What each function computes is what GTA V's EDGE build (spu_dad457863220b1cc) computes, in
+ * EDGE geometry's work on the GPU (D-988): one source for the Metal compute kernel and for C++ (PSPOCKET_EDGE_GPU=cpu,
+ * the tests and edge-gpu-check run the same functions on the CPU). The code is the argument of EK_CODE: C++ includes it
+ * through pspocket/core/edge_kernels.h (EK_CODE expands to the code, with the C++ meanings of EK_DEV and the like);
+ * the Metal backend stringifies it (EK_CODE(...) #__VA_ARGS__) and puts the Metal meanings in front: no generated
+ * file, as the iOS app compiles the runtime's sources as they are (D-014). So no preprocessor directive inside. What each function computes is what GTA V's EDGE build (spu_dad457863220b1cc) computes, in
  * the same order of operations (runtime/spu/replace/edge_dad4.c has the SPU's own versions of most of it); the floats
  * round to nearest here, toward zero on the SPU, so results agree to the last bit or two, not bit for bit.
  *
@@ -11,42 +13,10 @@
  * culled with EDGE's rules and the kept ones' indices packed in order.
  */
 
-#ifdef __METAL_VERSION__
-#define EK_DEV device
-#define EK_IN device const
-#define EK_THR thread
-typedef uint ek_u32;
-typedef int ek_s32;
-typedef uchar ek_u8;
-#define ek_as_u32(f) as_type<uint>(f)
-#define ek_as_f32(u) as_type<float>(u)
-#define ek_fma(a, b, c) fma(a, b, c)
-#define ek_sqrt(x) sqrt(x)
-#define EK_INLINE static inline
-#define EK_TABLE constant
-#else
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#define EK_DEV
-#define EK_IN const
-#define EK_THR
-typedef uint32_t ek_u32;
-typedef int32_t ek_s32;
-typedef uint8_t ek_u8;
-static inline ek_u32 ek_as_u32(float f) { ek_u32 u; std::memcpy(&u, &f, 4); return u; }
-static inline float ek_as_f32(ek_u32 u) { float f; std::memcpy(&f, &u, 4); return f; }
-#define ek_fma(a, b, c) std::fma(a, b, c)
-#define ek_sqrt(x) std::sqrt(x)
-#define EK_INLINE static inline
-#define EK_TABLE static const
+#ifndef EK_CODE
+#error "include pspocket/core/edge_kernels.h, or define EK_CODE to take the code"
 #endif
-
-/* A product rounded once and never fused into a following add by the compiler (the SPU's fm): fma with -0 adds
- * nothing (a product of +0 stays +0, of -0 stays -0). Every product below that the SPU makes with fm goes through it,
- * so neither compiler (C++ with fp-contract, Metal) changes the arithmetic. */
-#define ek_mul(a, b) ek_fma(a, b, -0.0f)
-
+EK_CODE(
 /* ---- big-endian access ---- */
 
 EK_INLINE ek_u32 ek_ld32(EK_IN ek_u8* p, ek_u32 o)
@@ -154,8 +124,11 @@ EK_INLINE float ek_weight(ek_u32 byte) { return ek_mul(float(byte), ek_as_f32(0x
 EK_INLINE ek_rows ek_skin_rows(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v)
 {
     ek_rows r;
+    /* A bone past the palette (which the SPU would read from whatever local store holds after it; nothing in the walk
+     * names one) is the palette's last here, so the kernels stay in the blob. */
+    const ek_u32 last = j->matrix_count ? j->matrix_count - 1u : 0u;
     if (j->skin == 4u) {
-        const ek_u32 b = blob[j->weights + v];
+        const ek_u32 b = ek_min(ek_u32(blob[j->weights + v]), last);
         for (ek_u32 i = 0; i < 12u; i++) r.m[i] = ek_ldf(blob, j->matrices + 48u * b + 4u * i);
         return r;
     }
@@ -165,6 +138,8 @@ EK_INLINE ek_rows ek_skin_rows(EK_IN ek_u8* blob, EK_IN ps_edge_job* j, ek_u32 v
         w[k] = q[2u * k];
         bone[k] = q[2u * k + 1u];
     }
+    for (ek_u32 k = 0; k < 4u; k++)
+        if (bone[k] != 0xFFu || k) bone[k] = ek_min(bone[k], last);
     if (bone[0] == 0xFFu) { /* one bone: weight 255 for bone 0 */
         w[0] = 255u;
         bone[0] = 0u;
@@ -205,8 +180,8 @@ EK_INLINE void ek_skin_vector(EK_THR float* n, ek_rows r)
  * u - 2^(n-1) (the top bit flipped). */
 EK_INLINE ek_u32 ek_snorm(float f, ek_u32 n)
 {
-    const float half = float((1u << (n - 1u))) - 0.5f;
-    const float s = ek_mul(f, half) + half;
+    const float h = float((1u << (n - 1u))) - 0.5f; /* "half" is a type in Metal */
+    const float s = ek_mul(f, h) + h;
     const ek_u32 top = (1u << n) - 1u;
     const ek_u32 u = s > 0.0f ? (s >= float(top) ? top : ek_u32(s)) : 0u;
     return u ^ (1u << (n - 1u));
@@ -339,3 +314,4 @@ EK_INLINE bool ek_culled(EK_IN ps_edge_job* j, ek_screen a, ek_screen b, ek_scre
     }
     return false;
 }
+)

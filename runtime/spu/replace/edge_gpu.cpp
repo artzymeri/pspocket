@@ -20,10 +20,13 @@
 
 #include "pspocket/spu/edge_gpu.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <format>
+#include <mutex>
 
 #include "pspocket/core/be.h"
+#include "pspocket/core/log.hpp"
 #include "pspocket/spu/lifted.h"
 
 namespace pspocket::spu::edge_gpu {
@@ -40,6 +43,17 @@ inline float f32(uint32_t u)
     float f;
     std::memcpy(&f, &u, 4);
     return f;
+}
+
+// A condition the GPU path goes on through (the job's stages already skipped), said once each.
+void note(const std::string& what)
+{
+    static std::mutex m;
+    static std::vector<std::string> said;
+    std::lock_guard lock(m);
+    if (std::find(said.begin(), said.end(), what) != said.end()) return;
+    said.push_back(what);
+    PS_LOG_WARN("edge", "EDGE on the GPU: {}", what);
 }
 
 bool fail(Recording& r, std::string why)
@@ -78,6 +92,49 @@ bool parse_description(Recording& r, const uint8_t* ls, uint32_t d, uint32_t& st
         out.push_back(a);
     }
     return true;
+}
+
+// The output vertex as the configuration (byte 4 of the context: predefined 0 or 2, or 0xFF: the description at +0x74)
+// lays it out, into j.out / out_count / out_stride; false (with r.reject) when the GPU path does not make it.
+bool output_layout(Recording& r, const uint8_t* ls, uint32_t c, ps_edge_job& j)
+{
+    const uint32_t format = ld8(ls, c + 4);
+    const bool has_nrm = j.nrm_offset != ~0u, has_tan = j.tan_offset != ~0u;
+    j.out_count = 0;
+    const auto add = [&](uint32_t source, uint32_t fmt, uint32_t comps, uint32_t offset) {
+        j.out[j.out_count++] = ps_edge_out_attr{source, fmt, comps, offset};
+    };
+    if (format == 0) {
+        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
+        j.out_stride = 12;
+        return true;
+    }
+    if (format == 2) {
+        if (!has_nrm || !has_tan) return fail(r, "output format 2 without normals and tangents");
+        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
+        add(PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12);
+        add(PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16);
+        j.out_stride = 24;
+        return true;
+    }
+    if (format != 0xFF) return fail(r, std::format("output format {:#x}", format));
+    uint32_t stride = 0;
+    std::vector<Attr> a;
+    if (!parse_description(r, ls, ld32(ls, c + 0x74), stride, a)) return false;
+    for (const Attr& x : a) {
+        const bool there = x.id == PS_EDGE_ATTR_POSITION || (x.id == PS_EDGE_ATTR_NORMAL && has_nrm) ||
+                           (x.id == PS_EDGE_ATTR_TANGENT && has_tan);
+        if (!there || j.out_count == PS_EDGE_MAX_OUT) return fail(r, std::format("output attribute id {}", x.id));
+        if (x.format == PS_EDGE_FMT_F32 && x.size == 4 * x.components && x.components >= 1 && x.components <= 4)
+            add(x.id, PS_EDGE_FMT_F32, x.components, x.offset);
+        else if (x.format == PS_EDGE_FMT_X11Y11Z10N && x.size == 4)
+            add(x.id, PS_EDGE_FMT_X11Y11Z10N, 3, x.offset);
+        else
+            return fail(r, std::format("output attribute format {} size {}", x.format, x.size));
+        if (x.offset + x.size > stride) return fail(r, "output stride");
+    }
+    j.out_stride = stride;
+    return stride != 0 || fail(r, "output stride 0");
 }
 
 } // namespace
@@ -169,15 +226,18 @@ bool on_decompress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
         j.uv_data = r.append(ls, v2, nv * stride2);
         (void)fo2;
     }
+    // The output vertex now (the later stages cannot turn the job back to the SPU: this one skipped its work).
+    ps_edge_job probe = j;
+    if (!output_layout(r, ls, c, probe)) return false;
     r.stages |= 1;
     return true;
 }
 
 void leave_decompress(const Recording& r, uint8_t* ls, SPUContext& ctx)
 {
-    const uint32_t c = r.ctx, v1 = pref(ctx, 4);
+    const uint32_t c = r.ctx, v1 = pref(ctx, 4), v2 = pref(ctx, 6);
     st32(ls, c + 0x54, v1);
-    st32(ls, c + 0x58, v1);
+    st32(ls, c + 0x58, v2 && v2 < v1 ? v2 : v1); // the scratch from the lower stream on: both are consumed
     // Each attribute's table: the k-th attribute (primary first) in uniform table k.
     uint32_t ids = 0, k = 0;
     const auto table_of = [&](uint32_t id) {
@@ -200,24 +260,13 @@ void leave_decompress(const Recording& r, uint8_t* ls, SPUContext& ctx)
 
 bool on_skin(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 {
-    const uint32_t c = pref(ctx, 3), mats = pref(ctx, 4), count = pref(ctx, 5), weights = pref(ctx, 6);
+    const uint32_t c = pref(ctx, 3), mats = pref(ctx, 4), count = std::min<uint32_t>(pref(ctx, 5), 256), weights = pref(ctx, 6);
     const uint32_t skin = ld8(ls, c + 6) & 15u;
     ps_edge_job& j = r.job;
-    if (count == 0 || count > 256) return fail(r, std::format("{} skinning matrices", count));
     j.skin = skin;
     j.matrix_count = count;
     j.matrices = r.append(ls, mats, 48 * count);
     j.weights = r.append(ls, weights, j.num_vertexes * (skin == 4 ? 1u : 8u));
-    // Every bone named must be in the palette.
-    const uint8_t* w = r.blob.data() + j.weights;
-    for (uint32_t v = 0; v < j.num_vertexes; v++) {
-        if (skin == 4) {
-            if (w[v] >= count) return fail(r, std::format("bone {} of {}", w[v], count));
-        } else if (w[8 * v + 1] != 0xFF) {
-            for (uint32_t k = 0; k < 4; k++)
-                if (w[8 * v + 2 * k] && w[8 * v + 2 * k + 1] >= count) return fail(r, std::format("bone {} of {}", w[8 * v + 2 * k + 1], count));
-        }
-    }
     r.stages |= 2;
     return true;
 }
@@ -234,9 +283,11 @@ bool on_cull(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 {
     const uint32_t s = pref(ctx, 3), mode = pref(ctx, 4), voff = pref(ctx, 5);
     ps_edge_job& j = r.job;
-    if (voff != 0) return fail(r, std::format("culling from vertex {}", voff));
+    // Not seen in the walk (one batch from vertex 0, the configured count): said once if a job does.
+    if (voff != 0) note(std::format("culling from vertex {} (taken as 0)", voff));
     const uint32_t ni = ld16(ls, s + 0x17E);
-    if (ni != j.num_indexes || ni % 3) return fail(r, std::format("{} indices to cull ({} configured)", ni, j.num_indexes));
+    if (ni != j.num_indexes) note(std::format("{} indices to cull, {} configured", ni, j.num_indexes));
+    j.num_indexes = ni - ni % 3;
     j.indices = r.append(ls, ld32(ls, s + 0x50), 2 * ni);
 
     // The screen transform's constants, as 0x0ECF8 makes them (in the SPU's arithmetic: they are the same bits).
@@ -302,40 +353,7 @@ void leave_cull(const Recording& r, uint8_t* ls, SPUContext& ctx)
 
 bool on_compress(Recording& r, const uint8_t* ls, const SPUContext& ctx)
 {
-    const uint32_t c = pref(ctx, 3);
-    ps_edge_job& j = r.job;
-    const uint32_t format = ld8(ls, c + 4);
-    const bool has_nrm = j.nrm_offset != ~0u, has_tan = j.tan_offset != ~0u;
-    j.out_count = 0;
-    const auto add = [&](uint32_t source, uint32_t fmt, uint32_t comps, uint32_t offset) {
-        j.out[j.out_count++] = ps_edge_out_attr{source, fmt, comps, offset};
-    };
-    if (format == 0) {
-        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
-        j.out_stride = 12;
-    } else if (format == 2) {
-        if (!has_nrm || !has_tan) return fail(r, "output format 2 without normals and tangents");
-        add(PS_EDGE_ATTR_POSITION, PS_EDGE_FMT_F32, 3, 0);
-        add(PS_EDGE_ATTR_NORMAL, PS_EDGE_FMT_X11Y11Z10N, 3, 12);
-        add(PS_EDGE_ATTR_TANGENT, PS_EDGE_FMT_I16N, 4, 16);
-        j.out_stride = 24;
-    } else {
-        uint32_t stride = 0;
-        std::vector<Attr> a;
-        if (!parse_description(r, ls, ld32(ls, c + 0x74), stride, a)) return false;
-        for (const Attr& x : a) {
-            const bool there = x.id == PS_EDGE_ATTR_POSITION || (x.id == PS_EDGE_ATTR_NORMAL && has_nrm) ||
-                               (x.id == PS_EDGE_ATTR_TANGENT && has_tan);
-            if (!there || j.out_count == PS_EDGE_MAX_OUT) return fail(r, std::format("output attribute id {}", x.id));
-            if (x.format == PS_EDGE_FMT_F32 && x.size == 4 * x.components && x.components <= 4)
-                add(x.id, PS_EDGE_FMT_F32, x.components, x.offset);
-            else if (x.format == PS_EDGE_FMT_X11Y11Z10N && x.size == 4)
-                add(x.id, PS_EDGE_FMT_X11Y11Z10N, 3, x.offset);
-            else return fail(r, std::format("output attribute format {} size {}", x.format, x.size));
-            if (x.offset + x.size > stride) return fail(r, "output stride");
-        }
-        j.out_stride = stride;
-    }
+    if (!output_layout(r, ls, pref(ctx, 3), r.job)) note("the output vertex changed after the decompression: " + r.reject);
     r.stages |= 8;
     return true;
 }
@@ -351,3 +369,179 @@ void leave_compress(const Recording& r, uint8_t* ls, SPUContext& ctx)
 }
 
 } // namespace pspocket::spu::edge_gpu
+
+// ---- the job: the stages' stand-ins, the dropped PUTs, the work item ----
+
+#include "pspocket/core/edge_job.h"
+#include "pspocket/core/edge_kernels.h"
+#include "pspocket/core/edge_registry.hpp"
+#include "pspocket/core/memory_map.h"
+#include "pspocket/core/timebase.h"
+#include "pspocket/spu/runtime.h"
+#include "native.h"
+
+namespace pspocket::spu::edge_gpu {
+namespace {
+
+constexpr uint64_t kDad4 = 0xDAD457863220B1CCull; // GTA V's EDGE build, the one whose stages are known here
+
+struct JobState {
+    Recording rec;
+    bool active = false;    // the job takes the deferred path (until its decompression declines)
+    bool recorded = false;  // its decompression was recorded: the later stages are skipped too
+    bool finished = false;  // its work item went out
+    uint32_t lo = ~0u, hi = 0, dropped = 0; // the PUTs into its ring allocation, dropped
+    uint64_t start_ns = 0;
+};
+thread_local JobState t_job;
+
+std::atomic<uint64_t> g_ns[2], g_jobs[2]; // EDGE jobs' host time and count: [0] the SPU's path, [1] deferred
+
+// mode cpu: the work item's kernels here, their output written into the allocation as the job would have put it: the
+// kept indices, then (to keep the hole's full count) degenerate triangles, then the vertices.
+void run_here(const edge::WorkItem& item, uint8_t* membase)
+{
+    const ps_edge_job& j = *reinterpret_cast<const ps_edge_job*>(item.blob.data());
+    uint8_t* alloc = membase + item.alloc_ea;
+    std::vector<ek_screen> scr(j.num_vertexes);
+    for (uint32_t v = 0; v < j.num_vertexes; v++)
+        scr[v] = ek_vertex(item.blob.data(), &j, v, alloc + item.index_bytes + v * j.out_stride);
+    const uint8_t* idx = item.blob.data() + j.indices;
+    uint32_t out = 0, fill = 0;
+    for (uint32_t i = 0; i + 2 < j.num_indexes; i += 3) {
+        const uint32_t a = ps_ld16(idx + 2 * i), b = ps_ld16(idx + 2 * i + 2), c = ps_ld16(idx + 2 * i + 4);
+        if (a >= j.num_vertexes || b >= j.num_vertexes || c >= j.num_vertexes) continue;
+        if (ek_culled(&j, scr[a], scr[b], scr[c])) continue;
+        ps_st16(alloc + 2 * out, a);
+        ps_st16(alloc + 2 * out + 2, b);
+        ps_st16(alloc + 2 * out + 4, c);
+        fill = a;
+        out += 3;
+    }
+    for (; out < j.num_indexes; out++) ps_st16(alloc + 2 * out, fill);
+}
+
+void finalize(SPUContext* ctx)
+{
+    JobState& s = t_job;
+    s.finished = true;
+    Recording& r = s.rec;
+    r.finish();
+    const ps_edge_job& j = r.job;
+    auto item = std::make_unique<edge::WorkItem>();
+    item->alloc_ea = s.lo;
+    item->alloc_size = s.hi - s.lo;
+    item->index_bytes = (2 * j.num_indexes + 15) & ~15u;
+    if (item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
+        note(std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
+            item->index_bytes, j.num_vertexes, j.out_stride));
+    item->blob = std::move(r.blob);
+    if (edge::mode() == edge::Mode::cpu) {
+        run_here(*item, ctx->membase);
+        // what the RSX reads now (the job's own PUTs make their stores visible as these do: mfc.cpp)
+        std::atomic_thread_fence(std::memory_order_release);
+        r.blob = std::move(item->blob);
+        return;
+    }
+    edge::publish(std::move(item));
+}
+
+// The job's PUTs into RSX local memory once its culling is recorded (its indices, then its vertices): dropped (the GPU makes what they would put). The
+// first PUT elsewhere after them is its command buffer hole: the work item goes out before it (the RSX may read the hole
+// from then on).
+int filter(void*, SPUContext* ctx, uint32_t, uint32_t cmd, uint32_t, uint32_t ea, uint32_t size)
+{
+    JobState& s = t_job;
+    if (!s.recorded || s.finished || (s.rec.stages & 4) == 0) return 0; // from the culling on: the indices go out next
+    if ((cmd & 0xF0) != 0x20) return 0; // PUTs only
+    if (ea - PS_MEM_RSX_LOCAL_BASE < PS_MEM_RSX_LOCAL_SIZE) {
+        s.lo = std::min(s.lo, ea);
+        s.hi = std::max(s.hi, ea + size);
+        s.dropped++;
+        return 1;
+    }
+    if (s.dropped) finalize(ctx);
+    return 0;
+}
+
+bool skipping() { return t_job.active && t_job.recorded; }
+
+} // namespace
+
+bool job_begin(uint64_t key)
+{
+    if (key != kDad4 || edge::mode() == edge::Mode::off) return false;
+    JobState& s = t_job;
+    s.active = edge::deferred_now();
+    s.recorded = s.finished = false;
+    s.lo = ~0u;
+    s.hi = s.dropped = 0;
+    s.start_ns = ps_host_now_ns();
+    if (s.active) ps_spu_set_mfc_filter(filter, nullptr);
+    return true;
+}
+
+void job_end()
+{
+    JobState& s = t_job;
+    ps_spu_set_mfc_filter(nullptr, nullptr);
+    const bool deferred = s.active && s.recorded;
+    if (deferred && !s.finished && s.dropped) note("a job's PUTs dropped but no command buffer hole after them");
+    g_ns[deferred].fetch_add(ps_host_now_ns() - s.start_ns, std::memory_order_relaxed);
+    g_jobs[deferred].fetch_add(1, std::memory_order_relaxed);
+    edge::count_job(deferred);
+    s.active = false;
+}
+
+JobTimes job_times()
+{
+    return {g_jobs[0].load(), g_ns[0].load(), g_jobs[1].load(), g_ns[1].load()};
+}
+
+} // namespace pspocket::spu::edge_gpu
+
+// The stages' stand-ins, listed in GTA V's EDGE build (replace.cpp): each declines (the lifted function runs) unless the
+// job takes the deferred path.
+using namespace pspocket::spu::edge_gpu;
+
+extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
+{
+    JobState& s = t_job;
+    if (!s.active || s.recorded) return 0;
+    s.rec.clear();
+    if (!on_decompress(s.rec, ls, *ctx)) {
+        note("a job left to the SPU: " + s.rec.reject);
+        pspocket::edge::count_rejected();
+        s.active = false;
+        ps_spu_set_mfc_filter(nullptr, nullptr);
+        return 0;
+    }
+    leave_decompress(s.rec, ls, *ctx);
+    s.recorded = true;
+    return 1;
+}
+
+extern "C" int ps_edge_dad4_gpu_07a10(SPUContext* ctx, uint8_t* ls)
+{
+    if (!skipping()) return 0;
+    if ((ls[(ctx->gpr[3].u32[3] + 6) & PS_SPU_LS_MASK] & 15u) == 0) return 0; // no skinning: the function does nothing
+    on_skin(t_job.rec, ls, *ctx);
+    leave_skin(t_job.rec, ls, *ctx);
+    return 1;
+}
+
+extern "C" int ps_edge_dad4_gpu_0eff8(SPUContext* ctx, uint8_t* ls)
+{
+    if (!skipping()) return 0;
+    on_cull(t_job.rec, ls, *ctx);
+    leave_cull(t_job.rec, ls, *ctx);
+    return 1;
+}
+
+extern "C" int ps_edge_dad4_gpu_0f5b8(SPUContext* ctx, uint8_t* ls)
+{
+    if (!skipping()) return 0;
+    on_compress(t_job.rec, ls, *ctx);
+    leave_compress(t_job.rec, ls, *ctx);
+    return 1;
+}

@@ -24,6 +24,13 @@ int ps_edge_dad4_0a56c(SPUContext* ctx, uint8_t* ls); /* of 0x0A098: control hal
 int ps_edge_dad4_0a720(SPUContext* ctx, uint8_t* ls); /* of 0x0A098: index decompression, to 0x0A894 */
 int ps_edge_dad4_0b850(SPUContext* ctx, uint8_t* ls); /* a loop of 0x0B778: head 0x0B850, exit 0x0B9B0 */
 
+/* EDGE geometry on the GPU (edge_gpu.cpp, D-988): the stages of the same build recorded instead of computed when the job
+ * takes the deferred path (PSPOCKET_EDGE_GPU); otherwise they decline. */
+int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls); /* vertex decompression */
+int ps_edge_dad4_gpu_07a10(SPUContext* ctx, uint8_t* ls); /* skinning */
+int ps_edge_dad4_gpu_0eff8(SPUContext* ctx, uint8_t* ls); /* culling */
+int ps_edge_dad4_gpu_0f5b8(SPUContext* ctx, uint8_t* ls); /* vertex compression */
+
 /* Sony's MP3 decoder module (flashMP3.pic), program 884ae88f68a9e778: decodeFrame (flashmp3.c). */
 int ps_flashmp3_884a_1e820(SPUContext* ctx, uint8_t* ls);
 

@@ -165,6 +165,12 @@ uint32_t ps_spu_dma_writes_over(uint32_t ea, uint32_t size, ps_spu_dma_write* ou
 typedef void (*ps_spu_mfc_observer)(void* user, const SPUContext* ctx, uint32_t pc, uint32_t cmd, uint32_t lsa,
     uint32_t ea, uint32_t size);
 void ps_spu_set_mfc_observer(ps_spu_mfc_observer fn, void* user);
+/* A filter of the calling host thread's transfers (D-988): called before each transfer (a list's elements one by one;
+ * not the atomic commands); a non-zero result leaves it undone, as if it had been made (EDGE geometry on the GPU drops
+ * the job's PUTs of what the GPU makes instead). NULL: none (the default). */
+typedef int (*ps_spu_mfc_filter)(void* user, SPUContext* ctx, uint32_t pc, uint32_t cmd, uint32_t lsa, uint32_t ea,
+    uint32_t size);
+void ps_spu_set_mfc_filter(ps_spu_mfc_filter fn, void* user);
 
 /* ---------------------------------------------------------------------------------------------------------------
  * Run loop.
