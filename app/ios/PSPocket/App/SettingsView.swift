@@ -10,6 +10,8 @@ struct SettingsView: View {
     @Environment(SelfTestModel.self) private var selfTest
     @State private var firmware = Firmware()
     @State private var pickingFirmware = false
+    /// Read by the runtime at the game's start (runtime/platform/ios/src/game.mm, set_env_from_settings; D-996).
+    @AppStorage("edgeGPU") private var edgeGPU = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -43,6 +45,15 @@ struct SettingsView: View {
                 } footer: {
                     Text("Games read their system files from /dev_flash. Pick the PS3 update you downloaded "
                          + "(PS3UPDAT.PUP, from playstation.com) and pspocket installs it on this iPhone, once.")
+                }
+                Section {
+                    Toggle("3D models on the GPU (EDGE)", isOn: $edgeGPU)
+                } header: {
+                    Text("Experiments")
+                } footer: {
+                    Text("Moves the work of Sony's EDGE geometry (skinning, unpacking and culling the game's 3D "
+                         + "models) from the processor to the graphics chip. Takes effect the next time a game "
+                         + "starts. Turn it off if models look wrong.")
                 }
                 Section("Diagnostics") {
                     NavigationLink(value: Page.selfTest) { Label("Self-test", systemImage: "checklist") }

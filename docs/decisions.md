@@ -16154,3 +16154,11 @@ have said ten times the time left at its first preparation after translator gene
 - The up-front estimate before anything is translated: 4.6 predicted seconds a MB of SPU C (23 before) and 0.78 MB a
   saved image (0.33; GTA V's 265 images now give 208 MB of C).
 - Measured again: rate SPU 0.35 (0.33 for the lift before with the old model, measured alike).
+
+## D-996 · 2026-10-15 · Settings › Experiments in the app: a toggle for EDGE on the GPU
+
+The user wants to try EDGE on the GPU (D-987) on the phone without a Mac at hand to write Documents/pspocket-env.txt.
+Settings gets an Experiments section with "3D models on the GPU (EDGE)", a UserDefaults key (`edgeGPU`) the runtime
+reads once at the game's start (game.mm, set_env_from_settings) into PSPOCKET_EDGE_GPU=1. A value the switch file set
+wins, so a test set up from the Mac stays as it is; the setting is logged as "(from Settings)" like the file's lines.
+Off by default. Further switches join the same table (key, PSPOCKET_ name, value).

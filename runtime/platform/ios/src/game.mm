@@ -339,6 +339,25 @@ void set_env_from_file(const std::filesystem::path& path)
     }
 }
 
+// The app's Settings › Experiments switches (D-996): a UserDefaults key the app's toggle writes, read once at boot into
+// the PSPOCKET_ switch it stands for. A value the switch file set first wins (a test the Mac set up stays as it is).
+void set_env_from_settings()
+{
+    struct Switch {
+        NSString* key;
+        const char* name;
+        const char* on;
+    };
+    static const Switch kSwitches[] = {
+        {@"edgeGPU", "PSPOCKET_EDGE_GPU", "1"}, // Sony's EDGE geometry on the GPU (D-987)
+    };
+    for (const Switch& s : kSwitches) {
+        if (![[NSUserDefaults standardUserDefaults] boolForKey:s.key] || std::getenv(s.name)) continue;
+        setenv(s.name, s.on, 0);
+        PS_LOG_INFO(kChan, "{}={} (from Settings)", s.name, s.on);
+    }
+}
+
 } // namespace
 
 extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_size)
@@ -358,6 +377,7 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     }
     ps_ios_install_log_sink(on_log, nullptr);
     if (o->log_path) set_env_from_file(std::filesystem::path(o->log_path).parent_path() / "pspocket-env.txt");
+    set_env_from_settings();
 
     std::vector<u8> bytes;
     if (!read_file(o->elf_path, bytes)) return fail(error, error_size, std::string("cannot read ") + o->elf_path);
