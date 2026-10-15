@@ -275,4 +275,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// EDGE geometry on the GPU (D-988): the Metal source of its kernel ("edge_jobs": pspocket/core/edge_job.h and
+// edge_kernels.inc with the Metal meanings of their words), and the compile options it needs (IEEE arithmetic), as an
+// MTLCompileOptions* (for the tests, which run it against the same code on the CPU).
+std::string edge_kernel_source();
+void* edge_kernel_options();
+
 } // namespace pspocket::rsx::metal

@@ -151,8 +151,12 @@ void Recording::clear()
 uint32_t Recording::append(const uint8_t* ls, uint32_t at, uint32_t n)
 {
     const uint32_t offset = static_cast<uint32_t>(blob.size());
-    blob.resize(offset + ((n + 15) & ~15u) + 16, 0);
-    for (uint32_t i = 0; i < n; i++) blob[offset + i] = ls[(at + i) & PS_SPU_LS_MASK];
+    n = std::min<uint32_t>(n, PS_SPU_LS_SIZE);
+    at &= PS_SPU_LS_MASK;
+    const uint32_t first = std::min(n, PS_SPU_LS_SIZE - at); // local store wraps
+    blob.insert(blob.end(), ls + at, ls + at + first);
+    if (first < n) blob.insert(blob.end(), ls, ls + (n - first));
+    blob.resize(offset + ((n + 15) & ~15u) + 16, 0); // 16-aligned, and room for the kernels' 4-byte reads past the end
     return offset;
 }
 
@@ -395,8 +399,6 @@ struct JobState {
 };
 thread_local JobState t_job;
 
-std::atomic<uint64_t> g_ns[2], g_jobs[2]; // EDGE jobs' host time and count: [0] the SPU's path, [1] deferred
-
 // mode cpu: the work item's kernels here, their output written into the allocation as the job would have put it: the
 // kept indices, then (to keep the hole's full count) degenerate triangles, then the vertices.
 void run_here(const edge::WorkItem& item, uint8_t* membase)
@@ -428,19 +430,19 @@ void finalize(SPUContext* ctx)
     Recording& r = s.rec;
     r.finish();
     const ps_edge_job& j = r.job;
-    auto item = std::make_unique<edge::WorkItem>();
+    std::unique_ptr<edge::WorkItem> item = edge::acquire(); // a used one, its blob's room kept
     item->alloc_ea = s.lo;
     item->alloc_size = s.hi - s.lo;
     item->index_bytes = (2 * j.num_indexes + 15) & ~15u;
     if (item->index_bytes + j.num_vertexes * j.out_stride > item->alloc_size)
         note(std::format("an allocation of {:#x} bytes for {:#x} of indices and {} vertices of {} bytes", item->alloc_size,
             item->index_bytes, j.num_vertexes, j.out_stride));
-    item->blob = std::move(r.blob);
+    std::swap(item->blob, r.blob); // the recording goes on with the old blob's room
     if (edge::mode() == edge::Mode::cpu) {
         run_here(*item, ctx->membase);
         // what the RSX reads now (the job's own PUTs make their stores visible as these do: mfc.cpp)
         std::atomic_thread_fence(std::memory_order_release);
-        r.blob = std::move(item->blob);
+        edge::recycle(std::move(item));
         return;
     }
     edge::publish(std::move(item));
@@ -487,15 +489,8 @@ void job_end()
     ps_spu_set_mfc_filter(nullptr, nullptr);
     const bool deferred = s.active && s.recorded;
     if (deferred && !s.finished && s.dropped) note("a job's PUTs dropped but no command buffer hole after them");
-    g_ns[deferred].fetch_add(ps_host_now_ns() - s.start_ns, std::memory_order_relaxed);
-    g_jobs[deferred].fetch_add(1, std::memory_order_relaxed);
-    edge::count_job(deferred);
+    edge::count_job(deferred, ps_host_now_ns() - s.start_ns);
     s.active = false;
-}
-
-JobTimes job_times()
-{
-    return {g_jobs[0].load(), g_ns[0].load(), g_jobs[1].load(), g_ns[1].load()};
 }
 
 } // namespace pspocket::spu::edge_gpu

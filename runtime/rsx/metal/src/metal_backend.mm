@@ -221,6 +221,12 @@ bool MetalBackend::Impl::init()
     check_surfaces = std::getenv("PSPOCKET_RSX_CHECK_SURFACES") != nullptr;
     if (const char* f = std::getenv("PSPOCKET_SKIP_FP")) skip_fp = std::strtoull(f, nullptr, 16); // a measuring aid
     if (const char* f = std::getenv("PSPOCKET_GPU_AB")) ab_period = static_cast<u32>(std::max(1, std::atoi(f)));
+    if (edge_pipeline && edge::mode() == edge::Mode::ab) {
+        // EDGE's own halves (D-988), apart from PSPOCKET_GPU_AB's (whose ab_on() switches other experiments too).
+        const char* f = std::getenv("PSPOCKET_EDGE_AB");
+        edge_ab_period = static_cast<u32>(std::max(1, f ? std::atoi(f) : 30));
+        PS_LOG_INFO(kChan, "EDGE A/B: on the GPU in every other {} frames", edge_ab_period);
+    }
     if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) { // D-953: N[:MASK of FastPath items]
         ab_period = static_cast<u32>(std::max(1, std::atoi(f)));
         ab_cpu = true;
@@ -348,10 +354,13 @@ void MetalBackend::Impl::submit(bool wait)
         auto gpu = gpu_ns;
         auto ab = ab_period ? ab_ns : nullptr;
         const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_half();
+        auto edge_ab = edge_ab_period ? edge_ab_gpu_ns : nullptr;
+        const usize edge_half = edge_ab_half;
         [render_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             const double s = cb.GPUEndTime - cb.GPUStartTime;
             if (s > 0) gpu->fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
             if (ab && s > 0) (*ab)[half].fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
+            if (edge_ab && s > 0) (*edge_ab)[edge_half].fetch_add(static_cast<u64>(s * 1e9), std::memory_order_relaxed);
         }];
         [render_cb commit];
         render_cb = nil;
@@ -1792,6 +1801,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // vertices and indices come from the kernels, its count from their indirect arguments.
     std::unique_ptr<edge::WorkItem> edge_item;
     EdgeDraw edge_draw;
+    bool edge = false; // this draw is EDGE's: its item queued, its draw indirect
     const u32 inputs = vp_inputs & state.vertex_attrib_input_mask();
     auto guest_ok = [&](u32 ea, u32 size) { return size != 0 && mem.is_committed(ea) && mem.is_committed(ea + size - 1); };
     auto register_value = [&](shader::MslAttrib& at, u32 i) {
@@ -1836,6 +1846,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             restart_begin.push_back(0);
             drawn_indices.push_back({true, 0, 2}); // its offset once the allocation is made
             stats_edge.draws++;
+            edge = true;
             break;
         }
         const u32 isize = ia.u16_indices ? 2 : 4;
@@ -2006,6 +2017,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         vertex_data = transient.alloc(std::max<u32>(std::max(total, edge_end), 16), 16);
         if (edge_item) {
             edge_queue(*edge_item, vertex_data, edge_draw);
+            edge::recycle(std::move(edge_item)); // its blob is in the allocation now
             for (u32 k = 0; k < edge_attr_count; k++)
                 vs.attribs[edge_attrs[k].attr].offset = vertex_data.offset + edge_draw.shadow + edge_attrs[k].rel;
             drawn_indices[0].offset = vertex_data.offset + edge_draw.shadow;
@@ -2342,7 +2354,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     MTLPrimitiveType ptype = MTLPrimitiveTypeTriangle;
     const bool native = native_primitive(d.primitive, ptype);
     const u32 pulled_mode = vs.index_mode;
-    if (edge_item) {
+    if (edge) {
         // EDGE's draw (D-988): over the indices the kernels kept, as many as their arguments say.
         vs.index_offset = 0;
         vs.index_mode = shader::kIndexDrawnU16BE;
@@ -2428,6 +2440,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         ab_last_draws = stats.draws;
     }
     stats.flips++;
+    if (edge_ab_period) edge_ab_flip();
     if (pass_times) {
         pass_place = 0;
         if (stats.flips % 300 == 0) log_pass_times();
@@ -2758,6 +2771,28 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                 per_frame(m.stats.feedback_rebound, m.report_feedback_rebound),
                 per_frame(m.stats.feedback_strict, m.report_feedback_strict), w.feedback_reused,
                 w.texture_cache_invalidations, most);
+        }
+        if (m.edge_pipeline) {
+            // EDGE geometry on the GPU (D-988): the draws and their kernels' GPU time; the SPU jobs, deferred and run
+            // whole, and their host time a job (the A/B's halves are the two kinds with PSPOCKET_EDGE_GPU=ab).
+            const edge::Stats es = edge::stats();
+            const u64 edge_ns = m.edge_gpu_ns->load(std::memory_order_relaxed);
+            const auto us_a_job = [](u64 ns, u64 jobs) { return jobs ? static_cast<double>(ns) / 1e3 / static_cast<double>(jobs) : 0.0; };
+            PS_LOG_INFO(kChan, "EDGE on the GPU (last {}): {:.0f} draws a frame, {:.1f} dispatches, kernels {:.3f} ms a frame, "
+                               "{:.0f} KB of work items a frame; SPU jobs deferred {:.0f} a frame at {:.2f} us, run whole {:.0f} "
+                               "a frame at {:.2f} us; {} left to the SPU by a stage, {} items replaced before their draw",
+                w.flips, per_frame(m.stats_edge.draws, m.report_edge.draws),
+                per_frame(m.stats_edge.dispatches, m.report_edge.dispatches),
+                per_frame(edge_ns, m.report_edge_gpu_ns) / 1e6,
+                per_frame(m.stats_edge.blob_bytes, m.report_edge.blob_bytes) / 1024.0,
+                per_frame(es.jobs_deferred, m.report_edge_stats.jobs_deferred),
+                us_a_job(es.ns_deferred - m.report_edge_stats.ns_deferred, es.jobs_deferred - m.report_edge_stats.jobs_deferred),
+                per_frame(es.jobs_spu, m.report_edge_stats.jobs_spu),
+                us_a_job(es.ns_spu - m.report_edge_stats.ns_spu, es.jobs_spu - m.report_edge_stats.jobs_spu),
+                es.rejected - m.report_edge_stats.rejected, es.replaced - m.report_edge_stats.replaced);
+            m.report_edge = m.stats_edge;
+            m.report_edge_gpu_ns = edge_ns;
+            m.report_edge_stats = es;
         }
         m.feedback_sources.clear();
         m.report_feedback_reused = m.stats.feedback_reused;

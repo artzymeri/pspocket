@@ -433,6 +433,15 @@ struct MetalBackend::Impl {
     } stats_edge;
     EdgeStats report_edge{};
     u64 report_edge_gpu_ns = 0;
+    edge::Stats report_edge_stats{};
+    // PSPOCKET_EDGE_GPU=ab: EDGE on the GPU in every other PSPOCKET_EDGE_AB frames (default 30), each half's GPU time,
+    // RSX thread CPU time and EDGE SPU job time summed apart and logged every 20 halves.
+    u32 edge_ab_period = 0;
+    usize edge_ab_half = 0; // the half of the frame being recorded (1: on the GPU)
+    std::shared_ptr<std::array<std::atomic<u64>, 2>> edge_ab_gpu_ns = std::make_shared<std::array<std::atomic<u64>, 2>>();
+    std::array<u64, 2> edge_ab_frames{}, edge_ab_cpu_ns{}, edge_ab_spu_ns{}, edge_ab_jobs{}, edge_ab_draws{};
+    u64 edge_ab_cpu_last = 0, edge_ab_spu_last = 0, edge_ab_jobs_last = 0, edge_ab_draws_last = 0;
+    void edge_ab_flip();
     bool edge_init();
     std::unique_ptr<edge::WorkItem> edge_take(u32 index_ea);
     u32 edge_layout(const edge::WorkItem& item, u32 at, EdgeDraw& out);

@@ -29,7 +29,10 @@ std::atomic<bool> g_consumer{false};
 std::mutex g_mutex;
 std::unordered_map<uint32_t, std::unique_ptr<WorkItem>> g_items;
 std::atomic<uint32_t> g_waiting{0};
-std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0}, g_jobs_gpu{0}, g_jobs_cpu{0}, g_rejected{0};
+std::mutex g_pool_mutex;
+std::vector<std::unique_ptr<WorkItem>> g_pool;
+std::atomic<uint64_t> g_published{0}, g_taken{0}, g_replaced{0}, g_rejected{0};
+std::atomic<uint64_t> g_jobs[2], g_ns[2]; // [0] run whole by the SPU, [1] deferred
 
 } // namespace
 
@@ -53,15 +56,42 @@ void set_ab_half(bool on) { g_half.store(on, std::memory_order_relaxed); }
 void set_consumer(bool ready) { g_consumer.store(ready, std::memory_order_release); }
 bool ab_half() { return g_half.load(std::memory_order_relaxed); }
 
+std::unique_ptr<WorkItem> acquire()
+{
+    {
+        std::lock_guard lock(g_pool_mutex);
+        if (!g_pool.empty()) {
+            std::unique_ptr<WorkItem> item = std::move(g_pool.back());
+            g_pool.pop_back();
+            return item;
+        }
+    }
+    return std::make_unique<WorkItem>();
+}
+
+void recycle(std::unique_ptr<WorkItem> item)
+{
+    if (!item) return;
+    item->blob.clear();
+    std::lock_guard lock(g_pool_mutex);
+    if (g_pool.size() < 4096) g_pool.push_back(std::move(item));
+}
+
 void publish(std::unique_ptr<WorkItem> item)
 {
     const uint32_t ea = item->alloc_ea;
     std::lock_guard lock(g_mutex);
     auto& slot = g_items[ea];
-    if (slot) g_replaced.fetch_add(1, std::memory_order_relaxed);
+    std::unique_ptr<WorkItem> old = std::move(slot);
+    if (old) g_replaced.fetch_add(1, std::memory_order_relaxed);
     else g_waiting.fetch_add(1, std::memory_order_relaxed);
     slot = std::move(item);
     g_published.fetch_add(1, std::memory_order_relaxed);
+    if (old) {
+        old->blob.clear();
+        std::lock_guard pool(g_pool_mutex);
+        if (g_pool.size() < 4096) g_pool.push_back(std::move(old));
+    }
 }
 
 std::unique_ptr<WorkItem> take(uint32_t ea)
@@ -81,10 +111,15 @@ bool any_waiting() { return g_waiting.load(std::memory_order_acquire) != 0; }
 
 Stats stats()
 {
-    return {g_published.load(), g_taken.load(), g_replaced.load(), g_jobs_gpu.load(), g_jobs_cpu.load(), g_rejected.load()};
+    return {g_published.load(), g_taken.load(), g_replaced.load(), g_jobs[1].load(), g_ns[1].load(), g_jobs[0].load(),
+        g_ns[0].load(), g_rejected.load()};
 }
 
-void count_job(bool deferred) { (deferred ? g_jobs_gpu : g_jobs_cpu).fetch_add(1, std::memory_order_relaxed); }
+void count_job(bool deferred, uint64_t ns)
+{
+    g_jobs[deferred].fetch_add(1, std::memory_order_relaxed);
+    g_ns[deferred].fetch_add(ns, std::memory_order_relaxed);
+}
 void count_rejected() { g_rejected.fetch_add(1, std::memory_order_relaxed); }
 
 } // namespace pspocket::edge

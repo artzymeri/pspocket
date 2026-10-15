@@ -34,17 +34,23 @@ struct WorkItem {
     uint32_t index_bytes = 0;  // the index area at its start (the full count, 16-byte aligned); the vertices follow
 };
 
+// Work items made once and used again (no allocation a job): acquire one to fill, recycle it once used.
+std::unique_ptr<WorkItem> acquire();
+void recycle(std::unique_ptr<WorkItem> item);
+
 void publish(std::unique_ptr<WorkItem> item);
 // The item published for the allocation at `ea`, removed; nullptr when there is none.
 std::unique_ptr<WorkItem> take(uint32_t ea);
 // Whether any item is waiting (a cheap test for a draw that may not be EDGE's).
 bool any_waiting();
 
+// EDGE jobs so far (of builds with a GPU path): deferred (their stages recorded) or run whole by their SPU, with their
+// SPU threads' host time; the work items published and taken; jobs a stage left to the SPU.
 struct Stats {
-    uint64_t published, taken, replaced, jobs_gpu, jobs_cpu, rejected;
+    uint64_t published, taken, replaced, jobs_deferred, ns_deferred, jobs_spu, ns_spu, rejected;
 };
 Stats stats();
-void count_job(bool deferred);
+void count_job(bool deferred, uint64_t ns);
 void count_rejected();
 
 } // namespace pspocket::edge

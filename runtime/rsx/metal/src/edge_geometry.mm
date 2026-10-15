@@ -124,10 +124,10 @@ static_assert(sizeof(Dispatch) == 32);
 
 } // namespace
 
-bool MetalBackend::Impl::edge_init()
+std::string edge_kernel_source() { return std::string(kEdgePrefix) + kEdgeDecls + "\n" + kEdgeCode + kEdgeKernel; }
+
+void* edge_kernel_options()
 {
-    if (edge::mode() == edge::Mode::off) return true;
-    const std::string source = std::string(kEdgePrefix) + kEdgeDecls + "\n" + kEdgeCode + kEdgeKernel;
     MTLCompileOptions* options = [MTLCompileOptions new];
     // IEEE arithmetic: the kernels' order of operations is the SPU's (no reassociation, no approximations).
     if (@available(macOS 15.0, iOS 18.0, *)) {
@@ -138,6 +138,14 @@ bool MetalBackend::Impl::edge_init()
         options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
+    return (__bridge_retained void*)options;
+}
+
+bool MetalBackend::Impl::edge_init()
+{
+    if (edge::mode() == edge::Mode::off) return true;
+    const std::string source = edge_kernel_source();
+    MTLCompileOptions* options = (__bridge_transfer MTLCompileOptions*)edge_kernel_options();
     NSError* error = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:options error:&error];
     if (!lib) {
@@ -228,7 +236,9 @@ void MetalBackend::Impl::edge_flush()
     auto gpu = gpu_ns;
     auto edge_ns = edge_gpu_ns;
     auto ab = ab_period ? ab_ns : nullptr;
+    auto edge_ab = edge_ab_period ? edge_ab_gpu_ns : nullptr;
     const usize half = submit_half >= 0 ? static_cast<usize>(submit_half) : ab_half();
+    const usize edge_half = edge_ab_half;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         const double s = done.GPUEndTime - done.GPUStartTime;
         if (s <= 0) return;
@@ -236,8 +246,43 @@ void MetalBackend::Impl::edge_flush()
         gpu->fetch_add(ns, std::memory_order_relaxed);
         edge_ns->fetch_add(ns, std::memory_order_relaxed);
         if (ab) (*ab)[half].fetch_add(ns, std::memory_order_relaxed);
+        if (edge_ab) (*edge_ab)[edge_half].fetch_add(ns, std::memory_order_relaxed);
     }];
     [cb commit];
+}
+
+// A flip with PSPOCKET_EDGE_GPU=ab: the frame that ends here counted in its half, the next one's half set for the jobs.
+void MetalBackend::Impl::edge_ab_flip()
+{
+    const usize h = edge_ab_half;
+    edge_ab_frames[h]++;
+    const u64 cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    if (edge_ab_cpu_last) edge_ab_cpu_ns[h] += cpu - edge_ab_cpu_last;
+    edge_ab_cpu_last = cpu;
+    const edge::Stats es = edge::stats();
+    const u64 spu = es.ns_deferred + es.ns_spu, jobs = es.jobs_deferred + es.jobs_spu;
+    edge_ab_spu_ns[h] += spu - edge_ab_spu_last;
+    edge_ab_jobs[h] += jobs - edge_ab_jobs_last;
+    edge_ab_draws[h] += stats.draws - edge_ab_draws_last;
+    edge_ab_spu_last = spu;
+    edge_ab_jobs_last = jobs;
+    edge_ab_draws_last = stats.draws;
+    edge_ab_half = (stats.flips / edge_ab_period) % 2;
+    edge::set_ab_half(edge_ab_half == 1);
+    if (stats.flips % (edge_ab_period * 20) == 0) {
+        const auto per = [&](u64 v, usize k) {
+            return edge_ab_frames[k] ? static_cast<double>(v) / static_cast<double>(edge_ab_frames[k]) : 0.0;
+        };
+        const double g0 = static_cast<double>((*edge_ab_gpu_ns)[0].exchange(0)), g1 = static_cast<double>((*edge_ab_gpu_ns)[1].exchange(0));
+        PS_LOG_INFO(kChan, "EDGE A/B (PSPOCKET_EDGE_GPU=ab): SPUs ({} frames) GPU {:.3f} ms a frame, RSX thread {:.3f} ms, "
+                           "EDGE SPU jobs {:.3f} ms ({:.0f} a frame), {:.0f} draws; GPU ({} frames) GPU {:.3f} ms, RSX "
+                           "thread {:.3f} ms, EDGE SPU jobs {:.3f} ms ({:.0f} a frame), {:.0f} draws",
+            edge_ab_frames[0], per(static_cast<u64>(g0), 0) / 1e6, per(edge_ab_cpu_ns[0], 0) / 1e6,
+            per(edge_ab_spu_ns[0], 0) / 1e6, per(edge_ab_jobs[0], 0), per(edge_ab_draws[0], 0), edge_ab_frames[1],
+            per(static_cast<u64>(g1), 1) / 1e6, per(edge_ab_cpu_ns[1], 1) / 1e6, per(edge_ab_spu_ns[1], 1) / 1e6,
+            per(edge_ab_jobs[1], 1), per(edge_ab_draws[1], 1));
+        edge_ab_frames = edge_ab_cpu_ns = edge_ab_spu_ns = edge_ab_jobs = edge_ab_draws = {};
+    }
 }
 
 } // namespace pspocket::rsx::metal
