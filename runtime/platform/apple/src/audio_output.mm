@@ -8,7 +8,9 @@
 #include "pspocket/platform/audio_output.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <mutex>
 
 #include "pspocket/core/audio_ring.hpp"
 #include "pspocket/core/log.hpp"
@@ -28,47 +30,120 @@ struct AudioOutput::Impl {
     AVAudioEngine* engine = nil;
     AVAudioSourceNode* source = nil;
     AVAudioUnitTimePitch* pitch = nil; // cellAudio's stretcher
-    bool valid = false;
+    id observer = nil;                 // the engine's configuration changes (D-997)
+    std::mutex mutex;                  // around making, starting and stopping the engine
+    f32 volume = -1;                   // PSPOCKET_AUDIO_VOLUME, kept for an engine made again
+    bool stretch = false;
+    f32 tempo = 1.0f;
+    std::atomic<bool> valid{false};
+    u32 restarts = 0;
+
+    // The engine and its nodes; the ring stays (what cellAudio pushed meanwhile plays when it runs again).
+    void make();
+    bool start(const char* why);
+    void observe();
 };
 
-AudioOutput::AudioOutput() : impl_(std::make_unique<Impl>())
+void AudioOutput::Impl::make()
 {
-    Impl* impl = impl_.get();
+    if (observer) [[NSNotificationCenter defaultCenter] removeObserver:observer];
+    observer = nil;
+    if (engine) [engine stop];
     AVAudioFormat* format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:kSampleRate channels:2];
-    impl->engine = [AVAudioEngine new];
-    impl->source = [[AVAudioSourceNode alloc] initWithFormat:format
+    engine = [AVAudioEngine new];
+    AudioRing* r = &ring;
+    source = [[AVAudioSourceNode alloc] initWithFormat:format
         renderBlock:^OSStatus(BOOL* silence, const AudioTimeStamp*, AVAudioFrameCount frames, AudioBufferList* out) {
             if (out->mNumberBuffers < 2) return noErr;
             auto* left = static_cast<f32*>(out->mBuffers[0].mData);
             auto* right = static_cast<f32*>(out->mBuffers[1].mData);
-            *silence = impl->ring.pull(left, right, frames) == 0;
+            *silence = r->pull(left, right, frames) == 0;
             return noErr;
         }];
-    impl->pitch = [AVAudioUnitTimePitch new];
-    impl->pitch.bypass = YES;
-    [impl->engine attachNode:impl->source];
-    [impl->engine attachNode:impl->pitch];
-    [impl->engine connect:impl->source to:impl->pitch format:format];
-    [impl->engine connect:impl->pitch to:impl->engine.mainMixerNode format:format];
+    pitch = [AVAudioUnitTimePitch new];
+    pitch.rate = stretch ? tempo : 1.0f;
+    pitch.bypass = stretch ? NO : YES;
+    [engine attachNode:source];
+    [engine attachNode:pitch];
+    [engine connect:source to:pitch format:format];
+    [engine connect:pitch to:engine.mainMixerNode format:format];
+    if (volume >= 0) engine.mainMixerNode.outputVolume = volume;
+    observe();
+}
+
+// AVAudioEngine stops when its output changes (another device, another sample rate: AirPlay screen mirroring
+// starting or ending, headphones, a Mac's default output) and says so; it is started again on what is there now. The
+// connections are made again so the main mixer converts to the new output's format. Before (run 330 and the user's
+// report of 2026-10-15), the game was silent from the first mirroring to the end of the session.
+void AudioOutput::Impl::observe()
+{
+    Impl* self = this;
+    observer = [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioEngineConfigurationChangeNotification
+                                                                 object:engine
+                                                                  queue:nil
+                                                             usingBlock:^(NSNotification*) {
+                                                                 std::lock_guard lock(self->mutex);
+                                                                 self->start("the sound's output changed");
+                                                             }];
+}
+
+bool AudioOutput::Impl::start(const char* why)
+{
+    if (engine.isRunning) return true;
+    AVAudioFormat* format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:kSampleRate channels:2];
+    if (why) {
+        [engine disconnectNodeOutput:pitch];
+        [engine connect:pitch to:engine.mainMixerNode format:format];
+    }
+    [engine prepare];
+    NSError* error = nil;
+    if (![engine startAndReturnError:&error]) {
+        PS_LOG_ERROR(kChan, "the audio engine didn't start{}{}: {}", why ? " again after " : "", why ? why : "",
+            error ? error.localizedDescription.UTF8String : "no reason given");
+        return false;
+    }
+    valid = true;
+    const double device_rate = [engine.outputNode outputFormatForBus:0].sampleRate;
+    if (why) {
+        restarts++;
+        PS_LOG_INFO(kChan, "sound out again ({}; device {} Hz; restart {})", why, device_rate, restarts);
+    } else {
+        PS_LOG_INFO(kChan, "sound out: {} Hz stereo through AVAudioEngine (device {} Hz)", kSampleRate, device_rate);
+    }
+    return true;
+}
+
+AudioOutput::AudioOutput() : impl_(std::make_unique<Impl>())
+{
+    Impl* impl = impl_.get();
     // PSPOCKET_AUDIO_VOLUME=0..1 (D-976): the device still pulls the sound at its pace (cellAudio's "sound:" lines
     // measure the game's lateness against it) at that volume: 0 measures a walk without playing it aloud.
     if (const char* v = std::getenv("PSPOCKET_AUDIO_VOLUME"); v && *v) {
-        impl->engine.mainMixerNode.outputVolume = std::clamp(static_cast<f32>(std::atof(v)), 0.0f, 1.0f);
-        PS_LOG_INFO(kChan, "sound out at volume {}", impl->engine.mainMixerNode.outputVolume);
+        impl->volume = std::clamp(static_cast<f32>(std::atof(v)), 0.0f, 1.0f);
+        PS_LOG_INFO(kChan, "sound out at volume {}", impl->volume);
     }
-    NSError* error = nil;
-    if (![impl->engine startAndReturnError:&error]) {
-        PS_LOG_ERROR(kChan, "the audio engine didn't start: {}",
-            error ? error.localizedDescription.UTF8String : "no reason given");
+    std::lock_guard lock(impl->mutex);
+    impl->make();
+    impl->start(nullptr);
+}
+
+void AudioOutput::restart(const char* why, bool rebuild)
+{
+    std::lock_guard lock(impl_->mutex);
+    if (rebuild) {
+        impl_->make();
+    } else if (impl_->engine.isRunning) {
         return;
     }
-    impl->valid = true;
-    PS_LOG_INFO(kChan, "sound out: {} Hz stereo through AVAudioEngine (device {} Hz)", kSampleRate,
-        [impl->engine.outputNode outputFormatForBus:0].sampleRate);
+    impl_->start(why);
 }
+
+bool AudioOutput::running() const { return impl_->engine.isRunning; }
 
 AudioOutput::~AudioOutput()
 {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->observer) [[NSNotificationCenter defaultCenter] removeObserver:impl_->observer];
     if (impl_->engine) [impl_->engine stop];
 }
 
@@ -86,6 +161,9 @@ u32 AudioOutput::device_frames() const { return impl_->ring.largest_pull(); }
 void AudioOutput::set_stretch(bool on, f32 tempo)
 {
     if (!impl_->valid) return;
+    std::lock_guard lock(impl_->mutex); // an engine made again (restart) takes these as it is made
+    impl_->stretch = on;
+    impl_->tempo = tempo;
     impl_->pitch.rate = on ? tempo : 1.0f;
     impl_->pitch.bypass = on ? NO : YES;
 }

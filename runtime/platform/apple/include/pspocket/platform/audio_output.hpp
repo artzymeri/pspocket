@@ -22,6 +22,14 @@ public:
     // False when the engine couldn't start (no output device): push() then drops everything.
     bool valid() const;
 
+    // Starts the engine again where the system's sound now goes (D-997). The engine starts itself again after its
+    // configuration changed (AVAudioEngineConfigurationChangeNotification: another output, such as AirPlay screen
+    // mirroring starting or ending); the platform calls this after what the engine is not told of (on iOS: an
+    // interruption ended, the route changed, the app came back, `rebuild` after the media services were reset: the
+    // engine and its nodes made anew). Does nothing while it runs, unless `rebuild`. Any thread.
+    void restart(const char* why, bool rebuild = false);
+    bool running() const;
+
     // One period from cellAudio's sink: `frames` interleaved stereo float frames. Never blocks.
     void push(const f32* samples, u32 frames);
 

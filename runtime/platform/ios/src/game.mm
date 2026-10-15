@@ -339,6 +339,28 @@ void set_env_from_file(const std::filesystem::path& path)
     }
 }
 
+// The playback category (it plays with the ring/silent switch on), a cellAudio period a callback, active (D-074;
+// again after iOS's media services were reset, D-997).
+void set_up_audio_session(AVAudioSession* session)
+{
+    NSError* audio_error = nil;
+    if (![session setCategory:AVAudioSessionCategoryPlayback error:&audio_error] ||
+        ![session setPreferredIOBufferDuration:static_cast<double>(hle::kAudioBlockFrames) / hle::kAudioSampleRate
+                                         error:&audio_error] ||
+        ![session setActive:YES error:&audio_error]) {
+        PS_LOG_WARN(kChan, "audio session: {}", audio_error ? audio_error.localizedDescription.UTF8String : "?");
+    }
+}
+
+// Where the sound goes now: the outputs' names and kinds ("ArtZ's MacBook Pro (AirPlay)", "Speaker (Speaker)").
+std::string audio_route(AVAudioSession* session)
+{
+    std::string r;
+    for (AVAudioSessionPortDescription* port in session.currentRoute.outputs)
+        r += std::format("{}{} ({})", r.empty() ? "" : ", ", port.portName.UTF8String, port.portType.UTF8String);
+    return r.empty() ? "nothing" : r;
+}
+
 // The app's Settings › Experiments switches (D-996): a UserDefaults key the app's toggle writes, read once at boot into
 // the PSPOCKET_ switch it stands for. A value the switch file set first wins (a test the Mac set up stays as it is).
 void set_env_from_settings()
@@ -642,16 +664,10 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     // Sound: the playback category (it plays with the ring/silent switch on) and a speaker that takes a cellAudio
     // period at a time (iOS's default, about 20 ms per callback, would swing the 34 ms buffer by more than half), then
     // cellAudio's mix to the speaker, paced by what it holds (D-074) and stretched while the game is behind (D-075).
-    NSError* audio_error = nil;
     AVAudioSession* session = [AVAudioSession sharedInstance];
-    if (![session setCategory:AVAudioSessionCategoryPlayback error:&audio_error] ||
-        ![session setPreferredIOBufferDuration:static_cast<double>(hle::kAudioBlockFrames) / hle::kAudioSampleRate
-                                         error:&audio_error] ||
-        ![session setActive:YES error:&audio_error]) {
-        PS_LOG_WARN(kChan, "audio session: {}", audio_error ? audio_error.localizedDescription.UTF8String : "?");
-    }
-    PS_LOG_INFO(kChan, "audio session: {} Hz, {:.1f} ms per callback", session.sampleRate,
-        session.IOBufferDuration * 1000.0);
+    set_up_audio_session(session);
+    PS_LOG_INFO(kChan, "audio session: {} Hz, {:.1f} ms per callback, out to {}", session.sampleRate,
+        session.IOBufferDuration * 1000.0, audio_route(session));
     s->audio = std::make_unique<platform::AudioOutput>();
     if (s->audio->valid()) {
         platform::AudioOutput* out = s->audio.get();
@@ -659,6 +675,50 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
             *s->hle, [out](const f32* samples, u32 frames) { out->push(samples, frames); },
             [out] { return hle::AudioBufferLevel{out->queued(), out->device_frames()}; },
             [out](bool on, f32 tempo) { out->set_stretch(on, tempo); });
+    }
+    // The sound follows wherever iOS sends it (D-997): AirPlay screen mirroring to a Mac moves it there and back, a
+    // call or Siri interrupts it, headphones come and go. The engine starts itself again when its output changes
+    // (AudioOutput); these are what it is not told of. The session lives as long as the app, as these observers do.
+    {
+        platform::AudioOutput* out = s->audio.get();
+        NSNotificationCenter* centre = [NSNotificationCenter defaultCenter];
+        [centre addObserverForName:AVAudioSessionInterruptionNotification
+                            object:nil
+                             queue:nil
+                        usingBlock:^(NSNotification* n) {
+                            const auto type = static_cast<AVAudioSessionInterruptionType>(
+                                [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue]);
+                            PS_LOG_INFO(kChan, "sound interrupted: {}",
+                                type == AVAudioSessionInterruptionTypeBegan ? "began" : "ended");
+                            if (type != AVAudioSessionInterruptionTypeEnded) return;
+                            [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                            out->restart("an interruption ended");
+                        }];
+        [centre addObserverForName:AVAudioSessionRouteChangeNotification
+                            object:nil
+                             queue:nil
+                        usingBlock:^(NSNotification* n) {
+                            const auto reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+                            PS_LOG_INFO(kChan, "sound now out to {} (route change, reason {})",
+                                audio_route([AVAudioSession sharedInstance]), reason);
+                            out->restart("the route changed");
+                        }];
+        [centre addObserverForName:AVAudioSessionMediaServicesWereResetNotification
+                            object:nil
+                             queue:nil
+                        usingBlock:^(NSNotification*) {
+                            PS_LOG_WARN(kChan, "iOS's media services were reset: the sound is set up again");
+                            set_up_audio_session([AVAudioSession sharedInstance]);
+                            out->restart("the media services were reset", true);
+                        }];
+        [centre addObserverForName:UIApplicationDidBecomeActiveNotification
+                            object:nil
+                             queue:nil
+                        usingBlock:^(NSNotification*) {
+                            if (out->running()) return;
+                            [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                            out->restart("the app came back");
+                        }];
     }
 
     // Firmware modules (D-157): with the system software installed, the import libraries pspocket has nothing of are

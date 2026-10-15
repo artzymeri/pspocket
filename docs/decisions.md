@@ -16162,3 +16162,22 @@ Settings gets an Experiments section with "3D models on the GPU (EDGE)", a UserD
 reads once at the game's start (game.mm, set_env_from_settings) into PSPOCKET_EDGE_GPU=1. A value the switch file set
 wins, so a test set up from the Mac stays as it is; the setting is logged as "(from Settings)" like the file's lines.
 Off by default. Further switches join the same table (key, PSPOCKET_ name, value).
+
+## D-997 · 2026-10-15 · The sound follows the output iOS chooses: AirPlay mirroring, interruptions, resets
+
+The user's report: screen mirroring the iPhone to a Mac (AirPlay) silenced the game, and it stayed silent after the
+mirroring ended. AVAudioEngine stops when its output changes and posts AVAudioEngineConfigurationChangeNotification;
+AudioOutput never listened, so the engine stayed stopped for the rest of the session. Calls, Siri, headphones and a
+reset of iOS's media services had the same gap.
+
+- AudioOutput (runtime/platform/apple, macOS and iOS): on its engine's configuration change it connects the time-pitch
+  unit to the main mixer again (the mixer converts to the new output's format) and starts the engine on what is there
+  now, logged "sound out again (...; restart N)". `restart(why, rebuild)` for what the engine is not told of: nothing
+  while it runs; `rebuild` makes the engine and its nodes anew (the ring, the volume and the stretcher's setting kept).
+  set_stretch takes the same lock, so it never meets a time-pitch unit being replaced.
+- The iPhone (game.mm): the audio session's setup in one function (set_up_audio_session); observers for the end of an
+  interruption (session active again, restart), route changes (logged with the outputs' names and kinds, restart),
+  the media services reset (session set up again, rebuild) and the app becoming active (restart if stopped). The
+  session's first line names the route.
+- Checked on the Mac (a scratch program against the platform library, volume 0): the engine plays, a rebuild with the
+  stretcher on keeps it playing (23,040 frames, then 49,501). A real AirPlay switch is for the phone.
