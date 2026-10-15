@@ -16075,8 +16075,10 @@ GTA V's EDGE job hoisted 2,347 instructions out of its loops).
   2,843 hoists.
 - Static over all 150 programs (LLVM 22; with D-958, D-959, D-960, D-963 and D-964 in both): 5,477,958 host
   instructions with one C function each, 4,770,792 in the fast functions (-12.9%), spills 1,311,508 to 1,109,264
-  (-15.4%); the twins 4,482,941 at -O1. Translation: GTA V's SPU programs compile in 453 CPU seconds (fast at -O2,
-  twins at -O1) against 1,084 for the lift before this work, measured under similar load (LLVM 22, three threads).
+  (-15.4%); the twins 4,482,941 at -O1. Translation: pspocket-prepare compiles GTA V's 150 SPU programs (with a stand-in PPU
+  translation, three threads on the Mac, one after the other) in 121 s against 233 s for the lift before this work
+  (-48%); the cost model still predicts the old sizes (the preparation's rates: SPU 0.03 against 0.33), so the phone's
+  first time left will be long until its rates learn.
 - Measured in one session (D-962): the final lift against it without D-961, 6.5% less SPU time (GraphicsMain -19%).
 
 ## D-962 · 2026-10-15 · Two translations of the SPU programs in one session; poll exits that store only live registers (not kept)
@@ -16134,4 +16136,5 @@ asm, so the compiler cannot turn it back into the two; Apple clang built one of 
 lookup (D-253), so the Mac's own builds keep the shuffle (`!defined(__apple_build_version__)`). LLVM 22 over all 150
 programs: rev64 and ext 312,177 to 12,390, TBL +150,519, host instructions 5,601,900 to 5,477,958 (-2.2%), spills
 +0.5% (the index takes a register). spu-check over a game library LLVM 22 built (pspocket-prepare with a stand-in
-PPU translation, `--library`): 150 programs, 68,836 trials, no difference. Not measurable on the Mac (Apple clang).
+PPU translation, `--library`): 150 programs, 68,836 trials, no difference (again after the rebase onto D-965 to
+D-969's replacements: 68,835 trials). Not measurable on the Mac (Apple clang).
