@@ -1,6 +1,6 @@
 // edge-gpu-check: EDGE geometry's GPU path against the SPU, on states of the game's jobs (D-988).
 //
-//   edge-gpu-check PROBE_DIR [--max N] [--verbose]
+//   edge-gpu-check PROBE_DIR [--max N] [--verbose] [--metal [--threads N] [--repeat N]]
 //
 // PROBE_DIR holds the states spu-job-replay saved at the entry and return of the EDGE stages of GTA V's EDGE build
 // (--probe 0daf0 --probe 07a10 --probe 0eff8 --probe 0f5b8). For each job the stages' stand-ins (spu/edge_gpu.hpp)
@@ -10,6 +10,9 @@
 // with the SPU's: the output vertices (bytes), the screen-space vertices the culling used, and the kept indices.
 // The kernels' code emulates the SPU's arithmetic on rounding to nearest (as the GPU's): it runs in the default
 // floating-point environment, and its results are the SPU's bit for bit but for rare fused products (D-988).
+// --metal runs the work items on this machine's GPU too (the Metal kernel, as the backend compiles it) and compares its
+// output with the CPU's, and times the dispatch of them all (the fastest of --repeat, default 5; --threads a job,
+// default 256).
 // The probes hold the game's data: they stay in the gitignored inventory/ (CLAUDE.md rule 1).
 
 #include <algorithm>
@@ -29,10 +32,14 @@
 #include "pspocket/spu/context.h"
 #include "pspocket/spu/edge_gpu.hpp"
 #include "pspocket/spu/fp.h"
+#if PSPOCKET_HAVE_METAL
+#include "pspocket/rsx/metal/metal_backend.hpp"
+#endif
 
 #include "pspocket/core/edge_kernels.h"
 
 namespace eg = pspocket::spu::edge_gpu;
+using namespace pspocket;
 
 namespace {
 
@@ -104,11 +111,16 @@ std::string compare_leave(const State& in, const State& out, void (*leave)(const
 int main(int argc, char** argv)
 {
     std::string dir;
-    bool verbose = false;
+    bool verbose = false, metal = false;
+    uint32_t threads = 256;
+    int repeat = 5;
     uint64_t max = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--verbose") verbose = true;
+        else if (a == "--metal") metal = true;
+        else if (a == "--threads" && i + 1 < argc) threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
+        else if (a == "--repeat" && i + 1 < argc) repeat = std::atoi(argv[++i]);
         else if (a == "--max" && i + 1 < argc) max = std::strtoull(argv[++i], nullptr, 0);
         else if (dir.empty()) dir = a;
         else {
@@ -126,6 +138,8 @@ int main(int argc, char** argv)
         if (n.find("-0daf0-0-in.bin") != std::string::npos) seqs[std::strtoull(n.c_str(), nullptr, 10)] = true;
     }
     Totals t;
+    std::vector<std::vector<uint8_t>> blobs; // --metal: every work item
+    std::vector<std::vector<uint8_t>> cpu_vertices, cpu_indices;
     const auto path = [&](uint64_t seq, const char* fn, const char* io) {
         return std::filesystem::path(dir) / std::format("{}-{}-0-{}.bin", seq, fn, io);
     };
@@ -170,7 +184,8 @@ int main(int argc, char** argv)
         // The kernels' code over the work item.
         std::vector<uint8_t> out(j.num_vertexes * j.out_stride + 16, 0);
         std::vector<ek_screen> scr(j.num_vertexes);
-        for (uint32_t v = 0; v < j.num_vertexes; v++) scr[v] = ek_vertex(r.blob.data(), &j, v, out.data() + v * j.out_stride);
+        const std::vector<float> pal = ek_palette(r.blob.data());
+        for (uint32_t v = 0; v < j.num_vertexes; v++) scr[v] = ek_vertex(r.blob.data(), &j, pal.data(), v, out.data() + v * j.out_stride);
         std::vector<uint16_t> kept;
         const uint8_t* idx = r.blob.data() + j.indices;
         for (uint32_t i = 0; i + 2 < j.num_indexes; i += 3) {
@@ -195,7 +210,7 @@ int main(int argc, char** argv)
                     const uint8_t* q = r.blob.data() + j.uv_data + v * j.uv_stride + off;
                     float vec[4];
                     ek_unit_vector((uint32_t(q[0]) << 16) | (uint32_t(q[1]) << 8) | q[2], vec);
-                    if (j.skin && !decode_only) ek_skin_vector(vec, ek_skin_rows(r.blob.data(), &j, v));
+                    if (j.skin && !decode_only) ek_skin_vector(vec, ek_skin_rows(r.blob.data(), &j, pal.data(), v));
                     const uint32_t table = ps_ld32(tabs.ls.data() + r.ctx + 0x58 + 4 * (which ? 3 : 2));
                     for (uint32_t k = 0; k < 4; k++) {
                         float want;
@@ -209,6 +224,15 @@ int main(int argc, char** argv)
             }
             if (bad) std::printf("job %llu: %u normal and tangent components differ (at most %u ulps), skinning %u\n",
                 static_cast<unsigned long long>(seq), bad, worst, j.skin);
+        }
+
+        if (metal) {
+            blobs.push_back(r.blob);
+            cpu_vertices.push_back(out);
+            cpu_vertices.back().resize(j.num_vertexes * j.out_stride);
+            std::vector<uint8_t> be(2 * kept.size());
+            for (size_t i = 0; i < kept.size(); i++) ps_st16(be.data() + 2 * i, kept[i]);
+            cpu_indices.push_back(be);
         }
 
         // Against the SPU: the output vertices.
@@ -328,5 +352,24 @@ int main(int argc, char** argv)
     std::printf("culling: %llu jobs, %llu triangles, kept %llu by the SPU and %llu here; %llu index lists the same\n",
         static_cast<unsigned long long>(t.cull_jobs), static_cast<unsigned long long>(t.tri), static_cast<unsigned long long>(t.kept_spu),
         static_cast<unsigned long long>(t.kept_gpu), static_cast<unsigned long long>(t.lists_same));
+#if PSPOCKET_HAVE_METAL
+    if (metal) {
+        const rsx::metal::EdgeKernelRun run = rsx::metal::edge_run_kernel(blobs, threads, repeat);
+        if (!run.error.empty()) {
+            std::printf("metal: %s\n", run.error.c_str());
+            return 1;
+        }
+        uint64_t same_v = 0, same_i = 0;
+        for (size_t k = 0; k < blobs.size(); k++) {
+            same_v += run.vertices[k] == cpu_vertices[k];
+            same_i += run.indices[k] == cpu_indices[k] && run.counts[k] == cpu_indices[k].size() / 2;
+        }
+        std::printf("metal: %zu jobs, %llu the same vertices and %llu the same kept indices as the CPU's; %.3f ms of GPU "
+                    "for them all (%u threads a job, the fastest of %d)\n", blobs.size(), static_cast<unsigned long long>(same_v),
+            static_cast<unsigned long long>(same_i), run.gpu_ms, threads, repeat);
+    }
+#else
+    if (metal) std::printf("metal: this build has no Metal backend\n");
+#endif
     return 0;
 }

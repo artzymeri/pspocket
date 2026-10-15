@@ -126,6 +126,10 @@ pspocket_set_warnings(spu-job-replay)
 # the SPU, on states of the game's jobs saved by spu-job-replay --probe (D-988).
 add_executable(edge-gpu-check tools/edge_gpu_check.cpp)
 target_link_libraries(edge-gpu-check PRIVATE pspocket::spu pspocket::core)
+if(TARGET pspocket::rsx_metal)
+    target_link_libraries(edge-gpu-check PRIVATE pspocket::rsx_metal)
+    target_compile_definitions(edge-gpu-check PRIVATE PSPOCKET_HAVE_METAL=1)
+endif()
 pspocket_set_warnings(edge-gpu-check)
 
 # Programs lifted again alone (a lifter change that touches a few programs, D-965), compiled into pspocket-boot,
