@@ -122,6 +122,7 @@
 #include "pspocket/loader/system.hpp"
 #include "pspocket/lv2/kernel.hpp"
 #include "pspocket/lv2/report.hpp"
+#include "pspocket/lv2/sync.hpp"
 #include "pspocket/core/png.hpp"
 #include "pspocket/core/thread_report.hpp"
 #include "pspocket/game/host.hpp"
@@ -1622,6 +1623,13 @@ int main(int argc, char** argv)
             std::printf("SPU DMA in RSX local memory %#010x: %llu bytes read, %llu written\n", PS_MEM_RSX_LOCAL_BASE + (mb << 20),
                 static_cast<unsigned long long>(got), static_cast<unsigned long long>(put));
         }
+    }
+    if (const lv2::SenderDeferrals d = lv2::sender_deferrals(); d.deferred) { // D-999
+        std::printf("events whose receiver let the sending PPU thread go on first: %llu (its next call %llu, it ran on "
+                    "%llu, the 10 ms limit %llu), %.1f ms waited\n",
+            static_cast<unsigned long long>(d.deferred), static_cast<unsigned long long>(d.by_call),
+            static_cast<unsigned long long>(d.by_run), static_cast<unsigned long long>(d.by_limit),
+            static_cast<double>(d.ns) / 1e6);
     }
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());

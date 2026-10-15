@@ -155,19 +155,29 @@ public:
 
     // Guarded by lock.
     std::deque<Event> events;
+    std::deque<WakerMark> senders; // beside `events`: the PPU thread that sent each (D-999)
     WaitQueue waiters;
 
-    // CELL_OK, CELL_EBUSY when full (not an error for the guest), CELL_ENOTCONN when destroyed.
-    Result send(const Event& event);
-    // Blocks until an event arrives. CELL_OK (event in `out`), CELL_ETIMEDOUT, CELL_ECANCELED (destroyed with
-    // SYS_EVENT_QUEUE_DESTROY_FORCE), CELL_ESRCH (destroyed before the call).
-    Result receive(Waiter& w, u64 timeout_us, Event& out);
+    // CELL_OK, CELL_EBUSY when full (not an error for the guest), CELL_ENOTCONN when destroyed. `sender`: the PPU
+    // thread sending (sys_event_port_send), given to the receiver.
+    Result send(const Event& event, const WakerMark& sender = {});
+    // Blocks until an event arrives. CELL_OK (event in `out`, its sender in `sender`), CELL_ETIMEDOUT, CELL_ECANCELED
+    // (destroyed with SYS_EVENT_QUEUE_DESTROY_FORCE), CELL_ESRCH (destroyed before the call).
+    Result receive(Waiter& w, u64 timeout_us, Event& out, WakerMark* sender = nullptr);
     // Takes up to `max` queued events without blocking.
     usize try_receive(Event* out, usize max);
     void drain();
     // Marks the queue dead. Without force, CELL_EBUSY while someone waits; with force, waiters get CELL_ECANCELED.
     Result destroy(bool force);
 };
+
+// How often a PPU thread a PPU thread's event woke waited for that sender to go on first (D-999, event.cpp), and why
+// the wait ended: the sender began its next call, its host thread ran on, or 10 ms passed.
+struct SenderDeferrals {
+    u64 deferred = 0, by_call = 0, by_run = 0, by_limit = 0;
+    u64 ns = 0; // time waited in all
+};
+SenderDeferrals sender_deferrals();
 
 // sys_event_port. Sending through a port to a destroyed queue gives CELL_ENOTCONN.
 class EventPort final : public Object {

@@ -134,6 +134,17 @@ struct WaitOn {
     u32 id = 0; // the object's lv2 ID
 };
 
+// The PPU thread whose call sent an event (D-999), so the thread that receives it can let that thread go on first, as
+// lv2's scheduler does on the PS3 (defer_to_sender, event.cpp): which thread, its priority, its lv2_calls when it
+// sent, its host thread (for that thread's CPU time) and when.
+struct WakerMark {
+    u32 thread = 0; // lv2 thread ID; 0: none
+    s32 prio = 0;
+    u64 calls = 0;
+    u64 host_thread = 0;
+    std::chrono::steady_clock::time_point at{};
+};
+
 struct Waiter {
     u32 id = 0;                // lv2 thread ID (the owner value locks record)
     std::atomic<s32> prio{0};  // lv2 priority: lower is more urgent
@@ -147,6 +158,7 @@ struct Waiter {
     // Written by the waker before wake(), read by the waiter after it returns.
     Result result = CELL_OK;
     u64 data[4]{};
+    WakerMark waker; // an event queue's: the PPU thread that sent the event (D-999)
     // What the waiter waits for (event flag: bit pattern and mode), written before it queues.
     u64 want[2]{};
 

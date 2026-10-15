@@ -16211,6 +16211,44 @@ every SPU program interpreted. Found (agent f2):
   "hdd1" beside hdd0's folder) and remove each other's cache at the start ("was in use ... removed"); the Mac runs
   for this put each hdd0 in a folder of its own.
 
+## D-999 · 2026-10-15 · The PPU thread that sends an event goes on before the thread it wakes (Assassin's Creed's install-screen freeze)
+
+The iPhone's Assassin's Creed (fresh hdd0) stopped drawing at its "press START to install" screen (frame 178, every
+PPU thread waiting, its sound task busy as usual: run 331's Instruments trace showed that task at its usual 30%,
+not a spin). The Mac showed the same thread states, the same log and the same missing call in 2 of 17 runs side by
+side (and 0 of 14 alone). Found:
+
+- **The race (the game's).** Its main thread runs the save data work on a worker thread object ("SaveFileThread",
+  Gear's thread wrapper at 0x763c8): reset the "go" event, Start (0x6e1c0: create the thread only if the object's
+  state word +144 is idle, <= 1; otherwise nothing, no error), reset "done", set "go", wait "done" (0xd21a08, 10 ms
+  polls). The worker runs cellSaveDataAutoLoad2, sets "done" (sys_event_port_send), and only then stores its state
+  idle (0x764a4) and exits. Woken by "done", the main thread starts the same object again for cellSaveDataAutoSave2:
+  if it gets to Start before the worker's store, no thread is made and it waits for "done" forever. On the PS3 the
+  sender keeps running (lv2's scheduler: the receiver, of the same priority 1001, runs after it), and its store is a
+  few instructions against the main thread's three syscalls. Here each PPU thread is a host thread: when the host
+  does not run the sender for a moment (another thread takes its core; the phone's six cores, run side by side on the
+  Mac) the receiver wins. Shown with the events traced (sends, receives, drains, thread creation: the second
+  SaveFileThread never created, no AutoSave2 after AutoLoad2 in every frozen log, the phone's included) and made
+  certain with a 2 ms sleep after each send (PSPOCKET_LV2_SEND_DELAY_US=2000): 2 of 5 runs froze, 1 more crashed in
+  the game's cache index (the SIGBUS at 0x0b0000f8 that runs under load also met, garden runs at 300 s), 2 passed.
+- **The fix (lv2, event.cpp).** A PPU thread woken by a PPU thread's sys_event_port_send, of the same or a lower
+  priority (a more urgent one would preempt the sender on the PS3), or taking an event such a thread queued under
+  10 ms before, goes back to guest code only once the sender is past its call: the sender begins its next call into
+  lv2 or a library (PpuThread::lv2_calls, counted where calls begin and return, dbg_stop_point), or its host thread has
+  run 20 us since (thread_info / the thread's CPU clock: a sender spinning in guest code without calls is running, so
+  nothing to wait for), or it is gone, or 10 ms have passed. The receiver yields, then sleeps 20 us at a time. Event
+  queues only, where the race was found; other wake-ups are as before.
+- **Measured:** with the 2 ms sleep after every send, 6 of 6 runs pass the install screen (no freeze, no cache crash).
+  pspocket-boot prints the waits at the end of a run. GTA V's gate walk (128 s): 8,300 to 8,400 waits, 98% ended by
+  the sender's next call, none by the limit, 144 to 205 ms waited in all (about 20 us each); median 29.8 fps on, off
+  and on again, the slowest window 29.8, 29.8 and 23.0 (that one window as the day's earlier gates without the change:
+  22.8 to 23.8 in 5 of 20). PSPOCKET_LV2_SENDER_FIRST=0 turns it off for A/B.
+- Test: tests/lv2/test_event.cpp (a sender that "runs" 3 ms between its send and its next call, by sleeping: a
+  receiver of the same or a lower priority comes back after the next call, from a wake and from a queued event; a more
+  urgent one at once; a sender that makes no further call holds it 10 ms, not more). It fails with
+  PSPOCKET_LV2_SENDER_FIRST=0.
+- Not translated code: the phone needs the app rebuilt, not its translations (kTranslatorGeneration unchanged).
+
 ## D-987 · 2026-10-15 · EDGE geometry on the GPU, phase 1: what GTA V's EDGE job reads and writes, the hole, go
 
 The steady-30 plan's last item (docs/improve.md, item 4, "later Metal compute"; the user: "do the edge on gpu too").

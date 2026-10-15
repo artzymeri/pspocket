@@ -161,6 +161,10 @@ public:
     // lv2 directly, so a thread inside an HLE function is not in a syscall.
     std::atomic<u32> current_syscall{kNoSyscall};
 
+    // The thread's calls into lv2 or a library, counted as each begins and as it returns (dbg_stop_point): another
+    // thread reads it to see this one get past a call (defer_to_sender, event.cpp, D-999). Written by the owning thread only.
+    std::atomic<u64> lv2_calls{0};
+
     // A debugger's stop (sys_dbg_stop_threads, D-937): once asked, the thread stops at its next call into lv2 or a
     // library, or as such a call returns (dbg_stop_point), and waits there until sys_dbg_continue_threads.
     // `dbg_stopped` while it waits; guarded by the kernel's debugging lock.
@@ -186,6 +190,7 @@ PpuThread* current_thread();
 void dbg_park(PpuThread& t);
 inline void dbg_stop_point(PpuThread& t)
 {
+    t.lv2_calls.store(t.lv2_calls.load(std::memory_order_relaxed) + 1, std::memory_order_release); // D-999
     if (t.dbg_stop.load(std::memory_order_acquire)) [[unlikely]] dbg_park(t);
 }
 // Makes `t` the lv2 thread of the calling host thread (nullptr: none): a PPU thread's host thread at its start, and the

@@ -401,3 +401,103 @@ TEST_CASE("lv2 event flag: handshakes between thread pairs", "[lv2][event_flag][
     REQUIRE(c.call(kFlagGet, request, pat) == CELL_OK);
     CHECK(f.r64(pat) == 0);
 }
+
+// D-999: a PPU thread woken by another PPU thread's event, of the same or a lower priority, goes back to guest code
+// only once the sender has got past its call (its next call into lv2 begins), as lv2's scheduler leaves the sender
+// running on the PS3. Assassin's Creed's main thread, woken by a worker's "done", otherwise found the worker's object
+// still busy and never started the next one (its first-install freeze). The sender here "runs guest code" between its
+// send and its next call by sleeping: a host thread the host does not run.
+TEST_CASE("lv2 event queue: the sending PPU thread goes on first (D-999)", "[lv2][event]")
+{
+    using namespace std::chrono_literals;
+    Fixture f;
+    Caller c(*f.kernel, "main");
+    const u32 q = make_queue(f, c, 1);
+    const u32 p = make_port(f, c);
+    REQUIRE(c.call(kPortConnectLocal, p, q) == CELL_OK);
+    const u32 other = make_queue(f, c, 1); // the sender's next call: a tryreceive here
+    const u32 events = f.alloc(32), number = f.alloc(4);
+
+    // A blocked receiver of the same priority comes back after the sender's next call, not before.
+    for (s32 prio : {1000, 1500}) {
+        std::atomic<bool> past{false}, saw_past{false};
+        std::thread receiver([&] {
+            Caller me(*f.kernel, "receiver", prio);
+            THREAD_REQUIRE(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
+            saw_past = past.load();
+        });
+        REQUIRE(eventually([&] { return queued<EventQueue>(*f.kernel, q) == 1; }));
+        std::thread sender([&] {
+            Caller me(*f.kernel, "sender", 1000);
+            THREAD_REQUIRE(me.call(kPortSend, p, 1, 2, 3) == CELL_OK);
+            std::this_thread::sleep_for(3ms); // not running: the receiver must not overtake it
+            past = true;
+            THREAD_REQUIRE(me.call(kQueueTryReceive, other, events, 1, number) == CELL_OK);
+        });
+        sender.join();
+        receiver.join();
+        CHECK(saw_past);
+    }
+
+    // An event the sender queued, taken soon after: the same.
+    {
+        std::atomic<bool> past{false}, sent{false}, saw_past{false};
+        std::thread sender([&] {
+            Caller me(*f.kernel, "sender", 1000);
+            THREAD_REQUIRE(me.call(kPortSend, p, 1, 2, 3) == CELL_OK);
+            sent = true;
+            std::this_thread::sleep_for(3ms);
+            past = true;
+            THREAD_REQUIRE(me.call(kQueueTryReceive, other, events, 1, number) == CELL_OK);
+        });
+        REQUIRE(eventually([&] { return sent.load(); }));
+        REQUIRE(c.call(kQueueReceive, q, 0, 0) == CELL_OK);
+        saw_past = past.load();
+        sender.join();
+        CHECK(saw_past);
+    }
+
+    // A more urgent receiver does not wait (on the PS3 it would preempt the sender).
+    {
+        std::atomic<bool> past{false}, saw_past{true};
+        std::thread receiver([&] {
+            Caller me(*f.kernel, "receiver", 500);
+            THREAD_REQUIRE(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
+            saw_past = past.load();
+        });
+        REQUIRE(eventually([&] { return queued<EventQueue>(*f.kernel, q) == 1; }));
+        std::thread sender([&] {
+            Caller me(*f.kernel, "sender", 1000);
+            THREAD_REQUIRE(me.call(kPortSend, p, 1, 2, 3) == CELL_OK);
+            std::this_thread::sleep_for(300ms);
+            past = true;
+        });
+        receiver.join();
+        CHECK_FALSE(saw_past);
+        sender.join();
+    }
+
+    // A sender that makes no further call for long holds its receiver 10 ms at most.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        s64 took = -1;
+        std::thread receiver([&] {
+            Caller me(*f.kernel, "receiver", 1000);
+            THREAD_REQUIRE(me.call(kQueueReceive, q, 0, 0) == CELL_OK);
+            took = elapsed_ms(t0);
+        });
+        REQUIRE(eventually([&] { return queued<EventQueue>(*f.kernel, q) == 1; }));
+        std::thread sender([&] {
+            Caller me(*f.kernel, "sender", 1000);
+            THREAD_REQUIRE(me.call(kPortSend, p, 1, 2, 3) == CELL_OK);
+            std::this_thread::sleep_for(500ms);
+        });
+        receiver.join();
+        CHECK(took >= 0);
+        CHECK(took < 300);
+        sender.join();
+    }
+    const SenderDeferrals d = sender_deferrals();
+    CHECK(d.deferred >= 4);
+    CHECK(d.by_limit >= 1);
+}

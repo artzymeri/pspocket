@@ -3,8 +3,31 @@
 //
 // Deviations: RPCS3 marks a port "busy" while a PPU sends to a lower-priority receiver (an artefact of its scheduler
 // emulation, which makes sys_event_port_disconnect return EBUSY meanwhile); there is no such window here.
+//
+// The sender goes on first (D-999). On the PS3, lv2's scheduler leaves a thread that sends an event running: the
+// receiver, of the same or a lower priority, runs after it, and games count on the few instructions the sender runs
+// next (Assassin's Creed signals "done" from a worker thread, then marks the worker's object idle; its main thread,
+// woken by the event, starts the worker again only if the object is idle, else not at all, and waits forever for it).
+// Here every PPU thread is a host thread: a sender the host does not run for a while (another thread takes its core)
+// lets the receiver get there first. So a PPU thread woken by another PPU thread's event, or taking one that thread
+// queued under 10 ms ago, and not more urgent than it (a more urgent receiver preempts the sender on the PS3), does not
+// go back to guest code until the sender has got past its call: until the sender begins another call into lv2 or a
+// library, or its host thread has run 20 us more, or it is gone, or 10 ms have passed since it sent.
+// PSPOCKET_LV2_SEND_DELAY_US=N (debugging) has every sys_event_port_send sleep N us before it returns, which makes
+// the senders such races lose to their receivers show; PSPOCKET_LV2_SENDER_FIRST=0 turns the waiting off.
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
+#include <thread>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 #include "internal.hpp"
 
@@ -17,11 +40,105 @@ constexpr u32 kMaxQueueSize = 127; // sys_event_queue_create size limit
 
 u64 process_pid() { return 1; } // RPCS3 process_getpid()
 
+// ---- the sender goes on first (D-999)
+
+constexpr auto kDeferLimit = std::chrono::milliseconds(10);
+constexpr u64 kSenderRunNs = 20'000; // the sender's host thread run this long since it sent: it is past its call
+
+// The calling host thread, for host_thread_cpu_ns.
+u64 host_thread_self()
+{
+#if defined(__APPLE__)
+    return pthread_mach_thread_np(pthread_self());
+#else
+    clockid_t clock{};
+    return pthread_getcpuclockid(pthread_self(), &clock) == 0 ? static_cast<u64>(clock) : ~u64{0};
+#endif
+}
+
+// The CPU time a host thread has run; false once it is gone.
+bool host_thread_cpu_ns(u64 thread, u64* ns)
+{
+#if defined(__APPLE__)
+    thread_basic_info_data_t info{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(static_cast<thread_act_t>(thread), THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
+            &count) != KERN_SUCCESS) {
+        return false;
+    }
+    *ns = (static_cast<u64>(info.user_time.seconds) + static_cast<u64>(info.system_time.seconds)) * 1'000'000'000ull +
+        (static_cast<u64>(info.user_time.microseconds) + static_cast<u64>(info.system_time.microseconds)) * 1000ull;
+    return true;
+#else
+    if (thread == ~u64{0}) return false;
+    timespec ts{};
+    if (clock_gettime(static_cast<clockid_t>(thread), &ts) != 0) return false;
+    *ns = static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
+    return true;
+#endif
+}
+
+WakerMark mark_sender(PpuThread& t)
+{
+    WakerMark m;
+    m.thread = t.id;
+    m.prio = t.priority();
+    m.calls = t.lv2_calls.load(std::memory_order_relaxed);
+    m.host_thread = host_thread_self();
+    m.at = std::chrono::steady_clock::now();
+    return m;
+}
+
+std::atomic<u64> g_deferred{0}, g_by_call{0}, g_by_run{0}, g_by_limit{0}, g_deferred_ns{0};
+
+// Holds the receiving thread `t` until the sender of `m` is past the call that sent (see the top of the file).
+void defer_to_sender(PpuThread& t, const WakerMark& m)
+{
+    static const bool on = [] { // PSPOCKET_LV2_SENDER_FIRST=0: off, for A/B measurements
+        const char* v = std::getenv("PSPOCKET_LV2_SENDER_FIRST");
+        return !v || std::string_view(v) != "0";
+    }();
+    if (!on || !m.thread || m.thread == t.id || t.priority() < m.prio) return; // none, itself, or a more urgent one
+    const auto start = std::chrono::steady_clock::now();
+    if (start - m.at >= kDeferLimit) return;
+    // The sender's CPU time from here on (reading it in every send would cost each one a call into the host's kernel).
+    u64 cpu_at = 0;
+    if (!host_thread_cpu_ns(m.host_thread, &cpu_at)) return;
+    std::atomic<u64>* counter = &g_by_limit;
+    for (u32 i = 0;; i++) {
+        const std::shared_ptr<PpuThread> sender = t.kernel.thread(m.thread);
+        // Its call's return and its next call each count one.
+        if (!sender || sender->lv2_calls.load(std::memory_order_acquire) >= m.calls + 2) {
+            counter = &g_by_call;
+            break;
+        }
+        u64 ns = 0;
+        if (!host_thread_cpu_ns(m.host_thread, &ns) || ns >= cpu_at + kSenderRunNs) {
+            counter = &g_by_run;
+            break;
+        }
+        if (std::chrono::steady_clock::now() - m.at >= kDeferLimit) break;
+        if (i < 8) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+    g_deferred.fetch_add(1, std::memory_order_relaxed);
+    counter->fetch_add(1, std::memory_order_relaxed);
+    g_deferred_ns.fetch_add(static_cast<u64>(waited.count()), std::memory_order_relaxed);
+}
+
 } // namespace
+
+SenderDeferrals sender_deferrals()
+{
+    return {g_deferred.load(std::memory_order_relaxed), g_by_call.load(std::memory_order_relaxed),
+        g_by_run.load(std::memory_order_relaxed), g_by_limit.load(std::memory_order_relaxed),
+        g_deferred_ns.load(std::memory_order_relaxed)};
+}
 
 // ------------------------------------------------------------------------------------------------- EventQueue
 
-Result EventQueue::send(const Event& event)
+Result EventQueue::send(const Event& event, const WakerMark& sender)
 {
     std::lock_guard lk(lock);
     if (dead) return err(CELL_ENOTCONN);
@@ -30,32 +147,40 @@ Result EventQueue::send(const Event& event)
         w->data[1] = event.data1;
         w->data[2] = event.data2;
         w->data[3] = event.data3;
+        w->waker = sender;
         wake(*w, CELL_OK);
         return CELL_OK;
     }
     if (events.size() < size) {
         events.push_back(event);
+        senders.push_back(sender);
         return CELL_OK;
     }
     return err(CELL_EBUSY);
 }
 
-Result EventQueue::receive(Waiter& w, u64 timeout_us, Event& out)
+Result EventQueue::receive(Waiter& w, u64 timeout_us, Event& out, WakerMark* sender)
 {
     std::unique_lock lk(lock);
     if (dead) return err(CELL_ESRCH);
     if (!events.empty()) {
         out = events.front();
         events.pop_front();
+        if (sender) *sender = senders.front();
+        senders.pop_front();
         return CELL_OK;
     }
+    w.waker = {};
     prepare_wait(w);
     waiters.push(&w);
     const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::EventQueue, id},
         [&](bool) { return waiters.remove(&w) ? CancelResult::Removed : CancelResult::Woken; });
     switch (ws) {
     case WaitStatus::Woken:
-        if (w.result == CELL_OK) out = Event{w.data[0], w.data[1], w.data[2], w.data[3]};
+        if (w.result == CELL_OK) {
+            out = Event{w.data[0], w.data[1], w.data[2], w.data[3]};
+            if (sender) *sender = w.waker;
+        }
         return w.result; // CELL_OK or CELL_ECANCELED
     case WaitStatus::TimedOut: return err(CELL_ETIMEDOUT);
     case WaitStatus::Aborted: break;
@@ -70,6 +195,7 @@ usize EventQueue::try_receive(Event* out, usize max)
     while (n < max && !events.empty()) {
         out[n++] = events.front();
         events.pop_front();
+        senders.pop_front();
     }
     return n;
 }
@@ -78,6 +204,7 @@ void EventQueue::drain()
 {
     std::lock_guard lk(lock);
     events.clear();
+    senders.clear();
 }
 
 Result EventQueue::destroy(bool force)
@@ -88,6 +215,7 @@ Result EventQueue::destroy(bool force)
     for (Waiter* w : waiters.take_all(SYS_SYNC_FIFO)) wake(*w, err(CELL_ECANCELED));
     if (!events.empty()) PS_LOG_WARN(kChan, "event queue {:#x} destroyed with {} unread event(s)", id, events.size());
     events.clear();
+    senders.clear();
     dead = true;
     return CELL_OK;
 }
@@ -277,8 +405,10 @@ Result sys_event_queue_receive(PpuThread& t, u32 equeue_id, u32, u64 timeout)
     if (!q) return err(CELL_ESRCH);
     if (q->type != SYS_PPU_QUEUE) return err(CELL_EINVAL);
     Event ev;
-    const Result r = finish(t, q->receive(t.waiter, timeout, ev));
+    WakerMark sender;
+    const Result r = finish(t, q->receive(t.waiter, timeout, ev, &sender));
     if (r == CELL_OK) {
+        defer_to_sender(t, sender); // D-999
         // lv2 returns the event in r4..r7; the liblv2 wrapper stores them to its sys_event_t.
         t.ctx->gpr[4] = ev.source;
         t.ctx->gpr[5] = ev.data1;
@@ -398,7 +528,13 @@ Result sys_event_port_send(PpuThread& t, u32 eport_id, u64 data1, u64 data2, u64
     }
     if (!queue) return err(CELL_ENOTCONN);
     const u64 source = port->name ? port->name : (process_pid() << 32) | eport_id;
-    return queue->send(Event{source, data1, data2, data3});
+    const Result r = queue->send(Event{source, data1, data2, data3}, mark_sender(t));
+    static const u32 delay_us = [] {
+        const char* v = std::getenv("PSPOCKET_LV2_SEND_DELAY_US");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    if (delay_us) [[unlikely]] std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+    return r;
 }
 
 Result sys_event_flag_create(PpuThread& t, u32 id, u32 attr, u64 init)
