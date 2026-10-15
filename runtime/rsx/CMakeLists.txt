@@ -25,6 +25,7 @@ add_library(pspocket::rsx ALIAS pspocket_rsx)
 if(APPLE)
     enable_language(OBJCXX)
     add_library(pspocket_rsx_metal STATIC
+        metal/src/edge_geometry.mm
         metal/src/metal_backend.mm
         metal/src/pipeline_cache.mm
         metal/src/surface_cache.mm

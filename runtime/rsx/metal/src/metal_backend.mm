@@ -148,6 +148,7 @@ bool MetalBackend::Impl::init()
                                                                   error:&error];
     depth_memory_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_depth_to_memory"]
                                                                   error:&error];
+    if (!edge_init()) edge_pipeline = nil; // EDGE geometry stays on the SPUs (D-988)
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
     blit.fragmentFunction = [kernels newFunctionWithName:@"rsx_blit_fs"];
@@ -313,6 +314,7 @@ void MetalBackend::Impl::submit(bool wait)
 {
     end_pass_for(kEndSubmit);  // the clears waiting run too (D-945)
     finish_closing(false);     // a buffer commits with no encoder open
+    edge_flush();              // the EDGE jobs its draws read, before it (D-988)
     // Uploads first: the render buffer samples what they decode (same queue, so in order).
     id<MTLCommandBuffer> last = nil;
     if (upload_cb) {
@@ -1786,6 +1788,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     restart_begin.push_back(0);
     TransientAllocator::Allocation vertex_data{}, index_data{};
     u32 min_vi = ~0u, max_vi = 0;
+    // EDGE geometry on the GPU (D-988): the job's work item when the index array starts at its ring allocation; its
+    // vertices and indices come from the kernels, its count from their indirect arguments.
+    std::unique_ptr<edge::WorkItem> edge_item;
+    EdgeDraw edge_draw;
     const u32 inputs = vp_inputs & state.vertex_attrib_input_mask();
     auto guest_ok = [&](u32 ea, u32 size) { return size != 0 && mem.is_committed(ea) && mem.is_committed(ea + size - 1); };
     auto register_value = [&](shader::MslAttrib& at, u32 i) {
@@ -1805,6 +1811,33 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         break;
     case DrawCommand::Indexed: {
         const IndexArrayInfo ia = state.index_array();
+        if (edge_pipeline && ia.u16_indices && !d.ranges.empty() && d.ranges[0].first == 0) {
+            if (const auto ea = rsx->translate(ia.offset, ia.location, 2)) edge_item = edge_take(*ea);
+        }
+        if (edge_item) {
+            // The job's hole draws every index from the first (the culling's stand-in kept them all): one range, its
+            // count the kernels', the vertices all of the job's.
+            u32 count = 0;
+            bool contiguous = true;
+            for (const DrawRange& r : d.ranges) {
+                contiguous &= r.first == count;
+                count += r.count;
+            }
+            const auto& j = *reinterpret_cast<const ps_edge_job*>(edge_item->blob.data());
+            if (!contiguous || count > j.num_indexes || j.num_vertexes == 0) {
+                PS_LOG_WARN(kChan, "EDGE draw at {:#x}: ranges not one run from 0 ({} indices, the job's {}): drawn from "
+                    "the GPU's indices all the same", edge_item->alloc_ea, count, j.num_indexes);
+            }
+            vs.index_mode = shader::kIndexU16BE;
+            min_vi = vs.base_index & 0xfffff;
+            max_vi = (vs.base_index + std::max<u32>(j.num_vertexes, 1) - 1) & 0xfffff;
+            ranges.push_back({0, count});
+            index_offsets.push_back(0);
+            restart_begin.push_back(0);
+            drawn_indices.push_back({true, 0, 2}); // its offset once the allocation is made
+            stats_edge.draws++;
+            break;
+        }
         const u32 isize = ia.u16_indices ? 2 : 4;
         // The restart index is compared with the index as stored, before the base index (RPCS3 upload_untouched); a
         // 16-bit index never equals one above 0xFFFF.
@@ -1916,6 +1949,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         using Copy = DrawScratch::Copy;
         auto& copies = draw_scratch.copies;
         u32 total = 0;
+        struct EdgeAttr {
+            u32 attr, rel; // the attribute, its first element's offset in the allocation
+        };
+        std::array<EdgeAttr, kVertexAttributeCount> edge_attrs{};
+        u32 edge_attr_count = 0;
         const u32 freq_mask = state.frequency_divider_mask();
         for (u32 i = 0; i < kVertexAttributeCount; i++) {
             const VertexArrayInfo a = state.vertex_array(i);
@@ -1940,9 +1978,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             const u32 bytes = (last - first) * a.stride + vertex_attribute_bytes(a.type, a.size);
             const u32 base = (state.vertex_data_base_offset() + a.offset) & 0x0fffffff; // rsx_utils.h
             const auto ea = rsx->translate(base + first * a.stride, a.location, bytes);
-            if (!ea || !guest_ok(*ea, bytes)) return skip(std::format("vertex array {} at {:#x} is not mapped", i, base));
             vs.attribs[i] = {0, a.stride, static_cast<u32>(a.type), a.size, a.frequency,
                 shader::kAttribSwap | (modulo ? shader::kAttribModulo : 0u), first, 0, {}};
+            if (edge_item && ea && *ea - edge_item->alloc_ea < edge_item->alloc_size) {
+                // An EDGE output stream: the kernels write it into the allocation's shadow (D-988).
+                edge_attrs[edge_attr_count++] = {i, *ea - edge_item->alloc_ea};
+                continue;
+            }
+            if (!ea || !guest_ok(*ea, bytes)) return skip(std::format("vertex array {} at {:#x} is not mapped", i, base));
             copies.push_back({i, *ea, bytes});
         }
         // Interleaved attributes read overlapping ranges of one buffer (position, normal, texture coordinates in one
@@ -1959,7 +2002,14 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             sp.offset = total;
             total += (sp.end - sp.ea + 15) & ~15u;
         }
-        vertex_data = transient.alloc(std::max<u32>(total, 16), 16);
+        const u32 edge_end = edge_item ? edge_layout(*edge_item, total, edge_draw) : 0;
+        vertex_data = transient.alloc(std::max<u32>(std::max(total, edge_end), 16), 16);
+        if (edge_item) {
+            edge_queue(*edge_item, vertex_data, edge_draw);
+            for (u32 k = 0; k < edge_attr_count; k++)
+                vs.attribs[edge_attrs[k].attr].offset = vertex_data.offset + edge_draw.shadow + edge_attrs[k].rel;
+            drawn_indices[0].offset = vertex_data.offset + edge_draw.shadow;
+        }
         for (const Span& sp : spans) {
             before_access(sp.ea, sp.end - sp.ea, false);
             std::memcpy(vertex_data.data + sp.offset, mem.host(sp.ea), sp.end - sp.ea);
@@ -2292,6 +2342,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     MTLPrimitiveType ptype = MTLPrimitiveTypeTriangle;
     const bool native = native_primitive(d.primitive, ptype);
     const u32 pulled_mode = vs.index_mode;
+    if (edge_item) {
+        // EDGE's draw (D-988): over the indices the kernels kept, as many as their arguments say.
+        vs.index_offset = 0;
+        vs.index_mode = shader::kIndexDrawnU16BE;
+        [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
+        if (native) {
+            [enc drawIndexedPrimitives:ptype indexType:MTLIndexTypeUInt16 indexBuffer:index_data.buffer
+                     indexBufferOffset:drawn_indices[0].offset indirectBuffer:vertex_data.buffer
+                  indirectBufferOffset:vertex_data.offset + edge_draw.args];
+        } else {
+            unsupported(std::format("EDGE draw of primitive {}", static_cast<u32>(d.primitive)));
+        }
+        ranges.clear(); // drawn
+    }
     for (usize r = 0; r < ranges.size(); r++) {
         if (r < index_offsets.size()) vs.index_offset = index_offsets[r];
         const DrawScratch::Range rg = ranges[r];

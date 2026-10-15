@@ -32,6 +32,8 @@
 #include "pspocket/rsx/shader/ir.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
 #include "pspocket/rsx/texture.hpp"
+#include "pspocket/core/edge_job.h"
+#include "pspocket/core/edge_registry.hpp"
 #include "pspocket/rsx/write_tracker.hpp"
 
 namespace pspocket::rsx::metal {
@@ -412,6 +414,30 @@ struct MetalBackend::Impl {
     TransientAllocator::Allocation consts_upload{}; // the transform constants as last uploaded (D-129)
     u64 consts_generation = ~0ull;                   // the transient generation they were uploaded in
     u16 consts_lo = 0xffff, consts_hi = 0;           // the constants that upload holds (D-278)
+
+    // EDGE geometry on the GPU (edge_geometry.mm, D-988): the draws' work items run by one compute dispatch per
+    // transient buffer in a command buffer committed before the render buffer (submit).
+    struct EdgeDraw {
+        u32 shadow = 0, index_bytes = 0, blob = 0, scratch = 0, args = 0; // in the draw's transient allocation
+    };
+    struct EdgeJob {
+        __strong id<MTLBuffer> buffer;
+        u32 d[5]; // blob, shadow (in the buffer), index_bytes, scratch, args (in the buffer)
+    };
+    id<MTLComputePipelineState> edge_pipeline = nil;
+    u32 edge_threads = 128;
+    std::vector<EdgeJob> edge_jobs;
+    std::shared_ptr<std::atomic<u64>> edge_gpu_ns = std::make_shared<std::atomic<u64>>(0);
+    struct EdgeStats {
+        u64 draws = 0, jobs = 0, dispatches = 0, blob_bytes = 0, refused = 0;
+    } stats_edge;
+    EdgeStats report_edge{};
+    u64 report_edge_gpu_ns = 0;
+    bool edge_init();
+    std::unique_ptr<edge::WorkItem> edge_take(u32 index_ea);
+    u32 edge_layout(const edge::WorkItem& item, u32 at, EdgeDraw& out);
+    void edge_queue(const edge::WorkItem& item, const TransientAllocator::Allocation& a, const EdgeDraw& e);
+    void edge_flush();
 
     // Command buffers: uploads (texture decode) go to their own buffer, committed before the render buffer.
     id<MTLCommandBuffer> upload_cb = nil;
