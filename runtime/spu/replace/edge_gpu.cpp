@@ -45,15 +45,17 @@ inline float f32(uint32_t u)
     return f;
 }
 
-// A condition the GPU path goes on through (the job's stages already skipped), said once each.
-void note(const std::string& what)
+// A condition the GPU path goes on through (the job's stages already skipped), said once each as a warning; a job
+// left to the SPU (expected: a configuration the path does not make), said once each as information.
+void note(const std::string& what, bool expected = false)
 {
     static std::mutex m;
     static std::vector<std::string> said;
     std::lock_guard lock(m);
     if (std::find(said.begin(), said.end(), what) != said.end()) return;
     said.push_back(what);
-    PS_LOG_WARN("edge", "EDGE on the GPU: {}", what);
+    if (expected) PS_LOG_INFO("edge", "EDGE on the GPU: {}", what);
+    else PS_LOG_WARN("edge", "EDGE on the GPU: {}", what);
 }
 
 bool fail(Recording& r, std::string why)
@@ -524,7 +526,7 @@ extern "C" int ps_edge_dad4_gpu_0daf0(SPUContext* ctx, uint8_t* ls)
     if (!s.active || s.recorded) return 0;
     s.rec.clear();
     if (!on_decompress(s.rec, ls, *ctx)) {
-        note("a job left to the SPU: " + s.rec.reject);
+        note("jobs left to the SPU: " + s.rec.reject, true);
         pspocket::edge::count_rejected();
         s.active = false;
         ps_spu_set_mfc_filter(nullptr, nullptr);

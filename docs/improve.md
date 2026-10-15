@@ -66,6 +66,11 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
   for the phone's busy scenes: some 55 to 60 ms of the 277 ms a frame saved, 24 to 27 fps from 18 to 21; the phone
   playtest decides. Next levers: EDGE in Metal compute, the lifted code's spills around calls, calls out of a program
   without the run loop.
+  2026-10-15 evening: EDGE in Metal compute built (D-987, D-988), behind PSPOCKET_EDGE_GPU (off by default): the EDGE
+  job keeps its control code and index decompression, its heavy stages run as one compute dispatch before the render
+  buffer, bit for bit the SPU's. In-walk A/B on the Mac: the EDGE jobs' SPU time -65% (13.2 to 4.7 ms a frame), the
+  RSX thread -6 to -8%, the GPU +0.6 ms a frame (a frame's jobs). Needs the EDGE program translated again (D-988).
+  Next: the index decompression on the GPU too (a third of what the deferred job still costs), the phone's numbers.
 
 ## SPU and SPURS: the biggest cost in play
 
