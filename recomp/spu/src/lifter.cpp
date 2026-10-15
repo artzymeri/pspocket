@@ -1493,8 +1493,9 @@ LiftResult lift(const LsImage& image, const Program& analyzed, const LiftOptions
     LiftOptions bounded = options;
     if (options.replace_boundaries)
         for (const u32 a : pspocket::spu::replace::listed_addresses(result.hash, image.code_start)) bounded.boundaries.insert(a);
-    // A boundary inside a function's code is a label of it, so the table has an entry there: a listed function the
-    // analyzer now folds into its caller (one that began after brsl $rt, .+4, which no longer calls, D-963) is one.
+    // A boundary inside a function's code is a label of it, so the table has an entry there (D-966): a loop head or
+    // exit reached by fall-through, a listed function the analyzer folds into its caller (one that began after
+    // brsl $rt, .+4, which no longer calls, D-963).
     Program program = analyzed;
     for (Function& f : program.functions)
         for (const u32 b : bounded.boundaries)
@@ -1511,23 +1512,12 @@ LiftResult lift(const LsImage& image, const Program& analyzed, const LiftOptions
     h += "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     std::map<u32, std::string> callable = symbols;
     std::erase_if(callable, [&](const auto& s) { return bounded.boundaries.contains(s.first); });
-    // A boundary inside a function is a label of it, an entry the run loop goes on at: a loop head or exit reached by
-    // fall-through starts no block of its own.
-    Program labelled;
-    const Program* lifted = &program;
-    if (!bounded.boundaries.empty()) {
-        labelled = program;
-        for (Function& f : labelled.functions)
-            for (const u32 a : bounded.boundaries)
-                if (std::binary_search(f.insns.begin(), f.insns.end(), a)) f.labels.insert(a);
-        lifted = &labelled;
-    }
-    const std::map<u32, CallSummary> sums = call_summaries(image, *lifted, bounded);
+    const std::map<u32, CallSummary> sums = call_summaries(image, program, bounded);
     // Each function's fast entries besides its entry (D-961), and whether it has a twin: any label but its entry and
     // those.
     std::map<u32, std::set<u32>> entries_of;
     std::set<u32> twins;
-    for (const Function& f : lifted->functions) {
+    for (const Function& f : program.functions) {
         if (!options.twins) continue;
         entries_of[f.entry] = fast_entries(image, f, callable, sums, bounded);
         for (u32 l : f.labels)
@@ -1548,7 +1538,7 @@ LiftResult lift(const LsImage& image, const Program& analyzed, const LiftOptions
     // The twins in units of their own, which builds compile at -O1 (D-961): in half the time.
     std::vector<std::string> twin_units(units);
     usize index = 0;
-    for (const Function& f : lifted->functions) {
+    for (const Function& f : program.functions) {
         std::string& unit = units[index % tus];
         std::string& twin_unit = twin_units[index++ % tus];
         const std::string& sym = symbols[f.entry];
@@ -1572,7 +1562,7 @@ LiftResult lift(const LsImage& image, const Program& analyzed, const LiftOptions
     // Program descriptor: every label is an entry (the function whose entry it is wins): the fast function at its
     // entry and fast entries, the twin anywhere else (D-961).
     std::map<u32, std::string> entries;
-    for (const Function& f : lifted->functions)
+    for (const Function& f : program.functions)
         for (u32 l : f.labels) {
             const bool fast = l == f.entry || !twins.contains(f.entry) || entries_of[f.entry].contains(l);
             const std::string sym = fast ? symbols[f.entry] : twin_symbol(symbols[f.entry]);
