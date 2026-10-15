@@ -48,7 +48,11 @@ research tracks over run 327's logs and profiles, the lifted code and Apple's do
   thread's per-draw costs (inventory/agents/f1), the SPU translator (f2), native EDGE (f3). Native MP3 and zlib done
   (inventory/agents/f4): D-974 (Sony's flashMP3.pic decodeFrame, equivalent PCM, x6 a call in the walk: the mixer -15%
   and the periods the game was late -41% in its A/B walk), D-975 (zlib 1.2.3 inflate, bit for bit, x4 a call), D-976
-  (the measurements). Next: the mixer's DSP on vDSP.
+  (the measurements). 2026-10-15: native EDGE's hot pieces merged (D-965 to D-969: one-bone skinning, normals and
+  tangents, EDGE/GFX SPU time -26% on the walk), the RSX thread's per-draw work -21% (D-984 and f1's), the mixer's own
+  DSP native in games/gta5/spu (D-979 to D-983: the synthesizer's biquads, the submix reverb, comb and delay, the voices'
+  rate converter, all exact on captured calls: about 10% of the mixer). Still running: the SPU translator (f2) and
+  EDGE's second round (f3); then every GTA V SPU program re-lifted and the phone build.
 
 ## SPU and SPURS: the biggest cost in play
 
