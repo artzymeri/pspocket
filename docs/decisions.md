@@ -16292,5 +16292,30 @@ SPU's thread (a check of the recording without the GPU).
   lifted again with the new table (here: spu-lift into inventory/edge/relift, linked by PSPOCKET_GAME_SPU_EXTRA; it
   differs from before at those four calls only). A translation made before does not reach the stand-ins: with the
   switch on, its jobs simply run on the SPU (nothing breaks, nothing is gained) until the game's SPU programs are
-  translated again (scripts/lift-spu.sh; on the phone a new preparation, which kTranslatorGeneration or a narrower
-  rule must ask for).
+  translated again (scripts/lift-spu.sh). kTranslatorGeneration goes to 5 for it: the phone prepares the game again.
+
+## D-989 · 2026-10-15 · EDGE on the GPU checked: the same bits as the SPUs over a whole walk; the in-walk A/B
+
+- **The same output.** `PSPOCKET_EDGE_GPU=verify` over the gate's 128 s walk: 1,432,691 EDGE jobs recorded, run on the
+  GPU beside their SPU and compared when the GPU was done: every job the same count of kept indices and the same list
+  (564,191,201 triangles kept by both); of 713,726,466 output vertices 713,726,428 the same bytes, the other 38 one
+  step apart in a packed normal or tangent (a fused product whose error terms' sum rounded the other way, D-988); F32
+  positions 0 ulps apart. Offline (edge-gpu-check over 721 jobs saved from the walk): the stand-ins leave the
+  context as the stages do in all, the kernels' C++ and Metal give the SPU's bytes in all 716 they take. Before the
+  emulation of the SPU's rounding the GPU differed in the last bits (99.0% of jobs the same kept count): it is worth
+  its cost (below).
+- **Frames.** Dumps every 150 frames from 1500 of two walks with the path off and one with it on (the walks are not
+  frame-exact): where the camera stands still (frames 1950 to 2700) the off-off pairs differ by a mean of 0.6 to 1.2
+  (of 255) and the on-off pairs by 0.6 to 1.6, the same noise; where it moves, both pairs differ as much (timing).
+  Looked at: characters, rooms and shadows right. The gate's thumbnails: 2 frame jumps, no dark frame, with it on or off.
+- **The A/B in one walk** (`PSPOCKET_EDGE_GPU=ab`, 30 frames a half, the Mac shared with other work): the EDGE jobs'
+  SPU time 13.24 to 4.68 ms a frame (-65%) and 9.89 to 3.70 (-63%); a deferred job 6.0 to 6.5 us against 17.8 to 20 us
+  whole; the RSX thread 8.03 to 7.39 ms a frame (-8%) and 7.02 to 6.59 (-6%): an EDGE draw copies and scans no vertex
+  and index data; the GPU +0.3 ms and -0.1 ms a frame (the windows' noise is larger). The kernels alone, a frame's 716
+  jobs on the Mac's GPU (edge-gpu-check --metal, the fastest of 20): 0.57 ms with the SPU's rounding emulated, 0.31 ms
+  without it; 1.8 ms before the bones' matrices went to threadgroup memory. What a deferred job still costs on its SPU:
+  the job's own control code (about half), the index decompression (a third: natives D-968), the job chain around it.
+- **Gates.** scripts/gate.sh quick (off): 25 of 25. scripts/gate.sh game off: pass (29.8 fps median, slowest 29.0, 2
+  frame jumps, no dark frame). With PSPOCKET_EDGE_GPU=1: pass on every check but the slowest 5 s window in two of three
+  walks taken while the Mac was loaded by other work (load average 20 to 58: 22.8 and 9.0 fps, every SPU workload's
+  time inflated in that window), 29.4 in the one walk on a quieter Mac.

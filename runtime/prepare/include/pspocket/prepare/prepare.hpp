@@ -91,8 +91,10 @@ Result prepare_game(const Options& options);
 // the translator hash follows): a library of an older generation is prepared again (library_is_current). 2: D-161
 // (a longjmp or fiber switch in translated code). 3: D-203 (jump tables a bounds check branches into) and D-205 (SPU
 // code words without guessed code, seeds carried over as used). 4: D-958 to D-964 (SPU functions as fast functions and
-// cold twins, a third less code to run and to compile: the phone's SPU programs translated again).
-inline constexpr int kTranslatorGeneration = 4;
+// cold twins, a third less code to run and to compile: the phone's SPU programs translated again). 5: D-988 (EDGE's
+// four stage functions listed in GTA V's EDGE build: its program translated again so that they are called through its
+// table, which EDGE on the GPU needs).
+inline constexpr int kTranslatorGeneration = 5;
 
 // What a game's preparation feeds the lifters: raised when a change adds inputs (not covered by the translator hash,
 // which follows the lifters only). A game library of an older inputs generation is prepared again; the system library
