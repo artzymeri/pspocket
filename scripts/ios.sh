@@ -60,6 +60,13 @@ Commands:
   session [FILE] [--since HH:MM]
                              Summarise each app session in a device log (default: the newest
                              inventory/phone/live/syslog-*.log): fps, sound, memory, heat, GPU, threads, faults.
+  perftrace [--seconds N] [--template NAME]
+                             Record an Instruments trace of the running app on the iPhone (xctrace --attach; default
+                             30 s of Time Profiler; "Game Performance", "Metal System Trace", "Power Profiler" or any
+                             template \`xcrun xctrace list templates\` names) into inventory/phone/traces/, and for
+                             Time Profiler print each thread's share and the RSX thread's top functions
+                             (scripts/trace_profile.py TRACE [THREAD]). Start the game first; phone connected and
+                             unlocked.
   testflight [--upload-only] gen, then archive the Release build, export it signed for App Store Connect (team
                              M7XJA39ZV6) and upload it for TestFlight: the way onto an iPhone that is not connected to
                              this Mac or on its network. The build number is the commit count, so each upload is
@@ -125,6 +132,8 @@ while [ $# -gt 0 ]; do
         --upload-only) UPLOAD_ONLY=1 ;;
         --no-gate) NO_GATE=1 ;;
         --since) [ $# -ge 2 ] || die "--since needs HH:MM"; SINCE="$2"; shift ;;
+        --seconds) [ $# -ge 2 ] || die "--seconds needs a number"; TRACE_SECONDS="$2"; shift ;;
+        --template) [ $# -ge 2 ] || die "--template needs a name"; TRACE_TEMPLATE="$2"; shift ;;
         *.log) SESSION_LOG="$(abspath "$1")" ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (scripts/ios.sh --help)" ;;
@@ -434,6 +443,36 @@ cmd_session() {
     fi
     say "sessions in $log"
     "$PYTHON" "$ROOT/scripts/phone_session.py" "$log" ${SINCE:+--since "$SINCE"}
+}
+
+# An Instruments trace of the running app (the plan for a steady 30 fps, item 7): where the phone's CPU goes, by
+# thread, without a build of its own. xctrace wants the device's UDID, not devicectl's identifier.
+cmd_perftrace() {
+    local id udid dir out template="${TRACE_TEMPLATE:-Time Profiler}" seconds="${TRACE_SECONDS:-30}"
+    id="$(device_id)"
+    require_unlocked "$id"
+    udid="$("$PYTHON" - "$IOS_BUILD/devices.json" "$id" <<'EOF'
+import json, sys
+try:
+    devices = json.load(open(sys.argv[1]))["result"]["devices"]
+except Exception:
+    devices = []
+match = [d for d in devices if sys.argv[2] in (d.get("identifier"), d.get("hardwareProperties", {}).get("udid"),
+                                                d.get("deviceProperties", {}).get("name"))]
+print(match[0]["hardwareProperties"].get("udid", sys.argv[2]) if match else sys.argv[2])
+EOF
+)"
+    dir="$ROOT/inventory/phone/traces"
+    mkdir -p "$dir"
+    out="$dir/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$template" | tr ' ' '-').trace"
+    say "recording $seconds s of $template from ${APP_NAME%.app} on $udid into $out"
+    xcrun xctrace record --device "$udid" --template "$template" --attach "${APP_NAME%.app}" \
+        --time-limit "${seconds}s" --output "$out" >&2 || die "xctrace could not record (is the game running?)"
+    if [ "$template" = "Time Profiler" ]; then
+        "$PYTHON" "$ROOT/scripts/trace_profile.py" "$out" | head -20
+        "$PYTHON" "$ROOT/scripts/trace_profile.py" "$out" pspocket.rsx 15 || true
+    fi
+    say "open it in Instruments: open \"$out\""
 }
 
 cmd_build() {
@@ -873,6 +912,7 @@ case "$COMMAND" in
     gate) cmd_gate ;;
     pull-log) cmd_pull_log ;;
     session) cmd_session ;;
+    perftrace) cmd_perftrace ;;
     push-signing-identity) cmd_push_signing_identity ;;
     all)
         cmd_build >/dev/null

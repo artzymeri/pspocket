@@ -15959,3 +15959,17 @@ between the two profiles, the noise of such a comparison.
 - Gates (this clone at 8898662 with ad69fe2's lifter change applied, the three jobs re-lifted ahead of the game
   library): quick PASS (23 suites), spu PASS (150 programs, no difference), game PASS (fps 29.8 median, RSX failures 0;
   checked against the main repository's message baseline: this clone has none of its own).
+
+## D-985 · 2026-10-15 · An Instruments trace of the phone in one command
+
+The plan for a steady 30 fps (docs/improve.md), item 7 (measuring). iOS 27's always-on Metal performance traces
+(metalperftrace on the Mac) record only what the system takes for a game session: on this Mac `metalperftrace collect`
+found none for pspocket-boot (a command-line tool), and the phone's own records need the app to be taken for a game
+(D-952 gave it the games category and Game Mode); to see on the next playtest.
+
+- `scripts/ios.sh perftrace [--seconds N] [--template NAME]` records the running app on the connected iPhone with
+  `xctrace record --attach PSPocket` (default 30 s of Time Profiler; Game Performance, Metal System Trace, Power
+  Profiler and the rest by name) into inventory/phone/traces/, with the device's UDID from devicectl's list.
+- scripts/trace_profile.py summarises a Time Profiler trace: each thread's share of the samples, and one thread's
+  functions by their own samples and in all (what the RSX thread's measurements in D-953 and D-984 were read with).
+  perftrace prints both for the RSX thread.
