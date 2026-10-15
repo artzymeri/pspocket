@@ -4,7 +4,7 @@
 # ---- unit tests (hand-checked vectors, decoder, disassembler, assembler)
 pspocket_add_test(test_spu
     SOURCES test_decoder.cpp test_interp_int.cpp test_interp_float.cpp test_interp_branch_mem.cpp bench_interp.cpp
-        test_discover.cpp test_lift_regs.cpp test_spu_registry.cpp test_spu_replace.cpp replace_blocks.c
+        test_discover.cpp test_lift_regs.cpp test_spu_registry.cpp test_spu_replace.cpp replace_blocks.c test_edge_gpu.cpp
     LIBS pspocket::recomp_spu)
 target_include_directories(test_spu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/runtime/spu/replace)
 # The building blocks are C over pspocket/spu/lifted.h, as the native replacements: no contraction, no fast-math (fp.h).
