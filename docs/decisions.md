@@ -16181,6 +16181,36 @@ reset of iOS's media services had the same gap.
   session's first line names the route.
 - Checked on the Mac (a scratch program against the platform library, volume 0): the engine plays, a rebuild with the
   stretcher on keeps it playing (23,040 frames, then 49,501). A real AirPlay switch is for the phone.
+## D-998 · 2026-10-15 · Assassin's Creed's "jump to LS 0" on its first install was a partial dev_flash, not the SPU translation
+
+Run 331 on the Mac (fresh hdd0, the 1.3 GB install, then the Animus garden): at about 235 s SPURS 0x102eb500's task
+(spu_2fed95d316ff1968, the game's sound task, "DARE MultiStream") stopped at LS 0x00004 after `bisl $lr,$14` with
+$14 = 0, with libraries from today's translator, `spu-lift --whole` and the translator of 381e1e1 alike, and not with
+every SPU program interpreted. Found (agent f2):
+
+- **The cause.** The task keeps a decoder function pointer at LS 0x3de80, written once when it loads the ATRAC
+  decoder module (command 0xffdd: 32 KB at LS 0x33980, its init at 0x33990 stores 0x37c58 there) and called for each
+  stream whose codec byte (stream block + 0x2d0, at LS 0x2f650) is 4, 5 or 6. The PPU sends 0xffdd only after reading
+  /dev_flash/sys/external/flashATRAC.pic itself (0x1044500: open, seek, read; nothing read: "Multistream: atrac failed
+  to load %d" and no command). The runs passed `--flash inventory/firmware/dev_flash`, the three files taken out of
+  the firmware for GTA V (flashMP3.pic, libsre, libspurs_jq), not the installed firmware's whole dev_flash
+  (inventory/firmware/installed/dev_flash, which runs 099-323 and docs/handoff.md use): the file was missing in every
+  run 331 log ("atrac failed to load -2147418106"), the decoder never loaded, and the first ATRAC stream (codec 5,
+  the garden's sound) called LS 0. Traced with the task interpreted (a library without it): the same crash, no
+  0xffdd ever in its command slot, the codec byte 5 set by the stream block's GET at 0x08188. With every SPU program
+  interpreted the game ran slower and had not reached that stream by 330 s; the installed hdd0's runs were 120 s.
+- **With the whole dev_flash** the reproduce run passes the point: the decoder loads at boot (its init interpreted,
+  184 instructions), and the reproduce run (fresh hdd0, the install, walk-garden) reaches 330 s with no fatal error, the garden at 58-60 fps; fresh runs of 100 s (four) and the installed hdd0 to 330 s alike.
+- **Fail loudly** (CLAUDE.md rule 5): a /dev_flash file a game opens or stats that the host's folder lacks is now an
+  error in the log, once per path, naming the folder (sys_fs log_result); the PS3 always has every file there, so a
+  game takes it as its own failure and plays on. scripts/boot.sh and scripts/translate-game.sh pass the installed
+  firmware's dev_flash when there is one (else the taken-out files, as before).
+- Test: tests/hle/test_ac_sysutil_fs_pad.cpp (a dev_flash folder with flashMP3.pic only: flashATRAC.pic's open is
+  ENOENT three times, one error naming the folder; flashMP3.pic and a missing /dev_hdd0 file no error).
+- Also found while reproducing: runs side by side whose hdd0 folders share a parent share their hdd1 (cellSysCache:
+  "hdd1" beside hdd0's folder) and remove each other's cache at the start ("was in use ... removed"); the Mac runs
+  for this put each hdd0 in a folder of its own.
+
 ## D-987 · 2026-10-15 · EDGE geometry on the GPU, phase 1: what GTA V's EDGE job reads and writes, the hole, go
 
 The steady-30 plan's last item (docs/improve.md, item 4, "later Metal compute"; the user: "do the edge on gpu too").

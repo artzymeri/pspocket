@@ -98,8 +98,11 @@ configure() {
 
 # 3 and 4, once per round: a run that saves the SPU programs, then their translation from every run so far.
 configure
+# /dev_flash: the installed firmware's whole dev_flash when there is one (a game reads system files of its own: D-998),
+# else the files taken out of it.
 flash=()
-if [ -d "$ROOT/inventory/firmware/dev_flash" ]; then flash=(--flash "$ROOT/inventory/firmware/dev_flash"); fi
+if [ -d "$ROOT/inventory/firmware/installed/dev_flash" ]; then flash=(--flash "$ROOT/inventory/firmware/installed/dev_flash")
+elif [ -d "$ROOT/inventory/firmware/dev_flash" ]; then flash=(--flash "$ROOT/inventory/firmware/dev_flash"); fi
 round=1
 while :; do
     n=1

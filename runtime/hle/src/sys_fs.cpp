@@ -26,6 +26,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include "guest.hpp"
 #include "pspocket/core/log.hpp"
@@ -63,12 +64,33 @@ std::string path_of(PPUContext& ctx, u32 addr)
     return out;
 }
 
+// A system software file the game asks for that the host's /dev_flash lacks (D-998): every file of the installed
+// firmware is there on a PS3, so a game takes a missing one as a failure of its own and may carry on without it
+// (Assassin's Creed without flashATRAC.pic: its sound task later calls the decoder it never loaded). Logged as an
+// error once per path, naming the host directory, so a partial firmware folder is found from the log.
+void log_missing_flash_file(PPUContext& ctx, const std::string& vpath)
+{
+    if (!vpath.starts_with("/dev_flash/")) return;
+    static std::mutex mutex;
+    static std::unordered_set<std::string> logged;
+    {
+        std::lock_guard lock(mutex);
+        if (!logged.insert(vpath).second) return;
+    }
+    const std::string host = thread_of(ctx).kernel.vfs_host_path("/dev_flash");
+    PS_LOG_ERROR(kChan, "{} is not in the host's dev_flash ({}): if it is a file of the system software, that folder "
+        "is part of an installed firmware only, and the game runs on without the file (pspocket-boot --flash: the "
+        "whole dev_flash of the installed firmware)", vpath, host.empty() ? "/dev_flash is not mounted" : host);
+}
+
 void log_result(PPUContext& ctx, const char* what, u32 path, s32 r, std::string_view extra = {})
 {
     if (r == lv2::CELL_OK) {
         PS_LOG_INFO(kChan, "{}({}){}", what, path_of(ctx, path), extra);
     } else {
-        PS_LOG_WARN(kChan, "{}({}) -> {}", what, path_of(ctx, path), lv2::error_name(r));
+        const std::string vpath = path_of(ctx, path);
+        PS_LOG_WARN(kChan, "{}({}) -> {}", what, vpath, lv2::error_name(r));
+        if (r == lv2::err(lv2::CELL_ENOENT)) log_missing_flash_file(ctx, vpath);
     }
 }
 

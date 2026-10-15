@@ -67,10 +67,14 @@ if [ -n "$ISO" ]; then
     DISC=(--bdvd "$ISO")
 fi
 mkdir -p "$GAME_DIR/hdd0/game"
-# /dev_flash: the system files a game reads itself, from the user's own firmware (D-067), when they have been taken
-# out of it: inventory/firmware/tools/fw_unself.py --raw flashMP3.pic writes inventory/firmware/dev_flash.
+# /dev_flash: the system files a game reads itself, from the user's own firmware (D-067): the installed firmware's
+# whole dev_flash when there is one (Assassin's Creed loads flashATRAC.pic from it and plays on without it, D-998),
+# else the files taken out of it (inventory/firmware/tools/fw_unself.py --raw flashMP3.pic writes
+# inventory/firmware/dev_flash).
 FLASH=()
-if [ -d inventory/firmware/dev_flash ]; then
+if [ -d inventory/firmware/installed/dev_flash ]; then
+    FLASH=(--flash inventory/firmware/installed/dev_flash)
+elif [ -d inventory/firmware/dev_flash ]; then
     FLASH=(--flash inventory/firmware/dev_flash)
 fi
 

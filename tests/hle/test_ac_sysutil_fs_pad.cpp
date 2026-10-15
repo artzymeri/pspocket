@@ -748,6 +748,40 @@ TEST_CASE("cellFsFstat, cellFsStReadFinish, cellFsGetFreeSize", "[hle][ac][fs]")
     fsys::remove_all(root);
 }
 
+// D-998: Assassin's Creed opens /dev_flash/sys/external/flashATRAC.pic itself and, when it is missing, plays on without
+// the decoder its sound task later calls (a jump to LS 0). A dev_flash folder with only some of the firmware's files
+// must show up in the log as an error naming the file and the folder, once per file; other devices' missing files
+// stay warnings.
+TEST_CASE("cellFsOpen: a file missing from /dev_flash is an error in the log, once", "[hle][ac][fs]")
+{
+    const fsys::path root = temp_root("flash");
+    fsys::create_directories(root / "flash" / "sys" / "external");
+    fsys::create_directories(root / "hdd0");
+    write_file(root / "flash" / "sys" / "external" / "flashMP3.pic", {'m', 'p', '3'});
+    Fixture f;
+    u8* base = f.base();
+    REQUIRE(f.kernel->vfs_mount("/dev_flash", (root / "flash").string(), true));
+    REQUIRE(f.kernel->vfs_mount("/dev_hdd0", (root / "hdd0").string(), false));
+    GuestThread a(f, 0, "a");
+    constexpr u32 kPath = kStrings, kFd = kOut;
+    CapturedLog log;
+
+    put(base, kPath, "/dev_flash/sys/external/flashMP3.pic");
+    REQUIRE(a.call("cellFsOpen", kPath, 0, kFd, 0, 0) == 0);
+    REQUIRE(a.call("cellFsClose", ps_read32(base, kFd)) == 0);
+    put(base, kPath, "/dev_flash/sys/external/flashATRAC.pic");
+    for (int i = 0; i < 3; i++) CHECK(a.call("cellFsOpen", kPath, 0, kFd, 0, 0) == r3_of(lv2::CELL_ENOENT));
+    put(base, kPath, "/dev_hdd0/none.bin");
+    CHECK(a.call("cellFsOpen", kPath, 0, kFd, 0, 0) == r3_of(lv2::CELL_ENOENT));
+
+    CHECK(log.count(log::Level::Error, "sys_fs", "/dev_flash/sys/external/flashATRAC.pic is not in the host's dev_flash ("
+        + (root / "flash").string()) == 1);
+    CHECK(log.count(log::Level::Warn, "sys_fs", "cellFsOpen(/dev_flash/sys/external/flashATRAC.pic) -> CELL_ENOENT") == 3);
+    CHECK(log.count(log::Level::Error, "sys_fs", "flashMP3.pic") == 0);
+    CHECK(log.count(log::Level::Error, "sys_fs", "none.bin") == 0);
+    fsys::remove_all(root);
+}
+
 TEST_CASE("cellFsAio: reads complete on the AIO thread, which calls back with the bytes in place", "[hle][ac][fs]")
 {
     InterpretMisses interpret;
