@@ -16734,3 +16734,15 @@ local memory, an early SDK's way (GTA IV's: 3 MB of local memory, no IO at init)
   state into the buffer (current = begin + 0x3a0), pspocket's none; Sony's cellGcmGetDefaultCommandWordSize is the
   init's cmdSize / 4 and its segment size 0x2000 words, pspocket's RPCS3's 0x400 and 0x100.
 - GTA IV's data is only on the phone: the next phone run shows what comes after the init.
+
+## D-1067 · 2026-10-16 · The bench every night on the user's Mac
+
+The bulletproof plan's net 5: regressions found the morning after, without anyone running the bench (the user agreed
+to "your Mac at night").
+
+- scripts/nightly-bench.sh install [HH:MM] writes ~/Library/LaunchAgents/com.pspocket.bench.plist (03:00 by default)
+  and loads it; remove takes it out; status prints the job's state and the last night's verdicts; run is what the job
+  does: scripts/bench.py --game all --mode all --nightly into inventory/bench/night-<date>-<commit>, keeping the newest
+  14 nights (each keeps its worst frames only). bench.py --nightly skips a busy Mac (another pspocket-boot or ninja,
+  load over 4, under 15 GB free) and keeps it awake with caffeinate while it runs; the log is inventory/bench/nightly.log.
+- launchd runs a job missed while the Mac slept at the next wake.
