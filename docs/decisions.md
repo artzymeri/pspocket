@@ -17130,6 +17130,26 @@ Mac.
 - The carry kernel's depth (D-1025) is now `precise::divide(d, 16777215)`: the kernels library is compiled with fast
   math, and its division put 0xff0000 back as 0xff0001 (the exact-mode test).
 
+## D-1031 · 2026-10-16 · GTA V's black block over the near sea: what it is, what it is not (open)
+
+- **What it is** (trace-on-black runs tob1-tob17, zal1-2, zq1, tobq1, D-1028's tools): just before the skydiver
+  reaches the sea, a square region of the near water (the extent of the 128x128 VTF height field around the camera)
+  is black (grey in some frames). In that region the G-buffer pass's water depth pre-pass (fragment program
+  e46f5d4e84de56cf, colour mask 0, LESS with depth write, vertex texture X32_FLOAT heights at 0xc27a/bf700 from guest
+  memory) writes depth, and **no draw writes colour**: the water surface strips (1fe44ba35deefc05, 17 to 28 draws in
+  block 0's query) and the near quads (da1f859167474ef4) do not cover it even with the depth and stencil tests forced
+  to pass (PSPOCKET_RSX_TRACE_ZALWAYS_FP), and the game's FIFO has no draw between the begin and end of the water
+  queries of blocks 1 to 3 (2 KB of state each, no BEGIN_END): the game itself leaves the near patch undrawn.
+- **What it is not**: the early "ready" reports (D-1021 removes them; the block stays), the occlusion counts (every
+  count forced to at least 100,000: stays, runs vis1-2), the CPU reading GPU-drawn targets late (every target up to
+  4 MB mirrored into memory each flip, D-1030: stays), the positions' invariance between programs (positions
+  `[[invariant]]` with preserveInvariance, translation 10: stays; reverted, it recompiles every shader), the stencil
+  (07 there, the surface's test passes).
+- **Next**: the decision is the game's PPU (its water renderer choosing which patches to draw, from the camera, the
+  water heights the SPU or the GPU computes, or the game's GPU timer that D-1021 now feeds with completion times). The
+  exact mode (D-1029) would tell whether any RSX ordering feeds it, but on the flip clock its 2 to 8 fps took the route
+  elsewhere: it needs presses anchored on game events (D-1042's steps).
+
 ## D-1032 · 2026-10-16 · The gate limits the alarms; phase 1 measured on the gate walk
 
 - games/gta5/gate.json `alarms_max`: reports_early, uninit_sampled, occlusion_overflow and dead_overlays at 0 (all 0
