@@ -173,6 +173,9 @@ const char* family_name(Family f) { return f == Family::Ps3Legal ? "PS3-legal" :
 
 bool hit(Point p, u64 detail)
 {
+    // Off is off: disable() clears the mask, not the configuration (D-1048: a test that configured S1 before another
+    // that disabled it saw S1 still hit, depending on Catch2's random order).
+    if (!(__atomic_load_n(&ps_chaos_mask, __ATOMIC_RELAXED) & (1u << p))) return false;
     const u32 ppm = g_config.ppm[p];
     if (!ppm) return false;
     if (ppm < 1000000 && t_stream.next() % 1000000 >= ppm) return false;

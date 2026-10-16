@@ -17238,3 +17238,10 @@ actions and the transient allocator's chunks) found it: the free list of transie
 - Found on the way: the test thread needs an autorelease pool for Metal's own objects to go (as the backend's draw,
   clear and flip have); and Assassin's Creed's two 5 s windows at 2.2 and 0.8 fps of 2026-10-16 (D-1041) are not this
   leak (the footprint was 0.5 GB then); one window at 5.8 fps showed in this run at about 200 s, still to look at.
+
+## D-1048 · 2026-10-17 · Shake mode: off is off for hit() too
+
+The gate failed in test_core: "shake mode: off costs a mask test" saw hit(S1) true right after disable(). disable()
+cleared the mask (what any() and the hooks' inline checks read) but not the configuration, and hit() read only the
+configuration: with Catch2's random order, a test that configured S1 ran first. hit() now also requires its point's
+bit in the mask. The [shake] tests pass in 20 random orders and in the gate's (seed 4048264227).
