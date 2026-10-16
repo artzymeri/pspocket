@@ -16602,3 +16602,27 @@ The loader had warned ("the game imports 1 function(s) the host lacks") and gone
   the count agrees with the report's other counts.
 - Next in net 4: the same audit before a game runs (at preparation, in the library), unnamed NIDs identified from the
   firmware's export tables (aliases like 0xb70b4ad3), and a list across every game.
+
+## D-1060 · 2026-10-16 · The open-world bench: GTA V's scenes from the user's save, checked by scripts
+
+The bulletproof plan's net 5, first version (from the research bench of 2026-10-16: GTA V loads the user's save to
+Michael's hallway about 42 s after the boot; cheats such as skyfall reach the city from the air, the sea and rain).
+
+- games/gta5/bench/: cases.json (case, save, route, timeout, the second the play starts; modes edge-off and edge-on),
+  routes (house-idle, street, skyfall-sea) in scripts/route.py's language (at, wait, seq, hold, with, tap) and
+  sequences.txt (GTA V's own cheat codes). Saves stay in inventory/gta5/saves/<name>/ (game data).
+- scripts/bench.sh [CASE ...] [--mode M|all] [--accept] [--nightly]: each run on an APFS clone of inventory/gta5/hdd0
+  with the save's savedata, a frozen copy of the shader cache, shaders compiled in the background (--async-shaders 4)
+  and SPU programs translated during the session (inventory/bench/spu-translate), as the phone runs; frames every
+  60th flip. --nightly refuses a busy Mac (another pspocket-boot or ninja, load average over 4, under 15 GB free).
+- scripts/bench_check.py: fails a run that did not reach its timeout, has RSX failures or unimplemented calls,
+  partly black frames in play or new warning shapes; warns on CPU ms a frame 10% over the median of its last 5
+  accepted runs (15% for a workload) or fps 10% under. "Partly black" is a fifth to 95% of the 64x36 thumbnail
+  exactly black: the research bench's black sea is 56% (whole rows), a night street seen from the air 2.5% (a first
+  rule of "a third at or under 6" took that night street for a glitch). It keeps the worst 6 frames and deletes the
+  rest. scripts/bench_report.py writes the run's index.html (local only: game frames).
+- First run (skyfall-sea, EDGE off; the route's wall-clock presses reached the city at night, not the sea): FAIL on 1
+  RSX failure, "blend equation 0xf006/0xf006 (signed) drawn as add (the shader interpreter's draw)": the shader
+  interpreter (D-940) lacks D-948's signed blending. 26.6 fps, 82.8 ms of CPU a frame, 989 draws a frame.
+- Next: routes on game time (D-1040 on), the flicker and hitch detectors shared with the phone, the nightly run,
+  more cases (rain, helicopter, night), Assassin's Creed's.

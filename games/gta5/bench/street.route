@@ -1,0 +1,14 @@
+# Out of the house to the street and a look around: the street's draws (2,300 to 3,100 a frame), the open sky.
+at 64
+tap cross        # Lester's call
+at 70
+hold ls-up 4.5   # out of the front door
+wait 1
+hold ls-up 6     # down the drive
+wait 1
+hold rs-left 4   # the camera round: the sky over Rockford Hills
+wait 1
+hold rs-up 1.5
+wait 2
+hold rs-right 4
+wait 10

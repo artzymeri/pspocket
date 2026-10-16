@@ -1,0 +1,37 @@
+# Skyfall from the save: the city from the air, out over the Pacific, into the sea (the black sea, run r6 of the
+# research bench), drowning, the respawn, a second skyfall. Six weather changes on the way (rain).
+at 64
+tap cross        # answer Lester's call (on foot without a call: a sprint tap)
+at 70
+hold ls-up 4.5   # out of the front door
+at 118
+tap cross        # a second answer in case the call came late
+at 125
+seq skyfall
+wait 4
+hold rs-left 3   # the camera round while falling
+wait 3
+hold rs-left 3
+wait 3
+hold rs-up 1.5
+wait 2
+seq weather
+wait 1
+seq weather
+wait 1
+seq weather
+wait 1
+seq weather
+wait 1
+seq weather
+wait 1
+seq weather
+wait 1
+hold ls-up 12    # glide forward
+at 205
+seq skyfall      # again after the respawn, wherever it is
+wait 4
+hold rs-left 3
+wait 3
+hold rs-left 3
+wait 15
