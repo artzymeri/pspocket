@@ -17187,3 +17187,24 @@ the default context is compared.
   answers as Sony's; not the driver information there: pspocket's RSX runs its own GCM_FLIP_COMMAND, which queues the
   buffer on head 1 first, RPCS3's way, flip flags 0xc0000001, where Sony's words leave 0x80000000). An argument value
   kCtxArg in a compare step is the default context's address.
+
+## D-1033 · 2026-10-17 · Debugging aids for the near-sea block: first calls, flip-clock anchors, the exact mode from a frame
+
+- PSPOCKET_LOG_FIRST_CALLS=1 (pspocket-boot): each imported function's first call is logged with the frame and the
+  second it came in ("first call of cellGcmGetTimeStampLocation at frame 1101"), to pick D-1042's call anchors.
+- On the flip clock (PSPOCKET_PRESS_CLOCK=flips, D-1028) the press clock's anchors (`@after:call:`, `@play`) now
+  resolve on the flip clock too (flips / 30), as the presses' own times do; before, an anchor fired on the wall clock
+  while the presses after it counted flips, so a slow run's steps came apart.
+- PSPOCKET_RSX_EXACT_FROM=FLIP: the exact mode (D-1029) from that flip on (the Metal backend ends the open pass, turns
+  pass merging and the feedback cache off; the front end's conditional draws wait from then too). The whole run exact
+  goes at 2 to 8 fps in the city and the route goes elsewhere; switched on just before the scene, the route gets
+  there at speed and the scene runs exact.
+- PSPOCKET_RSX_TRACE_METHODS=1: every method of a traced frame (D-1028) is a trace note with its argument and FIFO
+  get, to see what the game puts between two draws (D-1031's query windows with no BEGIN_END).
+- PSPOCKET_RSX_NO_DEPTH_CLAMP=1: near and far planes always clip (no MTLDepthClipModeClamp), and the trace's draw
+  lines name "depth clamp" and "user clip" when they are on. The near-sea block stays with clipping forced (run
+  clip1: the water draws have neither).
+- All off by default; nothing changes without the variables.
+- tests/rsx/test_metal.mm "a ZPASS report is ready only once the GPU has counted it" read a timestamp of 0 one run in
+  three when it ran alone: the host clock starts at its first read, and the completion handler's read was the first.
+  The test reads the clock first and checks the report's timestamp is past that.

@@ -1761,6 +1761,12 @@ int main(int argc, char** argv)
             if (f->calls.load(std::memory_order_relaxed)) return true;
         return false;
     };
+    // PSPOCKET_LOG_FIRST_CALLS=1 (D-1033): each imported function's first call logged with the frame it came in, to
+    // find call anchors (cross@after:call:NAME) that mark a point of the game.
+    static const bool log_first_calls = std::getenv("PSPOCKET_LOG_FIRST_CALLS") != nullptr;
+    std::vector<const hle::LinkedFunction*> not_called_yet;
+    if (log_first_calls)
+        for (const auto* f : hle.linked()) not_called_yet.push_back(f);
     std::vector<const hle::LinkedFunction*> pad_readers;
     for (const char* n : {"cellPadGetData", "cellPadGetDataExtra", "cellPadPeriphGetData"})
         for (const auto* f : linked_named(n)) pad_readers.push_back(f);
@@ -1793,6 +1799,14 @@ int main(int argc, char** argv)
         const auto now = Clock::now();
         if (done || now >= deadline || stall_stop.load()) break;
         const u64 flips_now = kernel.rsx() ? kernel.rsx()->flip_count() : 0;
+        if (log_first_calls) {
+            std::erase_if(not_called_yet, [&](const hle::LinkedFunction* f) {
+                if (!f->calls.load(std::memory_order_relaxed)) return false;
+                PS_LOG_INFO("boot", "first call of {} at frame {} ({:.1f} s)", f->name, flips_now,
+                    std::chrono::duration<double>(now - start).count());
+                return true;
+            });
+        }
         {
             const double t = std::chrono::duration<double>(now - start).count();
             if (!first_frame && flips_now) {
@@ -1806,7 +1820,8 @@ int main(int argc, char** argv)
             }
             if (!presses.empty()) {
                 hle::PadClock clock;
-                clock.t = t;
+                // On the flip clock (D-1028) anchors resolve on it too, as the presses' times count (D-1033).
+                clock.t = press_by_flips ? static_cast<double>(flips_now) / 30.0 : t;
                 clock.flips = flips_now;
                 clock.playing = play.playing();
                 clock.called = called;

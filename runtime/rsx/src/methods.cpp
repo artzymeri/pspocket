@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <format>
@@ -729,6 +730,11 @@ void Rsx::do_flip(u32 buffer_id)
     if (flip_pacing_.load(std::memory_order_relaxed) && vsync_.load(std::memory_order_relaxed)) wait_for_vblank();
     const u64 index = flips_.fetch_add(1, std::memory_order_relaxed) + 1;
     backend_.flip(FlipRequest{buffer_id, display_buffer(buffer_id), index}, state_);
+    static const u64 exact_from = [] { // the backend's PSPOCKET_RSX_EXACT_FROM (D-1033): conditional draws wait too
+        const char* v = std::getenv("PSPOCKET_RSX_EXACT_FROM");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    if (exact_from && index >= exact_from) config_.exact = true;
     if (on_flip) on_flip(buffer_id);
 }
 

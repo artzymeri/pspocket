@@ -741,6 +741,10 @@ Rsx::Dispatch Rsx::read_arguments(u32 get, u32 ea, u32 put, u32 word, u64 budget
 
 Rsx::Dispatch Rsx::dispatch(u32 reg, u32 value)
 {
+    // PSPOCKET_RSX_TRACE_METHODS=1 (a debugging aid, D-1033): every method of a traced frame, with its argument.
+    static const bool trace_methods = std::getenv("PSPOCKET_RSX_TRACE_METHODS") != nullptr;
+    if (trace_methods && backend_.tracing()) [[unlikely]]
+        backend_.trace_note(std::format("{} {:#x} (get {:#x})", method_label(reg), value, get_.load(std::memory_order_relaxed)));
     if (reg == m::NV406E_SEMAPHORE_ACQUIRE) {
         // Passed already before a desync this re-read goes back over (D-118).
         const bool replayed = replay_end_ != 0 && get_.load(std::memory_order_relaxed) < replay_end_;

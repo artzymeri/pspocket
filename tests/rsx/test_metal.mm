@@ -4292,6 +4292,10 @@ TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, 
     // GTA V's queries (0xB21908 begin: count 0, pad 1 by the CPU; 0xB21AD0 ready: pad 0) take a report whose pad is 0
     // as counted. Its water module skipped the sea on a "ready" zero that came frames before the count (2026-10-16).
     REQUIRE_METAL();
+    // The host clock starts at its first read (a run's boot): read it here, so a timestamp the handler writes is past
+    // 0 even when this test runs alone (it read 0 there one run in three).
+    const u64 before = Rsx::timestamp_ns();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     for (const bool early : {false, true}) {
         INFO(std::format("PSPOCKET_RSX_EARLY_REPORTS {}", early));
         if (early) setenv("PSPOCKET_RSX_EARLY_REPORTS", "1", 1);
@@ -4335,7 +4339,7 @@ TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, 
         const u32 count = wait_report(e, 0, 0);
         CHECK(count > 1000);
         CHECK(ps_read32(e.mem.base(), report + 12) == 0);
-        CHECK(ps_read64(e.mem.base(), report) != 0);
+        CHECK(ps_read64(e.mem.base(), report) > before); // the GPU's completion time, not the method's
         CHECK_FALSE(e.backend->report_pending(report + 8));
     }
 }

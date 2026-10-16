@@ -1808,6 +1808,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
                 (raster.poly_offset_fill ? std::format("; offset {} {}", raster.poly_offset_scale, raster.poly_offset_bias)
                                          : std::string()) +
                 (raster.cull_enable ? std::format("; cull {:#x}", raster.cull_face) : std::string()) +
+                (raster.depth_clamp || !raster.depth_clip ? std::string("; depth clamp") : std::string()) +
+                (raster.user_clip_control ? std::format("; user clip {:#x}", raster.user_clip_control) : std::string()) +
                 (zpass_on ? std::string("; counted") : std::string()),
             blend, trace_tex);
     }
@@ -2287,7 +2289,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         es.viewport_set = true;
     }
     // NV4097_SET_ZMIN_MAX_CONTROL: depth clamped rather than clipped (RPCS3 VKGSRender.cpp: clamp, or no clip).
-    const MTLDepthClipMode clip = raster.depth_clamp || !raster.depth_clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
+    // PSPOCKET_RSX_NO_DEPTH_CLAMP=1 (a debugging aid, D-1033): near and far planes always clip.
+    static const bool no_clamp = std::getenv("PSPOCKET_RSX_NO_DEPTH_CLAMP") != nullptr;
+    const MTLDepthClipMode clip =
+        (raster.depth_clamp || !raster.depth_clip) && !no_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
     if (es.clip_mode != static_cast<s32>(clip)) {
         [enc setDepthClipMode:clip];
         es.clip_mode = static_cast<s32>(clip);
@@ -2789,6 +2794,21 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_flip(request);
+    }
+    // PSPOCKET_RSX_EXACT_FROM=FLIP (D-1033): the exact mode from that frame on, so a route reaches its scene at speed and
+    // the scene runs exact (pass merging and the feedback cache go off with it).
+    static const u64 exact_from = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_EXACT_FROM");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    if (exact_from && !impl_->exact && request.flip_index >= exact_from) {
+        @autoreleasepool {
+            impl_->end_pass_for(Impl::kEndFlush);
+            impl_->exact = true;
+            impl_->config.merge_passes = false;
+            impl_->feedback_cached = false;
+        }
+        PS_LOG_INFO(kChan, "the exact mode from flip {} (PSPOCKET_RSX_EXACT_FROM)", request.flip_index);
     }
     Impl& m = *impl_;
     if (++m.report_flips == Impl::kGpuReportFlips) {
