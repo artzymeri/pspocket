@@ -117,6 +117,7 @@
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/loader/disc.hpp"
+#include "pspocket/loader/frame_watch.hpp"
 #include "pspocket/loader/hdd_game.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/loader/system.hpp"
@@ -665,6 +666,9 @@ struct RunSummary {
     // shot passes the jumps, which compare neighbours (run 327's fight, D-951).
     u64 dark_frames = 0;
     std::vector<std::pair<u64, double>> dark_at; // the first ones: flip, the black share
+    // The phone's glitch detectors over every flip's GPU thumbnail (FrameWatch, D-1064, D-1070), with --summary.
+    loader::FrameWatch watch;
+    std::vector<loader::FrameWatch::Event> glitches; // those past the rate limit (one a kind every 2 minutes)
 };
 RunSummary g_summary;
 
@@ -798,6 +802,17 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
         kernel.unimplemented_count(), unimplemented_functions);
     j += std::format("  \"spu_loads\": {{\"lifted\": {}, \"interpreted\": {}, \"images_without_lifted\": {}}},\n",
         spu.attached, spu.unknown, spu.images);
+    j += "  \"glitches\": {\"counts\": {"; // D-1070
+    for (usize k = 0; k < g_summary.watch.counts.size(); k++)
+        j += std::format("{}{}: {}", k ? ", " : "", json_string(loader::FrameWatch::name(static_cast<loader::FrameWatch::Kind>(k))),
+            g_summary.watch.counts[k]);
+    j += "}, \"events\": [";
+    for (usize k = 0; k < g_summary.glitches.size(); k++) {
+        const auto& e = g_summary.glitches[k];
+        j += std::format("{}{{\"kind\": {}, \"flip\": {}, \"value\": {:.2f}}}", k ? ", " : "",
+            json_string(loader::FrameWatch::name(e.kind)), e.flip, e.value);
+    }
+    j += "]},\n";
     j += std::format("  \"frame_jumps\": {{\"compared\": {}, \"jumps\": {}, \"big\": {}, \"at\": [",
         g_summary.frames_compared, g_summary.jumps, g_summary.big_jumps);
     for (usize i = 0; i < g_summary.jump_at.size(); i++)
@@ -1021,6 +1036,12 @@ int main(int argc, char** argv)
     }
     if (!elf_path) return usage();
     if (!summary_path.empty()) log::set_sink(summary_sink, nullptr); // warnings and errors counted by shape
+    if (!summary_path.empty()) // called under g_summary.mutex, from the thumbnail callback
+        g_summary.watch.on_event = [](const loader::FrameWatch::Event& e) {
+            g_summary.glitches.push_back(e);
+            std::printf("glitch: %s at flip %llu (%.2f)\n", loader::FrameWatch::name(e.kind),
+                static_cast<unsigned long long>(e.flip), e.value);
+        };
 
     std::vector<u8> bytes;
     if (!read_file(elf_path, bytes)) {
@@ -1136,8 +1157,14 @@ int main(int argc, char** argv)
             static std::atomic<u64> trace_on_black{0}, traced_flip{0};
             if (const char* v = std::getenv("PSPOCKET_TRACE_ON_BLACK"); v && !frames_dir.empty())
                 trace_on_black = std::max<u64>(1, std::strtoull(v, nullptr, 0));
-            if (frame_jumps || trace_on_black) { // the GPU's thumbnails (D-1027), the frames --frame-every names
+            if (frame_jumps || trace_on_black || !summary_path.empty()) { // the GPU's thumbnails (D-1027)
                 mc.thumbnail = [&](const u8* bgra64x36, u64 flip) {
+                    if (!summary_path.empty()) { // the glitch detectors (D-1070)
+                        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                        std::lock_guard lock(g_summary.mutex);
+                        g_summary.watch.frame_bgra(bgra64x36, 64, 36, 64 * 4, flip, now);
+                    }
                     if (frame_jumps && flip >= frame_from && flip % frame_every == 0) compare_frame(bgra64x36, flip);
                     const u64 from = trace_on_black.load();
                     if (!from || flip < from || traced_flip.load()) return;

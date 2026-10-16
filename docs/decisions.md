@@ -16888,3 +16888,12 @@ before Finalize and Shutdown. 40 of 40 runs pass.
   (scaled) of each of the draw's targets is read back and logged: the draw that made a pixel what it is.
 - The frame trace also names conditional-rendering skips (`Backend::draw_skipped`), the RSX's NV0039 and NV3089 copies
   (`Backend::trace_note`), each draw's depth test, depth write, stencil and vertex program start.
+
+## D-1070 · 2026-10-16 · The glitch detectors fed every flip on the Mac and the phone
+
+- With D-1027's GPU thumbnail of every flip (64x36, MetalBackendConfig::thumbnail), FrameWatch (D-1064) now sees every
+  frame: the iPhone app's session feeds it from the Metal completion thread (a mutex shared with the flag button), and
+  pspocket-boot feeds it whenever --summary is given; the summary gains "glitches": counts by kind and the events past
+  the rate limit (kind, flip, value), each also printed as "glitch: KIND at flip N". bench_check.py warns on flicker,
+  hitch and frozen events in play (partly black stays the frames' own check) until they have run some nights.
+- "Frozen" waits 60 s, not 10: Assassin's Creed's loading screen held one picture 10 s in the first 45 s run.

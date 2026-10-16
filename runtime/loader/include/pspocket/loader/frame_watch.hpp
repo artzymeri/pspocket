@@ -10,7 +10,7 @@
 //                 one before that again (under a third of it): something drawn in every other frame. A camera cut is
 //                 A, B, B.
 //   hitch         over 500 ms between two frames while the game was flipping at least 10 a second.
-//   frozen        the same picture (mean difference under 0.5) for 10 s while frames keep coming: the game stuck
+//   frozen        the same picture (mean difference under 0.5) for 60 s while frames keep coming: the game stuck
 //                 drawing one frame (a loop that still flips).
 // Events are rate-limited per kind (one per kind every `min_gap_ns`); every one is counted.
 
@@ -41,7 +41,7 @@ public:
         double black_min = 0.2, black_max = 0.95;
         double flicker_diff = 20, flicker_back = 1.0 / 3;
         u64 hitch_ns = 500'000'000;
-        u64 frozen_ns = 10'000'000'000;
+        u64 frozen_ns = 60'000'000'000; // a loading screen holds still 10 s and more (Assassin's Creed's, D-1070)
         u64 min_gap_ns = 120'000'000'000; // one event per kind every 2 minutes
     };
 

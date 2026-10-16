@@ -153,6 +153,7 @@ struct Session {
     // Glitch reports (D-1065): the detectors over each frame's thumbnail, the folder reports go to, and how many this
     // session wrote (at most kMaxReports).
     std::unique_ptr<loader::FrameWatch> watch;
+    std::mutex watch_mutex; // frames come on a Metal completion thread, the flag from the UI
     std::string reports_dir;
     std::atomic<int> reports_written{0};
     // The app's Documents folder (the log's), where a frame trace is asked for and kept (D-947): an empty file
@@ -576,6 +577,15 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         mc.trace_surface = [raw](const std::string& name, const u8* bgra, u32 w, u32 h) {
             if (!raw->trace_dir.empty()) write_png_rgb(raw->trace_dir + "/" + name + ".png", bgra, w, h, w * 4, true);
         };
+        // Glitch reports (D-1065): every flip's 64x36 thumbnail from the GPU (D-1027) into the detectors.
+        mc.thumbnail = [raw](const u8* bgra, u64 flip) {
+            const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            std::lock_guard lock(raw->watch_mutex);
+            if (raw->watch)
+                raw->watch->frame_bgra(bgra, rsx::metal::kThumbnailWidth, rsx::metal::kThumbnailHeight,
+                    rsx::metal::kThumbnailWidth * 4, flip, now);
+        };
         mc.present = [raw](const rsx::metal::PresentFrame& f) {
             const u64 flips = raw->flips.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto now = std::chrono::steady_clock::now();
@@ -826,9 +836,12 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         s->system = loader::SystemLibrary::load((flash.parent_path() / "system").string(), *s->lle, *s->memory, &why);
         if (!s->system) PS_LOG_INFO(kChan, "{}", why);
     }
-    // Glitch reports (D-1065): the detectors, fed each frame's thumbnail once the backend has them.
+    // Glitch reports (D-1065): the detectors, fed each frame's GPU thumbnail (mc.thumbnail above, D-1027).
     if (o->log_path) s->reports_dir = (std::filesystem::path(o->log_path).parent_path() / "reports").string();
-    s->watch = std::make_unique<loader::FrameWatch>();
+    {
+        std::lock_guard lock(s->watch_mutex);
+        s->watch = std::make_unique<loader::FrameWatch>();
+    }
     {
         Session* sp = s.get(); // the session lives as long as the app
         s->watch->on_event = [sp](const loader::FrameWatch::Event& e) {
@@ -1069,6 +1082,7 @@ extern "C" void ps_game_flag(void)
     if (!g_session || !g_session->watch) return;
     const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard lock(g_session->watch_mutex);
     g_session->watch->flag(g_session->flips.load(std::memory_order_relaxed), now);
 }
 

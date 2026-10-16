@@ -146,6 +146,11 @@ def main(argv):
     ws = windows(log, a.from_s)
     b = budget(ws)
     from_flip = min((w["since"] - w["frames"] for w in ws), default=0) # the first frame of the play windows
+    # The phone's detectors over every flip (D-1070): flicker, hitch, frozen in play are warnings until they have run
+    # some nights (partly black is the frames' own check above).
+    for e in summary.get("glitches", {}).get("events", []):
+        if e["kind"] in ("flicker", "hitch", "frozen") and e["flip"] >= from_flip:
+            warns.append(f"{e['kind']} at flip {e['flip']} ({e['value']:.1f})")
     fr = frames_check(os.path.join(a.run_dir, "frames"), from_flip, a.keep)
     if fr["partly_black"]:
         fails.append(f"{len(fr['partly_black'])} partly black frame(s) in play, the worst {fr['partly_black'][0]['black']:.0%} "

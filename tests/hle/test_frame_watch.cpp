@@ -66,7 +66,7 @@ TEST_CASE("frame watch: a surface nothing drew, flicker, hitches, a frozen pictu
         CHECK(got.size() == 1); // rate-limited: counted, not reported again
         CHECK(w.counts[static_cast<usize>(FrameWatch::Kind::Flicker)] >= 2);
     }
-    SECTION("over half a second between frames while flipping is a hitch; a frozen picture after 10 s")
+    SECTION("over half a second between frames while flipping is a hitch; a frozen picture after 60 s, not after 10 (a loading screen)")
     {
         for (int i = 0; i < 60; i++) feed(scene(i % 2 ? 20 : 22));
         t += 800'000'000;
@@ -75,6 +75,8 @@ TEST_CASE("frame watch: a surface nothing drew, flicker, hitches, a frozen pictu
         CHECK(got[0].kind == FrameWatch::Kind::Hitch);
         CHECK(got[0].value > 800);
         for (int i = 0; i < 31 * 11; i++) feed(scene(50));
+        CHECK(got.size() == 1); // 11 s of one picture: a loading screen
+        for (int i = 0; i < 31 * 50; i++) feed(scene(50));
         REQUIRE(got.size() == 2);
         CHECK(got[1].kind == FrameWatch::Kind::Frozen);
     }
