@@ -26,7 +26,8 @@ add_library(pspocket_lv2 STATIC
     src/prx.cpp
     src/rsxaudio.cpp
     src/raw_spu.cpp
-    src/vm.cpp)
+    src/vm.cpp
+    src/waker.cpp)
 target_include_directories(pspocket_lv2 PUBLIC include PRIVATE src)
 target_link_libraries(pspocket_lv2 PUBLIC pspocket::core pspocket::ppu pspocket::rsx pspocket::spu)
 pspocket_set_warnings(pspocket_lv2)

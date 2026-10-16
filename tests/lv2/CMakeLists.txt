@@ -3,7 +3,7 @@
 # and wait report.
 pspocket_add_test(test_lv2
     SOURCES test_dispatch.cpp test_threads.cpp test_mutex_cond.cpp test_rwlock_sema.cpp test_event.cpp
-            test_lw.cpp test_time.cpp test_memory.cpp test_fs.cpp test_process.cpp test_report.cpp test_usbd.cpp test_devices.cpp test_services.cpp test_misc_calls.cpp test_dbg.cpp test_rsxaudio.cpp test_raw_spu.cpp
+            test_lw.cpp test_time.cpp test_memory.cpp test_fs.cpp test_process.cpp test_report.cpp test_usbd.cpp test_devices.cpp test_services.cpp test_misc_calls.cpp test_dbg.cpp test_rsxaudio.cpp test_raw_spu.cpp test_waker_first.cpp
     LIBS pspocket::lv2 pspocket::recomp_spu)
 # White-box access (wait-queue lengths) for the ordering tests; tests/common for thread_check.hpp (D-585).
 target_include_directories(test_lv2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/runtime/lv2/src

@@ -15,6 +15,7 @@
 #include <algorithm>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 
 #if defined(__APPLE__)
 #include <pthread/qos.h>
@@ -55,6 +56,8 @@ void* host_thread_main(void* raw)
     }
 #endif
     try {
+        if (t.waiter.waker.thread) defer_to_waker(t); // its creator goes on first (D-1041)
+        if (chaos::on(chaos::S5_ThreadStart)) [[unlikely]] chaos::delay(chaos::S5_ThreadStart, t.id); // D-1045
         run_guest(k, *t.ctx, k.base(), t.entry, true);
         PS_LOG_ERROR(kChan, "PPU thread {:#x} returned from its entry function {:#010x} (r3 = {:#x}) instead of calling "
                             "sys_ppu_thread_exit; treating it as an exit",
@@ -163,6 +166,9 @@ Result Kernel::start_thread(u32 id)
         std::lock_guard lock(s.host_threads->mutex);
         s.host_threads->live++;
     }
+    // A thread of the same or a lower priority runs after its creator on the PS3 (D-1041).
+    t->waiter.waker = {};
+    if (PpuThread* creator = current_thread()) note_starter(*creator, *t);
     auto* args = new StartArgs{t, s.host_threads};
     pthread_t handle;
     const int rc = pthread_create(&handle, &attr, host_thread_main, args);

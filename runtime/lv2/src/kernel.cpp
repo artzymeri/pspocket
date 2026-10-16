@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "spu.hpp"
 #include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
@@ -274,6 +275,7 @@ void prepare_wait(Waiter& w)
 {
     std::lock_guard lock(w.park_mutex);
     w.signaled = false;
+    w.waker = {};
 }
 
 void wake(Waiter& w, Result result)
@@ -283,6 +285,7 @@ void wake(Waiter& w, Result result)
     std::lock_guard lock(w.park_mutex);
     w.result = result;
     w.signaled = true;
+    note_waker(w); // the waker goes on first (D-1041, waker.cpp)
     w.park_cv.notify_all();
 }
 
@@ -661,6 +664,7 @@ Kernel::Kernel(GuestMemory& memory, Config config) : memory_(memory), config_(st
     PS_CHECK(memory_.reserved());
     if (!config_.executor) config_.executor = default_executor;
     impl_ = std::make_unique<Impl>(*this);
+    chaos::configure_from_env(); // shake mode, when PSPOCKET_SHAKE asks (D-1045)
 }
 
 Kernel::~Kernel()
@@ -885,6 +889,7 @@ void Kernel::syscall(PPUContext& ctx)
     }
     dbg_stop_point(*t); // a debugger's stop (D-937)
     const u64 number = ctx.gpr[11];
+    if (chaos::on(chaos::S1_Syscall)) [[unlikely]] chaos::delay(chaos::S1_Syscall, number); // shake mode (D-1045)
     if (const auto observer = impl_->syscall_observer.load(std::memory_order_relaxed)) [[unlikely]] {
         observer(impl_->syscall_observer_user, static_cast<u32>(number), &ctx.gpr[3]);
     }
@@ -902,7 +907,7 @@ void Kernel::syscall(PPUContext& ctx)
             } in_syscall(*t, static_cast<u32>(number));
             entry.fn(*t, ctx);
             PS_LOG_TRACE(kChan, "{} -> r3={:#x}", entry.name, ctx.gpr[3]);
-            dbg_stop_point(*t);
+            return_point(*t);
             return;
         }
     }

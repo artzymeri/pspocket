@@ -164,8 +164,10 @@ public:
     // The thread's calls into lv2 or a library, counted as each begins and as it returns (dbg_stop_point): another
     // thread reads it to see this one get on (defer_to_sender, event.cpp, D-999). Written by the owning thread only.
     std::atomic<u64> lv2_calls{0};
-    // The PPU thread whose event last woke this one, for sender_barrier (D-999). The owning thread only.
+    // The PPU thread that last woke this one, for sender_barrier (D-999). The owning thread only.
     WakerMark woken_by;
+    // This thread woke a PPU thread in its current call (note_waker; PSPOCKET_LV2_WAKE_DELAY_US). The owning thread.
+    bool woke = false;
 
     // A debugger's stop (sys_dbg_stop_threads, D-937): once asked, the thread stops at its next call into lv2 or a
     // library, or as such a call returns (dbg_stop_point), and waits there until sys_dbg_continue_threads.
@@ -195,6 +197,28 @@ inline void dbg_stop_point(PpuThread& t)
     t.lv2_calls.store(t.lv2_calls.load(std::memory_order_relaxed) + 1, std::memory_order_release); // D-999
     if (t.dbg_stop.load(std::memory_order_acquire)) [[unlikely]] dbg_park(t);
 }
+// The waker goes on first (D-999, D-1041, waker.cpp). How far the rule goes (PSPOCKET_LV2_SENDER_FIRST): off, event
+// queues only (D-999), or every wake and thread start (the default).
+enum class WakerFirst : u8 { Off, Events, All };
+WakerFirst waker_first();
+// The mark a wake by `t` leaves on the woken thread; `kind` is kWakeKinds'.
+WakerMark waker_mark(PpuThread& t, u8 kind);
+// wake() calls it: the calling PPU thread, if any, wakes `w` (its mark on w.waker).
+void note_waker(Waiter& w);
+// Kernel::start_thread: `creator` starts `started`, which lets it go on first.
+void note_starter(PpuThread& creator, PpuThread& started);
+// Holds `t` until its waker (t.waiter.waker, then cleared) goes on, as lv2's scheduler on the PS3.
+void defer_to_waker(PpuThread& t);
+void woke_delay(PpuThread& t);
+// Where a PPU thread goes back to guest code from a call into lv2 or a library (Kernel::syscall, the HLE stubs): a
+// debugger's stop, and the wait for the thread that woke it during the call.
+inline void return_point(PpuThread& t)
+{
+    dbg_stop_point(t);
+    if (t.woke) [[unlikely]] woke_delay(t);
+    if (t.waiter.waker.thread) [[unlikely]] defer_to_waker(t);
+}
+
 // Makes `t` the lv2 thread of the calling host thread (nullptr: none): a PPU thread's host thread at its start, and the
 // host thread of one of its fibers while that runs as the PPU thread (cellFiber, D-568).
 void set_current_thread(PpuThread* t);

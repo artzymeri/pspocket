@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "pspocket/core/types.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/lv2/errors.hpp"
 
 namespace pspocket::lv2 {
@@ -128,21 +129,27 @@ enum class WaitKind : u8 {
     Net,         // a network call (sys_net_bnet_recvfrom, accept, select, poll...); no ID
 };
 const char* wait_kind_name(WaitKind kind);
+// What a wake the waker-first rule counts was (D-1041, waker.cpp): a WaitKind (None: an event taken from its queue),
+// or a thread's start.
+inline constexpr usize kWakeStart = static_cast<usize>(WaitKind::Net) + 1;
+inline constexpr usize kWakeKinds = kWakeStart + 1;
+const char* wake_kind_name(usize kind);
 
 struct WaitOn {
     WaitKind kind = WaitKind::None;
     u32 id = 0; // the object's lv2 ID
 };
 
-// The PPU thread whose call sent an event (D-999), so the thread that receives it can let that thread go on first, as
-// lv2's scheduler does on the PS3 (defer_to_sender, event.cpp): which thread, its priority, its lv2_calls when it
-// sent, its host thread (for that thread's CPU time) and when.
+// The PPU thread whose call woke a thread (D-999 events, D-1041 every wake), so the woken thread can let that thread
+// go on first, as lv2's scheduler does on the PS3 (defer_to_waker, waker.cpp): which thread, its priority, its
+// lv2_calls when it woke the other, its host thread (to see it gone), when, and what the wake was (kWakeKinds).
 struct WakerMark {
     u32 thread = 0; // lv2 thread ID; 0: none
     s32 prio = 0;
     u64 calls = 0;
     u64 host_thread = 0;
     std::chrono::steady_clock::time_point at{};
+    u8 kind = 0;
 };
 
 struct Waiter {
@@ -158,7 +165,9 @@ struct Waiter {
     // Written by the waker before wake(), read by the waiter after it returns.
     Result result = CELL_OK;
     u64 data[4]{};
-    WakerMark waker; // an event queue's: the PPU thread that sent the event (D-999)
+    // The PPU thread that woke the waiter (D-999, D-1041: wake() notes it), or that started it; its owner takes it as
+    // it goes back to guest code (return_point).
+    WakerMark waker;
     // What the waiter waits for (event flag: bit pattern and mode), written before it queues.
     u64 want[2]{};
 
@@ -243,7 +252,7 @@ std::chrono::steady_clock::time_point deadline_after_us(std::chrono::steady_cloc
 // return. On timeout or abort, `cancel(aborting)` runs with `lk` re-taken and says where the waiter is. `on` names
 // the object for reports (Waiter::waiting_on) while the waiter is parked.
 template <class Cancel>
-WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, WaitOn on, Cancel&& cancel)
+WaitStatus park_wait(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, WaitOn on, Cancel&& cancel)
 {
     bool timed = timeout_us != 0;
     const auto now = std::chrono::steady_clock::now();
@@ -283,6 +292,15 @@ WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, Wai
             break;
         }
     }
+}
+
+template <class Cancel>
+WaitStatus park(Waiter& w, std::unique_lock<std::mutex>& lk, u64 timeout_us, WaitOn on, Cancel&& cancel)
+{
+    const WaitStatus ws = park_wait(w, lk, timeout_us, on, std::forward<Cancel>(cancel));
+    // Shake mode's S4 (D-1045): the woken thread a little late back, with no lock held.
+    if (ws == WaitStatus::Woken && chaos::on(chaos::S4_AfterPark)) [[unlikely]] chaos::delay(chaos::S4_AfterPark, w.id);
+    return ws;
 }
 
 // Sleeps for `us` microseconds unless the wait is aborted. Returns false when aborted.

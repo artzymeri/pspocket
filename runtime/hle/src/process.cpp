@@ -3,6 +3,7 @@
 // rpcs3/Emu/Memory/vm.cpp (vm::alloc first fit in vm::main), Emu/Cell/Modules/sys_ppu_thread_.cpp (TLS).
 
 #include "pspocket/hle/process.hpp"
+#include "pspocket/core/chaos.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -53,8 +54,9 @@ void stub_trampoline(PPUContext* ctx, uint8_t* base)
             ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], lv2::current_thread() ? lv2::current_thread()->id : 0);
         auto* t = static_cast<lv2::PpuThread*>(ctx->runtime);
         if (t) lv2::dbg_stop_point(*t); // a debugger's stop (D-937)
+        if (chaos::on(chaos::S2_HleEntry)) [[unlikely]] chaos::delay(chaos::S2_HleEntry, f->nid); // shake mode (D-1045)
         f->impl->fn(*ctx, base);
-        if (t) lv2::dbg_stop_point(*t);
+        if (t) lv2::return_point(*t); // a debugger's stop; the thread that woke this one goes first (D-1041)
         return;
     }
     const std::string_view name = f->name.empty() ? std::string_view("?") : std::string_view(f->name);

@@ -16897,3 +16897,44 @@ before Finalize and Shutdown. 40 of 40 runs pass.
   the rate limit (kind, flip, value), each also printed as "glitch: KIND at flip N". bench_check.py warns on flicker,
   hitch and frozen events in play (partly black stays the frames' own check) until they have run some nights.
 - "Frozen" waits 60 s, not 10: Assassin's Creed's loading screen held one picture 10 s in the first 45 s run.
+## D-1041 · 2026-10-16 · The waker goes on first for every wake and for thread start, the semaphore's lighter
+
+D-999 held a PPU thread woken by another PPU thread's event until the sender had begun its next call into lv2 or a
+library (or waited there, or was gone; 10 ms at most), as lv2's scheduler leaves the sender running on the PS3. Every
+other wake went through kernel.cpp's wake() with no such rule: a mutex or lwmutex handed over at unlock, a condition
+variable or lwcond signalled, an rwlock released, a semaphore posted, an event flag set, a thread's exit waking its
+joiner; and a new thread could run before the thread that started it went on (the "bulletproof engine" plan's A1 and
+A3).
+
+- **runtime/lv2/src/waker.cpp** (event.cpp's D-999 code moved and widened): wake() notes the PPU thread that wakes
+  (note_waker: Waiter::waker, with what the wake was), only when a waiter is woken, so an uncontended lwmutex (which
+  never enters the kernel) and a post nobody waits for cost nothing. Kernel::start_thread notes the creator on the new
+  thread (note_starter). The woken thread takes it where it goes back to guest code: return_point (kernel.hpp) at the
+  end of Kernel::syscall and of every library function (process.cpp's stub_trampoline), and a new thread before its
+  first instruction. defer_to_waker applies D-999's rule: not for a more urgent thread, 10 ms at most from the wake;
+  sender_barrier (before an event queue's destruction or a thread's creation) as before, for every strict kind.
+- **Light kinds** (PSPOCKET_LV2_WAKER_LIGHT, default "semaphore"): held only until the waker is back from the call
+  that woke (its lv2_calls past the wake's return), and no barrier. Measured on GTA V's gate walk, with the full rule
+  the semaphore's 28,662 waits (220 a second: GTA V's posts are each followed by long stretches of guest code) took
+  11.1 s of the walk's 128 s, its median fps 27.6 and its slowest window 16.8 against 29.8 and 26.4 with the events
+  only (the machine at load 18; the same at load 11 measured 19 us a wait, at load 50 760 us: the waker not run by the
+  host is the case the rule is for, and the case it costs most).
+- PSPOCKET_LV2_SENDER_FIRST=0 turns it off, =events keeps D-999's event queues only (A/B). PSPOCKET_LV2_WAKE_DELAY_US=N
+  has every call that woke a PPU thread sleep N us at its end (D-999's send delay for every wake). pspocket-boot prints
+  the waits by kind at the end and the summary has them (waker_first).
+- **Measured** (GTA V's gate walk, 128 s, A/B in one session): two runs each, interleaved (the machine at load
+  8 to 25): D-999's events only, median 29.6 and 29.6 fps, slowest window 27.2 and 28.0, 8,332 and 8,032 waits,
+  548 and 339 ms; every wake (the semaphore light), median 29.8 and 29.4, slowest 29.1 and 27.8, 40,696 and 40,477
+  waits, 868 ms (the semaphore's 31,730 284 ms, 9 us each; the events' 8,673 578 ms; lwmutex 264, 6 ms; thread start
+  24, 0.1 ms; join 1) and about 0.9 s the second (semaphore 691 ms); both gates pass. Assassin's Creed, a fresh hdd0
+  through the install into the garden (330 s, walk-garden.txt): to its end, no fault or fatal error, the garden at 55
+  to 60 fps; 47,790 waits, 1.85 s (event queue 43,943 1.49 s, lwmutex 3,180 343 ms, sleep 611, thread start 5); two
+  5 s windows at 2.2 and 0.8 fps while it loads into the garden (at 215 to 225 s), not compared with an events-only
+  run: that run was stopped for the disk (6 to 9 GB free), so the A/B on AC is still to do
+- Tests: tests/lv2/test_waker_first.cpp, a contract matrix: every primitive (mutex hand-off, cond signal, rwlock read
+  and write release, semaphore post, lwmutex hand-off, lwcond signal modes 2 and 3, event flag set, event send) against
+  the woken thread's priority the same, lower and more urgent, the waker a host thread the host does not run (it
+  sleeps) between its wake and its next call; a post or unlock that wakes nobody leaves no mark and no wait; a new
+  thread of the same or lower priority runs after its creator's next call, a more urgent one at once, and a joiner
+  waits for the exiting thread to be gone. PSPOCKET_WAKER_MATRIX_ROUNDS=N runs it N times. It fails with
+  PSPOCKET_LV2_SENDER_FIRST=0 (every case) and =events (every case but the event's).
