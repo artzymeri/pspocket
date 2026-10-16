@@ -11,6 +11,7 @@
 #include "guest.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <initializer_list>
 #include <string_view>
@@ -387,6 +388,11 @@ TEST_CASE("cellFiber: a worker control's fibers run on two worker threads; joine
         REQUIRE(e.call("cellFiberPpuUtilWorkerControlJoinFiber", {kControl, fiber_at(i), out(i)}) == 0);
         CHECK(ps_read32(e.b, out(i)) == 100 + i);
     }
+    // Both workers inside RunFibers before Shutdown (the control word's top byte counts them): one worker can run all
+    // six fibers before the other thread starts, and a RunFibers after Shutdown returns STAT, as Sony's does.
+    for (int i = 0; i < 2000 && ps_read8(e.b, kControl + 0x200) != 2; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(ps_read8(e.b, kControl + 0x200) == 2);
     // Finalize before Shutdown: STAT (the control still runs); Shutdown lets the workers' RunFibers return.
     CHECK(e.call("cellFiberPpuUtilWorkerControlFinalize", {kControl}) == kStat);
     REQUIRE(e.call("cellFiberPpuUtilWorkerControlShutdown", {kControl}) == 0);

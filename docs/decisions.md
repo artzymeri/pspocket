@@ -16768,3 +16768,11 @@ The bulletproof plan's net 4: what a game nobody has run yet needs, before anyon
 - Tried on Assassin's Creed: 759 imports, none missing; 45 s from its library, 18 fps in the loading screens, no RSX
   failures, no unimplemented calls, 10,839 SPU program loads lifted and none interpreted. Without the library the
   PPU code is interpreted (11 to 13 fps) and the report says so.
+
+## D-1069 · 2026-10-16 · The worker-control fiber test waits for both workers before Shutdown
+
+The gate failed once on "cellFiber: a worker control's fibers run on two worker threads" (2 in 15 runs alone):
+one worker thread ran all six fibers before the other thread entered cellFiberPpuUtilWorkerControlRunFibers, the
+test's Shutdown came first, and the late RunFibers returned CELL_FIBER_ERROR_STAT, as Sony's does for a control no
+longer initialized. The library is right; the test now waits (up to 10 s) until the control word's worker count is 2
+before Finalize and Shutdown. 40 of 40 runs pass.
