@@ -396,11 +396,18 @@ s32 start_interrupt_thread(PPUContext& ctx, HleProcess& p)
     return lv2::sys_ppu_thread_start(t, static_cast<u32>(ps_read64(base, v.addr())));
 }
 
-// _cellGcmInitBody(context**, cmdSize, ioSize, ioAddress): RPCS3 _cellGcmInitBody.
-s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u32 io_address)
+// _cellGcmInitBody(context**, cmdSize, ioSize, ioAddress): RPCS3 _cellGcmInitBody. `io_buffer` false is the
+// command buffer in local memory (D-1040): libgcm_sys's other entry, 0xB70B4AD3 (at 0xe58, `b 0xcc0`), runs the same
+// body as _cellGcmInitBody (0xe5c, `li r7,1; b 0xcc0`) with the caller's r7 in place of 1. Sony's body with r7 = 0
+// (0xd40-0xe08, 0x9a8 at 0xa48): cmdSize must be over 0xffff and a multiple of 4, ioSize and ioAddress are not
+// looked at, nothing is mapped for the RSX, and the command buffer starts at local memory's base (the address
+// sys_rsx_memory_allocate gave, passed where ioAddress goes); the rest (the context 4 KB in, the FIFO at offset
+// 0x1000, which no IO mapping holds: the RSX reads it from local memory) is _cellGcmInitBody's. GTA IV (BLUS30127)
+// calls it with cmdSize 0x300000, ioSize 0, ioAddress 0, r7 0.
+s32 init_body(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u32 io_address, bool io_buffer)
 {
-    PS_LOG_INFO(kChan, "_cellGcmInitBody(context {:#x}, cmdSize {:#x}, ioSize {:#x}, ioAddress {:#x})", context,
-        cmd_size, io_size, io_address);
+    PS_LOG_INFO(kChan, "_cellGcmInitBody(context {:#x}, cmdSize {:#x}, ioSize {:#x}, ioAddress {:#x}){}", context,
+        cmd_size, io_size, io_address, io_buffer ? "" : ", the command buffer in local memory");
     GcmState& g = gcm();
     std::lock_guard lock(g.mutex);
     lv2::PpuThread& t = thread_of(ctx);
@@ -448,7 +455,12 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
 
     g.local_addr = PS_MEM_RSX_LOCAL_BASE;
     g.local_size = kLocalSize;
-    if (const s32 r = map_ea_io(ctx, g, io_address, 0, io_size, false); r != lv2::CELL_OK) {
+    if (!io_buffer) {
+        // libgcm_sys 0xa50-0xa64: the size's checks; the buffer is local memory's start (0xa5c: r30 = the address).
+        if (cmd_size <= 0xFFFF || (cmd_size & 3) || cmd_size > g.local_size) return error(CELL_GCM_ERROR_FAILURE);
+        io_address = g.local_addr;
+        io_size = 0;
+    } else if (const s32 r = map_ea_io(ctx, g, io_address, 0, io_size, false); r != lv2::CELL_OK) {
         PS_LOG_ERROR(kChan, "_cellGcmInitBody: mapping {:#x} bytes at {:#010x} for the RSX failed: {}", io_size,
             io_address, lv2::error_name(r));
         return error(CELL_GCM_ERROR_FAILURE);
@@ -458,7 +470,7 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
     lv2_syscall(ctx, 674, {kContextId, 0x001, 0x1000, 0x1000, 0, 0});
     for (const u64 head : {0, 1}) lv2_syscall(ctx, 674, {kContextId, 0x10a, head, 0, kFlipDone, 0});
     ps_write32(base, g.driver_info + 0x12C0, ps_read32(base, g.driver_info + 0x12C0) | 4);
-    g.io_address = io_address;
+    g.io_address = io_buffer ? io_address : 0xFFF00000; // cellGcmGetConfiguration's ioAddress, as libgcm_sys's
     g.io_size = io_size;
     g.cmd_begin = io_address;
     g.cmd_fragments = cmd_size / kFragment;
@@ -530,6 +542,18 @@ s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u3
         return error(CELL_GCM_ERROR_FAILURE);
     }
     return lv2::CELL_OK;
+}
+
+s32 _cellGcmInitBody(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u32 io_address)
+{
+    return init_body(ctx, context, cmd_size, io_size, io_address, true);
+}
+
+// libgcm_sys's unnamed 0xB70B4AD3: _cellGcmInitBody with the caller's fifth argument, 0 for the command buffer in
+// local memory (init_body, D-1040).
+s32 cellGcmSys_B70B4AD3(PPUContext& ctx, u32 context, u32 cmd_size, u32 io_size, u32 io_address, u32 io_buffer)
+{
+    return init_body(ctx, context, cmd_size, io_size, io_address, io_buffer != 0);
 }
 
 // RPCS3: a TODO that does nothing.
@@ -1769,6 +1793,7 @@ void register_cellGcmSys(Registry& r)
 {
     r.add(kModule, {
         PS_HLE_FUNC(0x15BAE46B, _cellGcmInitBody),
+        PS_HLE_FUNC(0xB70B4AD3, cellGcmSys_B70B4AD3),
         PS_HLE_FUNC(0x3A33C1FD, _cellGcmFunc15),
         PS_HLE_FUNC(0x661FE266, _cellGcmFunc12),
         PS_HLE_FUNC(0xE315A0B2, cellGcmGetConfiguration),

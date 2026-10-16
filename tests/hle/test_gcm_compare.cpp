@@ -44,7 +44,18 @@ struct Op {
     u64 flags = 0;
 };
 
+// How the run initialises GCM: _cellGcmInitBody, or libgcm_sys's unnamed 0xB70B4AD3 with its fifth argument
+// (D-1040: 0 is the command buffer in local memory); the init's answer, its lv2 RSX calls and the game's context
+// (begin, end, current) are compared too.
+struct Init {
+    const char* fn = "_cellGcmInitBody";
+    std::vector<u64> args{kCtxPtr, kCmdSize, 0x100000, kIo};
+};
+
 struct Run {
+    u32 init_answer = 0;
+    std::vector<u32> context; // begin, end, current
+    std::vector<std::string> init_calls;
     std::vector<u32> answers;
     std::vector<u8> out;
     std::vector<u8> driver; // the heads and the handler mask
@@ -78,7 +89,7 @@ lv2::Config rsx_config()
     return c;
 }
 
-Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
+Run run(const std::string& flash, const std::vector<Op>& ops, bool sony, const Init& init = {})
 {
     Fixture f({}, rsx_config());
     REQUIRE(f.hle->link_internal_functions({"cellGcmSys"}));
@@ -95,7 +106,10 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
         if (sony) {
             std::array<u64, 8> a{};
             std::copy(args.begin(), args.end(), a.begin());
-            return lib.call(t, recomp::nid_of(name), {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]});
+            const std::string_view n = name;
+            const u32 nid = n.starts_with("cellGcmSys_") ? static_cast<u32>(std::strtoul(name + 11, nullptr, 16))
+                                                         : recomp::nid_of(name);
+            return lib.call(t, nid, {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]});
         }
         const Function& fn = GuestThread::find(name);
         for (usize i = 0; i < args.size(); i++) t.ctx.gpr[3 + i] = args[i];
@@ -105,15 +119,19 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
         return static_cast<u32>(t.ctx.gpr[3]);
     };
     Run r;
-    calls.on = std::getenv("PSPOCKET_GCM_COMPARE_INIT") != nullptr; // debugging: the init's calls too
-    REQUIRE(call("_cellGcmInitBody", {kCtxPtr, kCmdSize, 0x100000, kIo}) == 0);
+    calls.on = true; // the init's calls
+    r.init_answer = call(init.fn, init.args);
+    {
+        std::lock_guard lock(calls.mutex);
+        r.init_calls = std::move(calls.list);
+        calls.list.clear();
+    }
+    if (r.init_answer != 0) return r;
+    const u32 context = ps_read32(base, kCtxPtr);
+    for (const u32 off : {0u, 4u, 8u}) r.context.push_back(ps_read32(base, context + off));
     rsx::Rsx* rsx = f.kernel->rsx();
     REQUIRE(rsx);
     const u32 di = 0x10200000; // lv2's driver information (sys_rsx's layout)
-    {
-        std::lock_guard lock(calls.mutex);
-        calls.on = true;
-    }
     for (const Op& op : ops) {
         const std::string_view name = op.fn;
         if (name == "=") {
@@ -153,10 +171,27 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony)
     return r;
 }
 
-void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what)
+void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what, const Init& init = {})
 {
-    const Run mine = run(flash, ops, false);
-    const Run sonys = run(flash, ops, true);
+    const Run mine = run(flash, ops, false, init);
+    const Run sonys = run(flash, ops, true, init);
+    {
+        INFO(std::format("{}: the init's answer", what));
+        CHECK(mine.init_answer == sonys.init_answer);
+        std::string a, b;
+        for (const auto& c : mine.init_calls) a += c + "\n";
+        for (const auto& c : sonys.init_calls) b += c + "\n";
+        INFO(std::format("{}: the init's lv2 RSX calls", what));
+        CHECK(a == b);
+    }
+    if (mine.init_answer != 0 || sonys.init_answer != 0) return;
+    // Begin and end. Not current: Sony's init writes 0x3a0 bytes of the RSX's first state into the buffer (current is
+    // begin + 0x3a0 after it), pspocket's none, whichever the entry (found with D-1040, not changed by it).
+    for (usize i = 0; i < 2; i++) {
+        INFO(std::format("{}: the context's word {} (begin, end): ours {:#x}, Sony's {:#x}", what, i,
+            mine.context[i], sonys.context[i]));
+        CHECK(mine.context[i] == sonys.context[i]);
+    }
     for (usize i = 0; i < ops.size(); i++) {
         INFO(std::format("{}: step {} {} -> ours {:#x}, Sony's {:#x}", what, i, ops[i].fn, mine.answers[i],
             sonys.answers[i]));
@@ -164,6 +199,10 @@ void compare(const std::string& flash, const std::vector<Op>& ops, const std::st
     }
     usize at = 0;
     while (at < mine.out.size() && mine.out[at] == sonys.out[at]) at++;
+    for (usize i = at & ~usize{3}; i < std::min<usize>(mine.out.size(), (at & ~usize{3}) + 0x80); i += 4) {
+        const u32 x = ps_ld32(mine.out.data() + i), y = ps_ld32(sonys.out.data() + i);
+        if (x != y) UNSCOPED_INFO(std::format("{}: output +{:#x}: ours {:#010x}, Sony's {:#010x}", what, i, x, y));
+    }
     INFO(std::format("{}: output differs first at +{:#x}", what, at));
     CHECK(at == mine.out.size());
     for (usize i = 0; i + 4 <= mine.driver.size(); i += 4) {
@@ -195,6 +234,26 @@ TEST_CASE("cellGcmSys against libgcm_sys", "[hle][lle][gcm]")
     const std::string& fl = *flash;
 
     SECTION("init") { compare(fl, {}, "init"); }
+
+    // D-1040: GTA IV's (BLUS30127) init, 0xB70B4AD3 with r7 = 0: the command buffer in local memory, nothing mapped
+    // for the RSX; with r7 = 1 it is _cellGcmInitBody. The state each leaves, through the getters.
+    SECTION("init: 0xB70B4AD3, the command buffer in local memory or in IO")
+    {
+        // Not the default command and segment word sizes: Sony's are the init's cmdSize / 4 and 0x2000, pspocket's
+        // RPCS3's 0x400 and 0x100, whichever the entry (found with D-1040, not changed by it).
+        const std::vector<Op> state{{"cellGcmGetConfiguration", {kOut}, kVoid}, {"cellGcmAddressToOffset", {0xC0000000, kOut + 0x40}}, {"cellGcmAddressToOffset", {0xC0301000, kOut + 0x44}},
+            {"cellGcmAddressToOffset", {kIo, kOut + 0x48}}, {"cellGcmAddressToOffset", {kIo + 0x1000, kOut + 0x4C}},
+            {"cellGcmIoOffsetToAddress", {0, kOut + 0x50}}, {"cellGcmIoOffsetToAddress", {0x1000, kOut + 0x54}},
+            {"cellGcmGetMaxIoMapSize", {}}, {"cellGcmMapMainMemory", {kMaps, 0x100000, kOut + 0x58}},
+            {"cellGcmAddressToOffset", {kMaps, kOut + 0x5C}}, {"cellGcmIoOffsetToAddress", {0, kOut + 0x60}}};
+        compare(fl, state, "local, as GTA IV", {"cellGcmSys_B70B4AD3", {kCtxPtr, 0x300000, 0, 0, 0}});
+        compare(fl, state, "local, an IO buffer given", {"cellGcmSys_B70B4AD3", {kCtxPtr, kCmdSize, 0x100000, kIo, 0}});
+        compare(fl, state, "r7 1", {"cellGcmSys_B70B4AD3", {kCtxPtr, kCmdSize, 0x100000, kIo, 1}});
+        compare(fl, state, "_cellGcmInitBody");
+        // Sony's checks of the size in local memory (0xa50-0xa64): over 0xffff, a multiple of 4.
+        compare(fl, {}, "local, too small", {"cellGcmSys_B70B4AD3", {kCtxPtr, 0xFFFF, 0, 0, 0}});
+        compare(fl, {}, "local, unaligned", {"cellGcmSys_B70B4AD3", {kCtxPtr, 0x10002, 0, 0, 0}});
+    }
 
     SECTION("the magic number table and the driver information's getters")
     {

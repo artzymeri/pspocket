@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <format>
 #include <thread>
 
 #include "pspocket/core/memory_map.h"
@@ -115,7 +116,8 @@ TEST_CASE("cellGcmSys: init, configuration, offsets, IO mapping, tiles, Z-cull, 
     u8* b = f.base();
 
     for (const hle::Function& fn : hle::registry().functions()) {
-        if (fn.module == "cellGcmSys") CHECK(fn.nid == recomp::nid_of(fn.name));
+        if (fn.module == "cellGcmSys")
+            CHECK((fn.nid == recomp::nid_of(fn.name) || fn.name == std::format("cellGcmSys_{:08X}", fn.nid)));
     }
 
     REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);
@@ -233,6 +235,38 @@ TEST_CASE("cellGcmSys end to end: commands written through the context run on th
     rsx->notify();
     REQUIRE(rsx->wait_idle(2 * kSecond));
     CHECK(rsx->flip_count() == 2);
+}
+
+// D-1040: GTA IV (BLUS30127) initialises through libgcm_sys's unnamed 0xB70B4AD3 with r7 = 0, ioSize and ioAddress
+// 0: the command buffer at local memory's start, read by the RSX from there (no IO mapping holds the FIFO's offset).
+// It was unimplemented: its caller then jumped to guest 0x400.
+TEST_CASE("cellGcmSys: 0xB70B4AD3, the command buffer in local memory (GTA IV's init)", "[hle][gcm]")
+{
+    GcmFixture f;
+    GuestThread g(f, 0, "gcm");
+    u8* b = f.base();
+    REQUIRE(g.call("cellGcmSys_B70B4AD3", kCtxPtr, 0x300000, 0, 0, 0) == 0);
+    const u32 ctx = ps_read32(b, kCtxPtr);
+    CHECK(ps_read32(b, ctx + 0x0) == 0xC0001000); // begin: 4 KB into local memory
+    CHECK(ps_read32(b, ctx + 0x8) == 0xC0001000); // current
+    const u32 control = static_cast<u32>(g.call("cellGcmGetControlRegister"));
+    rsx::Rsx* rsx = f.kernel->rsx();
+    REQUIRE(rsx != nullptr);
+    u32 cur = ps_read32(b, ctx + 0x8);
+    ps_write32(b, cur, rsx::cmd::method_header(rsx::m::NV406E_SET_REFERENCE, 1));
+    ps_write32(b, cur + 4, 0x4C4F43);
+    cur += 8;
+    ps_write32(b, ctx + 0x8, cur);
+    store32_release(b, control, cur - 0xC0000000); // put: the local offset of current
+    rsx->notify();
+    REQUIRE(rsx->wait_idle(2 * kSecond));
+    CHECK(load32_acquire(b, control + 8) == 0x4C4F43); // ref
+    CHECK(load32_acquire(b, control + 4) == cur - 0xC0000000);
+    // The configuration: no IO (libgcm_sys's ioAddress 0xfff00000, ioSize 0).
+    const u32 config = kOut;
+    g.call("cellGcmGetConfiguration", config);
+    CHECK(ps_read32(b, config + 4) == 0xFFF00000);
+    CHECK(ps_read32(b, config + 12) == 0);
 }
 
 TEST_CASE("cellGcmSys: the command buffer callback flushes and jumps to the next segment", "[hle][gcm]")

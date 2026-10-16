@@ -16708,3 +16708,29 @@ From scripts/nid_audit.py's aliases (D-1062), checked in the firmware's code:
   unnamed constants are FreeType internals nothing imports; the encoders' constants (cellAvcEnc, cellM4vEnc) are in
   libraries pspocket does not register.
 
+## D-1040 · 2026-10-16 · GTA IV's GCM init: libgcm_sys's unnamed 0xB70B4AD3, the command buffer in local memory
+
+GTA IV (BLUS30127) stopped at boot on the phone (game-153115.log): `hle: UNIMPLEMENTED cellGcmSys::? (0xb70b4ad3)`
+with r3..r7 = the context pointer, 0x300000, 0, 0, 0, then a jump to guest 0x400 (SIGBUS). Read in Sony's
+libgcm_sys (the firmware's libgcm_sys.sprx): 0xB70B4AD3's entry at 0xe58 is `b 0xcc0`, _cellGcmInitBody's at 0xe5c
+`li r7,1; b 0xcc0`: the same body with the caller's r7 where _cellGcmInitBody has 1. The body keeps r7 (r31, r28),
+passes it to the context's setup (0x70c: flag bit 0x10 of sys_rsx_context_allocate when 0) and to 0x9a8, and with 0
+(0xdac) passes local memory's address (sys_rsx_memory_allocate's) where ioAddress goes. 0x9a8 with 0 (0xa48-0xa64):
+cmdSize over 0xffff and a multiple of 4 (else CELL_GCM_ERROR_FAILURE), ioSize and ioAddress not looked at, nothing
+mapped; the rest as with 1: the context 4 KB into the buffer, the FIFO at offset 0x1000. So 0 is the command buffer in
+local memory, an early SDK's way (GTA IV's: 3 MB of local memory, no IO at init).
+
+- runtime/hle/src/cellGcmSys.cpp: init_body(..., io_buffer), _cellGcmInitBody its io_buffer = true, and
+  cellGcmSys_B70B4AD3 (a name of its NID, as the NIDs known only by number are) with the fifth argument. With 0 the
+  buffer is local memory's base, nothing is mapped; cellGcmGetConfiguration's ioAddress 0xfff00000 and ioSize 0 as
+  Sony's. The RSX reads a FIFO whose first offset no IO mapping holds from local memory already (Rsx::set_fifo_pointers,
+  RPCS3's rule). Flag 0x10 is not passed to sys_rsx_context_allocate (pspocket's lv2 keeps the mode flags only).
+- Tests: tests/hle/test_gcm_compare.cpp now compares each init too (its answer, its lv2 RSX calls, the context's begin
+  and end), and a new section runs 0xB70B4AD3 against Sony's with r7 = 0 (GTA IV's arguments; an IO buffer given) and
+  1, and _cellGcmInitBody, through the getters (configuration, AddressToOffset of local memory and the IO buffer,
+  IoOffsetToAddress, MapMainMemory after), and Sony's two size checks: all the same. tests/hle/test_gcm.cpp: commands
+  written at the local context run on the RSX (its reference register), the configuration's IO.
+- Found on the way, not changed (every entry, also _cellGcmInitBody): Sony's init writes 0x3a0 bytes of the RSX's first
+  state into the buffer (current = begin + 0x3a0), pspocket's none; Sony's cellGcmGetDefaultCommandWordSize is the
+  init's cmdSize / 4 and its segment size 0x2000 words, pspocket's RPCS3's 0x400 and 0x100.
+- GTA IV's data is only on the phone: the next phone run shows what comes after the init.
