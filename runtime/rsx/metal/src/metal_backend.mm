@@ -1696,7 +1696,6 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         fs.blend_color[1] = static_cast<float>((draw_blend.color >> 8) & 0xff) / 255.f;
         fs.blend_color[2] = static_cast<float>(draw_blend.color & 0xff) / 255.f;
         fs.blend_color[3] = static_cast<float>(draw_blend.color >> 24) / 255.f;
-        stats.shader_blend_draws++;
     }
     for (u32 t = 0; t < kFragmentTextureCount; t++) {
         fs.tex_scale[t][0] = fs.tex_scale[t][1] = 1.f;
@@ -2171,8 +2170,17 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             if (compile_pending) stats.draws_compiling++;
             return skip("");
         }
+        // Programs there, the pipeline still compiling: the interpreter would blend a signed equation as add, so the
+        // draw waits here too (D-1026; the gate's loaded run drew it through this path, D-1071).
+        if (shader_blend && !force_interpreter) {
+            skip_reason = "signed blending waits for the pipeline";
+            stats.draws_compiling++;
+            return skip("");
+        }
         interpret = true;
+        shader_blend = 0;
     }
+    if (shader_blend) stats.shader_blend_draws++;
     // The interpreter's functions, the programs encoded for it (once each) and its pipeline for these targets (D-940).
     id<MTLBuffer> ivp_code = nil, ifp_code = nil;
     shader::InterpVsOptions ivo{};

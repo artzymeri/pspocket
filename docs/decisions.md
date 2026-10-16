@@ -17087,3 +17087,13 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
   of a route and lists the programs one draws and the other does not.
 - Test: metal e2e "the exact mode has what the GPU drew in guest memory when a label lands" (a triangle in memory with
   no flush and no readback; a depth buffer made over the target starts with its bytes).
+
+## D-1071 · 2026-10-16 · Signed blending also waits while the pipeline compiles
+
+D-1026 made a draw with a signed blend equation wait for its programs instead of the shader interpreter drawing it as
+add. The gate's loaded run still failed its test ("blend equation 0xf006/0xf006 (signed) drawn as add (the shader
+interpreter's draw)"): with the programs compiled and the pipeline state still compiling, the draw went to the
+interpreter through the pipeline's own fallback, which D-1026 did not cover, and it counted as a shader-blended draw.
+That path now waits too (skip reason "signed blending waits for the pipeline"), the interpreter's draws never count
+as shader-blended, and shader_blend_draws counts only draws made. The test passes 30 of 30 with ten copies at once.
+The phone compiles slowly all the time: it took this path more often than the Mac.
