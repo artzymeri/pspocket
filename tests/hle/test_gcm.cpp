@@ -269,6 +269,51 @@ TEST_CASE("cellGcmSys: 0xB70B4AD3, the command buffer in local memory (GTA IV's 
     CHECK(ps_read32(b, config + 12) == 0);
 }
 
+// D-1044: with flip pacing (PSPOCKET_FLIP_VSYNC=1) and the flip mode vsync, a flip waits on the RSX thread for the
+// next vblank (the GCM interrupt thread's): the flip, its label and its status come at the vblank. HSYNC flips at once.
+TEST_CASE("cellGcmSys: flips wait for the vblank with vsync, not with hsync (flip pacing)", "[hle][gcm]")
+{
+    GcmFixture f;
+    GuestThread g(f, 0, "gcm");
+    u8* b = f.base();
+    REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);
+    rsx::Rsx* rsx = f.kernel->rsx();
+    REQUIRE(rsx != nullptr);
+    rsx->set_flip_pacing(true);
+    const u32 ctx = ps_read32(b, kCtxPtr);
+    const u32 control = static_cast<u32>(g.call("cellGcmGetControlRegister"));
+    REQUIRE(g.call("cellGcmSetDisplayBuffer", 0, 0x00100000, 5120, 1280, 720) == 0);
+    // Vblanks come from the interrupt thread every 1/59.94 s.
+    const u64 v0 = g.call("cellGcmGetVBlankCount");
+    const auto t_wait = std::chrono::steady_clock::now();
+    while (g.call("cellGcmGetVBlankCount") < v0 + 3 && std::chrono::steady_clock::now() - t_wait < std::chrono::seconds(2))
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(g.call("cellGcmGetVBlankCount") >= v0 + 3);
+    const auto flip_once = [&] {
+        const u64 flips = rsx->flip_count();
+        g.call("_cellGcmSetFlipCommand", ctx, 0);
+        store32_release(b, control, ps_read32(b, ctx + 0x8) - kIo);
+        rsx->notify();
+        REQUIRE(rsx->wait_idle(2 * kSecond));
+        CHECK(rsx->flip_count() == flips + 1);
+    };
+    for (const u32 mode : {2u, 1u}) { // CELL_GCM_DISPLAY_VSYNC, then HSYNC
+        INFO("flip mode " << mode);
+        g.call("cellGcmSetFlipMode", mode);
+        const rsx::Rsx::FlipPacing before = rsx->flip_pacing_stats();
+        for (int i = 0; i < 5; i++) flip_once();
+        const rsx::Rsx::FlipPacing after = rsx->flip_pacing_stats();
+        if (mode == 2) {
+            CHECK(after.held == before.held + 5);
+            CHECK(after.timed_out == before.timed_out);
+            CHECK(after.held_ns > before.held_ns); // each waited for its vblank (16.7 ms apart at most)
+            CHECK(after.held_ns - before.held_ns < 5ull * 50'000'000ull);
+        } else {
+            CHECK(after.held == before.held);
+        }
+    }
+}
+
 TEST_CASE("cellGcmSys: the command buffer callback flushes and jumps to the next segment", "[hle][gcm]")
 {
     GcmFixture f;

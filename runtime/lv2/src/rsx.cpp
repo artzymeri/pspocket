@@ -357,6 +357,7 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
         return CELL_OK;
     case 0x101: // display sync (cellGcmSetFlipMode): 2 = vsync
         d.vsync = a4 == 2;
+        d.rsx->set_vsync(d.vsync); // flip pacing (D-1044)
         return CELL_OK;
     case 0x104: { // display buffer
         const u32 id = a3 & 0xFF;
@@ -415,6 +416,7 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
     case 0x108: // vblank frequency (cellGcmSetVBlankFrequency: a5 1) and the second vblank's (a5 2), as RPCS3
         if (a5 == 1) {
             d.vsync = true; // RPCS3: "this function resets vsync state to enabled"
+            d.rsx->set_vsync(true);
             return CELL_OK;
         }
         if (a5 == 2) {
@@ -506,6 +508,7 @@ Result sys_rsx_context_attribute(PpuThread& t, u32 context_id, u32 package_id, u
         gm.w32_release(head + di::h_lastVTimeHigh, static_cast<u32>(now >> 32));
         gm.w64_release(head + di::h_lastSecondVTime, std::max<u64>(a4, gm.r64(head + di::h_lastSecondVTime) + 1));
         gm.w64_release(head + di::h_vBlankCount, gm.r64(head + di::h_vBlankCount) + 1);
+        d.rsx->note_vblank(); // a flip with vsync waits for it (D-1044)
         return CELL_OK;
     }
     default:

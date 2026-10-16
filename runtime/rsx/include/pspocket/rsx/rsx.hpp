@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -110,6 +111,27 @@ public:
     // A flip lv2 asks for outside the command buffer (sys_rsx_context_attribute 0x102: cellGcmSetFlipImmediate): the
     // RSX thread runs it at its next step as a GCM_FLIP_HEAD with `value` (RPCS3 request_emu_flip). D-519.
     void request_flip(u32 head, u32 value);
+    // Flip pacing by the flip mode (D-1044). lv2 sets the display sync (sys_rsx_context_attribute 0x101: cellGcmSetFlipMode;
+    // 0x108 resets it to vsync) and counts each vblank here (0xFED, from the GCM interrupt thread). With vsync, a flip
+    // waits on the RSX thread for the next vblank, as the PS3 shows a buffer at a refresh: the flip status, the flip
+    // label (cellGcmSetWaitFlip) and the flip handler follow at the vblank. Only while vblanks come (one in the last
+    // 100 ms), 50 ms at most. PSPOCKET_FLIP_VSYNC=1 turns it on (default off: measured against GTA V's 30 fps
+    // pacing, D-971); hsync flips at once, as every flip did before.
+    void set_vsync(bool on) { vsync_.store(on, std::memory_order_relaxed); }
+    bool vsync() const { return vsync_.load(std::memory_order_relaxed); }
+    void note_vblank();
+    bool flip_pacing() const { return flip_pacing_.load(std::memory_order_relaxed); }
+    void set_flip_pacing(bool on) { flip_pacing_.store(on, std::memory_order_relaxed); } // tests; else PSPOCKET_FLIP_VSYNC
+    struct FlipPacing {
+        u64 held = 0;    // flips that waited for a vblank
+        u64 held_ns = 0; // time they waited
+        u64 timed_out = 0;
+    };
+    FlipPacing flip_pacing_stats() const
+    {
+        return {flips_held_.load(std::memory_order_relaxed), flips_held_ns_.load(std::memory_order_relaxed),
+            flips_held_timeouts_.load(std::memory_order_relaxed)};
+    }
     // A buffer lv2 queued on a head (0x103), for a later flip of "the last queued" (GCM_FLIP_HEAD's 0xf).
     void note_queued(u32 head, u32 buffer_id) { last_queued_[head & 7].store(buffer_id, std::memory_order_relaxed); }
 
@@ -382,6 +404,15 @@ private:
     std::atomic<u64> words_{0};
     std::atomic<u64> failures_{0};
     std::atomic<u64> flips_{0};
+    // Flip pacing (D-1044).
+    std::atomic<bool> vsync_{true}; // lv2's display sync; the PS3's (and RPCS3's) default is vsync
+    std::atomic<bool> flip_pacing_{false}; // PSPOCKET_FLIP_VSYNC=1
+    std::mutex vblank_mutex_;
+    std::condition_variable vblank_cv_;
+    u64 vblanks_ = 0; // guarded by vblank_mutex_
+    std::chrono::steady_clock::time_point last_vblank_{};
+    std::atomic<u64> flips_held_{0}, flips_held_ns_{0}, flips_held_timeouts_{0};
+    void wait_for_vblank();
     std::atomic<u64> conditional_skips_{0};
     std::atomic<u64> draw_splits_{0};
     std::atomic<u64> data_epoch_{0};

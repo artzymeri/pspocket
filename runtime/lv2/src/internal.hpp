@@ -366,7 +366,7 @@ struct RsxDevice {
     u32 driver_info = 0;
     u32 reports = 0;
     u32 main_mem_size = 0; // IO address space
-    bool vsync = false;    // display sync (cellGcmSetFlipMode)
+    bool vsync = true;     // display sync (cellGcmSetFlipMode); the PS3 starts with vsync (RPCS3 requested_vsync)
     bool second_vhandler = false; // 0x108 for the second vblank (RPCS3 enable_second_vhandler)
     // The hardware cursor (0x10B, 0x10C, 0x10D), kept for an overlay to draw: 64x64 from `offset` in local memory.
     struct Cursor {

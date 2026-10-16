@@ -16938,3 +16938,26 @@ A3).
   thread of the same or lower priority runs after its creator's next call, a more urgent one at once, and a joiner
   waits for the exiting thread to be gone. PSPOCKET_WAKER_MATRIX_ROUNDS=N runs it N times. It fails with
   PSPOCKET_LV2_SENDER_FIRST=0 (every case) and =events (every case but the event's).
+
+## D-1044 · 2026-10-16 · Flips paced by the flip mode (vsync waits for the vblank), behind PSPOCKET_FLIP_VSYNC
+
+The flip mode was stored and never read (lv2 0x101); every flip happened as soon as the RSX reached it, so
+cellGcmSetWaitFlip released at the flip, the flip status and the flip handler came at that moment, and nothing tied
+the flips to the vblanks the GCM interrupt thread counts (D-971 holds frames at present time instead).
+
+- The RSX (rsx.hpp) keeps the display sync lv2 sets (0x101, cellGcmSetFlipMode; 0x108 resets it to vsync) and counts
+  the vblanks lv2's 0xFED reports. With pacing on and vsync, Rsx::do_flip waits on the RSX thread for the next vblank
+  (RPCS3 RSXThread.cpp handle_emu_flip with the PS3 frame limit: a flip asked at vblank count N happens once the count
+  is past N), so the flip, the flip label (cellGcmSetWaitFlip) and the status and handler follow at the vblank; only
+  while vblanks come (one in the last 100 ms), 50 ms at most. HSYNC flips at once.
+- lv2's display sync now starts as vsync, as the PS3 and RPCS3 (requested_vsync); GTA V never sets it.
+- **Off by default** (PSPOCKET_FLIP_VSYNC=1 turns it on): GTA V's gate walk, A/B in one session: two runs with pacing (and every wake), median 28.8 and 29.8
+  fps, slowest window 25.2 and 27.6 (one of them failed the gate's frame jumps, 3 of 2), against 29.8 and 29.4,
+  29.1 and 27.8 without: within the noise of a loaded machine, but no better, and a frame finished a little after a
+  vblank waits for the next one (the PS3's own rule, at the PS3's speed). Kept off until measured on the phone
+- pspocket-boot prints the flips held, their time and the 50 ms limits when pacing is on.
+- Not changed: libgcm_sys's full flip ring. Sony's cellGcmSetPrepareFlip with eight flips queued in a context the RSX
+  never runs went into the context's callback (0 in the compare test: a SIGBUS), so its answer could not be compared
+  yet; pspocket keeps dropping the oldest slot with a warning.
+- Tests: tests/hle/test_gcm.cpp (with pacing and vsync five flips each held for a vblank, with HSYNC none),
+  tests/hle/test_ac_gcm_spurs_prx.cpp (the default vsync, the RSX's mode following cellGcmSetFlipMode).

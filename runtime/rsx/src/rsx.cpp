@@ -1,8 +1,10 @@
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/rsx/rsx.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <cstring>
 #include <format>
 
@@ -163,6 +165,7 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     : mem_(mem), backend_(backend), config_(config)
 {
     fifo_location_.store(config_.fifo_location, std::memory_order_release);
+    if (const char* v = std::getenv("PSPOCKET_FLIP_VSYNC")) flip_pacing_ = std::string_view(v) == "1"; // D-1044
     return_stack_.reserve(config_.call_stack_depth);
     (void)handlers();
     if (const char* e = std::getenv("PSPOCKET_RSX_EARLY_REPORTS"); e && *e && std::strcmp(e, "0") != 0)
@@ -193,6 +196,7 @@ void Rsx::stop()
     if (!thread_.joinable()) return;
     stop_requested_.store(true, std::memory_order_release);
     notify();
+    vblank_cv_.notify_all(); // a flip waiting for its vblank (D-1044)
     thread_.join();
     backend_.run_deferred(true); // the CPU may look at what the RSX wrote last (D-107)
 }
@@ -858,6 +862,7 @@ void Rsx::thread_main()
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
     while (!stop_requested_.load(std::memory_order_acquire)) {
+        if (chaos::on(chaos::S11_RsxFifo)) [[unlikely]] chaos::delay(chaos::S11_RsxFifo, get_.load()); // D-1045
         const RunStatus status = step(4096);
         if (status == RunStatus::Budget) continue;
         const bool idle = status != RunStatus::Blocked && !fifo_reset_.load(std::memory_order_acquire);

@@ -671,8 +671,36 @@ void Rsx::m_nv3089_image_in(u32 reg, u32 value)
 
 // ---- flips and lv1 driver methods -------------------------------------------------------------------------------
 
+void Rsx::note_vblank()
+{
+    {
+        std::lock_guard lock(vblank_mutex_);
+        vblanks_++;
+        last_vblank_ = std::chrono::steady_clock::now();
+    }
+    vblank_cv_.notify_all();
+}
+
+// A flip with vsync waits for the next vblank (rsx.hpp, D-1044; RPCS3 RSXThread.cpp handle_emu_flip with the PS3 frame
+// limit: a flip requested at vblank count N happens once the count is past N).
+void Rsx::wait_for_vblank()
+{
+    using Clock = std::chrono::steady_clock;
+    std::unique_lock lock(vblank_mutex_);
+    const auto now = Clock::now();
+    if (last_vblank_ == Clock::time_point{} || now - last_vblank_ > std::chrono::milliseconds(100)) return; // none come
+    const u64 at = vblanks_;
+    const bool came = vblank_cv_.wait_for(lock, std::chrono::milliseconds(50),
+        [&] { return vblanks_ != at || stop_requested_.load(std::memory_order_acquire); });
+    flips_held_.fetch_add(1, std::memory_order_relaxed);
+    flips_held_ns_.fetch_add(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - now).count()), std::memory_order_relaxed);
+    if (!came) flips_held_timeouts_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Rsx::do_flip(u32 buffer_id)
 {
+    if (flip_pacing_.load(std::memory_order_relaxed) && vsync_.load(std::memory_order_relaxed)) wait_for_vblank();
     const u64 index = flips_.fetch_add(1, std::memory_order_relaxed) + 1;
     backend_.flip(FlipRequest{buffer_id, display_buffer(buffer_id), index}, state_);
     if (on_flip) on_flip(buffer_id);

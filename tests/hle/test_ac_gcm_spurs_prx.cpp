@@ -182,16 +182,23 @@ TEST_CASE("cellGcmSys (AC): flip mode through lv2, time stamps and reports in lo
         return dev.tiles[i];
     };
 
-    // Before cellGcmInit libgcm_sys sends the flip mode with no context, which lv2 refuses (D-519).
-    g.call("cellGcmSetFlipMode", 2);
-    CHECK_FALSE(vsync());
+    // Before cellGcmInit libgcm_sys sends the flip mode with no context, which lv2 refuses (D-519): the default stays,
+    // vsync (RPCS3's requested_vsync, D-1044).
+    g.call("cellGcmSetFlipMode", 1);
+    CHECK(vsync());
 
-    // Flip mode: lv2's display sync (0x101) takes it, vsync for CELL_GCM_DISPLAY_VSYNC (2) only, as RPCS3.
+    // Flip mode: lv2's display sync (0x101) takes it, vsync for CELL_GCM_DISPLAY_VSYNC (2) only, as RPCS3; the RSX
+    // paces its flips by it (D-1044).
     REQUIRE(g.call("_cellGcmInitBody", kCtxPtr, kCmdSize, 0x100000, kIo) == 0);
+    CHECK(vsync());
+    CHECK(f.kernel->rsx()->vsync());
+    g.call("cellGcmSetFlipMode", 1); // CELL_GCM_DISPLAY_HSYNC
     CHECK_FALSE(vsync());
+    CHECK_FALSE(f.kernel->rsx()->vsync());
     g.call("cellGcmSetFlipMode", 2);
     CHECK(vsync());
-    g.call("cellGcmSetFlipMode", 1); // CELL_GCM_DISPLAY_HSYNC
+    CHECK(f.kernel->rsx()->vsync());
+    g.call("cellGcmSetFlipMode", 1);
     CHECK_FALSE(vsync());
 
     // Reports: CellGcmReportData {u64 timer, u32 value, u32 pad}, 16 bytes each from the reports area's 0x1400.
