@@ -893,6 +893,14 @@ s32 cellJpgDecExtDecodeData(PPUContext& ctx, u32 handle, u32 stream, u32 data, u
         disp_param)), call);
 }
 
+// libjpgdec's unnamed 0xDB9AFFCE (D-1066): it sets r8 = r9 = 0 and r10 = 1, then branches into the body
+// cellJpgDecExtDecodeData shares with cellJpgDecDecodeData (r10 = 1 is the Ext entry): cellJpgDecExtDecodeData without
+// a display callback (scripts/nid_audit.py).
+s32 cellJpgDec_DB9AFFCE(PPUContext& ctx, u32 handle, u32 stream, u32 data, u32 ctrl, u32 out)
+{
+    return cellJpgDecExtDecodeData(ctx, handle, stream, data, ctrl, out, 0, 0);
+}
+
 } // namespace
 
 void register_cellJpgDec(Registry& r)
@@ -911,6 +919,7 @@ void register_cellJpgDec(Registry& r)
         PS_HLE_UNVERIFIED(0xB91EB3D2, cellJpgDecExtReadHeader),
         PS_HLE_UNVERIFIED(0x65CBBB16, cellJpgDecExtSetParameter),
         PS_HLE_UNVERIFIED(0x716F8792, cellJpgDecExtDecodeData),
+        PS_HLE_UNVERIFIED(0xDB9AFFCE, cellJpgDec_DB9AFFCE),
     });
 }
 

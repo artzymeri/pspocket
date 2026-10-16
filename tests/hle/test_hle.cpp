@@ -411,3 +411,10 @@ TEST_CASE("Host variables: a thread linking one that another is laying out gets 
     }
     CHECK(unwritten == 0);
 }
+
+TEST_CASE("Unnamed exports that are named functions in the firmware's code are answered (D-1066)", "[hle]")
+{
+    const hle::Registry& reg = hle::registry();
+    CHECK(reg.find("cellJpgDec", 0xDB9AFFCE) != nullptr);     // cellJpgDecExtDecodeData without a display callback
+    CHECK(reg.find("sceNpCommerce2", 0x9684D405) != nullptr); // sceNpCommerce2DoProductBrowseFinishAsync
+}

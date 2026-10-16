@@ -16646,6 +16646,18 @@ The bulletproof plan's net 4: unnamed NIDs identified from the firmware's own mo
 - These are the work queue for net 4: an alias is its named function with the argument fixed; a constant or void
   export is an exact stub.
 
+## D-1063 · 2026-10-16 · The bench in Python, any game's cases; Assassin's Creed's first install passes on the Mac
+
+- scripts/bench.py replaces bench.sh (D-1060): games/<game>/bench/cases.json names the game's data folder, its
+  dev_flash, its modes and cases; a case starts from a save (inventory/<data>/saves/<name>) or fresh (hdd0 paths
+  emptied first: a first install); "library" runs the game from a library pspocket-prepare makes, incrementally, in
+  inventory/<data>/bench-library, as the phone does. --game all runs every game with a disc image present.
+- games/ac1/bench/cases.json: install-garden (an empty game folder, the iPhone's freeze of D-999; 330 s, play from
+  120 s) and training (the Animus training from the save; 570 s), with the installed system software (D-998).
+- First run of install-garden: PASS, 26.9 fps over the play windows (60 in the garden, 18 in the install's loading
+  screens), 64.6 ms of CPU a frame, 777 draws a frame, no RSX failures, no partly black frames, 11,701 flips. The
+  phone's freeze does not reproduce on the Mac with D-999.
+
 ## D-1064 · 2026-10-16 · Glitch detectors on frame thumbnails, shared by the Mac and the iPhone
 
 The bulletproof plan's net 5: the detectors that turn "the user saw a glitch" into an event, the same code for the
@@ -16679,3 +16691,20 @@ The bulletproof plan's net 5: a session on the phone turns into bench cases with
   developer disk image does not mount on this phone with this Xcode), then removed from the phone. pull-save [--title]:
   the game's savedata to inventory/<game>/saves/<stamp>/ for a bench case.
 - Privacy: only game frames' thumbnails and pspocket's own log; nothing leaves the phone except over the user's cable.
+
+## D-1066 · 2026-10-16 · Two unnamed exports that are named functions: cellJpgDec 0xDB9AFFCE, sceNpCommerce2 0x9684D405
+
+From scripts/nid_audit.py's aliases (D-1062), checked in the firmware's code:
+
+- cellJpgDec 0xDB9AFFCE sets r8 = r9 = 0 and r10 = 1, then branches into the body cellJpgDecExtDecodeData (r10 = 1)
+  and cellJpgDecDecodeData (r10 = 0) share: cellJpgDecExtDecodeData without a display callback (five arguments).
+- sceNpCommerce2 0x9684D405 branches into sceNpCommerce2DoProductBrowseFinishAsync's body setting nothing: the same
+  function.
+- Left out: cellGame 0x47DB7335, 0x5A067101, 0x9C79F4F1 are cellGameGetParamString, cellGameCreateGameData and
+  cellGameSetParamString with "elmMode" 1 in the request libsysutil_game sends to the system software (the named ones
+  send 0); what mode 1 does happens in the system software, so they stay unanswered until a game shows it.
+  sceNpCommerce2 0x6A53FDF9 (DoProductBrowseStartAsync with an internal flag 1) likewise. _cellAudio 0xCD7BC431 is
+  cellAudioPortOpen's own NID under the internal library name (already answered as cellAudio). cell_FreeType2's
+  unnamed constants are FreeType internals nothing imports; the encoders' constants (cellAvcEnc, cellM4vEnc) are in
+  libraries pspocket does not register.
+

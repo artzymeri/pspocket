@@ -613,6 +613,13 @@ s32 sceNpCommerce2DoProductBrowseFinishAsync(PPUContext&, u32 ctx_id)
     return finish_dialog("sceNpCommerce2DoProductBrowseFinishAsync", ctx_id);
 }
 
+// libsceNpCommerce2's unnamed 0x9684D405 (D-1066): a plain branch into sceNpCommerce2DoProductBrowseFinishAsync's body,
+// with no register set (scripts/nid_audit.py): the same function.
+s32 sceNpCommerce2_9684D405(PPUContext&, u32 ctx_id)
+{
+    return finish_dialog("sceNpCommerce2_9684D405", ctx_id);
+}
+
 s32 sceNpCommerce2DoServiceListFinishAsync(PPUContext&, u32 ctx_id)
 {
     return finish_dialog("sceNpCommerce2DoServiceListFinishAsync", ctx_id);
@@ -881,6 +888,7 @@ void register_sceNpCommerce2(Registry& r)
         PS_HLE_FUNC(0xDE7AB33D, sceNpCommerce2DoProductCodeStartAsync),
         PS_HLE_FUNC(0xA9F945B3, sceNpCommerce2DoProductCodeFinishAsync),
         PS_HLE_FUNC(0xB23E3BD1, sceNpCommerce2DoProductBrowseFinishAsync),
+        PS_HLE_FUNC(0x9684D405, sceNpCommerce2_9684D405),
         PS_HLE_FUNC(0x9050617D, sceNpCommerce2DoServiceListFinishAsync),
         PS_HLE_FUNC(0x62023E98, sceNpCommerce2CreateSessionAbort),
         PS_HLE_FUNC(0x9825A0FC, sceNpCommerce2DoProductBrowseStartAsync),
