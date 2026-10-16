@@ -1,7 +1,7 @@
 #!/bin/zsh
-# The bench every night (D-1067): a launchd job of the user's runs scripts/bench.py --game all --mode all --nightly at
-# 03:00 (bench.py skips a busy Mac: another pspocket-boot or ninja, load over 4, under 15 GB free) and keeps the
-# newest 14 nights of inventory/bench/night-*.
+# The bench every night (D-1067): a launchd job of the user's runs scripts/bench.py --game all --mode all --nightly
+# --accept-clean at 03:00 (runs without a failure or warning join the baseline; bench.py skips a busy Mac: another
+# pspocket-boot or ninja, load over 4, under 15 GB free) and keeps the newest 14 nights of inventory/bench/night-*.
 #
 #   scripts/nightly-bench.sh install [HH:MM]   write and load ~/Library/LaunchAgents/com.pspocket.bench.plist
 #   scripts/nightly-bench.sh remove            unload and delete it
@@ -44,7 +44,7 @@ run)
     cd $ROOT || exit 1
     echo "== $(date '+%Y-%m-%d %H:%M') nightly bench at $(git rev-parse --short HEAD)"
     out=inventory/bench/night-$(date +%Y%m%d)-$(git rev-parse --short HEAD)
-    python3 scripts/bench.py --game all --mode all --nightly --out $out
+    python3 scripts/bench.py --game all --mode all --nightly --accept-clean --out $out
     rc=$?
     # The newest 14 nights stay; each keeps its worst frames only (bench_check.py).
     nights=(inventory/bench/night-*(N/On))

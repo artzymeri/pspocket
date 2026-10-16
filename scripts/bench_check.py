@@ -3,7 +3,7 @@
 shapes; against the case's rolling baseline.
 
     scripts/bench_check.py RUN_DIR --case NAME --mode MODE --from-s S [--baseline FILE] [--messages FILE]
-                           [--accept] [--keep N]
+                           [--accept | --accept-clean] [--keep N]
 
 RUN_DIR holds run.log, summary.json and frames/ (pspocket-boot --frames, every 60th frame). Writes RUN_DIR/result.json
 and prints one line. Frames become 64x36 grey thumbnails (ffmpeg); all but the N worst are deleted (game data, never
@@ -129,6 +129,7 @@ def main(argv):
     ap.add_argument("--baseline", default="inventory/bench/baseline.json")
     ap.add_argument("--messages", default="inventory/bench/messages.json")
     ap.add_argument("--accept", action="store_true")
+    ap.add_argument("--accept-clean", action="store_true")
     ap.add_argument("--keep", type=int, default=6)
     a = ap.parse_args(argv[1:])
     log, summ = os.path.join(a.run_dir, "run.log"), os.path.join(a.run_dir, "summary.json")
@@ -172,7 +173,8 @@ def main(argv):
               "fails": fails, "warns": warns, "budget": b, "frames": fr, "summary": summary,
               "baseline_runs": len(hist)}
     json.dump(result, open(os.path.join(a.run_dir, "result.json"), "w"), indent=1)
-    if a.accept and b and not fails:
+    # --accept-clean (the nightly bench, D-1067): only a run with no warning joins, until the baseline has 3 runs.
+    if b and not fails and (a.accept or (a.accept_clean and (not warns or len(hist) < 3))):
         base[key] = (hist + [{"cpu_ms": b["cpu_ms"], "fps": b["fps"], "work_ms": b["work_ms"]}])[-5:]
         os.makedirs(os.path.dirname(a.baseline) or ".", exist_ok=True)
         json.dump(base, open(a.baseline, "w"), indent=1)

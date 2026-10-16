@@ -2,8 +2,8 @@
 """The open-world bench (D-1060, D-1063): each case of games/<game>/bench/cases.json run on a fresh copy of the game's
 hdd0 (from a save, or fresh for a first install), as the phone runs it, then checked by scripts/bench_check.py.
 
-    scripts/bench.py [CASE ...] [--game gta5|ac1|all] [--mode M|all] [--accept] [--keep-frames N] [--out DIR]
-                     [--nightly]
+    scripts/bench.py [CASE ...] [--game gta5|ac1|all] [--mode M|all] [--accept | --accept-clean] [--keep-frames N]
+                     [--out DIR] [--nightly]
 
 cases.json:
     "data": the inventory/ folder of the game's data (decrypt/EBOOT.elf, disc.iso, hdd0, shaders, saves/)
@@ -107,7 +107,8 @@ def run_case(game, spec, case, mode, out, lib, a):
     for p in (hdd0, shaders, os.path.join(run, "hdd1")):
         shutil.rmtree(p, ignore_errors=True)
     check = [sys.executable, "scripts/bench_check.py", run, "--case", f"{game}/{case['name']}", "--mode", mode,
-             "--from-s", str(case.get("from_s", 0)), "--keep", str(a.keep_frames)] + (["--accept"] if a.accept else [])
+             "--from-s", str(case.get("from_s", 0)), "--keep", str(a.keep_frames)] + (["--accept"] if a.accept else []) \
+        + (["--accept-clean"] if a.accept_clean else [])
     r = sh(check, capture_output=True, text=True)
     print(r.stdout.strip(), flush=True)
     with open(os.path.join(out, "results.txt"), "a") as f:
@@ -121,6 +122,7 @@ def main(argv):
     ap.add_argument("--game", default="gta5")
     ap.add_argument("--mode", default=None)
     ap.add_argument("--accept", action="store_true")
+    ap.add_argument("--accept-clean", action="store_true")
     ap.add_argument("--keep-frames", type=int, default=6)
     ap.add_argument("--out")
     ap.add_argument("--nightly", action="store_true")

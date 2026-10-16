@@ -16746,3 +16746,5 @@ to "your Mac at night").
   14 nights (each keeps its worst frames only). bench.py --nightly skips a busy Mac (another pspocket-boot or ninja,
   load over 4, under 15 GB free) and keeps it awake with caffeinate while it runs; the log is inventory/bench/nightly.log.
 - launchd runs a job missed while the Mac slept at the next wake.
+- The baseline grows from the nights themselves: --accept-clean adds a run with no failure and no warning (any run
+  without failures until the case has 3), so a slow or broken night never becomes the new normal.
