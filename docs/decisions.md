@@ -17070,18 +17070,15 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
 
 - **What it is**: the RSX's ordering kept where the fast backend trades it for speed, so a glitch that goes away in the
   exact mode is the fast paths' and one that stays is the translation's (shaders, formats, the game's own logic).
-- **Labels, semaphores, the reference, reports, notifies** wait for the GPU (`Config::sync_on_label`), and at every
-  such sync (`MetalBackend::sync`) and flip every GPU-newer target is written back into guest memory **on the GPU**:
-  D-137's overlay kernels write straight into no-copy buffers over RSX local memory (16 MB windows, or a target's own
-  pages; targets elsewhere go through the usual readback), the backend waits, the targets are no longer newer on the
-  GPU and their memory is watched, so a CPU write after it makes them reload (D-110). A CPU that sees a label sees what
-  the RSX drew before it.
-- **A new target starts with what memory holds** (the targets under it written back first, then
-  `upload_surface_from_guest`), instead of cleared or carried (D-1025 is off).
-- **A conditional draw whose report is pending waits** for the count; NV0039 copies and readbacks are synchronous
-  (`copy_on_gpu`, `flush_memory_later` refused); pass merging (D-945), the feedback cache (D-947), the surface pool
-  (D-984) and carrying (D-1025) are off; EDGE geometry stays on the SPUs (D-988); pspocket-boot waits for every program
-  and pipeline (no asynchronous compiles, no shader interpreter, D-158, D-940).
+- **Labels, semaphores, the reference, reports and notifies land after the GPU's work before them**, and the targets
+  that work drew go into guest memory **on the GPU** with it: at each such write the backend lays every target drawn
+  since it was last written back over guest memory with D-137's overlay kernels, straight into no-copy buffers over
+  RSX local memory (16 MB windows, or a target's own pages), commits the command buffer and queues the write behind it
+  (a D-107 Deferred): nothing waits, and a CPU that sees a label sees what the RSX drew before it. (A first version
+  waited for the GPU at every label, `sync_on_label`, and wrote targets back in `sync()`: 1.5 fps on the skyfall route,
+  too slow to reach the sea.)
+- **A new target starts with what memory holds** when nothing GPU-newer is under it (`upload_surface_from_guest`;
+  carried as D-1025 otherwise).
 - **The A/B**: `--summary` has the run's draw signature (`MetalBackend::draw_signature`: draws by fragment program hash
   at the last 300-frame report); `scripts/rsx_ab.py FAST.json EXACT.json` compares the per-frame rates of two runs
   of a route and lists the programs one draws and the other does not.
@@ -17121,3 +17118,12 @@ phone translated. So a TestFlight build plays the game built into it (GTA V), wi
 rest interpreted (the session translator's libraries cannot be mapped either); other games need the cable install.
 Built without the gate (the change is in the iOS host only, which the gate does not run), for the user away from the
 Mac.
+
+## D-1030 · 2026-10-16 · PSPOCKET_RSX_MIRROR=KB: drawn targets into guest memory at each flip (an experiment)
+
+- At each flip the GPU-newer targets of at most KB drawn in the frame are laid into guest memory on the GPU (D-1029's
+  windows), in the frame's command buffer, nothing waiting: a CPU that reads what the GPU drew finds it a frame later.
+  Tried against GTA V's black sea block (the theory: its CPU reads the water simulation's 128x128 target): with every
+  target up to 4 MB mirrored the block stays (runs mirror3, mirror4). Left as a switch, off.
+- The carry kernel's depth (D-1025) is now `precise::divide(d, 16777215)`: the kernels library is compiled with fast
+  math, and its division put 0xff0000 back as 0xff0001 (the exact-mode test).

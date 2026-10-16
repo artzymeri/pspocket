@@ -171,7 +171,6 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     if (const char* e = std::getenv("PSPOCKET_RSX_EARLY_REPORTS"); e && *e && std::strcmp(e, "0") != 0)
         config_.early_reports = true; // D-1021
     if (const char* e = std::getenv("PSPOCKET_RSX_EXACT"); e && *e && std::strcmp(e, "0") != 0) config_.exact = true;
-    if (config_.exact) config_.sync_on_label = true; // D-1029
     // PSPOCKET_RSX_CPU_AB=N[:MASK] (D-953): bit 32 of MASK (all by default) is the FIFO's argument runs (D-955).
     if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) {
         const char* mask = std::strchr(f, ':');

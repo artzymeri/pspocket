@@ -338,7 +338,7 @@ kernel void rsx_memory_to_surface(device const uchar* src [[buffer(0)]], device 
     switch (p.mode) {
     case kOvZ24S8: {
         const uint v = ld32be(src, o);
-        const float z = float(v >> 8) / 16777215.0;
+        const float z = precise::divide(float(v >> 8), 16777215.0f); // as the CPU's upload: the write-back's rint gets d back
         const uint bits = as_type<uint>(z);
         texels[i * 4u] = uchar(bits); texels[i * 4u + 1u] = uchar(bits >> 8);
         texels[i * 4u + 2u] = uchar(bits >> 16); texels[i * 4u + 3u] = uchar(bits >> 24);

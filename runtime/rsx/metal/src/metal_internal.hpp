@@ -97,6 +97,7 @@ struct Surface {
     u64 stencil_generation = 0; // writes to a depth buffer's stencil
     u64 guest_hash = 0;          // PSPOCKET_RSX_CHECK_SURFACES: its guest memory when it last matched or was made
     u64 serial = 0;              // unique among the backend's surfaces, never reused (D-137)
+    u64 mirror_generation = ~0ull; // its generations when last mirrored into guest memory (D-1030)
     // A depth buffer (D-088) or colour target (D-098) read as a texture of another format: its conversion per decode
     // mode, the generation it was made from, and its swizzled views.
     struct Conversion {
@@ -1131,6 +1132,8 @@ struct MetalBackend::Impl {
     // Every GPU-newer target into guest memory (on the GPU where a window covers it, else a readback), then waits;
     // they are no longer newer on the GPU and their memory is watched for the CPU's writes.
     void exact_write_back();
+    void mirror_targets(); // PSPOCKET_RSX_MIRROR (D-1030)
+    void exact_defer(u32 addr, u32 size, std::function<void()> action); // D-1029
     u64 exact_write_backs = 0, exact_bytes = 0;
     // The draw signature (D-1029): draws drawn by fragment program hash, and a copy at each report for other threads.
     std::unordered_map<u64, u64> fp_draws;

@@ -119,9 +119,8 @@ bool MetalBackend::Impl::init()
     exact = config.exact;
     if (exact) { // D-1029
         config.merge_passes = false;
-        carry_on = false;
-        PS_LOG_INFO(kChan, "the exact mode (PSPOCKET_RSX_EXACT): targets in guest memory at every label, no merging, "
-            "no feedback cache, no surface pool, synchronous copies");
+        PS_LOG_INFO(kChan, "the exact mode (PSPOCKET_RSX_EXACT): labels after the GPU's work, the targets it drew in "
+            "guest memory with them; no merging, no feedback cache, no surface pool, synchronous copies");
     }
     device = config.device ? (__bridge id<MTLDevice>)config.device : MTLCreateSystemDefaultDevice();
     if (!device) {
@@ -2509,6 +2508,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     tick++;
     end_pass_for(kEndFlip);
     finish_closing(false); // the frame's stores are counted in it (D-945)
+    mirror_targets(); // D-1030
     const usize half = ab_half(); // the PSPOCKET_GPU_AB half of the frame that ends here
     if (ab_period) {
         // The RSX thread's CPU time of the frame that ends here, to the half its draws were in (D-278): with GPU time
@@ -2783,7 +2783,6 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_flip(request);
-        if (impl_->exact) impl_->exact_write_back(); // the CPU may read what the frame drew once it flipped (D-1029)
     }
     Impl& m = *impl_;
     if (++m.report_flips == Impl::kGpuReportFlips) {
@@ -3062,11 +3061,40 @@ void MetalBackend::sync()
     @autoreleasepool {
         impl_->submit(true);
         impl_->run_deferred(true);
-        if (impl_->exact) impl_->exact_write_back(); // D-1029
     }
 }
 
 // ---- the exact mode (D-1029) ----------------------------------------------------------------------------------
+
+// PSPOCKET_RSX_MIRROR=KB (D-1030): at each flip, the targets of at most KB drawn in the frame go into guest memory on
+// the GPU, in the frame's own command buffer (nothing waits): the CPU reading what the GPU drew finds it there a frame
+// later, as it would have found it at once on the PS3 (GTA V's CPU reads its water simulation's output, and computes
+// the heights its water draws from). They stay newer on the GPU: guest memory gets them only when the frame has run.
+void MetalBackend::Impl::mirror_targets()
+{
+    static const u64 limit = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_MIRROR");
+        return v ? std::strtoull(v, nullptr, 0) * 1024 : 0ull;
+    }();
+    if (!limit && !exact) return;
+    for (const auto& c : surfaces) {
+        Surface* s = c.get();
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized || (!exact && s->bytes() > limit)) continue;
+        if (s->mirror_generation == s->generation + (s->stencil_generation << 32)) continue; // not drawn since
+        if (!overlay_supported(*s)) continue;
+        u32 base = 0;
+        id<MTLBuffer> w = guest_window(s->address, s->bytes(), base);
+        if (!w) continue;
+        u32 size = 0;
+        for (const GuestWindow& g : guest_windows)
+            if (g.buffer == w) size = g.size;
+        sync_surface(*s);
+        TransientAllocator::Allocation target{w, 0, nullptr};
+        encode_overlay(*s, target, base, size);
+        s->mirror_generation = s->generation + (s->stencil_generation << 32);
+        stats.targets_mirrored++;
+    }
+}
 
 id<MTLBuffer> MetalBackend::Impl::guest_window(u32 addr, u32 size, u32& base)
 {
@@ -3099,6 +3127,27 @@ id<MTLBuffer> MetalBackend::Impl::guest_window(u32 addr, u32 size, u32& base)
     guest_windows.push_back({b, static_cast<u32>(wl), static_cast<u32>(wh - wl)});
     base = static_cast<u32>(wl);
     return b;
+}
+
+void MetalBackend::Impl::exact_defer(u32 addr, u32 size, std::function<void()> action)
+{
+    // What the GPU drew before the write goes into guest memory with the GPU's work, and the write lands once the GPU
+    // has done it all (a Deferred behind the committed buffer): the CPU that sees a label sees what the RSX drew before
+    // it, and nothing waits (D-1029).
+    end_pass_for(kEndFlush);
+    mirror_targets();
+    Deferred d;
+    d.then = std::move(action);
+    d.write_addr = addr, d.write_size = size;
+    if (render_cb || upload_cb) {
+        d.buffer = render_buffer();
+        submit(false);
+    } else if (last_committed && last_committed.status < MTLCommandBufferStatusCompleted) {
+        d.buffer = last_committed;
+    }
+    note_deferred(d);
+    deferred.push_back(std::move(d));
+    run_deferred(false); // what is ready lands now
 }
 
 void MetalBackend::Impl::exact_write_back()
@@ -3293,6 +3342,12 @@ bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 wr
 
 void MetalBackend::defer(u32 addr, u32 size, std::function<void()> action)
 {
+    if (impl_->exact) { // D-1029: after the GPU's work before it, the targets it drew in guest memory
+        @autoreleasepool {
+            impl_->exact_defer(addr, size, std::move(action));
+        }
+        return;
+    }
     if (impl_->deferred.empty()) {
         action();
         return;
@@ -3304,7 +3359,7 @@ void MetalBackend::defer(u32 addr, u32 size, std::function<void()> action)
     impl_->deferred.push_back(std::move(d));
 }
 
-bool MetalBackend::deferring() const { return !impl_->deferred.empty(); }
+bool MetalBackend::deferring() const { return impl_->exact || !impl_->deferred.empty(); }
 
 void MetalBackend::before_access(u32 addr, u32 size, bool write)
 {

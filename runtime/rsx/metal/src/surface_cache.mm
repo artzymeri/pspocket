@@ -337,24 +337,6 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
     }
     Surface* parent = swizzled || inner ? nullptr : find_parent(address, pitch, width, height, format);
     const u32 row = width * surface_color_bpp(format);
-    if (exact) {
-        // D-1029: the targets under it go to memory first, and it starts with what memory holds.
-        exact_write_back();
-        Surface* made = make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
-        evict_overlapping(address, pitch ? pitch : row, row, height, parent, nullptr, made);
-        if (made) {
-            end_pass_for(kEndOther);
-            upload_surface_from_guest(*made);
-            if (parent) {
-                made->parent = parent;
-                made->parent_x = ((address - parent->address) % pitch) / surface_color_bpp(format);
-                made->parent_y = (address - parent->address) / pitch;
-                parent->children.push_back(made);
-                stats.surface_children++;
-            }
-        }
-        return made;
-    }
     // What the GPU drew under it and memory does not hold yet, which it starts with (D-1025): made first, so no texture
     // of theirs comes back to it from the pool before they are read.
     std::vector<Surface*> carry =
@@ -363,6 +345,10 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
     const bool carried = made && carry_into(*made, carry);
     if (!carried) carry.clear();
     evict_overlapping(address, pitch ? pitch : row, row, height, inner, parent, made, carry);
+    if (exact && made && !carried && !(inner && inner->initialized) && !parent) {
+        end_pass_for(kEndOther); // D-1029: it starts with what memory holds
+        upload_surface_from_guest(*made);
+    }
     if (inner) {
         if (made && inner->initialized && !carried) grow_surface(*made, *inner);
         else if (carried) stats.surfaces_grown++; // grown on the GPU with the others under it (D-1025)
@@ -435,20 +421,14 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
     // A depth buffer over a colour target holds its bytes (D-1025): GTA V packs its depth into an A8B8G8R8 target, then
     // tests against that memory as a Z24S8 buffer (the clouds and sky through its half-size depth). Made anew, the
     // buffer started cleared to 1.0 and the bytes were gone (the striped sky of 2026-10-16).
-    if (exact) { // D-1029, as get_color_surface
-        exact_write_back();
-        Surface* made = make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
-        evict_overlapping(address, pitch ? pitch : row, row, height, nullptr, nullptr, made);
-        if (made) {
-            end_pass_for(kEndOther);
-            upload_surface_from_guest(*made);
-        }
-        return made;
-    }
     std::vector<Surface*> carry = carry_sources(address, pitch ? pitch : row, row, height, nullptr, nullptr, nullptr);
     Surface* made = make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
     if (!made || !carry_into(*made, carry)) carry.clear();
     evict_overlapping(address, pitch ? pitch : row, row, height, nullptr, nullptr, made, carry);
+    if (exact && made && !made->initialized) {
+        end_pass_for(kEndOther); // D-1029: it starts with what memory holds
+        upload_surface_from_guest(*made);
+    }
     return made;
 }
 
