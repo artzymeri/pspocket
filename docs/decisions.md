@@ -17245,3 +17245,29 @@ The gate failed in test_core: "shake mode: off costs a mask test" saw hit(S1) tr
 cleared the mask (what any() and the hooks' inline checks read) but not the configuration, and hit() read only the
 configuration: with Catch2's random order, a test that configured S1 ran first. hit() now also requires its point's
 bit in the mask. The [shake] tests pass in 20 random orders and in the gate's (seed 4048264227).
+
+## D-1049 · 2026-10-17 · Assassin's Creed's install-garden A/B of the waker rule; its slow windows are the next area's shader compiles
+
+The coordinator's ask after D-1041: the events-only against every-wake A/B on Assassin's Creed's first install into
+the garden, and what the two slow 5 s windows around 215 to 225 s of 2026-10-16 were. Runs with D-1047's leak fix, a
+fresh hdd0 copy each (the game folder and save emptied, as games/ac1/bench's install-garden), walk-garden.txt, 330 s,
+the Metal backend, --max-footprint 6, alternated in one session (the Mac at load 6 to 8):
+
+| run | play windows (from 120 s) mean / median / slowest fps | waker waits, ms | peak footprint |
+|---|---|---|---|
+| every wake 1 | 42.2 / 40.3 / 11.0 | 51,145, 181 | 1.17 GB |
+| events only 1 | 43.6 / 43.0 / 17.6 | 45,427, 166 | 1.17 GB |
+| every wake 2 | 41.5 / 37.4 / 15.6 | 52,930, 237 | 1.29 GB |
+| events only 2 | 43.1 / 45.2 / 14.4 | 44,771, 136 | 1.14 GB |
+
+All four to their timeout with no fault, stall or footprint stop; every wake about 1.5 fps (3%) under events only on the
+mean, within the runs' spread (medians 37 to 45), for 15 to 100 ms more of waits over the run.
+
+- **The slow windows** come in both modes, in the window after the walk's cross@200 (the 2026-10-16 run's at 215 to
+  225 s came from the same press, its load slower then). A run with a thread report a second (--report-every 1): from
+  200 to 202 s the RSX processed 0.9 M words where it does about 30 M a second, 38 frames in two seconds; no PPU thread
+  waits for it (Bink's threads on their mutexes for a few ms, the Loading thread on its queue), and the Metal backend's
+  window line there says "48 programs and 67 pipelines made (2871 ms)" (the A/B's events-only run: 66 programs and 109
+  pipelines, 2,610 ms). The area past the press draws with programs not seen before, compiled on the RSX thread: these
+  runs have no shader cache (inventory/work/ac-data has none) and no --async-shaders, as the bench (--async-shaders 4)
+  and the phone (D-158) have. Not the waker rule; nothing to change in lv2.
