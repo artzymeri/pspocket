@@ -17050,4 +17050,11 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
 - Tests: tests/core/test_chaos.cpp (off by the mask, the configuration's forms and refusals, a rate, the same stream
   for a seed and a thread name, another for another seed, S8's failures counted and logged and none once off, S7's
   timebase monotonic over four threads and within 3% of the true rate).
-- **First runs**: (the next entry of this decision, after they ran)
+- **First runs** (GTA V's gate walk, 128 s, scripts/shake.sh gta5): seeds 1 to 3 "legal", all to their timeout,
+  triaged clean, median 29.6, 29.4 and 29.8 fps; seed 1's injections: S1 21,101 (2.1 s of delays), S2 205,326
+  (20.5 s), S3 4,121, S4 28,038 (7.0 s), S5 12, S6 2,676, S8 165,601 conditional stores failed, S10 707,852
+  selections shuffled, S11 2,215, S12 2,015 reads (5.1 s), S13 7 save data callbacks (0.9 s), S14 490; S9 none (GTA V's
+  SPU programs never wait on a channel the host has to fill: its SPURS workers poll). Seeds 11 and 12 "adversarial"
+  (S7, S15, S16: 510 rate changes, about 10,000 woken threads overtaking their wakers a run): clean, 29.8 and 28.4 fps.
+  Nothing found in GTA V's prologue yet. Assassin's Creed's install path under shake mode (the run that found D-999's
+  races) is the next to run: not run here, the disk under 10 GB free (each run copies hdd0 and installs 1.3 GB).
