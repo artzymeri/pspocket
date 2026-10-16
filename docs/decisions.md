@@ -16663,3 +16663,19 @@ Events are counted always and reported once per kind every 2 minutes; the last 3
 Test: tests/hle test_frame_watch.cpp (synthetic thumbnails: a night scene, a half black frame twice, a fade, A-B-A
 against a cut, a gap of 800 ms, 11 s of one picture). Next: fed by the Metal backend's per-frame thumbnail (asked of
 the graphics track), in pspocket-boot's summary and the app's reports.
+
+## D-1065 · 2026-10-16 · Glitch reports on the iPhone: the detectors, a flag button, pull-reports and pull-save
+
+The bulletproof plan's net 5: a session on the phone turns into bench cases without the user describing anything.
+
+- game.mm: a FrameWatch (D-1064) per session; each event (partly black, flicker, hitch, frozen) or the player's flag
+  writes Documents/reports/<stamp>-<kind>/ off the thread that saw it: report.json (kind, flip, value, time, heat, the
+  PSPOCKET_ switches set), log.txt (the log's last 200 lines), thumbs.png (the last 32 thumbnails, 8 a row, oldest
+  first). At most 30 a session, one a kind every 2 minutes; the folder keeps its newest 50 MB. The detectors get
+  frames once the Metal backend gives each frame's 64x36 thumbnail (asked of the graphics track); until then only the
+  flag writes reports.
+- The game screen's status overlay (double tap) has "Flag what I just saw": ps_game_flag(), ps_game_reports_written().
+- scripts/ios.sh pull-reports: Documents/reports to inventory/phone/reports/ over USB (afcclient, file by file: the
+  developer disk image does not mount on this phone with this Xcode), then removed from the phone. pull-save [--title]:
+  the game's savedata to inventory/<game>/saves/<stamp>/ for a bench case.
+- Privacy: only game frames' thumbnails and pspocket's own log; nothing leaves the phone except over the user's cable.

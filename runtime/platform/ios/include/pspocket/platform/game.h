@@ -89,6 +89,11 @@ void ps_game_get_stats(ps_game_stats* out);
 /* The last log lines (oldest first, one per line), at most `size - 1` bytes. */
 void ps_game_log_tail(char* out, size_t size);
 
+/* The player flags what they just saw (D-1065): a glitch report with the last frames' thumbnails and the log goes to
+ * Documents/reports/. ps_game_reports_written: how many this session wrote (at most 30). */
+void ps_game_flag(void);
+int ps_game_reports_written(void);
+
 #ifdef __cplusplus
 }
 #endif

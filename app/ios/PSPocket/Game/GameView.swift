@@ -6,6 +6,7 @@ import UIKit
 struct GameScreen: View {
     @Environment(GameModel.self) private var game
     @State private var showInfo = false
+    @State private var reports = 0
 
     var body: some View {
         ZStack {
@@ -45,6 +46,17 @@ struct GameScreen: View {
             Text(game.logTail.split(separator: "\n").suffix(8).joined(separator: "\n"))
                 .font(.system(size: 9, design: .monospaced))
                 .lineLimit(8)
+            // A glitch report of what was just on screen (D-1065): the last frames and the log, in Documents/reports.
+            Button {
+                ps_game_flag()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { reports = Int(ps_game_reports_written()) }
+            } label: {
+                Label(reports > 0 ? "Flag what I just saw (\(reports) saved)" : "Flag what I just saw",
+                      systemImage: "flag")
+                    .font(.caption.bold())
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
         }
         .padding(8)
         .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))

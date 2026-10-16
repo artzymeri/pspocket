@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <ctime>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -50,6 +51,7 @@
 #include "pspocket/lv2/report.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/disc.hpp"
+#include "pspocket/loader/frame_watch.hpp"
 #include "pspocket/loader/game_modules.hpp"
 #include "pspocket/loader/hdd_game.hpp"
 #include "pspocket/loader/lle.hpp"
@@ -148,6 +150,11 @@ struct Session {
     // Its own PRX modules translated ahead of time (D-238): after `modules`, which it is installed on.
     std::unique_ptr<loader::GameModules> game_modules;
     std::string coverage; // where the SPU images it meets are saved
+    // Glitch reports (D-1065): the detectors over each frame's thumbnail, the folder reports go to, and how many this
+    // session wrote (at most kMaxReports).
+    std::unique_ptr<loader::FrameWatch> watch;
+    std::string reports_dir;
+    std::atomic<int> reports_written{0};
     // The app's Documents folder (the log's), where a frame trace is asked for and kept (D-947): an empty file
     // Documents/pspocket-trace, put there over USB, has the backend trace the next frame into Documents/trace-<flip>/.
     std::string documents;
@@ -379,6 +386,85 @@ void set_env_from_settings()
         setenv(s.name, s.on, 0);
         PS_LOG_INFO(kChan, "{}={} (from Settings)", s.name, s.on);
     }
+}
+
+// ---- glitch reports (D-1065) ----
+//
+// A detector's event (FrameWatch: partly black, flicker, hitch, frozen) or the player's flag writes
+// Documents/reports/<stamp>-<kind>/: report.json (what, when, the build, the switches, heat), log.txt (the log's last
+// lines) and thumbs.png (the last 32 frames' 64x36 thumbnails, 8 a row, oldest first). At most 30 a session; the folder
+// keeps the newest 50 MB. scripts/ios.sh pull-reports copies them to the Mac (inventory/phone/reports/).
+constexpr int kMaxReports = 30;
+constexpr u64 kReportsBytes = 50ull << 20;
+
+void trim_reports(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> runs;
+    u64 total = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        u64 bytes = 0;
+        for (const auto& f : std::filesystem::recursive_directory_iterator(e.path(), ec))
+            if (f.is_regular_file(ec)) bytes += f.file_size(ec);
+        total += bytes;
+        runs.emplace_back(e.last_write_time(ec), e.path());
+    }
+    std::sort(runs.begin(), runs.end());
+    for (const auto& [when, path] : runs) {
+        if (total <= kReportsBytes) break;
+        u64 bytes = 0;
+        for (const auto& f : std::filesystem::recursive_directory_iterator(path, ec))
+            if (f.is_regular_file(ec)) bytes += f.file_size(ec);
+        std::filesystem::remove_all(path, ec);
+        total -= std::min(total, bytes);
+    }
+}
+
+void write_report(Session* s, const loader::FrameWatch::Event& e, std::vector<loader::FrameWatch::Thumb> thumbs)
+{
+    if (!s || s->reports_dir.empty() || s->reports_written.fetch_add(1) >= kMaxReports) return;
+    std::string log;
+    {
+        std::lock_guard lock(g_log_mutex);
+        for (const std::string& line : g_tail) log += line + "\n";
+    }
+    const std::string kind = loader::FrameWatch::name(e.kind);
+    const u64 flip = e.flip;
+    const double value = e.value;
+    const std::string dir = s->reports_dir;
+    // Off the thread that saw it (the RSX thread's present, or the main thread's button): files take milliseconds.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        const std::time_t now = std::time(nullptr);
+        char stamp[32];
+        std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
+        const std::filesystem::path run = std::filesystem::path(dir) / (std::string(stamp) + "-" + kind);
+        std::error_code ec;
+        std::filesystem::create_directories(run, ec);
+        std::string env;
+        for (const char* name : {"PSPOCKET_EDGE_GPU", "PSPOCKET_EDGE_GPU_EXACT", "PSPOCKET_RSX_NO_SURFACE_POOL",
+                 "PSPOCKET_START_MISSING", "PSPOCKET_SPU_NATIVE"})
+            if (const char* v = std::getenv(name)) env += std::format("{}\"{}\": \"{}\"", env.empty() ? "" : ", ", name, v);
+        std::ofstream(run / "report.json") << std::format(
+            "{{\n  \"kind\": \"{}\",\n  \"flip\": {},\n  \"value\": {:.3f},\n  \"time\": \"{}\",\n  \"heat\": \"{}\",\n"
+            "  \"switches\": {{{}}}\n}}\n", kind, flip, value, stamp, thermal_name(), env);
+        std::ofstream(run / "log.txt") << log;
+        if (!thumbs.empty()) {
+            constexpr u32 kCols = 8, kW = loader::FrameWatch::kW, kH = loader::FrameWatch::kH;
+            const u32 rows = static_cast<u32>((thumbs.size() + kCols - 1) / kCols);
+            std::vector<u8> px(static_cast<usize>(kCols * kW) * rows * kH * 4, 0);
+            for (usize i = 0; i < thumbs.size(); i++) {
+                const u32 ox = static_cast<u32>(i % kCols) * kW, oy = static_cast<u32>(i / kCols) * kH;
+                for (u32 y = 0; y < kH; y++)
+                    for (u32 x = 0; x < kW; x++) {
+                        u8* d = &px[((oy + y) * kCols * kW + ox + x) * 4];
+                        const u8* t = &thumbs[i][(y * kW + x) * 3];
+                        d[0] = t[0], d[1] = t[1], d[2] = t[2], d[3] = 255;
+                    }
+            }
+            write_png_rgb((run / "thumbs.png").string(), px.data(), kCols * kW, rows * kH, kCols * kW * 4, true);
+        }
+        trim_reports(dir);
+    });
 }
 
 } // namespace
@@ -740,6 +826,16 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
         s->system = loader::SystemLibrary::load((flash.parent_path() / "system").string(), *s->lle, *s->memory, &why);
         if (!s->system) PS_LOG_INFO(kChan, "{}", why);
     }
+    // Glitch reports (D-1065): the detectors, fed each frame's thumbnail once the backend has them.
+    if (o->log_path) s->reports_dir = (std::filesystem::path(o->log_path).parent_path() / "reports").string();
+    s->watch = std::make_unique<loader::FrameWatch>();
+    {
+        Session* sp = s.get(); // the session lives as long as the app
+        s->watch->on_event = [sp](const loader::FrameWatch::Event& e) {
+            PS_LOG_WARN(kChan, "glitch report: {} at flip {} ({:.2f})", loader::FrameWatch::name(e.kind), e.flip, e.value);
+            write_report(sp, e, sp->watch->recent());
+        };
+    }
     loader::LoadReport report;
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report, s->lle.get()); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
@@ -967,6 +1063,16 @@ extern "C" void ps_game_get_stats(ps_game_stats* out)
     out->flips = g_session->flips.load(std::memory_order_relaxed);
     out->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_session->start).count();
 }
+
+extern "C" void ps_game_flag(void)
+{
+    if (!g_session || !g_session->watch) return;
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    g_session->watch->flag(g_session->flips.load(std::memory_order_relaxed), now);
+}
+
+extern "C" int ps_game_reports_written(void) { return g_session ? g_session->reports_written.load() : 0; }
 
 extern "C" void ps_game_log_tail(char* out, size_t size)
 {

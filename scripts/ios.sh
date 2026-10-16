@@ -60,6 +60,10 @@ Commands:
   session [FILE] [--since HH:MM]
                              Summarise each app session in a device log (default: the newest
                              inventory/phone/live/syslog-*.log): fps, sound, memory, heat, GPU, threads, faults.
+  pull-reports               Copy the app's glitch reports (Documents/reports: report.json, log.txt, thumbs.png each,
+                             D-1065) to inventory/phone/reports/ over USB (afcclient), then remove them from the phone.
+  pull-save [--title ID]     Copy the game's saves from the phone's hdd0 (home/00000001/savedata/<TITLE_ID>*) to
+                             inventory/<game>/saves/<stamp>/ for the bench (D-1060). Default title BLES01807.
   perftrace [--seconds N] [--template NAME]
                              Record an Instruments trace of the running app on the iPhone (xctrace --attach; default
                              30 s of Time Profiler; "Game Performance", "Metal System Trace", "Power Profiler" or any
@@ -443,6 +447,55 @@ cmd_session() {
     fi
     say "sessions in $log"
     "$PYTHON" "$ROOT/scripts/phone_session.py" "$log" ${SINCE:+--since "$SINCE"}
+}
+
+# Copies a folder of the app's container from the phone over USB, file by file (afcclient: devicectl's developer disk
+# image does not mount on this phone with this Xcode).
+afc_pull_dir() { # <remote dir> <local dir>
+    local remote="$1" local_dir="$2" udid entry
+    udid="$(idevice_id -l | head -1)"
+    [ -n "$udid" ] || die "no iPhone on USB (idevice_id -l): plug it in and unlock it"
+    mkdir -p "$local_dir"
+    afcclient -u "$udid" --container "$BUNDLE_ID" ls "$remote" 2>/dev/null | while IFS= read -r entry; do
+        [ -n "$entry" ] && [ "$entry" != "." ] && [ "$entry" != ".." ] || continue
+        if afcclient -u "$udid" --container "$BUNDLE_ID" info "$remote/$entry" 2>/dev/null | grep -q "S_IFDIR"; then
+            afc_pull_dir "$remote/$entry" "$local_dir/$entry"
+        else
+            afcclient -u "$udid" --container "$BUNDLE_ID" get "$remote/$entry" "$local_dir/$entry" >/dev/null 2>&1 \
+                || warn "could not copy $remote/$entry"
+        fi
+    done
+}
+
+cmd_pull_reports() {
+    local dir udid n
+    dir="$ROOT/inventory/phone/reports"
+    afc_pull_dir Documents/reports "$dir"
+    n=$(find "$dir" -name report.json 2>/dev/null | wc -l | tr -d ' ')
+    say "$n glitch report(s) in $dir"
+    udid="$(idevice_id -l | head -1)"
+    # Removed from the phone once copied (a report whose report.json arrived).
+    for r in $(afcclient -u "$udid" --container "$BUNDLE_ID" ls Documents/reports 2>/dev/null); do
+        if [ "$r" != "." ] && [ "$r" != ".." ] && [ -f "$dir/$r/report.json" ]; then
+            afcclient -u "$udid" --container "$BUNDLE_ID" rm "Documents/reports/$r" >/dev/null 2>&1 || true
+        fi
+    done
+    for r in "$dir"/*/report.json; do
+        [ -f "$r" ] && echo "  $(basename "$(dirname "$r")"): $(tr -d '\n' < "$r" | cut -c1-150)" >&2
+    done
+}
+
+cmd_pull_save() {
+    local title="${GAME_TITLE:-BLES01807}" game dest udid s
+    case "$title" in BLES01807) game=gta5 ;; *) game="$title" ;; esac
+    dest="$ROOT/inventory/$game/saves/$(date +%Y%m%d-%H%M%S)"
+    udid="$(idevice_id -l | head -1)"
+    [ -n "$udid" ] || die "no iPhone on USB (idevice_id -l): plug it in and unlock it"
+    for s in $(afcclient -u "$udid" --container "$BUNDLE_ID" ls Documents/hdd0/home/00000001/savedata 2>/dev/null | grep "^$title"); do
+        afc_pull_dir "Documents/hdd0/home/00000001/savedata/$s" "$dest/$s"
+    done
+    [ -d "$dest" ] || die "no saves of $title on the phone"
+    say "saves of $title in $dest: $(ls "$dest" | tr '\n' ' ')(name it in games/$game/bench/cases.json as \"$(basename "$dest")\")"
 }
 
 # An Instruments trace of the running app (the plan for a steady 30 fps, item 7): where the phone's CPU goes, by
@@ -919,6 +972,8 @@ case "$COMMAND" in
     pull-log) cmd_pull_log ;;
     session) cmd_session ;;
     perftrace) cmd_perftrace ;;
+    pull-reports) cmd_pull_reports ;;
+    pull-save) cmd_pull_save ;;
     push-signing-identity) cmd_push_signing_identity ;;
     all)
         cmd_build >/dev/null
