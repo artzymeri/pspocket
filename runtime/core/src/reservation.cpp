@@ -30,6 +30,8 @@
 // the volatile accessors of be.h on ARM64 and keep ThreadSanitizer quiet about the seqlock data reads.
 
 #include "pspocket/core/reservation.h"
+
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/timebase.h"
 
 #include <atomic>
@@ -255,6 +257,11 @@ extern "C" uint64_t ps_res_version(uint32_t addr)
 extern "C" bool ps_res_store_line(uint8_t* base, uint32_t addr, uint64_t version, const void* expected128,
     const void* data128)
 {
+    // Shake mode's S8 (D-1045): PUTLLC may fail for no reason too (the reservation lost to a snoop).
+    if (pspocket::chaos::on(pspocket::chaos::S8_StoreConditional) &&
+        pspocket::chaos::hit(pspocket::chaos::S8_StoreConditional, addr)) [[unlikely]] {
+        return false;
+    }
     Slot& slot = slot_of(addr);
     // The caller's buffers copied before the lock: its window as short as it can be (D-972).
     u64 expected[kWords];
@@ -293,6 +300,11 @@ extern "C" bool ps_res_store_conditional(uint8_t* base, uint32_t addr, uint32_t 
     uint64_t version, const void* expected128)
 {
     if ((size != 4 && size != 8) || (addr & (size - 1)) != 0) return false;
+    // Shake mode's S8 (D-1045): a conditional store may fail for no reason (the architecture allows it).
+    if (pspocket::chaos::on(pspocket::chaos::S8_StoreConditional) &&
+        pspocket::chaos::hit(pspocket::chaos::S8_StoreConditional, addr)) [[unlikely]] {
+        return false;
+    }
 
     Slot& slot = slot_of(addr);
     if (!try_lock(slot, version)) return false;

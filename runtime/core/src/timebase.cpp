@@ -3,6 +3,7 @@
 #include <chrono>
 #include <thread>
 
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/types.hpp"
 
 #if defined(__APPLE__)
@@ -67,11 +68,14 @@ const HostClock& host_clock()
 extern "C" uint64_t ps_timebase_now(void)
 {
 #if defined(__APPLE__)
-    return host_clock().elapsed_tb();
+    const uint64_t tb = host_clock().elapsed_tb();
 #else
     const u128 ns = host_clock().elapsed_ns();
-    return static_cast<uint64_t>(ns * PS_TIMEBASE_HZ / 1'000'000'000ull);
+    const uint64_t tb = static_cast<uint64_t>(ns * PS_TIMEBASE_HZ / 1'000'000'000ull);
 #endif
+    // Shake mode's S7 (D-1045): a little fast or slow, a while at a time.
+    if (pspocket::chaos::on(pspocket::chaos::S7_TimebaseRate)) [[unlikely]] return pspocket::chaos::shaken_timebase(tb);
+    return tb;
 }
 
 extern "C" uint64_t ps_host_now_ns(void) { return host_clock().ns(); }

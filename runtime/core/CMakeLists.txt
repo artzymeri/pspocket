@@ -7,7 +7,8 @@ add_library(pspocket_core STATIC
     src/png.cpp
     src/reservation.cpp
     src/thread_report.cpp
-    src/timebase.cpp)
+    src/timebase.cpp
+    src/chaos.cpp)
 target_include_directories(pspocket_core PUBLIC include)
 pspocket_set_warnings(pspocket_core)
 add_library(pspocket::core ALIAS pspocket_core)
