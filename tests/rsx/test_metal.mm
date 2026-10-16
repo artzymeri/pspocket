@@ -923,7 +923,7 @@ TEST_CASE("metal e2e: an NV0039 copy of a render target is deferred, and the lab
     b.method(m::NV406E_SEMAPHORE_OFFSET, 65 * 0x10);
     b.method(m::NV406E_SEMAPHORE_RELEASE, 7);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle); // an idle FIFO runs what was deferred
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().deferred_readbacks == 1);
     CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(65)) == 7);
@@ -957,7 +957,7 @@ TEST_CASE("metal e2e: clear, upload programs, draw a triangle, read back through
     b.method(m::NV0039_OFFSET_IN, {kSurfaceOffset, 0x100000, kW * 4, kW * 4, kW * 4, kH, 0x101});
     b.method(m::NV0039_BUFFER_NOTIFY, 0);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(64)) == 1);
 
@@ -1003,7 +1003,7 @@ TEST_CASE("metal e2e: a float16 target reads back big-endian, red first (D-080)"
     b.method(m::NV0039_OFFSET_IN, {kSurfaceOffset, 0x100000, kW * 8, kW * 8, kW * 8, kH, 0x101});
     b.method(m::NV0039_BUFFER_NOTIFY, 0);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().readbacks == 1);
     const u8* p = e.mem.host(E2E::kReadbackEa) + (10 * kW + 20) * 8;
@@ -1033,7 +1033,7 @@ TEST_CASE("metal e2e: 16-bit exports, vertex colour interpolation and partial cl
     b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffffffff);
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
 
@@ -1132,7 +1132,7 @@ std::array<u8, 4> draw_with_outputs(const std::array<std::array<float, 4>, 3>& c
     state(b);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     return guest_pixel(e, kSurfaceOffset, 32, 40);
@@ -1227,7 +1227,7 @@ TEST_CASE("metal e2e: window z is clipped to NV4097_SET_CLIP_MIN/MAX and stored 
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kDepth, kW * kH * 2));
@@ -1303,7 +1303,7 @@ TEST_CASE("metal e2e: user clip planes keep what their distance has on the side 
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return std::pair{guest_pixel(e, kSurfaceOffset, 32, 20)[1] == 0xff, guest_pixel(e, kSurfaceOffset, 32, 50)[1] == 0xff};
@@ -1367,7 +1367,7 @@ TEST_CASE("metal e2e: a constant or vertex base written between the ranges of on
         b.method(m::NV4097_DRAW_ARRAYS, (2u << 24) | second_first);
         b.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return Result{guest_pixel(e, kSurfaceOffset, 16, 48), guest_pixel(e, kSurfaceOffset, 48, 48),
@@ -1467,7 +1467,7 @@ TEST_CASE("metal e2e: the depth bounds test passes the pixels whose stored depth
         b.method(m::NV4097_DRAW_ARRAYS, (3u << 24) | 3);
         b.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().depth_bounds_draws == (enable && (lo > 0.f || hi < 1.f) ? 1u : 0u));
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -1533,7 +1533,7 @@ TEST_CASE("metal e2e: points take NV4097_SET_POINT_SIZE unless the program's siz
         b.method(m::NV4097_DRAW_ARRAYS, 0);
         b.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         std::vector<std::array<u8, 4>> out;
@@ -1591,7 +1591,7 @@ TEST_CASE("metal e2e: polygon stipple keeps the pixels whose pattern bit is set 
         b.method(m::NV4097_SET_POLYGON_STIPPLE, stipple ? 1u : 0u);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         std::vector<bool> out;
@@ -1625,7 +1625,7 @@ TEST_CASE("metal e2e: the alpha test's reference is a half on a float16 target a
         b.method(m::NV4097_SET_ALPHA_REF, ref);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * bpp));
         const u8* p = e.mem.host(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + (40 * kW + 32) * bpp);
@@ -1653,7 +1653,7 @@ TEST_CASE("metal e2e: NV4097_SET_WINDOW_OFFSET moves where the target starts in 
     b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00); // green
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     const std::array<u8, 4> green{0xff, 0x00, 0xff, 0x00}, none{0, 0, 0, 0};
@@ -1708,7 +1708,7 @@ TEST_CASE("metal e2e: a fragment program's exported depth is clamped to [0, 1], 
         set_fragment_program(b, kFp2Offset, 0x4e);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return guest_pixel(e, kSurfaceOffset, 32, 40)[1] == 0xff;
@@ -1759,7 +1759,7 @@ TEST_CASE("metal e2e: an output the vertex output mask leaves out reaches the fr
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return guest_pixel(e, kSurfaceOffset, 32, 40);
@@ -1810,7 +1810,7 @@ TEST_CASE("metal e2e: an indexed strip restarts at the restart index, which is n
         b.method(m::NV4097_DRAW_INDEX_ARRAY, (8u << 24) | 0);
         b.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         const auto red = [&](u32 x, u32 y) { return guest_pixel(e, kSurfaceOffset, x, y)[1] == 0xff; };
@@ -1881,7 +1881,7 @@ TEST_CASE("metal e2e: indexed draws run over the game's own indices, 16 and 32 b
         c.method(m::NV4097_DRAW_INDEX_ARRAY, (2u << 24) | 7);
         c.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().ranges_indexed_by_metal == 3);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -1933,7 +1933,7 @@ TEST_CASE("metal e2e: a mesh of 400 vertices draws the same through 16-bit and 3
             b.method(m::NV4097_DRAW_INDEX_ARRAY, ((std::min(256u, count - first) - 1) << 24) | first);
         b.method(m::NV4097_SET_BEGIN_END, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().ranges_indexed_by_metal >= 1);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -1984,7 +1984,7 @@ TEST_CASE("metal e2e: textured draw with a swizzled texture and a channel remap"
     });
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(e.backend->stats().textures_decoded == 1);
@@ -2044,7 +2044,7 @@ TEST_CASE("metal e2e: render to a surface, then sample it as a texture")
     b.method(m::NV4097_SET_TEXTURE_CONTROL3, kW * 4);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_samples == 1);
     CHECK(e.backend->stats().textures_decoded == 0); // the render target was bound, not decoded from memory
@@ -2115,7 +2115,7 @@ u32 copy_target_then_sample(E2E& e, u32 line_length)
     bind_linear_texture(b, kTexOffset, tex::A8R8G8B8, kW * 4);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     return b.offset();
 }
@@ -2179,7 +2179,7 @@ TEST_CASE("metal e2e: the RSX's own semaphore release queued behind a readback s
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle); // not blocked on the acquire
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().gpu_copies == 1);
     CHECK(e.backend->stats().deferred_conflicts == 0);
@@ -2240,7 +2240,7 @@ TEST_CASE("metal e2e: copies that touch nothing deferred run at once; a write ov
     b.method(m::NV308A_POINT, {0, 1, 1});
     b.method(m::NV308A_COLOR, 0x11223344);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().deferred_readbacks == 1);
     CHECK(e.backend->stats().deferred_conflicts == 1); // only the NV308A write waited
@@ -2356,7 +2356,7 @@ TEST_CASE("metal e2e: a fragment program rewritten between two draws of one batc
     set_fragment_program(b, kFpOffset, 0x40);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the texture's blue
@@ -2394,7 +2394,7 @@ void reload_round_trip(u32 surface_format, u32 bpp, bool depth, u32 clear_mask, 
     c.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(1u << 16) | 0, (1u << 16) | 0});
     c.method(m::NV4097_CLEAR_SURFACE, clear_mask);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_reloads == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + target, pitch * kH));
@@ -2472,7 +2472,7 @@ TEST_CASE("metal e2e: an NV308A pixel written over a rendered target keeps what 
     b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {(1u << 16) | 63, (1u << 16) | 63});
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // (63, 63): a pass over the target again
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_reloads == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -2506,7 +2506,7 @@ TEST_CASE("metal e2e: a swizzled target goes to guest memory in Morton order and
     bind_vertex_arrays(b);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(pixel(32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // the red triangle
@@ -2594,7 +2594,7 @@ std::array<u8, 4> draw_with_branch_bits(bool call, bool if_true, u32 bits)
     bind_vertex_arrays(b);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().draws == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -2655,7 +2655,7 @@ TEST_CASE("metal e2e: a transform constant written between two draws of one batc
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().draws == 3);
     for (u32 i = 0; i < 3; i++) REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + i * 0x100000, kW * kH * 4));
@@ -2706,7 +2706,7 @@ TEST_CASE("metal e2e: vertex programs uploaded again before each draw are found 
         draw_triangle(b);
     }
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00}, blue{0xff, 0x00, 0x00, 0xff};
     const std::array<u8, 4> expected[] = {red, green, red, green, blue};
@@ -2763,7 +2763,7 @@ TEST_CASE("metal e2e: only the transform constants a vertex program reads are up
     }
     const u64 before = e.backend->stats().vertex_constant_bytes_copied;
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().vertex_constant_bytes_copied - before == 3 * 16);
     const std::array<u8, 4> expected[] = {{0xff, 0xff, 0x00, 0x00}, {0xff, 0x00, 0xff, 0x00}, {0xff, 0x00, 0x00, 0xff}};
@@ -2802,7 +2802,7 @@ TEST_CASE("metal e2e: interleaved vertex attributes are copied once and read rig
     const u64 before = e.backend->stats().vertex_bytes_copied;
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().vertex_bytes_copied - before == 60);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -2859,7 +2859,7 @@ TEST_CASE("metal e2e: the shader cache records what draws compile and makes it a
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
@@ -2901,7 +2901,7 @@ TEST_CASE("metal e2e: with background compiles, a draw goes without its programs
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return guest_pixel(e, kSurfaceOffset, 32, 48);
@@ -2950,7 +2950,7 @@ TEST_CASE("metal e2e: with background compiles, a draw whose programs or pipelin
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return guest_pixel(e, kSurfaceOffset, 32, 48);
@@ -3002,7 +3002,7 @@ TEST_CASE("metal e2e: an A8R8G8B8 texture over an A8B8G8R8 target reads its red 
     bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kW * 4);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_samples == 1);
     CHECK(e.backend->stats().textures_decoded == 0);
@@ -3031,7 +3031,7 @@ TEST_CASE("metal e2e: a clear writes its value into an A8B8G8R8 target's words a
     c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00ff0000);
     c.method(m::NV4097_CLEAR_SURFACE, clear::kRed);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceB, 5, 7) == std::array<u8, 4>{0x00, 0xff, 0x00, 0x00});
@@ -3075,7 +3075,7 @@ TEST_CASE("metal e2e: a multisampled target is drawn one texel per sample, its s
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
         std::vector<std::vector<bool>> red(kH * sy, std::vector<bool>(kW * sx));
@@ -3138,7 +3138,7 @@ TEST_CASE("metal e2e: a point on a two-by-two multisampled target covers its siz
     b.method(m::NV4097_DRAW_ARRAYS, 0);
     b.method(m::NV4097_SET_BEGIN_END, 0);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
     const auto red = [&](u32 x, u32 y) { return guest_pixel_pitch(e, kSurfaceOffset, pitch, x, y)[1] == 0xff; };
@@ -3175,7 +3175,7 @@ TEST_CASE("metal e2e: WPOS on a multisampled target is the pixel's position, the
     bind_vertex_arrays(b);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, pitch * kH * sy));
     // Pixel (24, 48) and (40, 48), inside the triangle: each of their four samples holds (x + 0.5 + 1) / 64.
@@ -3208,7 +3208,7 @@ TEST_CASE("metal e2e: a target narrower than the one at its address is its left 
     b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff778899);
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
     CHECK(guest_pixel_pitch(e, kSurfaceB, kPitch, 5, 7) == std::array<u8, 4>{0xff, 0x77, 0x88, 0x99});
@@ -3230,7 +3230,7 @@ TEST_CASE("metal e2e: a target wider than the one at its address keeps what that
     b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff445566);
     b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surfaces_grown == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kPitch * kH));
@@ -3263,7 +3263,7 @@ TEST_CASE("metal e2e: a texture smaller than the target at its address samples t
     bind_linear_texture(b, kSurfaceB, tex::A8R8G8B8, kPitch);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_corners == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -3299,7 +3299,7 @@ TEST_CASE("metal e2e: a target inside a larger one keeps it, and each sees what 
     b.method(m::NV4097_SET_TEXTURE_IMAGE_RECT, ((2 * kW) << 16) | kH);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_children == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -3352,7 +3352,7 @@ TEST_CASE("metal e2e: an A8B8G8R8 target read as a Y16_X16 texture converts on t
     bind_linear_texture(b, kSurfaceB, tex::Y16_X16, kW * 4);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().readbacks == 0); // run 066: a write-back and a decode from memory every frame
     CHECK(e.backend->stats().color_conversions == 1);
@@ -3390,7 +3390,7 @@ std::vector<u8> sample_f16_as_argb(E2E& e, u64& readbacks, u32* end = nullptr)
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
     if (end) *end = b.offset();
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     readbacks = e.backend->stats().readbacks;
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -3454,7 +3454,7 @@ TEST_CASE("metal e2e: a texture laid over a target is decoded again after the ta
     bind_linear_texture(c, kSurfaceB, tex::A8R8G8B8, kW * 8, 2 * kW, 2 * kH);
     draw_triangle(c);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().texture_overlays == 2);
     CHECK(e.backend->stats().readbacks == 1); // the first flush
@@ -3493,7 +3493,7 @@ TEST_CASE("metal e2e: a texture a target covers whole comes from the target alon
     };
     // Every texel the same R5G6B5 value: both halves of the depth word (depth 0xFFFFFF and stencil 0xFF).
     u32 at = clear_and_sample(0, 0xffffffff);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().textures_from_target == 1);
     CHECK(e.backend->stats().texture_bytes_copied == 0);
@@ -3534,7 +3534,7 @@ TEST_CASE("metal e2e: a texture over two depth buffers side by side shows both, 
     bind_linear_texture(b, kDepth, tex::R5G6B5, kPitch, 4 * kW, kH); // both buffers' rows, two texels per word
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().readbacks == 0);
     CHECK(e.backend->stats().textures_from_target == 1);
@@ -3565,7 +3565,7 @@ TEST_CASE("metal e2e: a texture with its own layout inside a target's memory is 
     bind_linear_texture(b, kSurfaceB + 4096, tex::A8R8G8B8, kW * 2, kW / 2, kH / 2); // half the pitch, inside it
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().texture_overlays == 0);
     CHECK(e.backend->stats().textures_from_target == 0);
@@ -3597,7 +3597,7 @@ TEST_CASE("metal e2e: a Z24S8 depth buffer read as a texture of another size is 
         bind_linear_texture(b, kDepth, tex::R5G6B5, kW * 4, 2 * kW, kH);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         readbacks = e.backend->stats().readbacks;
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -3645,7 +3645,7 @@ TEST_CASE("metal e2e: a G8B8 target read as a G8B8 texture samples it, (A, R, G,
     bind_linear_texture(b, kSurfaceB, tex::G8B8, kW * 2);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_samples == 1);
     CHECK(e.backend->stats().textures_decoded == 0);
@@ -3700,7 +3700,7 @@ TEST_CASE("metal e2e: a B8 target read as a B8 texture gives its byte in every c
     bind_linear_texture(b, kSurfaceB, tex::B8, kW);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().surface_samples == 1);
     CHECK(e.backend->stats().textures_decoded == 0);
@@ -3735,7 +3735,7 @@ TEST_CASE("metal e2e: a Z24S8 depth buffer read as an A8R8G8B8 texture gives its
     bind_linear_texture(b, kDepth, tex::A8R8G8B8, kW * 4);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().readbacks == 0); // converted on the GPU (D-088)
     CHECK(e.backend->stats().depth_conversions == 1);
@@ -3762,7 +3762,7 @@ TEST_CASE("metal e2e: draws that sample the target they draw to, without writing
     b.method(m::NV4097_SET_COLOR_MASK, 0);
     for (int i = 0; i < 50; i++) draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().feedback_copies == 1);
     CHECK(e.backend->stats().render_passes <= 2); // the clear's, then the draws' after the one copy
@@ -3794,7 +3794,7 @@ TEST_CASE("metal e2e: a draw that samples the target it draws to sees the draws 
     b.method(m::NV4097_INVALIDATE_L2, 1); // cellGcmSetInvalidateTextureCache
     draw_triangle(b); // samples the green (a new copy) and writes it: black here would be the old copy
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().feedback_copies == 2);
     CHECK(e.backend->stats().feedback_invalidated == 1);
@@ -3828,7 +3828,7 @@ TEST_CASE("metal e2e: without an invalidation, a draw that samples its target re
     set_fragment_program(b, kFp2Offset, 0x40);
     for (int i = 0; i < 20; i++) draw_triangle(b); // read the black the cache took in, and write it
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().feedback_copies == 1);
     CHECK(e.backend->stats().feedback_reused == 20);
@@ -3865,7 +3865,7 @@ TEST_CASE("metal e2e: a target sampled again after the draws went to other targe
     set_fragment_program(b, kFp2Offset, 0x40);
     draw_triangle(b); // samples the green (a new copy): the targets changed since the first
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().feedback_copies == 2);
     CHECK(e.backend->stats().feedback_rebound == 1);
@@ -3894,7 +3894,7 @@ TEST_CASE("metal e2e: the signed blend equations are done in the shader (D-948)"
         b.method(m::NV4097_SET_BLEND_EQUATION, equation);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().shader_blend_draws == 1);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -3936,7 +3936,7 @@ TEST_CASE("metal e2e: the signed blend equations are done in the shader (D-948)"
         b.method(m::NV4097_SET_BLEND_EQUATION, 0xf006f006);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().shader_blend_draws == 1);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH));
@@ -3980,7 +3980,7 @@ TEST_CASE("metal e2e: draws that write the stencil of the depth buffer they read
     b.method(m::NV4097_SET_STENCIL_OP_ZPASS, static_cast<u32>(StencilOp::Replace));
     for (int i = 0; i < 3; i++) draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().depth_conversions == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -4015,7 +4015,7 @@ TEST_CASE("metal e2e: a Z16 depth buffer reads as X16 (its value) and as DEPTH16
         bind_linear_texture(b, kDepth, format, kW * 2);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().readbacks == 0);
         // X16 converts (D-088); DEPTH16 samples the depth buffer itself (D-106).
@@ -4071,7 +4071,7 @@ TEST_CASE("metal e2e: a DEPTH16 texture with a compare function returns the dept
         b.method(m::NV4097_SET_TEXTURE_FILTER, linear ? (2u << 16) | (2u << 24) : (1u << 16) | (1u << 24));
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         CHECK(guest_pixel(e, kSurfaceOffset, 20, 48) == std::array<u8, 4>{0xff, 0xff, 0xff, 0xff});
@@ -4118,7 +4118,7 @@ TEST_CASE("metal e2e: a shadow lookup on a depth buffer compares against the buf
         b.method(m::NV4097_SET_TEXTURE_ADDRESS, 3u | (3u << 8) | (3u << 16) | (zfunc << 28));
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().depth_conversions == 0);
         CHECK(e.backend->stats().readbacks == 0);
@@ -4158,7 +4158,7 @@ TEST_CASE("metal e2e: depth tiles side by side in one atlas stay apart, each rea
         bind_linear_texture(b, kAtlas + tile * kW * 2, tex::DEPTH16, kAtlasPitch);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().surface_samples == 1); // the tile's depth buffer, sampled (D-106), not stale memory
         CHECK(e.backend->stats().readbacks == 0);
@@ -4210,7 +4210,7 @@ TEST_CASE("metal e2e: occlusion queries count the samples that pass, and conditi
     b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
     e.backend->sync();
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().occlusion_reports == 2);
     // The triangle's pixels, counted from the target.
@@ -4270,7 +4270,7 @@ TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet renders,
     draw_triangle(b);
     b.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.rsx->status().conditional_skips == 0);
     CHECK(e.rsx->alarms().get(Alarm::ConditionalPending) == 1); // decided on a count not there yet (D-1022)
@@ -4317,7 +4317,7 @@ TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, 
         b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x00);
         b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         // Nothing went to the GPU yet (no flip, no sync): the count is not there.
         CHECK(e.backend->report_pending(report + 8));
@@ -4367,7 +4367,7 @@ TEST_CASE("metal e2e: occlusion queries past a command buffer's counters still c
     b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
     e.backend->sync();
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     const u32 first = wait_report(e, 0, 0xDEADBEEF);
     CHECK(first > 1000);
@@ -4404,7 +4404,7 @@ TEST_CASE("metal e2e: a depth buffer made over a colour target holds the target'
         b.method(m::NV4097_SET_DEPTH_MASK, 0);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         const u32 word = ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + 5 * kW * 4 + 7 * 4);
@@ -4443,7 +4443,7 @@ TEST_CASE("metal e2e: a colour target over a smaller one of another format carri
     b.method(m::NV4097_SET_COLOR_MASK, 0);
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().targets_carried == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kPitch * kH));
@@ -4497,7 +4497,7 @@ TEST_CASE("metal e2e: a target nobody drew yet is sampled as guest memory holds 
             if (e.backend->stats().draws_compiling == compiling) break;
             e.backend->wait_for_async_compiles();
         }
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         CHECK(e.backend->stats().draws_compiling >= 2);
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -4509,26 +4509,33 @@ TEST_CASE("metal e2e: a target nobody drew yet is sampled as guest memory holds 
 TEST_CASE("metal e2e: a draw with a signed blend equation waits for its program, not drawn by the interpreter (D-1026)")
 {
     // The interpreter (D-940) blends as Metal does: ADD_SIGNED drawn as add while GTA V's programs compiled (the
-    // bench's skyfall run, an RSX failure each time).
+    // bench's skyfall run, an RSX failure each time). The draw is made again until its programs are there (a loaded
+    // Mac compiles slowly): never by the interpreter, then by the translation, blending in its shader.
     REQUIRE_METAL();
     E2E e(0, {}, 1800, true, /*async_wait_ms=*/0.0, /*shader_interpreter=*/true);
     e.put_local_bytes(kFpOffset, fp_color(false));
     write_triangle(e, {0xf0100000, 0xf0100000, 0xf0100000});
-    auto b = e.at(0);
-    setup_surface(b, kSurfaceOffset);
-    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff808080);
-    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
-    upload_vertex_program(b);
-    set_fragment_program(b, kFpOffset, 0x40);
-    bind_vertex_arrays(b);
-    b.method(m::NV4097_SET_BLEND_ENABLE, 1);
-    b.method(m::NV4097_SET_BLEND_EQUATION, 0xf006f006);
-    draw_triangle(b);
-    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    u32 at = 0;
+    for (int tries = 0; tries < 20 && e.backend->stats().shader_blend_draws == 0; tries++) {
+        auto b = e.at(at);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+        b.method(m::NV4097_SET_BLEND_EQUATION, 0xf006f006);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        at = b.offset();
+        e.backend->wait_for_async_compiles();
+    }
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().draws_interpreted == 0);
-    CHECK(e.backend->stats().draws_compiling == 1);
+    CHECK(e.backend->stats().draws_compiling >= 1);  // the first draw waited
+    CHECK(e.backend->stats().shader_blend_draws == 1); // then the translation drew it
 }
 
 TEST_CASE("metal e2e: the exact mode has what the GPU drew in guest memory when a label lands (D-1029)")
@@ -4553,7 +4560,7 @@ TEST_CASE("metal e2e: the exact mode has what the GPU drew in guest memory when 
     b.method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10);
     b.method(m::NV406E_SEMAPHORE_RELEASE, 1);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(64)) == 1);
     // No flush: memory has it already.
@@ -4623,7 +4630,7 @@ TEST_CASE("metal e2e: a swizzled 3D texture samples the slice its coordinate's z
         b.method(m::NV4097_SET_TEXTURE_CONTROL3, 4u << 20); // depth 4
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         // Pixel (32, 48) samples texel (2, 3): red 16, green 48 (expanded as RPCS3 does), blue 8 * slice.
@@ -4680,7 +4687,7 @@ TEST_CASE("metal e2e: a texture is checked once per batch of commands, and again
     d.method(m::NV0039_BUFFER_NOTIFY, 0);
     draw(d);
     REQUIRE(e.submit(d) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(pixel() == std::array<u8, 4>{0xff, 0x40, 0x50, 0x60});
 }
 
@@ -4729,7 +4736,7 @@ TEST_CASE("metal e2e: a vertex program samples a vertex texture (TXL, D-093)")
     });
     draw_triangle(b);
     REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().draws == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -4785,7 +4792,7 @@ TEST_CASE("metal e2e: a vertex program samples cube and 3D vertex textures with 
         });
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
         return guest_pixel(e, kSurfaceOffset, 32, 48);
@@ -4824,7 +4831,7 @@ TEST_CASE("metal e2e: a texture unused for a while is freed, and decoded again w
     auto c = e.at(b.offset());
     draw(c);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.backend->stats().textures_decoded == 2); // decoded again
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
@@ -5062,7 +5069,7 @@ TEST_CASE("metal e2e: a fragment program written again draws its new constants, 
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
         offset = b.offset();
     }
-    for (const auto& f : e.failures) INFO(f.message);
+    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
     CHECK(e.failures.empty());
     const std::array<u8, 4> red{0xff, 0xff, 0x00, 0x00}, green{0xff, 0x00, 0xff, 0x00}, blue{0xff, 0x00, 0x00, 0xff};
     const std::array<u8, 4> expected[] = {red, green, blue, red};
@@ -5632,7 +5639,7 @@ struct FloatDraws {
         bind_vertex_arrays(b);
         draw_triangle(b);
         REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-        for (const auto& f : e.failures) INFO(f.message);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
         CHECK(e.failures.empty());
         e.failures.clear();
         REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 16));
@@ -6803,7 +6810,7 @@ TEST_CASE("metal bench: render passes, attachment traffic and GPU time of a fram
             REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
         }
         e.backend->sync();
-        for (const auto& fl : e.failures) INFO(fl.message);
+        for (const auto& fl : e.failures) UNSCOPED_INFO(fl.message);
         CHECK(e.failures.empty());
         REQUIRE(windows.size() >= 1);
         const metal::WindowStats& w = windows.back();
