@@ -17100,3 +17100,13 @@ all the time, takes this path more often than the Mac).
 - The gate's failures themselves were not load: ctest runs every "metal e2e" case a second time with the interpreter
   forced (test_rsx_metal_interpreted, PSPOCKET_RSX_INTERPRETER=1), where a draw that must not use the interpreter
   cannot pass. D-1026's case is left out of that run, as D-948's signed blending is.
+
+## D-1072 · 2026-10-16 · TestFlight builds cannot play: games need the cable install
+
+Build 1056 went to TestFlight while the user was away from the Mac. On the phone GTA V would not start: "the game
+library cannot run: ... game.dylib: signature registered, library validation passed, dlopen refused". D-150 predicted
+it: Apple re-signs a TestFlight app, and no development profile on the phone vouches for the Apple Development
+certificate the app signs its translations with; the TestFlight install also replaced the development install (same
+bundle ID) and with it the profile that did. The libraries and saves stay in the app's container; a development
+install (scripts/ios.sh install over USB) plays them again. scripts/ios.sh testflight now warns that its builds cannot
+load game libraries; TestFlight is for the self-test and the app shell only.

@@ -746,6 +746,10 @@ cmd_push_game() {
 
 cmd_testflight() {
     local hash version build_number archive log options status ipa
+    # A TestFlight install cannot play: Apple re-signs the app, no development profile vouches for the certificate the
+    # phone signs its translations with, and dlopen refuses every game library (D-150; seen with build 1056, D-1072).
+    # It replaces the development install too (same bundle ID). Games are played from `scripts/ios.sh install`.
+    warn "TestFlight builds cannot load the game libraries the phone makes (D-150, D-1072): games need a cable install"
     local auth=()
     if [ -n "${PSPOCKET_ASC_KEY_ID:-}" ]; then
         [ -n "${PSPOCKET_ASC_ISSUER_ID:-}" ] || die "PSPOCKET_ASC_KEY_ID needs PSPOCKET_ASC_ISSUER_ID"
