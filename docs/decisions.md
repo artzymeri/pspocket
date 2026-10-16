@@ -16748,3 +16748,6 @@ to "your Mac at night").
 - launchd runs a job missed while the Mac slept at the next wake.
 - The baseline grows from the nights themselves: --accept-clean adds a run with no failure and no warning (any run
   without failures until the case has 3), so a slow or broken night never becomes the new normal.
+- Two more GTA V cases from the save: rain-street (six weather changes to rain, then the wet street and its sky:
+  the sky flicker) and buzzard (the helicopter cheat, up over Rockford Hills and west to the water: the far city and
+  the sea from above, the missing and black sea).

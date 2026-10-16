@@ -1,0 +1,26 @@
+# A Buzzard (the helicopter cheat) on the drive, in, up over Rockford Hills and west towards the sea: the city's far
+# view, the water from above (the black sea and the missing sea of 2026-10-16), the streaming of a moving camera.
+at 64
+tap cross        # Lester's call
+at 70
+hold ls-up 4.5   # out of the front door
+wait 1
+hold ls-up 3     # onto the drive
+wait 1
+seq buzzard
+wait 4
+tap triangle     # into the helicopter
+wait 6
+hold r2 8        # up
+with r2 25       # still climbing a little while
+hold ls-up 25    # nose down: forward
+wait 1
+hold rs-left 3   # a look round from the air
+wait 2
+with r2 4
+hold ls-up 30    # on towards the coast
+wait 1
+hold l2 6        # down over the water
+wait 1
+hold rs-down 2   # the camera down at the sea
+wait 15

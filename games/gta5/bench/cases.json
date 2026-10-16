@@ -23,6 +23,20 @@
       "route": "skyfall-sea.route",
       "timeout": 250,
       "from_s": 120
+    },
+    {
+      "name": "rain-street",
+      "save": "michael-house",
+      "route": "rain-street.route",
+      "timeout": 150,
+      "from_s": 70
+    },
+    {
+      "name": "buzzard",
+      "save": "michael-house",
+      "route": "buzzard.route",
+      "timeout": 200,
+      "from_s": 90
     }
   ],
   "modes": {
