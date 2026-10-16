@@ -878,24 +878,40 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     pspocket_game_spu_register();
     enable_spu_modules();
 #endif
+    bool library_loaded = false;
     if (!game_library.empty()) {
         // The game's translated code from its game library (route B, D-152), checked against this runtime and this
         // executable before anything in it runs.
         game::LoadedLibrary loaded;
         std::string why;
-        if (!game::load_library(game_library, *s->memory, &loaded, &why))
+        if (game::load_library(game_library, *s->memory, &loaded, &why)) {
+            library_loaded = true;
+            if (loaded.library->spu_register) enable_spu_modules();
+            s->translated = loaded.library->ppu_function_count > 0;
+        } else {
+#if PSPOCKET_HAVE_GAME_PPU
+            // A TestFlight install cannot map what the phone signed (D-150, D-1072): the translation built into the
+            // app runs instead when it is this executable's (the check below), and the game says so in its log.
+            PS_LOG_WARN(kChan, "the game library cannot run ({}): trying the translation built into the app", why);
+#else
             return fail(error, error_size, "the game library cannot run: " + why);
-        if (loaded.library->spu_register) enable_spu_modules();
-        s->translated = loaded.library->ppu_function_count > 0;
+#endif
+        }
     }
     // What the game meets that no preparation knew, translated while it runs (D-236).
     if (!s->coverage.empty()) s->spu_translator = ios::start_session_translator(s->title_id, s->coverage + "/spu", *s->memory);
 #if PSPOCKET_HAVE_GAME_PPU
     // The game's PPU code translated ahead of time (D-092), for the executable it was translated from only (D-098).
-    if (game_library.empty() &&
-        loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count, &game_ppu_register)) {
-        s->translated = true;
-        PS_LOG_INFO(kChan, "the game's PPU code runs translated ahead of time");
+    if (!library_loaded) {
+        if (loader::register_translated_ppu(*s->memory, game_ppu_image_words, game_ppu_image_word_count,
+                &game_ppu_register)) {
+            s->translated = true;
+            PS_LOG_INFO(kChan, "the game's PPU code runs translated ahead of time");
+        } else if (!game_library.empty()) {
+            return fail(error, error_size, "the game library cannot run (a TestFlight install cannot load what the "
+                                           "phone translated: install from the Mac), and the app has no translation "
+                                           "of this game built in");
+        }
     }
 #endif
     install_fault_handler();

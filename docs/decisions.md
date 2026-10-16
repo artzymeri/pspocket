@@ -17110,3 +17110,14 @@ certificate the app signs its translations with; the TestFlight install also rep
 bundle ID) and with it the profile that did. The libraries and saves stay in the app's container; a development
 install (scripts/ios.sh install over USB) plays them again. scripts/ios.sh testflight now warns that its builds cannot
 load game libraries; TestFlight is for the self-test and the app shell only.
+
+## D-1073 · 2026-10-16 · A game library the phone cannot map falls back to the translation built into the app
+
+D-1072's TestFlight build refused GTA V outright: the game library failed to load and the session ended there, though
+the app carries GTA V's translation built in (PSPOCKET_HAVE_GAME_PPU, D-092). Now a library that does not load is
+logged ("trying the translation built into the app") and the built-in PPU translation runs when it is this
+executable's (D-098's check); only a game without one fails, saying that a TestFlight install cannot load what the
+phone translated. So a TestFlight build plays the game built into it (GTA V), with its SPU programs built in and the
+rest interpreted (the session translator's libraries cannot be mapped either); other games need the cable install.
+Built without the gate (the change is in the iOS host only, which the gate does not run), for the user away from the
+Mac.
