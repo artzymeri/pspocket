@@ -26,6 +26,7 @@
 #include <thread>
 
 #include "guest.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/timebase.h"
@@ -478,6 +479,7 @@ Worker::Selection Worker::select2(bool poll)
     for (u32 j = 0; j < CELL_SPURS_MAX_WORKLOAD; j++) packed[j] = static_cast<u8>(priority[j] | (priority[j + 16] << 4));
 
     Selection sel;
+    const bool shuffle = chaos::on(chaos::S10_SpursSelect) && chaos::hit(chaos::S10_SpursSelect, spu_num);
     std::array<u8, CELL_SPURS_MAX_WORKLOAD2> contention{};
     alignas(16) u8 final_line[PS_RES_LINE_SIZE]; // the line as stored, or as read when nothing changed
     reservation_op(base, spurs, [&](u8* line) {
@@ -506,7 +508,9 @@ Worker::Selection Worker::select2(bool poll)
             const u8 max_contention = i < CELL_SPURS_MAX_WORKLOAD ? max_byte & 0x0F : max_byte >> 4;
             if (!is_runnable || priority[i] == 0 || max_contention <= contention[i]) continue;
             if (!(wkl_flag || wkl_signal || ready > contention[i])) continue;
-            const u8 weight = static_cast<u8>((priority[i] << 4) | (i == current_wid ? 0x04 : 0));
+            // Shake mode's S10 (D-1045): among workloads of one priority, the order is not the game's to count on.
+            const u8 weight = static_cast<u8>((priority[i] << 4) | (i == current_wid ? 0x04 : 0) |
+                (shuffle ? static_cast<u8>(chaos::next() & 0x07) : 0));
             if (weight > max_weight) {
                 max_weight = weight;
                 sel.wid = i;
@@ -581,6 +585,7 @@ Worker::Selection Worker::select1(bool poll)
     }
 
     Selection sel;
+    const bool shuffle = chaos::on(chaos::S10_SpursSelect) && chaos::hit(chaos::S10_SpursSelect, spu_num);
     std::array<u8, CELL_SPURS_MAX_WORKLOAD> contention{};
     alignas(16) u8 final_line[PS_RES_LINE_SIZE]; // the line as stored, or as read when nothing changed
     reservation_op(base, spurs, [&](u8* line) {
@@ -618,6 +623,8 @@ Worker::Selection Worker::select1(bool poll)
             weight |= static_cast<u16>(((CELL_SPURS_MAX_SPU - contention[i]) & 0x0F) << 2);
             weight |= current_wid < CELL_SPURS_MAX_WORKLOAD && unique[i] == unique[current_wid] ? 0x02 : 0;
             weight |= 0x01;
+            // Shake mode's S10 (D-1045): the tie-breakers below the priority shuffled.
+            if (shuffle) weight = static_cast<u16>((weight & 0xFF00) | (chaos::next() & 0xFF));
             if (weight > max_weight) {
                 max_weight = weight;
                 sel.wid = i;

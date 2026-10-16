@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "guest.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/be.h"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -881,7 +882,7 @@ struct Lib {
     std::array<u8, 0x128> status{};
     Block status_mem;
     std::unique_ptr<Net> net;
-    std::mt19937 rng{std::random_device{}()};
+    std::mt19937 rng{chaos::random32()}; // shake mode: from its seed (D-1045)
     std::mutex filter_m;
     std::atomic<bool> has_filter{false};
     rudp::SendFilter filter;

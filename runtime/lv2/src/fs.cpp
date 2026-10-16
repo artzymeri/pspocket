@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 
 namespace pspocket::lv2 {
 
@@ -251,6 +252,7 @@ bool host_exists(const std::string& path)
 // is empty. Host I/O and image reads go through a bounce buffer. `total` gets the bytes read; the file's lock is held.
 Result read_locked(Kernel::Impl& s, FsFile& file, u32 buf, u64 nbytes, std::optional<u64> at, u64& total)
 {
+    if (chaos::on(chaos::S12_FsAio)) [[unlikely]] chaos::delay(chaos::S12_FsAio, nbytes); // a slow read (D-1045)
     std::vector<u8> bounce(static_cast<usize>(std::min<u64>(nbytes, kBounce)));
     total = 0;
     if (file.image_file) {

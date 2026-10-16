@@ -14,6 +14,7 @@
 #include <random>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 
 namespace pspocket::lv2 {
 
@@ -132,8 +133,7 @@ Result sys_crypto_engine_random_generate(PpuThread& t, u32 buffer, u64 size)
     if (size < 16) return err(CELL_EINVAL);
     const Guest& g = t.kernel.impl().guest;
     if (!g.valid(buffer, 16)) return err(CELL_EFAULT);
-    std::random_device rd;
-    for (u32 i = 0; i < 16; i += 4) g.w32(buffer + i, rd());
+    for (u32 i = 0; i < 16; i += 4) g.w32(buffer + i, chaos::random32()); // shake mode: its seed's (D-1045)
     return CELL_OK;
 }
 

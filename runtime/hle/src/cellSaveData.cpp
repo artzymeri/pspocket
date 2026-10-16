@@ -69,6 +69,7 @@
 
 #include "guest.hpp"
 #include "psf.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -830,6 +831,8 @@ s32 call_callback(PPUContext& ctx, u32 func, u32 result, u32 get, std::optional<
 {
     u8* base = guest_base(ctx);
     std::memset(base + result, 0, cb_result::userdata);
+    // Shake mode's S13 (D-1045): the system's work before each callback takes a while (a PS3's hard disk).
+    if (chaos::on(chaos::S13_SysutilDialog)) [[unlikely]] chaos::delay(chaos::S13_SysutilDialog, func);
     if (set) call_guest(ctx, func, {result, get, *set});
     else call_guest(ctx, func, {result, get});
     return static_cast<s32>(ps_read32(base, result + cb_result::result));

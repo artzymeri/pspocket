@@ -17016,3 +17016,38 @@ only then; a fault or a fatal error left no summary (gate.sh: "no summary: the r
 - Tests: tests/hle/test_watchdog.cpp (the freeze once per freeze and none before the first frame; the deadlock only
   with every thread blocked for good and the SPUs idle; the livelock and its presses; the thumbnail hash; two lv2
   threads on a queue nobody sends to found within the check's time, the same threads waiting with a timeout not).
+
+## D-1045 · 2026-10-16 · Shake mode: seeded perturbations where the threads meet, two families, shake.sh
+
+The races of D-999 showed in 2 of 36 runs side by side, and only under a 2 ms sleep after each send in most; the
+phone found them first. Shake mode makes such races show in a few runs on the Mac (the plan's P1a).
+
+- **runtime/core chaos** (pspocket/core/chaos.hpp): a mask of enabled points, one relaxed load at each point when off
+  (chaos::on); PSPOCKET_SHAKE="seed=N;legal|all|adversarial;S3=PPM:MAXUS;-S15" sets it at the kernel's creation.
+  Every decision comes from the calling thread's own stream (xorshift128+ seeded from the seed and the thread's name:
+  "PPU 0x1000003 worker" draws the same in every run of a seed); every injection is counted by point and logged (the
+  first 65,536: microseconds, the thread's stream, the point, a detail), PSPOCKET_SHAKE_LOG=FILE at exit.
+- **The points** (rate per million and largest delay by default):
+  S1 syscall entry (2%, 200 us), S2 library function entry (2%, 200 us), S3 the waker after its call (10%, 500 us),
+  S4 the woken thread before it goes back (10%, 500 us), S5 a new thread before its first instruction (50%, 2 ms),
+  S6 a usleep's end and the lv2 timer thread late (10%, 1 ms), S8 a conditional store (stwcx., stdcx., PUTLLC) that
+  fails for no reason (1%), S9 an SPU's channel read that would wait, delayed first (2%, 100 us), S10 SPURS's choice
+  among workloads of one priority shuffled (5% of the selections), S11 the RSX thread between batches (2%, 1 ms),
+  S12 a file read (20%, 5 ms), S13 a message dialog's answer and each save data callback later (always, 200 ms),
+  S14 cellAudio's period late (2%, 2 ms) — the **PS3-legal** family: a PS3 does these too (an interrupt or a more
+  urgent thread, the architecture's spurious reservation loss, a slow disc), so a game must survive them;
+  S7 the timebase 0.99 to 1.01 of its rate, chosen anew every quarter second (continuous, monotonic), S15 busy host
+  threads (half the cores, bursts up to 20 ms), S16 the woken thread overtaking its waker (20%: D-999 and D-1041
+  skipped) — the **host-adversarial** family: what the PS3 never does; a failure there only is pspocket's robustness
+  gap, not necessarily the game's.
+- The guest's random numbers (sys_get_random_number, sys_ss_random_number_generator, the crypto engine's, cellRudp's
+  generator) come from the shake stream while shaking (chaos::random32), so a seed repeats them.
+- **scripts/shake.sh gta5|ac**: the gate's prologue walk or Assassin's Creed's install and garden (a fresh hdd0 copy a
+  run, removed after), N seeds (--seeds, --from, --seed), --spec, each run with --stop-on-stall --livelock 60 and
+  triaged (D-1043): a table of seed, ending, median fps, buckets, ok/FAIL. --rerun S --times K says how often a seed
+  fails; --ddmin S delta-debugs the points (halves that still fail, then complements, each test up to K runs).
+  pspocket-boot prints the points' injections at the end and the summary has them (shake).
+- Tests: tests/core/test_chaos.cpp (off by the mask, the configuration's forms and refusals, a rate, the same stream
+  for a seed and a thread name, another for another seed, S8's failures counted and logged and none once off, S7's
+  timebase monotonic over four threads and within 3% of the true rate).
+- **First runs**: (the next entry of this decision, after they ran)

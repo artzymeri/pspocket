@@ -12,6 +12,7 @@
 #include <ctime>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/timebase.h"
 
 namespace pspocket::lv2 {
@@ -102,6 +103,7 @@ void TimerService::run()
             kicked_ = false;
         }
         // Timer locks are taken without the service lock (start/stop take a timer lock, then kick()).
+        if (chaos::on(chaos::S6_Timer)) [[unlikely]] chaos::delay(chaos::S6_Timer); // shake mode: late (D-1045)
         const u64 now = guest_system_time_us();
         u64 next = ~0ull;
         for (const auto& timer : snapshot) {
@@ -253,6 +255,7 @@ Result sys_timer_usleep(PpuThread& t, u64 sleep_time)
         return CELL_OK;
     }
     if (!sleep_us(t.waiter, sleep_time)) throw ThreadExit{};
+    if (chaos::on(chaos::S6_Timer)) [[unlikely]] chaos::delay(chaos::S6_Timer, sleep_time); // late (D-1045)
     return CELL_OK;
 }
 

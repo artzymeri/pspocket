@@ -88,6 +88,7 @@
 
 #include "audio_buffering.hpp"
 #include "guest.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/hle.hpp"
@@ -599,6 +600,7 @@ void audio_thread(AudioState& s, Runner& r)
             PS_LOG_INFO(kChan, "the process exited: the audio thread stops");
             return;
         }
+        if (chaos::on(chaos::S14_Audio)) [[unlikely]] chaos::delay(chaos::S14_Audio, n); // a late period (D-1045)
         if (const bool now_buffered = s.buffered.load(std::memory_order_acquire); now_buffered != buffered) {
             buffered = now_buffered; // a sink with a query came or went: start over in the other mode
             buffering = Buffering{};

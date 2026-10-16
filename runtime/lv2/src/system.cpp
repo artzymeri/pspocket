@@ -16,6 +16,7 @@
 #include <random>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/timebase.h"
 
 namespace pspocket::lv2 {
@@ -162,10 +163,9 @@ Result sys_ss_random_number_generator(PpuThread& t, u64 pkg_id, u32 buf, u64 siz
     if (pkg_id != 2) return static_cast<Result>(SYS_SS_RNG_ERROR_INVALID_PKG);
     if (size > 0x10000000) return static_cast<Result>(SYS_SS_RNG_ERROR_ENOMEM);
     if (size && !guest.valid(buf, size)) return err(CELL_EFAULT);
-    std::random_device rd;
     u8* out = guest.ptr(buf);
     for (u64 i = 0; i < size; i += 4) {
-        const u32 v = rd();
+        const u32 v = chaos::random32(); // the device's, or shake mode's seed (D-1045)
         std::memcpy(out + i, &v, static_cast<usize>(std::min<u64>(4, size - i)));
     }
     return CELL_OK;

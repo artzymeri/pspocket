@@ -27,6 +27,7 @@
 #include "guest.hpp"
 #include "idm.hpp"
 #include "prx.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -1019,9 +1020,8 @@ s32 sys_get_random_number(PPUContext& ctx, u32 addr, u64 size)
             size));
         return err(lv2::CELL_EFAULT);
     }
-    std::random_device random;
     for (u32 i = 0; i < size; i += 4) {
-        const u32 bits = random();
+        const u32 bits = chaos::random32(); // the device's, or shake mode's seed (D-1045)
         std::memcpy(base + addr + i, &bits, std::min<u64>(4, size - i));
     }
     return lv2::CELL_OK;

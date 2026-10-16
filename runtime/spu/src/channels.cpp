@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "internal.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/reservation.h"
 #include "pspocket/core/timebase.h"
@@ -58,6 +59,12 @@ int wait_until(SPUContext* ctx, ChannelLock& lock, u32 pc, Ready ready)
 {
     if (ready()) return 0;
     if (!ctx->host) return block_stop(ctx, pc);
+    if (chaos::on(chaos::S9_SpuPoll)) [[unlikely]] { // shake mode (D-1045): the SPU a little late to its channel
+        lock.unlock();
+        chaos::delay(chaos::S9_SpuPoll, pc);
+        lock.relock();
+        if (ready()) return 0;
+    }
     ps_spu_host* host = ctx->host;
     host->status.fetch_or(PS_SPU_STATUS_WAITING_FOR_CHANNEL, std::memory_order_relaxed);
     int result = 0;

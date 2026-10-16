@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -52,6 +53,7 @@
 #include <vector>
 
 #include "guest.hpp"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
@@ -1666,10 +1668,23 @@ void show_msg_dialog(u64 generation, u32 type, std::string_view message)
                                                                          : CELL_MSGDIALOG_BUTTON_YES;
     PS_LOG_WARN(kChan, "no dialog UI: the message dialog \"{}\" is answered {} at once", message,
         buttons == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK ? "OK" : button == CELL_MSGDIALOG_BUTTON_NO ? "NO" : "YES");
-    sysutil_queue_call([generation, button](PPUContext&) -> s32 {
-        msg_dialog_answered(generation, button);
-        return lv2::CELL_OK;
-    });
+    const auto answer = [generation, button] {
+        sysutil_queue_call([generation, button](PPUContext&) -> s32 {
+            msg_dialog_answered(generation, button);
+            return lv2::CELL_OK;
+        });
+    };
+    // Shake mode's S13 (D-1045): the player answers a while later (the generation keeps a late answer off the next
+    // dialog).
+    if (chaos::on(chaos::S13_SysutilDialog) && chaos::hit(chaos::S13_SysutilDialog, type)) [[unlikely]] {
+        const u32 us = static_cast<u32>(chaos::next() % (u64{chaos::max_us(chaos::S13_SysutilDialog)} + 1));
+        std::thread([answer, us] {
+            std::this_thread::sleep_for(std::chrono::microseconds(us));
+            answer();
+        }).detach();
+        return;
+    }
+    answer();
 }
 
 // cellMsgDialogOpen2(type, msgString, callback, userData, extParam), with RPCS3's checks in its order: a message
