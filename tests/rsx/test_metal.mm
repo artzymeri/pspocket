@@ -4531,6 +4531,53 @@ TEST_CASE("metal e2e: a draw with a signed blend equation waits for its program,
     CHECK(e.backend->stats().draws_compiling == 1);
 }
 
+TEST_CASE("metal e2e: the exact mode has what the GPU drew in guest memory when a label lands (D-1029)")
+{
+    // The reference mode: a CPU that sees a label sees what the RSX drew before it, as on the PS3 (GTA V's CPU reads
+    // targets after its labels); a depth buffer made over a colour target starts with its bytes from memory.
+    REQUIRE_METAL();
+    setenv("PSPOCKET_RSX_EXACT", "1", 1);
+    E2E e;
+    unsetenv("PSPOCKET_RSX_EXACT");
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff0000ff); // blue
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::NV406E_SET_CONTEXT_DMA_SEMAPHORE, loc::kDmaSemaphoreRW);
+    b.method(m::NV406E_SEMAPHORE_OFFSET, 64 * 0x10);
+    b.method(m::NV406E_SEMAPHORE_RELEASE, 1);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(64)) == 1);
+    // No flush: memory has it already.
+    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00}); // the triangle
+    CHECK(guest_pixel(e, kSurfaceOffset, 2, 2) == std::array<u8, 4>{0xff, 0x00, 0x00, 0xff});   // the clear
+    CHECK(e.backend->stats().readbacks == 0); // on the GPU, into memory
+
+    // A depth buffer over it holds its bytes: 0xff0000ff as Z24S8 is depth 0xff0000, stencil 0xff.
+    auto c = e.at(b.offset());
+    setup_surface(c, kSurfaceB);
+    c.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+    c.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kSurfaceOffset);
+    c.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+    c.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+    c.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Always));
+    c.method(m::NV4097_SET_DEPTH_MASK, 0);
+    draw_triangle(c);
+    c.method(m::NV406E_SEMAPHORE_RELEASE, 2);
+    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+    CHECK(e.failures.empty());
+    CHECK(ps_read32(e.mem.base(), e.config.layout.label_addr(64)) == 2);
+    CHECK(ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + 2 * kW * 4 + 2 * 4) == 0xff0000ff);
+}
+
 TEST_CASE("metal e2e: a swizzled 3D texture samples the slice its coordinate's z selects")
 {
     // GTA V's first mission samples a 64x64x32 R5G6B5 swizzled volume. Here 4x4x4: red = 8x, green = 16y, blue = 8z.

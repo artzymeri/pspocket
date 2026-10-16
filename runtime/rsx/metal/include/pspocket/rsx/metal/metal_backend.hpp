@@ -153,6 +153,12 @@ struct MetalBackendConfig {
     // store what the next one clears whole. False (or PSPOCKET_RSX_NO_PASS_MERGING set): every clear ends the pass
     // and runs where it is, as before.
     bool merge_passes = true;
+    // The exact mode (D-1029, PSPOCKET_RSX_EXACT=1, a reference for the Mac): what the GPU drew is in guest memory
+    // whenever the RSX lets the CPU see anything (every label, semaphore, report and flip waits for the GPU and writes
+    // the targets back, on the GPU, into guest memory), a new target starts with what memory holds, copies and
+    // readbacks are synchronous, and the fast paths that trade exactness (pass merging, the feedback cache, the
+    // surface pool, carrying, D-945, D-947, D-984, D-1025) are off.
+    bool exact = false;
 };
 
 struct BackendStats {
@@ -272,6 +278,13 @@ public:
     // Any thread: traces the frame after the next flip as MetalBackendConfig::trace_frame does (the iOS app, when a
     // trace is asked for over USB: D-947).
     void trace_next_frame();
+    // The draws drawn so far by fragment program (its content hash), at the last 300-frame report, most first: a run's
+    // draw signature, which scripts/rsx_ab.py compares between the fast and the exact modes (D-1029).
+    struct DrawSignature {
+        u64 flips = 0;
+        std::vector<std::pair<u64, u64>> draws;
+    };
+    DrawSignature draw_signature() const;
     // Waits until the shader cache has made everything it holds (tests), then hands it to the backend.
     void wait_for_shader_cache();
     void wait_for_async_compiles(); // until the background compiles are done (tests; D-158)

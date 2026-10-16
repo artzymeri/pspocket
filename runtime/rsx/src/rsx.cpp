@@ -170,6 +170,8 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     (void)handlers();
     if (const char* e = std::getenv("PSPOCKET_RSX_EARLY_REPORTS"); e && *e && std::strcmp(e, "0") != 0)
         config_.early_reports = true; // D-1021
+    if (const char* e = std::getenv("PSPOCKET_RSX_EXACT"); e && *e && std::strcmp(e, "0") != 0) config_.exact = true;
+    if (config_.exact) config_.sync_on_label = true; // D-1029
     // PSPOCKET_RSX_CPU_AB=N[:MASK] (D-953): bit 32 of MASK (all by default) is the FIFO's argument runs (D-955).
     if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) {
         const char* mask = std::strchr(f, ':');
@@ -612,6 +614,7 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
                     return RunStatus::Blocked;
                 }
                 note_flow(get, target);
+                if (backend_.tracing()) backend_.trace_note(std::format("FIFO jump {:#x} -> {:#x}", get, target));
                 get_.store(target, std::memory_order_release);
                 publish_get();
                 continue;
@@ -624,6 +627,8 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
                 }
                 return_stack_.push_back(get + 4);
                 note_flow(get, word & cmd::kCallOffsetMask);
+                if (backend_.tracing())
+                    backend_.trace_note(std::format("FIFO call {:#x} -> {:#x}", get, word & cmd::kCallOffsetMask));
                 get_.store(word & cmd::kCallOffsetMask, std::memory_order_release);
                 publish_get();
                 continue;
@@ -634,6 +639,7 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
                     return RunStatus::Error;
                 }
                 note_flow(get, return_stack_.back());
+                if (backend_.tracing()) backend_.trace_note(std::format("FIFO return {:#x} -> {:#x}", get, return_stack_.back()));
                 get_.store(return_stack_.back(), std::memory_order_release);
                 return_stack_.pop_back();
                 publish_get();

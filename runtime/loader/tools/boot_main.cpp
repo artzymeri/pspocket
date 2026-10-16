@@ -989,6 +989,15 @@ bool write_summary(const std::string& path, std::string_view exit, std::string_v
         }
         j += "}},\n";
     }
+#if defined(PSPOCKET_HAVE_METAL)
+    if (g_metal) { // the draws by fragment program (D-1029), for scripts/rsx_ab.py
+        const rsx::metal::MetalBackend::DrawSignature d = g_metal->draw_signature();
+        j += std::format("  \"draw_signature\": {{\"flips\": {}, \"draws\": {{", d.flips);
+        for (usize i = 0; i < d.draws.size(); i++)
+            j += std::format("{}\"{:016x}\": {}", i ? ", " : "", d.draws[i].first, d.draws[i].second);
+        j += "}},\n";
+    }
+#endif
     j += "  \"messages\": {";
     bool first = true;
     for (const auto& [shape, count] : g_summary.messages) {
@@ -1315,6 +1324,15 @@ int main(int argc, char** argv)
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
             mc.shader_cache = shader_cache;
+            // The exact mode (D-1029): every draw waits for its programs, nothing drawn by the interpreter.
+            static const bool exact = [] {
+                const char* v = std::getenv("PSPOCKET_RSX_EXACT");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (exact) {
+                compile_wait_ms = -1;
+                mc.shader_interpreter = false;
+            }
             mc.async_shaders = compile_wait_ms >= 0; // D-158
             if (compile_wait_ms >= 0) mc.compile_wait_ms = compile_wait_ms;
             if (!summary_path.empty()) {

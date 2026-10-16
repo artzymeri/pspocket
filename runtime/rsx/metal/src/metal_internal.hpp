@@ -1117,6 +1117,26 @@ struct MetalBackend::Impl {
     std::vector<Surface*> carry_sources(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
         const Surface* keep_too, Surface* also);
     bool carry_on = true; // PSPOCKET_RSX_NO_CARRY=1: off, the targets' bytes are lost as before (D-1025)
+
+    // ---- the exact mode (D-1029) ----
+    bool exact = false;
+    // No-copy buffers over RSX local memory (16 MB windows, or a target's own pages), which the GPU writes targets back
+    // into with the overlay kernels (D-137).
+    struct GuestWindow {
+        __strong id<MTLBuffer> buffer = nil;
+        u32 base = 0, size = 0;
+    };
+    std::vector<GuestWindow> guest_windows;
+    id<MTLBuffer> guest_window(u32 addr, u32 size, u32& base);
+    // Every GPU-newer target into guest memory (on the GPU where a window covers it, else a readback), then waits;
+    // they are no longer newer on the GPU and their memory is watched for the CPU's writes.
+    void exact_write_back();
+    u64 exact_write_backs = 0, exact_bytes = 0;
+    // The draw signature (D-1029): draws drawn by fragment program hash, and a copy at each report for other threads.
+    std::unordered_map<u64, u64> fp_draws;
+    mutable std::mutex fp_draws_mutex;
+    std::unordered_map<u64, u64> fp_draws_snapshot;
+    u64 fp_draws_flips = 0;
     id<MTLSamplerState> sampler_for(const TextureInfo& t);
     id<MTLTexture> view_2d(id<MTLTexture> tex, u32 face, u32 level);
     bool read_texture(id<MTLTexture> tex, u32 face, u32 level, u32 w, u32 h, std::vector<std::array<float, 4>>& out);

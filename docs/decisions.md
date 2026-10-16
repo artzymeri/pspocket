@@ -17058,3 +17058,32 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
   (S7, S15, S16: 510 rate changes, about 10,000 woken threads overtaking their wakers a run): clean, 29.8 and 28.4 fps.
   Nothing found in GTA V's prologue yet. Assassin's Creed's install path under shake mode (the run that found D-999's
   races) is the next to run: not run here, the disk under 10 GB free (each run copies hdd0 and installs 1.3 GB).
+- The frame trace also names conditional-rendering skips (`Backend::draw_skipped`), the RSX's NV0039 and NV3089 copies,
+  FIFO jumps, calls and returns, ZPASS enables, clears and each GET_REPORT with its count (waited for, in the traced
+  frame only) (`Backend::trace_note`), and each draw's fragment program hash, depth test and write, stencil state,
+  polygon offset, cull face and whether it is counted by an occlusion query.
+- `PSPOCKET_SKIP_VTF_FP_AT=EA`: draws with the fragment program at EA that sample a vertex texture are skipped;
+  `PSPOCKET_RSX_TRACE_ZALWAYS_FP=HASH`: in a traced frame, draws with that fragment program pass the depth test and
+  write their depth, so the probe shows where and how deep they land.
+
+## D-1029 · 2026-10-16 · The exact mode, a reference on the Mac (PSPOCKET_RSX_EXACT=1)
+
+- **What it is**: the RSX's ordering kept where the fast backend trades it for speed, so a glitch that goes away in the
+  exact mode is the fast paths' and one that stays is the translation's (shaders, formats, the game's own logic).
+- **Labels, semaphores, the reference, reports, notifies** wait for the GPU (`Config::sync_on_label`), and at every
+  such sync (`MetalBackend::sync`) and flip every GPU-newer target is written back into guest memory **on the GPU**:
+  D-137's overlay kernels write straight into no-copy buffers over RSX local memory (16 MB windows, or a target's own
+  pages; targets elsewhere go through the usual readback), the backend waits, the targets are no longer newer on the
+  GPU and their memory is watched, so a CPU write after it makes them reload (D-110). A CPU that sees a label sees what
+  the RSX drew before it.
+- **A new target starts with what memory holds** (the targets under it written back first, then
+  `upload_surface_from_guest`), instead of cleared or carried (D-1025 is off).
+- **A conditional draw whose report is pending waits** for the count; NV0039 copies and readbacks are synchronous
+  (`copy_on_gpu`, `flush_memory_later` refused); pass merging (D-945), the feedback cache (D-947), the surface pool
+  (D-984) and carrying (D-1025) are off; EDGE geometry stays on the SPUs (D-988); pspocket-boot waits for every program
+  and pipeline (no asynchronous compiles, no shader interpreter, D-158, D-940).
+- **The A/B**: `--summary` has the run's draw signature (`MetalBackend::draw_signature`: draws by fragment program hash
+  at the last 300-frame report); `scripts/rsx_ab.py FAST.json EXACT.json` compares the per-frame rates of two runs
+  of a route and lists the programs one draws and the other does not.
+- Test: metal e2e "the exact mode has what the GPU drew in guest memory when a label lands" (a triangle in memory with
+  no flush and no readback; a depth buffer made over the target starts with its bytes).

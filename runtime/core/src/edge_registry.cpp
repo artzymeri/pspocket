@@ -19,6 +19,10 @@ Mode read_mode()
 {
     const char* v = std::getenv("PSPOCKET_EDGE_GPU");
     if (!v || !*v || std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0) return Mode::off;
+    if (const char* x = std::getenv("PSPOCKET_RSX_EXACT"); x && *x && std::strcmp(x, "0") != 0) {
+        PS_LOG_INFO("edge", "EDGE geometry stays on the SPUs: the exact mode (PSPOCKET_RSX_EXACT, D-1029)");
+        return Mode::off;
+    }
     Mode m = Mode::gpu;
     if (std::strcmp(v, "cpu") == 0) m = Mode::cpu;
     else if (std::strcmp(v, "ab") == 0) m = Mode::ab;

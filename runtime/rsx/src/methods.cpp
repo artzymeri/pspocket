@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <format>
 #include <vector>
 
@@ -316,6 +318,11 @@ void Rsx::m_get_report(u32 reg, u32 value)
     // report whose pad is 0 as ready and read its count. Written when the method ran and the count frames later, its
     // water read a zero for "ready" and skipped the sea (the black and vanishing sea of 2026-10-16, D-1021). A count
     // the backend writes whole is left to it.
+    if (backend_.tracing() && later) { // the frame trace: the count now (D-1028), waiting for the GPU
+        backend_.sync();
+        for (int i = 0; i < 1000 && backend_.report_pending(*ea + 8); i++) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        backend_.trace_note(std::format("GET_REPORT ZPASS at {:#010x}: {} samples (get {:#x})", *ea, read32(*ea + 8), get()));
+    }
     if (whole) return;
     backend_.defer(*ea, 16, [this, e = *ea, later, result] {
         ps_write64(base(), e, timestamp_ns());
@@ -328,13 +335,18 @@ void Rsx::m_get_report(u32 reg, u32 value)
 
 void Rsx::m_clear_report_value(u32 reg, u32 value)
 {
+    if (backend_.tracing()) backend_.trace_note(std::format("CLEAR_REPORT_VALUE {} (get {:#x})", value, get()));
     if (value != reports::kZpassPixelCount && value != reports::kZcullStats) {
         fail(FailKind::Unsupported, reg, std::format("NV4097_CLEAR_REPORT_VALUE: bad type {}", value));
     }
     if (value == reports::kZpassPixelCount) backend_.clear_zpass();
 }
 
-void Rsx::m_zpass_pixel_count_enable(u32, u32 value) { backend_.set_zpass_counting(value != 0); }
+void Rsx::m_zpass_pixel_count_enable(u32, u32 value)
+{
+    if (backend_.tracing()) backend_.trace_note(std::format("ZPASS_PIXEL_COUNT_ENABLE {} (get {:#x})", value, get()));
+    backend_.set_zpass_counting(value != 0);
+}
 
 void Rsx::m_notify(u32, u32)
 {
@@ -409,7 +421,12 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
             fifo_error(std::format("NV4097_SET_RENDER_ENABLE: bad report offset {:#x}", value & 0xffffff));
             return;
         }
-        const bool pending = backend_.report_pending(*ea + 8);
+        bool pending = backend_.report_pending(*ea + 8);
+        if (pending && config_.exact) { // the exact mode waits for the count (D-1029), as the RSX's pipeline would
+            backend_.sync();
+            for (int i = 0; i < 1000 && backend_.report_pending(*ea + 8); i++) std::this_thread::sleep_for(std::chrono::microseconds(100));
+            pending = backend_.report_pending(*ea + 8);
+        }
         if (pending) alarms_.add(Alarm::ConditionalPending); // decided on a count not there yet (D-1022)
         render_enabled_ = pending || read32(*ea + 8) != 0;
         return;

@@ -82,6 +82,9 @@ struct Config {
     // later, as before D-1021 (a measuring aid; PSPOCKET_RSX_EARLY_REPORTS=1). Off: the backend writes the whole report
     // once the GPU has counted, the ready word last, as the RSX does.
     bool early_reports = false;
+    // The exact mode (D-1029, PSPOCKET_RSX_EXACT=1): labels, semaphores, the reference, reports and notifies wait for
+    // the GPU (sync_on_label) and a conditional draw whose report is pending waits for its count.
+    bool exact = false;
 };
 
 class Rsx {

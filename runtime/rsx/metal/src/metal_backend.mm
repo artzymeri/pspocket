@@ -115,6 +115,14 @@ bool MetalBackend::Impl::init()
 {
     visibility_slots = std::max<u32>(1, config.occlusion_counters); // D-1024
     if (const char* v = std::getenv("PSPOCKET_RSX_NO_CARRY"); v && *v && std::strcmp(v, "0") != 0) carry_on = false; // D-1025
+    if (const char* v = std::getenv("PSPOCKET_RSX_EXACT"); v && *v && std::strcmp(v, "0") != 0) config.exact = true;
+    exact = config.exact;
+    if (exact) { // D-1029
+        config.merge_passes = false;
+        carry_on = false;
+        PS_LOG_INFO(kChan, "the exact mode (PSPOCKET_RSX_EXACT): targets in guest memory at every label, no merging, "
+            "no feedback cache, no surface pool, synchronous copies");
+    }
     device = config.device ? (__bridge id<MTLDevice>)config.device : MTLCreateSystemDefaultDevice();
     if (!device) {
         PS_LOG_ERROR(kChan, "no Metal device: the RSX backend drops all GPU work");
@@ -260,7 +268,7 @@ bool MetalBackend::Impl::init()
     }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
-    if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK")) feedback_cached = false;            // D-947's comparison
+    if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK") || exact) feedback_cached = false;   // D-947's comparison, D-1029
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
         shader_cache = std::make_unique<ShaderCache>(device, config.shader_cache, config.shader_seeds,
             config.shader_cache_threads, config.shader_archives);
@@ -1629,6 +1637,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         interpret = true;
     }
     if (interpret && !interp_vp) return skip("");
+    // PSPOCKET_SKIP_VTF_FP_AT=EA (a debugging aid): draws with the fragment program at EA that sample a vertex texture
+    // are skipped.
+    static const u32 skip_vtf_fp_at = [] {
+        const char* v = std::getenv("PSPOCKET_SKIP_VTF_FP_AT");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    if (skip_vtf_fp_at && fp_ea == skip_vtf_fp_at && (interp_vp ? interp_vp_textures : (vp ? vp->shader.texture_mask : 0u))) return skip("PSPOCKET_SKIP_VTF_FP_AT");
     // The interpreter blends as Metal can (D-940): a signed equation, which the translation blends in its shader
     // (D-948), would be drawn as add. Such a draw waits for its programs, as draws did before the interpreter (D-1026).
     if (interpret && fo.blend_in_shader && !force_interpreter) {
@@ -1778,11 +1793,20 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         }
         const std::string zs = !ds.depth_test ? std::string("off")
             : std::format("{:#x}{}", ds.depth_func, ds.depth_write ? "" : " no write");
-        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{}{} ->{}; fp {:#010x} vp {:#x}; mask {:x}{:x}{:x}{:x}; z {}{}; blend {};{}",
+        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{}{} ->{}; fp {:#010x} ({:016x}) vp {:#x}; mask {:x}{:x}{:x}{:x}; z {}{}; blend {};{}",
             ++trace_count, static_cast<u32>(d.primitive), vertices,
             d.inline_words.empty() ? std::string() : std::format(" (inline array, {} words)", d.inline_words.size()),
-            describe_targets(targets), fp_ea, state.reg(m::NV4097_SET_TRANSFORM_PROGRAM_START), cm.mask[0], cm.mask[1],
-            cm.mask[2], cm.mask[3], zs, ds.stencil_test ? "; stencil on" : "", blend, trace_tex);
+            describe_targets(targets), fp_ea, fprog ? fprog->hash : 0, state.reg(m::NV4097_SET_TRANSFORM_PROGRAM_START), cm.mask[0], cm.mask[1],
+            cm.mask[2], cm.mask[3], zs,
+            (ds.stencil_test ? std::format("; stencil {:#x} ref {:#x} mask {:#x} write {:#x} ops {:#x}/{:#x}/{:#x}{}",
+                                   ds.front.func, ds.front.ref, ds.front.func_mask, ds.front.write_mask, ds.front.op_fail,
+                                   ds.front.op_zfail, ds.front.op_zpass, ds.two_sided_stencil ? " two-sided" : "")
+                             : std::string()) +
+                (raster.poly_offset_fill ? std::format("; offset {} {}", raster.poly_offset_scale, raster.poly_offset_bias)
+                                         : std::string()) +
+                (raster.cull_enable ? std::format("; cull {:#x}", raster.cull_face) : std::string()) +
+                (zpass_on ? std::string("; counted") : std::string()),
+            blend, trace_tex);
     }
 
     // ---- vertex parameters: viewport transform into Metal NDC for this surface
@@ -2195,6 +2219,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         stats.draws_interpreted++;
     }
     id<MTLRenderCommandEncoder> enc = start_encoder();
+    if (fprog) fp_draws[fprog->hash]++; // the draw signature (D-1029)
     // Occlusion counting (D-102): this pass's counter for the current query.
     if (zpass_on) {
         if (pass_zpass_slot < 0 && visibility_next < visibility_slots) {
@@ -2221,7 +2246,18 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         [enc setRenderPipelineState:pso];
         es.pso = pso;
     }
-    if (id<MTLDepthStencilState> depth = depth_state_for(ds); es.depth != depth) {
+    // PSPOCKET_RSX_TRACE_ZALWAYS_FP=HASH (a debugging aid, D-1028): in a traced frame, draws with the fragment program HASH
+    // pass the depth test always and write their depth, so the probe shows where they land and at what depth.
+    static const u64 zalways_fp = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_TRACE_ZALWAYS_FP");
+        return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    DepthStencilInfo ds_bound = ds;
+    if (tracing && zalways_fp && fprog && fprog->hash == zalways_fp && ds.depth_test) {
+        ds_bound.depth_func = static_cast<u32>(CompareFunc::Always);
+        ds_bound.depth_write = true;
+    }
+    if (id<MTLDepthStencilState> depth = depth_state_for(ds_bound); es.depth != depth) {
         [enc setDepthStencilState:depth];
         es.depth = depth;
     }
@@ -2690,6 +2726,16 @@ MetalBackend::~MetalBackend()
     }
 }
 
+MetalBackend::DrawSignature MetalBackend::draw_signature() const
+{
+    std::lock_guard lock(impl_->fp_draws_mutex);
+    DrawSignature d;
+    d.flips = impl_->fp_draws_flips;
+    d.draws.assign(impl_->fp_draws_snapshot.begin(), impl_->fp_draws_snapshot.end());
+    std::sort(d.draws.begin(), d.draws.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    return d;
+}
+
 void MetalBackend::trim_memory() { impl_->trim_requested.store(true, std::memory_order_release); }
 void MetalBackend::trace_next_frame() { impl_->trace_requested.store(true, std::memory_order_release); }
 
@@ -2729,6 +2775,7 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_flip(request);
+        if (impl_->exact) impl_->exact_write_back(); // the CPU may read what the frame drew once it flipped (D-1029)
     }
     Impl& m = *impl_;
     if (++m.report_flips == Impl::kGpuReportFlips) {
@@ -2897,6 +2944,11 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                 PS_LOG_INFO(kChan, "EDGE verify by kind (so far): {}", kinds);
             }
         }
+        {
+            std::lock_guard lock(m.fp_draws_mutex); // the draws by fragment program so far, for draw_signature()
+            m.fp_draws_snapshot = m.fp_draws;
+            m.fp_draws_flips = m.stats.flips;
+        }
         m.feedback_sources.clear();
         m.report_feedback_reused = m.stats.feedback_reused;
         m.report_feedback_first = m.stats.feedback_first;
@@ -3002,6 +3054,83 @@ void MetalBackend::sync()
     @autoreleasepool {
         impl_->submit(true);
         impl_->run_deferred(true);
+        if (impl_->exact) impl_->exact_write_back(); // D-1029
+    }
+}
+
+// ---- the exact mode (D-1029) ----------------------------------------------------------------------------------
+
+id<MTLBuffer> MetalBackend::Impl::guest_window(u32 addr, u32 size, u32& base)
+{
+    if (addr < PS_MEM_RSX_LOCAL_BASE || u64{addr} + size > u64{PS_MEM_RSX_LOCAL_BASE} + PS_MEM_RSX_LOCAL_SIZE) return nil;
+    const u64 page = GuestMemory::host_page_size();
+    const u64 lo = addr & ~(page - 1), hi = (u64{addr} + size + page - 1) & ~(page - 1);
+    for (const GuestWindow& w : guest_windows) {
+        if (lo >= w.base && hi <= u64{w.base} + w.size) {
+            base = w.base;
+            return w.buffer;
+        }
+    }
+    const auto committed = [&](u64 a, u64 b) {
+        for (u64 p = a; p < b; p += page)
+            if (!mem.is_committed(static_cast<u32>(p))) return false;
+        return true;
+    };
+    constexpr u64 kWindow = 16u << 20;
+    u64 wl = lo, wh = hi;
+    const u64 cl = addr & ~(kWindow - 1);
+    if (hi <= cl + kWindow && committed(cl, cl + kWindow)) {
+        wl = cl;
+        wh = cl + kWindow;
+    } else if (!committed(lo, hi)) {
+        return nil;
+    }
+    id<MTLBuffer> b = [device newBufferWithBytesNoCopy:mem.host(static_cast<u32>(wl)) length:wh - wl
+                                               options:MTLResourceStorageModeShared deallocator:nil];
+    if (!b) return nil;
+    guest_windows.push_back({b, static_cast<u32>(wl), static_cast<u32>(wh - wl)});
+    base = static_cast<u32>(wl);
+    return b;
+}
+
+void MetalBackend::Impl::exact_write_back()
+{
+    std::vector<Surface*> on_gpu, by_cpu;
+    for (const auto& c : surfaces) {
+        Surface* s = c.get();
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized || !readback_supported(*s)) continue;
+        u32 base = 0;
+        (overlay_supported(*s) && guest_window(s->address, s->bytes(), base) ? on_gpu : by_cpu).push_back(s);
+    }
+    if (on_gpu.empty() && by_cpu.empty()) return;
+    end_pass_for(kEndFlush);
+    for (Surface* s : on_gpu) {
+        sync_surface(*s); // what its children wrote (D-122)
+        u32 base = 0;
+        id<MTLBuffer> w = guest_window(s->address, s->bytes(), base);
+        const GuestWindow* gw = nullptr;
+        for (const GuestWindow& g : guest_windows)
+            if (g.buffer == w) gw = &g;
+        TransientAllocator::Allocation target{w, 0, nullptr};
+        encode_overlay(*s, target, base, gw ? gw->size : s->bytes());
+    }
+    submit(true);
+    for (Surface* s : on_gpu) {
+        s->gpu_newer = false;
+        own_write();
+        tracker.notify_write(s->address, s->bytes());
+        tracker.unwatch(s->watch);
+        s->watch = tracker.watch(s->address, s->bytes()); // a CPU write after this makes guest memory newer (D-110)
+        exact_bytes += s->bytes();
+        exact_write_backs++;
+    }
+    for (Surface* s : by_cpu) {
+        if (write_back(*s, "the exact mode")) {
+            tracker.unwatch(s->watch);
+            s->watch = tracker.watch(s->address, s->bytes());
+            exact_bytes += s->bytes();
+            exact_write_backs++;
+        }
     }
 }
 
@@ -3021,7 +3150,7 @@ void MetalBackend::Impl::end_pass_over(u32 addr, u32 size)
 bool MetalBackend::copy_on_gpu(u32 src, u32 src_pitch, u32 dst, u32 dst_pitch, u32 line_length, u32 line_count)
 {
     Impl& m = *impl_;
-    if (!m.device || line_length == 0 || line_count == 0) return false;
+    if (!m.device || line_length == 0 || line_count == 0 || m.exact) return false; // the exact mode copies in memory
     @autoreleasepool {
         const u32 src_size = src_pitch * (line_count - 1) + line_length;
         const u32 dst_size = dst_pitch * (line_count - 1) + line_length;
@@ -3113,7 +3242,7 @@ void MetalBackend::wait_for_shader_cache()
 bool MetalBackend::flush_memory_later(u32 addr, u32 size, u32 write_addr, u32 write_size, std::function<void()> then)
 {
     Impl& m = *impl_;
-    if (!m.device) return false;
+    if (!m.device || m.exact) return false; // the exact mode waits for the GPU (D-1029)
     @autoreleasepool {
         m.end_pass_over(addr, size);
         m.end_pass_over(write_addr, write_size);
