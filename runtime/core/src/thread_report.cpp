@@ -59,4 +59,30 @@ std::string thread_cpu_report(double seconds, usize top)
 #endif
 }
 
+std::vector<ThreadCpu> thread_cpu_times()
+{
+    std::vector<ThreadCpu> out;
+#if defined(__APPLE__)
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return out;
+    out.reserve(count);
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_identifier_info_data_t id{};
+        mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+        thread_extended_info_data_t ext{};
+        mach_msg_type_number_t ext_count = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id), &id_count) ==
+                KERN_SUCCESS &&
+            thread_info(threads[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&ext), &ext_count) ==
+                KERN_SUCCESS) {
+            out.push_back({id.thread_id, ext.pth_name, ext.pth_user_time + ext.pth_system_time});
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
+#endif
+    return out;
+}
+
 } // namespace pspocket

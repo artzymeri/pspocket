@@ -16961,3 +16961,58 @@ the flips to the vblanks the GCM interrupt thread counts (D-971 holds frames at 
   yet; pspocket keeps dropping the oldest slot with a warning.
 - Tests: tests/hle/test_gcm.cpp (with pacing and vsync five flips each held for a vblank, with HSYNC none),
   tests/hle/test_ac_gcm_spurs_prx.cpp (the default vsync, the RSX's mode following cellGcmSetFlipMode).
+
+## D-1042 · 2026-10-16 · Scripted presses on game time: a frame, a library call, play
+
+D-069's presses count seconds from the boot, so a walk holds for one build's speed only: a slower run presses Cross
+before the menu it was meant for. Shake mode's runs (D-1045) and the triage (D-1043) need walks that press at the same
+point of the game however fast it runs.
+
+- **Anchors** (pspocket/hle/pad_script.hpp): `cross@flip:2200` presses at the 2200th frame;
+  `cross@after:call:cellSaveDataAutoSave2+2s` 2 s after the game's first call of that library function (any linked
+  function by name; "after:" may be left out); `cross@play+5s` 5 s after the game is in play. "+Ns" (with an 's') is
+  the offset; a plain "+N" stays the repeat, ":H" the hold: `start@flip:100+2s+10:0.5`. The old seconds keep working
+  unchanged (the tests of D-069 pass as they were).
+- **wait: steps** in a press file: `wait:play`, `wait:flip:N`, `wait:call:NAME+2s` make the presses after it that give
+  plain seconds count from that anchor; `wait:boot` goes back to the boot.
+- **Play** (hle::PlayDetector): for 3 s, frames at 20 fps or more while the game reads the controller 10 times a second
+  or more (cellPadGetData's calls). A loading screen that does both counts too (GTA V's: "in play" at 3 s, frame 86);
+  scripts that need a precise point use a flip or call anchor.
+- pspocket-boot resolves the anchors every 20 ms while presses are scheduled (250 ms otherwise, for the milestones) and
+  logs each ("milestone at 0.39 s, frame 7: presses from call:cellSaveDataAutoLoad2"); the milestones go into the
+  summary (D-1043).
+- Tests: tests/hle/test_pad_script.cpp (the forms, bad texts, resolution as the anchors happen, wait steps, the play
+  detector over a loading screen and then play).
+
+## D-1043 · 2026-10-16 · The run watchdog on the Mac too (freeze, deadlock, livelock), a summary on every exit, triage.py
+
+A run on the Mac that stopped making progress ran on to its timeout (128 s, 330 s) and said what the threads waited on
+only then; a fault or a fatal error left no summary (gate.sh: "no summary: the run died"); the phone's freeze watcher
+(D-135) was the app's own.
+
+- **runtime/loader watchdog** (pspocket/loader/watchdog.hpp), shared by pspocket-boot and the app (game.mm's watcher
+  now is it, with its minute's PPU landings save on the watchdog's poll): every half second a sample (the flips, every
+  PPU thread's state from the thread report's snapshot, the SPU threads' and the RSX thread's CPU time from the host,
+  the frames' hashes) and three checks (StallJudge): a **freeze**, frames then none for 10 s (--freeze S); a
+  **deadlock**, every PPU thread that counts (started, not exited, not an interrupt thread or an attached host thread)
+  blocked without a timeout on the same wait for 5 s (--deadlock S) while the SPU threads together and the RSX each
+  used under 5% of a core: it needs no frame and no 10 s; a **livelock** (--livelock S, off by default), frames that
+  keep flipping with the same picture (a 16x9 thumbnail's hash, top 4 bits a channel, of the Metal captures: a frame a
+  second when nothing else captures), with how often the controller changed meanwhile. Each stall once (again after
+  progress), with the thread report, logged and kept; --stop-on-stall ends the run there (its exit names the stall).
+- **The summary on every exit path**: pspocket-boot writes --summary at its timeout, the game's exit, a guest or host
+  fault (from the fault handler, after the thread report, under its 5 s alarm), a fatal error (the log sink, before
+  the abort) and a stall stop. New fields: exit_detail (the fault's line, the fatal message, the stall), the
+  unimplemented functions and the stubs called (name, NID, calls), the PPU interpreter's instructions by owner, the SPU
+  interpreter's, the waker-first waits (D-1041), the milestones (the first frame, play, each press anchor, each stall)
+  and the stalls with their reports; shake mode's points and hits (D-1045).
+- **scripts/triage.py** [--summary FILE] [LOG...] [--json]: a summary and logs (pspocket-boot's run.log, the phone's
+  game-*.log) sorted into buckets, the most serious first, each with its evidence and next action: fault, fatal,
+  deadlock, freeze, livelock, unimplemented, RSX failures, SPU or PPU code interpreted, stubs, slow, no summary, clean.
+  The phone's GTA IV log (game-153115.log): "fault: SIGBUS: guest access to 0x00000400 ..." and "unimplemented:
+  cellGcmSys::? (0xb70b4ad3)" (D-1040). scripts/phone_session.py also counts the deadlock and livelock lines.
+- lv2's thread snapshot says which threads are interrupt threads; core's thread_cpu_times() gives every host
+  thread's CPU time without the status line's state.
+- Tests: tests/hle/test_watchdog.cpp (the freeze once per freeze and none before the first frame; the deadlock only
+  with every thread blocked for good and the SPUs idle; the livelock and its presses; the thumbnail hash; two lv2
+  threads on a queue nobody sends to found within the check's time, the same threads waiting with a timeout not).

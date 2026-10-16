@@ -70,7 +70,7 @@ def main(argv):
             s["warnings"].append(t)
         elif msg.startswith("memory low:"):
             s["trims"].append(t)
-        elif "freeze:" in msg or "[fatal]" in msg or level == "Fault":
+        elif "freeze:" in msg or "deadlock:" in msg or "livelock:" in msg or "[fatal]" in msg or level == "Fault":
             s["bad"].append(f"{t} {msg[:160]}")
         if "shader cache:" in msg and "made ahead in" in msg:
             s["cache"] = [msg[msg.index("shader cache:"):][:120]]

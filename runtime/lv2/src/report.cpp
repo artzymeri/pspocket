@@ -353,6 +353,7 @@ std::vector<ThreadSnapshot> snapshot_threads(Kernel& kernel, usize max_frames)
         }
         r.priority = t.priority();
         r.attached = t.attached;
+        r.interrupt = t.interrupt;
         r.current = &t == self;
         bool finished = false;
         {

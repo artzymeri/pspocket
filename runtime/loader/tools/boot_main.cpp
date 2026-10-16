@@ -51,6 +51,15 @@
 // frames, a third of the thumbnail black (D-951). --summary FILE writes the run as JSON when it ends (scripts/gate.sh
 // reads it, D-149): how it ended, fps per 5 s, the Metal backend's report windows, the peak memory footprint, RSX
 // failures, unimplemented calls, SPU code interpreted, frame jumps and every warning and error by shape (numbers as #).
+// --press takes game time too (D-1042): cross@flip:2200 at the 2200th frame, cross@after:call:cellSaveDataAutoSave2+2s
+// 2 s after the game's first call of that function, cross@play+5s 5 s after it is in play (frames and controller reads,
+// hle::PlayDetector); a press file's wait:ANCHOR step makes the plain seconds after it count from that anchor.
+// The watchdog (D-1043, pspocket/loader/watchdog.hpp) reports a freeze (no frame for --freeze S, 10 by default), a
+// deadlock (every PPU thread blocked without a timeout for --deadlock S, 5, with the SPUs and the RSX idle) and, with
+// --livelock S, frames that show the same picture for S seconds; each with the thread report, as a milestone in the
+// summary. --stop-on-stall ends the run at the first (its summary's exit names it). The summary is written on every
+// way the run ends: its timeout, the game's exit, a fault, a fatal error, a stall; with the gaps by name, the
+// interpreters' shares, the milestones and the stalls. scripts/triage.py sorts a summary and its log into buckets.
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
 // as the phone does) instead of the translation built into this program: its PPU functions and SPU programs, for the
 // executable it was made from only; a library made for another runtime or executable stops the run. With
@@ -107,12 +116,14 @@
 #endif
 
 #include "pspocket/core/be.h"
+#include "pspocket/core/chaos.hpp"
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/mmio.hpp"
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/spu_programs.hpp"
+#include "pspocket/loader/watchdog.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
@@ -168,6 +179,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
+        "                     [--freeze S] [--deadlock S] [--livelock S] [--stop-on-stall]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
         "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none] [--ppu-landings FILE]\n"
@@ -197,6 +209,7 @@ extern "C" uint32_t ps_ppu_zero_branch_from(void);
 u8* g_guest_base = nullptr;
 GuestMemory* g_memory = nullptr;
 hle::HleProcess* g_hle = nullptr;
+void emit_summary(std::string_view exit, std::string_view detail); // after the summary's parts, below (D-1043)
 std::atomic<lv2::Kernel*> g_kernel{nullptr};
 volatile sig_atomic_t g_fault_signal = 0;
 std::string g_dump_path; // --dump-on-fault
@@ -489,6 +502,9 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
             sig == SIGBUS ? "SIGBUS" : "SIGSEGV", info->si_addr, t ? t->id : 0, c ? c->cia : 0);
     }
     write_err(buf, std::min<int>(n, sizeof buf - 1));
+    // For the summary (D-1043): the fault's line, without its newlines. Best effort, as the report below.
+    std::string fault_line(buf, static_cast<usize>(std::clamp(n, 0, static_cast<int>(sizeof buf) - 1)));
+    std::erase(fault_line, '\n');
     report_host_frames(uctx);
     if (c) report_call_site(*c);
     if (!t) {
@@ -523,6 +539,12 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
         const std::string report =
             thread_report(*kernel, std::format("guest fault in PPU thread {:#x}", t ? t->id : 0));
         write_err(report.data(), static_cast<int>(report.size()));
+    }
+    if (g_kernel.load()) {
+        g_fault_signal = sig;
+        signal(SIGALRM, on_report_timeout);
+        alarm(5);
+        emit_summary("fault", fault_line);
     }
     _exit(128 + sig);
 }
@@ -669,8 +691,44 @@ struct RunSummary {
     // The phone's glitch detectors over every flip's GPU thumbnail (FrameWatch, D-1064, D-1070), with --summary.
     loader::FrameWatch watch;
     std::vector<loader::FrameWatch::Event> glitches; // those past the rate limit (one a kind every 2 minutes)
+    // What the run reached, in order (D-1043): the first frame, play, each press anchor, each stall.
+    struct Milestone {
+        std::string what;
+        double at = 0; // seconds since the main thread started
+        u64 flip = 0;
+    };
+    std::vector<Milestone> milestones;
 };
 RunSummary g_summary;
+
+// What the summary needs from main, so that a fault, a fatal error or a stall writes it too (D-1043).
+struct RunContext {
+    std::string summary_path;
+    lv2::Kernel* kernel = nullptr;
+    std::chrono::steady_clock::time_point start{};
+    std::function<std::string(u32)> ppu_owner; // whose code a guest address is (the executable, a module...)
+    std::atomic<bool> written{false};
+};
+RunContext g_run;
+std::atomic<loader::Watchdog*> g_watchdog{nullptr};
+
+double run_seconds()
+{
+    if (g_run.start == std::chrono::steady_clock::time_point{}) return 0;
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_run.start).count();
+}
+
+void add_milestone(std::string what, u64 flip)
+{
+    const double at = run_seconds();
+    PS_LOG_INFO("boot", "milestone at {:.2f} s, frame {}: {}", at, flip, what);
+    std::lock_guard lock(g_summary.mutex);
+    g_summary.milestones.push_back({std::move(what), at, flip});
+}
+
+// Writes --summary once, from whichever way the run ends: "exited", "timeout", "fault", "fatal", or the stall that
+// stopped it (--stop-on-stall); `detail` says more (the fault's line, the fatal message, the stall).
+void emit_summary(std::string_view exit, std::string_view detail);
 
 // The log on stderr as the default sink writes it, the warnings and errors also counted by shape.
 void summary_sink(void*, log::Level level, std::string_view channel, std::string_view message)
@@ -679,6 +737,14 @@ void summary_sink(void*, log::Level level, std::string_view channel, std::string
         log::level_name(level).data(), static_cast<int>(channel.size()), channel.data(), static_cast<int>(message.size()),
         message.data());
     if (level < log::Level::Warn) return;
+    if (level == log::Level::Fatal) { // the process aborts next: the summary first (D-1043)
+        {
+            std::lock_guard lock(g_summary.mutex);
+            g_summary.messages[message_shape(channel, message)]++;
+        }
+        emit_summary("fatal", std::format("{}: {}", channel, message));
+        return;
+    }
     std::string shape = message_shape(channel, message);
     std::lock_guard lock(g_summary.mutex);
     g_summary.messages[std::move(shape)]++;
@@ -779,14 +845,47 @@ private:
     std::vector<std::thread> threads_; // last: started once the rest exists
 };
 
-// --summary: the run as JSON (D-149), for scripts/gate.sh.
-bool write_summary(const std::string& path, bool exited, int status, double seconds, lv2::Kernel& kernel,
-    usize unimplemented_functions, const hle::SpuProgramStats& spu)
+// --summary: the run as JSON (D-149), for scripts/gate.sh and scripts/triage.py (D-1043). `exit`: "exited",
+// "timeout", "fault", "fatal" or a stall's name; `detail` its line.
+bool write_summary(const std::string& path, std::string_view exit, std::string_view detail, int status, double seconds,
+    lv2::Kernel& kernel)
 {
+    // Outside the summary's lock: the stalls' reports, the gaps by name, the interpreters' shares.
+    std::vector<loader::StallReport> stalls;
+    if (loader::Watchdog* w = g_watchdog.load()) stalls = w->reports();
+    std::vector<const hle::LinkedFunction*> missing, stubbed;
+    if (g_hle) {
+        for (const auto* f : g_hle->linked())
+            if (!f->impl && f->calls.load() > 0) (f->stub ? stubbed : missing).push_back(f);
+    }
+    const auto by_calls = [](auto* a, auto* b) { return a->calls.load() > b->calls.load(); };
+    std::sort(missing.begin(), missing.end(), by_calls);
+    std::sort(stubbed.begin(), stubbed.end(), by_calls);
+    const auto calls_json = [](const std::vector<const hle::LinkedFunction*>& list) {
+        std::string out = "[";
+        for (usize i = 0; i < list.size() && i < 64; i++) {
+            const auto* f = list[i];
+            out += std::format("{}{{\"name\": {}, \"nid\": \"0x{:08X}\", \"calls\": {}}}", i ? ", " : "",
+                json_string(f->module + "::" + (f->name.empty() ? "?" : f->name)), f->nid, f->calls.load());
+        }
+        return out + "]";
+    };
+    std::vector<ps_ppu_interp_site> sites(4096);
+    sites.resize(ps_ppu_interp_sites(sites.data(), static_cast<u32>(sites.size())));
+    std::map<std::string, u64> by_owner;
+    u64 ppu_total = 0;
+    for (const ps_ppu_interp_site& site : sites) {
+        by_owner[g_run.ppu_owner ? g_run.ppu_owner(site.pc) : std::string("?")] += site.steps;
+        ppu_total += site.steps;
+    }
+    const u64 spu_total = spu_interpreted_total();
+    const hle::SpuProgramStats spu = hle::spu_program_stats();
+    const lv2::SenderDeferrals wakes = lv2::sender_deferrals();
+
     std::lock_guard lock(g_summary.mutex);
     std::string j = "{\n";
-    j += std::format("  \"exit\": {},\n  \"exit_status\": {},\n  \"seconds\": {:.1f},\n",
-        json_string(exited ? "exited" : "timeout"), status, seconds);
+    j += std::format("  \"exit\": {},\n  \"exit_detail\": {},\n  \"exit_status\": {},\n  \"seconds\": {:.1f},\n",
+        json_string(std::string(exit)), json_string(std::string(detail)), status, seconds);
     rsx::Rsx* r = kernel.rsx();
     j += std::format("  \"flips\": {},\n  \"rsx_failures\": {},\n", r ? r->status().flips : 0, r ? r->failure_count() : 0);
     j += "  \"fps\": [";
@@ -799,7 +898,33 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
     }
     j += "},\n";
     j += std::format("  \"unimplemented_syscalls\": {},\n  \"unimplemented_functions\": {},\n",
-        kernel.unimplemented_count(), unimplemented_functions);
+        kernel.unimplemented_count(), missing.size());
+    j += std::format("  \"unimplemented\": {},\n  \"stubs\": {},\n", calls_json(missing), calls_json(stubbed));
+    j += std::format("  \"ppu_interpreted\": {{\"instructions\": {}, \"by_owner\": {{", ppu_total);
+    {
+        bool first_owner = true;
+        for (const auto& [who, steps] : by_owner) {
+            j += std::format("{}{}: {}", first_owner ? "" : ", ", json_string(who), steps);
+            first_owner = false;
+        }
+    }
+    j += std::format("}}}},\n  \"spu_interpreted\": {{\"instructions\": {}}},\n", spu_total);
+    j += std::format("  \"waker_first\": {{\"waits\": {}, \"ms\": {:.1f}, \"limit\": {}, \"barriers\": {}}},\n",
+        wakes.deferred, static_cast<double>(wakes.ns) / 1e6, wakes.by_limit, wakes.barriers);
+    j += "  \"milestones\": [";
+    for (usize i = 0; i < g_summary.milestones.size(); i++) {
+        const auto& m = g_summary.milestones[i];
+        j += std::format("{}\n    {{\"what\": {}, \"at\": {:.2f}, \"flip\": {}}}", i ? "," : "", json_string(m.what),
+            m.at, m.flip);
+    }
+    j += "\n  ],\n  \"stalls\": [";
+    for (usize i = 0; i < stalls.size(); i++) {
+        const auto& st = stalls[i];
+        j += std::format("{}\n    {{\"kind\": {}, \"at\": {:.1f}, \"flip\": {}, \"title\": {}, \"report\": {}}}",
+            i ? "," : "", json_string(loader::stall_name(st.kind)), st.at, st.flip, json_string(st.title),
+            json_string(st.report));
+    }
+    j += "\n  ],\n";
     j += std::format("  \"spu_loads\": {{\"lifted\": {}, \"interpreted\": {}, \"images_without_lifted\": {}}},\n",
         spu.attached, spu.unknown, spu.images);
     j += "  \"glitches\": {\"counts\": {"; // D-1070
@@ -848,7 +973,23 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
             }());
     }
 #endif
-    j += "\n  ],\n  \"messages\": {";
+    j += "\n  ],\n";
+    if (chaos::any()) { // shake mode (D-1045): what it enabled and what it did
+        const chaos::Counts c = chaos::counts();
+        j += std::format("  \"shake\": {{\"seed\": {}, \"spec\": {}, \"points\": {{", chaos::seed(),
+            json_string(chaos::description()));
+        bool first_point = true;
+        for (usize p = 1; p < chaos::kPoints; p++) {
+            const auto point = static_cast<chaos::Point>(p);
+            if (!chaos::on(point)) continue;
+            j += std::format("{}{}: {{\"family\": {}, \"hits\": {}, \"delay_ms\": {:.1f}}}", first_point ? "" : ", ",
+                json_string(chaos::info(point).id), json_string(chaos::family_name(chaos::info(point).family)),
+                c.hits[p], static_cast<double>(c.delay_us[p]) / 1e3);
+            first_point = false;
+        }
+        j += "}},\n";
+    }
+    j += "  \"messages\": {";
     bool first = true;
     for (const auto& [shape, count] : g_summary.messages) {
         j += std::format("{}\n    {}: {}", first ? "" : ",", json_string(shape), count);
@@ -858,6 +999,18 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
     std::ofstream out(path, std::ios::trunc);
     out << j;
     return static_cast<bool>(out);
+}
+
+void emit_summary(std::string_view exit, std::string_view detail)
+{
+    if (g_run.summary_path.empty() || !g_run.kernel || g_run.written.exchange(true)) return;
+    lv2::Kernel& kernel = *g_run.kernel;
+    const bool exited = exit == "exited";
+    if (!write_summary(g_run.summary_path, exit, detail, exited ? kernel.exit_status() : 0, run_seconds(), kernel))
+        std::fprintf(stderr, "pspocket-boot: cannot write %s\n", g_run.summary_path.c_str());
+    else
+        std::fprintf(stderr, "summary (%.*s): %s\n", static_cast<int>(exit.size()), exit.data(),
+            g_run.summary_path.c_str());
 }
 
 } // namespace
@@ -919,9 +1072,13 @@ int main(int argc, char** argv)
     std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot
     [[maybe_unused]] bool frame_jumps = false;
     std::string summary_path;
+    // The watchdog (D-1043): --freeze S, --deadlock S, --livelock S (0: that check off), --stop-on-stall.
+    double freeze_s = 10, deadlock_s = 5, livelock_s = 0;
+    bool stop_on_stall = false;
+    hle::PadAnchor press_base; // a press file's "wait:" step (D-1042)
     const auto add_press = [&](std::string_view spec) {
         std::string error;
-        const auto press = hle::parse_pad_press(spec, &error);
+        const auto press = hle::parse_pad_press(spec, &error, &press_base);
         if (!press) {
             std::fprintf(stderr, "pspocket-boot: %s\n", error.c_str());
             return false;
@@ -999,12 +1156,27 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "pspocket-boot: cannot read %s\n", v);
                 return 66;
             }
+            press_base = {};
             for (std::string line; std::getline(in, line);) {
                 if (const auto hash = line.find('#'); hash != std::string::npos) line.resize(hash);
                 std::istringstream words(line);
-                for (std::string w; words >> w;)
+                for (std::string w; words >> w;) {
+                    if (w.starts_with("wait:")) { // the presses after it count from its anchor (D-1042)
+                        std::string error;
+                        if (w == "wait:boot") {
+                            press_base = {};
+                        } else if (const auto anchor = hle::parse_pad_anchor(std::string_view(w).substr(5), &error)) {
+                            press_base = *anchor;
+                        } else {
+                            std::fprintf(stderr, "pspocket-boot: %s: %s\n", v, error.c_str());
+                            return 64;
+                        }
+                        continue;
+                    }
                     if (!add_press(w)) return 64;
+                }
             }
+            press_base = {};
         } else if (a == "--frame-jumps") {
             frame_jumps = true;
             gpu = "metal";
@@ -1012,6 +1184,13 @@ int main(int argc, char** argv)
             const char* v = value();
             if (!v) return usage();
             summary_path = v;
+        } else if (a == "--freeze" || a == "--deadlock" || a == "--livelock") {
+            const char* v = value();
+            if (!v || std::atof(v) < 0) return usage();
+            (a == "--freeze" ? freeze_s : a == "--deadlock" ? deadlock_s : livelock_s) = std::atof(v);
+            if (a == "--livelock" && livelock_s > 0) gpu = "metal"; // its frames' hashes come from the captures
+        } else if (a == "--stop-on-stall") {
+            stop_on_stall = true;
         }
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
@@ -1144,10 +1323,15 @@ int main(int argc, char** argv)
                     g_summary.windows.push_back(w);
                 };
             }
-            if (!frames_dir.empty()) {
-                mc.capture_every = frame_every;
+            if (!frames_dir.empty() || livelock_s > 0) {
+                // The livelock check alone: a frame a second or so (D-1043).
+                mc.capture_every = !frames_dir.empty() ? frame_every : 30;
                 mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {
-                    if (flip < frame_from) return;
+                    if (livelock_s > 0) {
+                        if (loader::Watchdog* dog = g_watchdog.load())
+                            dog->note_frame(flip, loader::frame_thumbnail_hash(bgra, w, h));
+                    }
+                    if (frames_dir.empty() || flip < frame_from) return;
                     frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
                 };
             }
@@ -1480,6 +1664,88 @@ int main(int argc, char** argv)
 
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
+    // Whose code a guest address is (D-228): the executable's, a firmware module's (the PRX region, D-178), a module
+    // the game loaded (D-159), or other (HLE stubs, code the game made in memory). For the end's lines and the summary.
+    const auto owner = [&](u32 pc) -> std::string {
+        for (const recomp::ProgramHeader& ph : (*exe)->elf().segments())
+            if (ph.type == 1 && pc >= ph.vaddr && pc < ph.vaddr + ph.memsz) return "the executable";
+        // The firmware's fixed layout first; a game's own modules sit above it in the PRX region (D-238).
+        const u32 firmware_end = lle ? lle->layout_end() : PS_MEM_PRX_BASE + PS_MEM_PRX_SIZE;
+        if (pc >= PS_MEM_PRX_BASE && pc < firmware_end) return "a firmware module";
+        if (const u32 id = runtime_modules.id_by_address(pc)) {
+            hle::ModuleInfo info;
+            if (runtime_modules.info(id, info)) return "the game's module " + info.name;
+            return "a module the game loaded";
+        }
+        if (pc - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE) return "the PRX region";
+        return "other code";
+    };
+    // The summary from any way the run ends (D-1043).
+    g_run.summary_path = summary_path;
+    g_run.ppu_owner = owner;
+    g_run.start = start;
+    g_run.kernel = &kernel;
+    struct ForgetRun {
+        ~ForgetRun()
+        {
+            g_run.written = true; // nothing more once main's state goes
+            g_run.kernel = nullptr;
+            g_run.ppu_owner = nullptr;
+        }
+    } forget_run;
+    // The watchdog (D-1043): a freeze, a deadlock or a livelock is reported with every thread's state, at once.
+    std::atomic<bool> stall_stop{false};
+    std::string stall_exit, stall_detail;
+    std::mutex stall_mutex;
+    loader::WatchdogConfig watch_config;
+    watch_config.freeze_s = freeze_s;
+    watch_config.deadlock_s = deadlock_s;
+    watch_config.livelock_s = livelock_s;
+    loader::Watchdog watchdog(kernel, watch_config, [&](const loader::StallReport& r) {
+        PS_LOG_WARN("watch", "{}", r.title);
+        std::fwrite(r.report.data(), 1, r.report.size(), stdout);
+        std::fflush(stdout);
+        add_milestone(r.title, r.flip);
+        if (stop_on_stall) {
+            {
+                std::lock_guard lock(stall_mutex);
+                stall_exit = loader::stall_name(r.kind);
+                stall_detail = r.title;
+            }
+            stall_stop = true;
+        }
+    }, [](u32 addr) -> std::string {
+        const hle::LinkedFunction* f = g_hle ? g_hle->linked_at(addr) : nullptr;
+        if (!f) return {};
+        return f->module + "::" + (f->name.empty() ? std::format("{:#010x}", f->nid) : f->name);
+    });
+    g_watchdog = &watchdog;
+    struct ForgetWatchdog {
+        loader::Watchdog& dog;
+        ~ForgetWatchdog()
+        {
+            g_watchdog = nullptr;
+            dog.stop();
+        }
+    } forget_watchdog{watchdog};
+    if (freeze_s > 0 || deadlock_s > 0 || livelock_s > 0) watchdog.start();
+    // Game time for the presses' anchors (D-1042) and the milestones: the first frame, play, each anchor.
+    hle::PlayDetector play;
+    bool first_frame = false;
+    const auto linked_named = [&](std::string_view name) {
+        std::vector<const hle::LinkedFunction*> out;
+        for (const auto* f : hle.linked())
+            if (f->name == name) out.push_back(f);
+        return out;
+    };
+    const auto called = [&](std::string_view name) {
+        for (const auto* f : linked_named(name))
+            if (f->calls.load(std::memory_order_relaxed)) return true;
+        return false;
+    };
+    std::vector<const hle::LinkedFunction*> pad_readers;
+    for (const char* n : {"cellPadGetData", "cellPadGetDataExtra", "cellPadPeriphGetData"})
+        for (const auto* f : linked_named(n)) pad_readers.push_back(f);
     const auto seconds = [](double s) {
         return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(s));
     };
@@ -1503,11 +1769,33 @@ int main(int argc, char** argv)
     }();
     for (;;) {
         auto until = std::min(next_rate, report_every_s > 0 ? std::min(deadline, next_report) : deadline);
-        if (!presses.empty()) until = std::min(until, Clock::now() + std::chrono::milliseconds(20));
+        until = std::min(until, Clock::now() + std::chrono::milliseconds(presses.empty() ? 250 : 20));
         done = kernel.wait_for_exit(std::chrono::ceil<std::chrono::milliseconds>(std::max(until - Clock::now(),
             Clock::duration::zero())));
         const auto now = Clock::now();
-        if (done || now >= deadline) break;
+        if (done || now >= deadline || stall_stop.load()) break;
+        const u64 flips_now = kernel.rsx() ? kernel.rsx()->flip_count() : 0;
+        {
+            const double t = std::chrono::duration<double>(now - start).count();
+            if (!first_frame && flips_now) {
+                first_frame = true;
+                add_milestone("first frame", flips_now);
+            }
+            if (!play.playing()) {
+                u64 reads = 0;
+                for (const auto* f : pad_readers) reads += f->calls.load(std::memory_order_relaxed);
+                if (play.update(t, flips_now, reads)) add_milestone("in play (PlayDetector)", flips_now);
+            }
+            if (!presses.empty()) {
+                hle::PadClock clock;
+                clock.t = t;
+                clock.flips = flips_now;
+                clock.playing = play.playing();
+                clock.called = called;
+                for (const std::string& a : hle::resolve_pad_anchors(presses, clock))
+                    if (a != "boot") add_milestone("presses from " + a, flips_now);
+            }
+        }
         if (!presses.empty()) {
             rsx::Rsx* pr = press_by_flips ? kernel.rsx() : nullptr;
             const double t = press_by_flips ? (pr ? static_cast<double>(pr->status().flips) / 30.0 : 0.0)
@@ -1516,6 +1804,7 @@ int main(int argc, char** argv)
             for (const hle::PadPress& p : presses)
                 if (p.down_at(t) && text.find(p.button) == std::string::npos) text += (text.empty() ? "" : "+") + p.button;
             if (text != pad_text) {
+                watchdog.note_pad_change();
                 hle::set_pad_input(hle, hle::pad_state_at(presses, t));
                 PS_LOG_INFO("boot", "controller at {:.2f} s: {}", t, text.empty() ? "released" : text);
                 pad_text = text;
@@ -1572,7 +1861,8 @@ int main(int argc, char** argv)
 #endif
 
     // At a timeout, what every thread waits for (the summary stays the last thing printed).
-    if (!done) print_thread_report(kernel, std::format("timeout after {:.1f} s", secs));
+    const bool stopped = !done && stall_stop.load(); // --stop-on-stall
+    if (!done && !stopped) print_thread_report(kernel, std::format("timeout after {:.1f} s", secs));
 
     // Summary: which gaps the run hit, most-called first.
     std::vector<const hle::LinkedFunction*> missing, stubbed;
@@ -1581,7 +1871,7 @@ int main(int argc, char** argv)
     const auto by_calls = [](auto* a, auto* b) { return a->calls.load() > b->calls.load(); };
     std::sort(missing.begin(), missing.end(), by_calls);
     std::sort(stubbed.begin(), stubbed.end(), by_calls);
-    std::printf("\n%s after %.1f s\n", done ? "process exited" : "timeout", secs);
+    std::printf("\n%s after %.1f s\n", done ? "process exited" : stopped ? "stopped on a stall" : "timeout", secs);
     if (done) std::printf("exit status: %d\n", kernel.exit_status());
     std::printf("imports: %u functions (%u implemented, %u RPCS3 stubs), %u unresolved variables\n",
         report.functions_linked, report.functions_implemented, report.functions_stubbed, report.variables_unresolved);
@@ -1651,20 +1941,6 @@ int main(int argc, char** argv)
     // (D-228): the executable's, a firmware module's (the PRX region, D-178), a module the game loaded (D-159), or
     // other (HLE stubs, code the game made in memory). "No interpreting" is measured per owner.
     {
-        const auto owner = [&](u32 pc) -> std::string {
-            for (const recomp::ProgramHeader& ph : (*exe)->elf().segments())
-                if (ph.type == 1 && pc >= ph.vaddr && pc < ph.vaddr + ph.memsz) return "the executable";
-            // The firmware's fixed layout first; a game's own modules sit above it in the PRX region (D-238).
-            const u32 firmware_end = lle ? lle->layout_end() : PS_MEM_PRX_BASE + PS_MEM_PRX_SIZE;
-            if (pc >= PS_MEM_PRX_BASE && pc < firmware_end) return "a firmware module";
-            if (const u32 id = runtime_modules.id_by_address(pc)) {
-                hle::ModuleInfo info;
-                if (runtime_modules.info(id, info)) return "the game's module " + info.name;
-                return "a module the game loaded";
-            }
-            if (pc - PS_MEM_PRX_BASE < PS_MEM_PRX_SIZE) return "the PRX region";
-            return "other code";
-        };
         std::vector<ps_ppu_interp_site> all(4096);
         all.resize(ps_ppu_interp_sites(all.data(), static_cast<u32>(all.size())));
         std::map<std::string, u64> by_owner;
@@ -1691,14 +1967,27 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(got), static_cast<unsigned long long>(put));
         }
     }
-    if (const lv2::SenderDeferrals d = lv2::sender_deferrals(); d.deferred || d.barriers) { // D-999
-        std::printf("events whose receiver let the sending PPU thread go on first: %llu (until it began its next call "
+    if (rsx::Rsx* r = kernel.rsx(); r && r->flip_pacing()) { // D-1044
+        const rsx::Rsx::FlipPacing fp = r->flip_pacing_stats();
+        std::printf("flips held for the vblank (PSPOCKET_FLIP_VSYNC): %llu of %llu, %.1f ms in all (%.2f ms each), %llu "
+                    "at the 50 ms limit\n",
+            static_cast<unsigned long long>(fp.held), static_cast<unsigned long long>(r->flip_count()),
+            static_cast<double>(fp.held_ns) / 1e6, fp.held ? static_cast<double>(fp.held_ns) / 1e6 / static_cast<double>(fp.held) : 0.0,
+            static_cast<unsigned long long>(fp.timed_out));
+    }
+    if (const lv2::SenderDeferrals d = lv2::sender_deferrals(); d.deferred || d.barriers) { // D-999, D-1041
+        std::printf("wakes whose woken thread let the waking PPU thread go on first: %llu (until it began its next call "
                     "%llu, waited %llu, the 10 ms limit %llu), %.1f ms waited; queues destroyed and threads created after "
                     "it finished: %llu (the 20 ms limit %llu), %.1f ms waited\n",
             static_cast<unsigned long long>(d.deferred), static_cast<unsigned long long>(d.by_calls),
             static_cast<unsigned long long>(d.by_wait), static_cast<unsigned long long>(d.by_limit),
             static_cast<double>(d.ns) / 1e6, static_cast<unsigned long long>(d.barriers),
             static_cast<unsigned long long>(d.barrier_limit), static_cast<double>(d.barrier_ns) / 1e6);
+        for (usize k = 0; k < lv2::kWakeKinds; k++) {
+            if (!d.kind_deferred[k]) continue;
+            std::printf("  %-14s %9llu waits, %8.1f ms\n", lv2::wake_kind_name(k),
+                static_cast<unsigned long long>(d.kind_deferred[k]), static_cast<double>(d.kind_ns[k]) / 1e6);
+        }
     }
     if (rsx::Rsx* r = kernel.rsx()) { // the RSX's correctness alarms over the run (D-1022)
         const rsx::AlarmCounts a = r->alarms().snapshot();
@@ -1716,11 +2005,22 @@ int main(int argc, char** argv)
     for (const auto* f : stubbed)
         std::printf("  %8llu  %s::%s (0x%08X)\n", static_cast<unsigned long long>(f->calls.load()), f->module.c_str(),
             f->name.empty() ? "?" : f->name.c_str(), f->nid);
-    if (!summary_path.empty()) {
-        if (!write_summary(summary_path, done, done ? kernel.exit_status() : 0, secs, kernel, missing.size(), spu))
-            std::fprintf(stderr, "pspocket-boot: cannot write %s\n", summary_path.c_str());
-        else
-            std::printf("summary: %s\n", summary_path.c_str());
+    watchdog.stop();
+    if (chaos::any()) { // shake mode (D-1045)
+        const chaos::Counts c = chaos::counts();
+        std::printf("shake mode: %s\n", chaos::description().c_str());
+        for (usize p = 1; p < chaos::kPoints; p++) {
+            if (!c.hits[p]) continue;
+            const chaos::PointInfo& pi = chaos::info(static_cast<chaos::Point>(p));
+            std::printf("  %-4s %-36s %-16s %10llu injections, %9.1f ms of delays\n", pi.id, pi.name,
+                chaos::family_name(pi.family), static_cast<unsigned long long>(c.hits[p]),
+                static_cast<double>(c.delay_us[p]) / 1e3);
+        }
+        if (const std::string log = chaos::write_log(); !log.empty()) std::printf("shake log: %s\n", log.c_str());
+    }
+    {
+        std::lock_guard lock(stall_mutex);
+        emit_summary(done ? "exited" : !stall_exit.empty() ? stall_exit : "timeout", stall_detail);
     }
 
     if (!kernel.shutdown()) {

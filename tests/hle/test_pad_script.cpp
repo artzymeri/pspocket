@@ -82,3 +82,108 @@ TEST_CASE("pad script: stick directions push one axis all the way while they are
     CHECK(later.left_y == 128);
     CHECK_FALSE(parse_pad_press("ls-forward@1").has_value());
 }
+
+// D-1042: presses on game time. The old seconds keep working (above); an anchor makes a press wait for the frame, the
+// call or the play it names, then count from when it happened.
+TEST_CASE("pad script: anchors on game time (flip, call, play) and wait steps", "[hle][pad]")
+{
+    const auto flip = parse_pad_press("cross@flip:2200");
+    REQUIRE(flip.has_value());
+    CHECK(flip->anchor.kind == PadAnchor::Kind::Flip);
+    CHECK(flip->anchor.flip == 2200);
+    CHECK_FALSE(flip->anchored.has_value());
+    CHECK_FALSE(flip->down_at(1000)); // not yet anchored: never down
+
+    const auto save = parse_pad_press("circle@after:call:cellSaveDataAutoSave2+2s");
+    REQUIRE(save.has_value());
+    CHECK(save->anchor.kind == PadAnchor::Kind::Call);
+    CHECK(save->anchor.call == "cellSaveDataAutoSave2");
+    CHECK(save->anchor.offset == 2.0);
+    CHECK(save->every == 0.0);
+
+    const auto again = parse_pad_press("start@flip:100+2s+10:0.5");
+    REQUIRE(again.has_value());
+    CHECK(again->anchor.offset == 2.0);
+    CHECK(again->every == 10.0);
+    CHECK(again->hold == 0.5);
+    const auto repeat = parse_pad_press("start@play+10:0.5"); // a plain +N is the repeat, as before
+    REQUIRE(repeat.has_value());
+    CHECK(repeat->anchor.kind == PadAnchor::Kind::Play);
+    CHECK(repeat->anchor.offset == 0.0);
+    CHECK(repeat->every == 10.0);
+    CHECK(parse_pad_press("cross@call:cellPadGetData")->anchor.call == "cellPadGetData"); // "after:" is optional
+
+    std::string error;
+    for (const char* bad : {"cross@flip:", "cross@flip:x", "cross@call:", "cross@after:", "cross@after:soon",
+             "cross@flip:10+xs", "cross@playx", "cross@flip:10+0", "cross@flip:1.5"}) {
+        INFO(bad);
+        CHECK_FALSE(parse_pad_press(bad, &error).has_value());
+        CHECK(error.find("--press") != std::string::npos);
+    }
+
+    // Resolved as they happen: each press counts from the moment its anchor did.
+    std::vector<PadPress> presses{*flip, *save, *parse_pad_press("square@play+1s"), *parse_pad_press("triangle@5")};
+    std::vector<std::string> calls;
+    PadClock clock;
+    clock.called = [&](std::string_view n) { return std::find(calls.begin(), calls.end(), n) != calls.end(); };
+    clock.t = 10;
+    clock.flips = 2000;
+    auto fired = resolve_pad_anchors(presses, clock);
+    CHECK(fired.empty()); // the seconds since the boot need no anchor; the flip is not there yet
+    CHECK(presses[3].down_at(5.1));
+    CHECK_FALSE(presses[0].down_at(10.1));
+    clock.t = 20;
+    clock.flips = 2200;
+    calls.push_back("cellSaveDataAutoSave2");
+    fired = resolve_pad_anchors(presses, clock);
+    CHECK(fired == std::vector<std::string>{"flip:2200", "call:cellSaveDataAutoSave2"});
+    CHECK(presses[0].down_at(20.1));
+    CHECK_FALSE(presses[1].down_at(21.0));
+    CHECK(presses[1].down_at(22.1)); // 2 s after the call was seen
+    CHECK_FALSE(presses[2].down_at(30));
+    clock.t = 40;
+    clock.playing = true;
+    CHECK(resolve_pad_anchors(presses, clock) == std::vector<std::string>{"play"});
+    CHECK(presses[2].down_at(41.1));
+    CHECK(pad_state_at(presses, 41.1).digital2 == 0x80); // square
+    CHECK(resolve_pad_anchors(presses, clock).empty()); // once
+
+    // A press file's "wait:" step: plain seconds after it count from its anchor.
+    const auto step = parse_pad_anchor("call:cellSaveDataAutoLoad2+1.5s");
+    REQUIRE(step.has_value());
+    CHECK(step->offset == 1.5);
+    const auto after = parse_pad_press("cross@3:1", nullptr, &*step);
+    REQUIRE(after.has_value());
+    CHECK(after->anchor.call == "cellSaveDataAutoLoad2");
+    CHECK(after->at == 3.0);
+    std::vector<PadPress> one{*after};
+    clock.t = 100;
+    calls.push_back("cellSaveDataAutoLoad2");
+    resolve_pad_anchors(one, clock);
+    CHECK_FALSE(one[0].down_at(104.4));
+    CHECK(one[0].down_at(104.6)); // 100 + 1.5 + 3
+    CHECK_FALSE(parse_pad_anchor("soon", &error).has_value());
+    CHECK(error.find("wait:") != std::string::npos);
+    CHECK(parse_pad_anchor("play")->kind == PadAnchor::Kind::Play);
+}
+
+TEST_CASE("pad script: the game is in play after 3 s of frames while it reads the controller", "[hle][pad]")
+{
+    PlayDetector d;
+    u64 flips = 0, reads = 0;
+    double t = 0;
+    for (; t < 10; t += 0.02) { // a loading screen: frames, no controller
+        flips += t - static_cast<int>(t) < 0.5 ? 1 : 0;
+        CHECK_FALSE(d.update(t, flips, reads));
+    }
+    const double from = t;
+    for (; t < from + 5; t += 0.02) { // 25 frames a second and 50 reads
+        if (static_cast<int>(t * 50) % 2 == 0) flips++;
+        reads++;
+        d.update(t, flips, reads);
+    }
+    CHECK(d.playing());
+    CHECK(d.since() >= from + 2.0); // the first second may reach back into the loading screen
+    CHECK(d.since() <= from + 3.2);
+    CHECK(d.update(t + 100, flips, reads)); // stays
+}

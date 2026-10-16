@@ -2,6 +2,7 @@
 
 #include "pspocket/hle/pad_script.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -61,19 +62,113 @@ std::optional<double> number(std::string_view s)
     return v;
 }
 
+// The longest prefix of `s` that is a non-negative decimal number, and its length (0: none).
+std::pair<double, usize> leading_number(std::string_view s)
+{
+    usize n = 0;
+    while (n < s.size() && (std::isdigit(static_cast<unsigned char>(s[n])) || s[n] == '.')) n++;
+    if (!n) return {0, 0};
+    const auto v = number(s.substr(0, n));
+    return v ? std::pair{*v, n} : std::pair{0.0, usize{0}};
+}
+
+// An anchor at the start of `s` (after "@"): its kind and how many characters it took; Boot and 0 when `s` does not
+// start with one. "+Ns" after it is left for the caller.
+std::optional<PadAnchor> anchor_prefix(std::string_view s, usize& used, std::string* why)
+{
+    usize at = 0;
+    if (s.starts_with("after:")) at = 6;
+    const std::string_view r = s.substr(at);
+    PadAnchor a;
+    if (r.starts_with("flip:")) {
+        const auto [v, n] = leading_number(r.substr(5));
+        if (!n || v != std::floor(v)) {
+            if (why) *why = "bad frame number after flip:";
+            return std::nullopt;
+        }
+        a.kind = PadAnchor::Kind::Flip;
+        a.flip = static_cast<u64>(v);
+        used = at + 5 + n;
+        return a;
+    }
+    if (r.starts_with("call:")) {
+        usize n = 5;
+        while (n < r.size() && (std::isalnum(static_cast<unsigned char>(r[n])) || r[n] == '_')) n++;
+        if (n == 5) {
+            if (why) *why = "no function name after call:";
+            return std::nullopt;
+        }
+        a.kind = PadAnchor::Kind::Call;
+        a.call = std::string(r.substr(5, n - 5));
+        used = at + n;
+        return a;
+    }
+    if (r.starts_with("play")) {
+        a.kind = PadAnchor::Kind::Play;
+        used = at + 4;
+        return a;
+    }
+    if (at) {
+        if (why) *why = "after: needs flip:N, call:NAME or play";
+        return std::nullopt;
+    }
+    used = 0;
+    return a; // Boot
+}
+
 } // namespace
+
+std::string PadAnchor::text() const
+{
+    std::string out;
+    switch (kind) {
+    case Kind::Boot: out = "boot"; break;
+    case Kind::Flip: out = std::format("flip:{}", flip); break;
+    case Kind::Call: out = "call:" + call; break;
+    case Kind::Play: out = "play"; break;
+    }
+    if (offset > 0) out += std::format("+{}s", offset);
+    return out;
+}
+
+std::optional<PadAnchor> parse_pad_anchor(std::string_view text, std::string* error)
+{
+    std::string why;
+    usize used = 0;
+    auto a = anchor_prefix(text, used, &why);
+    if (a && used == 0) why = "not an anchor (play, flip:N, call:NAME)";
+    if (a && used) {
+        std::string_view rest = text.substr(used);
+        if (rest.starts_with('+') && rest.ends_with('s')) {
+            const auto v = number(rest.substr(1, rest.size() - 2));
+            if (v) {
+                a->offset = *v;
+                rest = {};
+            }
+        }
+        if (rest.empty()) return a;
+        why = std::format("'{}' after the anchor", rest);
+    }
+    if (error) *error = std::format("wait:{}: {}", text, why);
+    return std::nullopt;
+}
 
 bool PadPress::down_at(double t) const
 {
-    if (t < at) return false;
-    const double since = every > 0 ? std::fmod(t - at, every) : t - at;
+    if (!anchored) return false;
+    const double from = *anchored + anchor.offset + at;
+    if (t < from) return false;
+    const double since = every > 0 ? std::fmod(t - from, every) : t - from;
     return since < hold;
 }
 
-std::optional<PadPress> parse_pad_press(std::string_view text, std::string* error)
+std::optional<PadPress> parse_pad_press(std::string_view text, std::string* error, const PadAnchor* base)
 {
     const auto fail = [&](std::string why) -> std::optional<PadPress> {
-        if (error) *error = std::format("--press {}: {} (BUTTON@START[+EVERY][:HOLD], seconds)", text, why);
+        if (error) {
+            *error = std::format("--press {}: {} (BUTTON@START[+EVERY][:HOLD], seconds; START may be flip:N, "
+                                 "after:call:NAME or play, with +Ns)", text, why);
+        }
         return std::nullopt;
     };
     const usize at = text.find('@');
@@ -92,6 +187,30 @@ std::optional<PadPress> parse_pad_press(std::string_view text, std::string* erro
     p.axis_value = info->axis_value;
 
     std::string_view rest = text.substr(at + 1);
+    std::string why;
+    usize used = 0;
+    const auto anchor = anchor_prefix(rest, used, &why);
+    if (!anchor) return fail(why);
+    if (used) {
+        // An anchor, then [+Ns][+EVERY][:HOLD]: written as seconds 0 for the parse below.
+        p.anchor = *anchor;
+        p.anchored.reset();
+        rest = rest.substr(used);
+        if (rest.starts_with('+')) {
+            const usize end = rest.find_first_of("+:", 1);
+            const std::string_view first = rest.substr(1, end == std::string_view::npos ? std::string_view::npos : end - 1);
+            if (first.ends_with('s')) {
+                const auto off = number(first.substr(0, first.size() - 1));
+                if (!off) return fail("bad offset");
+                p.anchor.offset = *off;
+                rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end);
+            }
+        }
+        if (!rest.empty() && rest[0] != '+' && rest[0] != ':') return fail(std::format("'{}' after the anchor", rest));
+    } else if (base && base->kind != PadAnchor::Kind::Boot) {
+        p.anchor = *base;
+        p.anchored.reset();
+    }
     if (const usize colon = rest.find(':'); colon != std::string_view::npos) {
         const auto hold = number(rest.substr(colon + 1));
         if (!hold || *hold <= 0) return fail("bad hold time");
@@ -104,11 +223,61 @@ std::optional<PadPress> parse_pad_press(std::string_view text, std::string* erro
         p.every = *every;
         rest = rest.substr(0, plus);
     }
-    const auto start = number(rest);
-    if (!start) return fail("bad start time");
-    p.at = *start;
+    if (used) {
+        if (!rest.empty()) return fail("bad repeat interval");
+        p.at = 0;
+    } else {
+        const auto start = number(rest);
+        if (!start) return fail("bad start time");
+        p.at = *start;
+    }
     if (p.every > 0 && p.hold >= p.every) return fail("the hold time must be shorter than the repeat interval");
     return p;
+}
+
+std::vector<std::string> resolve_pad_anchors(std::vector<PadPress>& presses, const PadClock& clock)
+{
+    std::vector<std::string> fired;
+    for (PadPress& p : presses) {
+        if (p.anchored) continue;
+        bool now = false;
+        switch (p.anchor.kind) {
+        case PadAnchor::Kind::Boot: now = true; break;
+        case PadAnchor::Kind::Flip: now = clock.flips >= p.anchor.flip; break;
+        case PadAnchor::Kind::Call: now = clock.called && clock.called(p.anchor.call); break;
+        case PadAnchor::Kind::Play: now = clock.playing; break;
+        }
+        if (!now) continue;
+        p.anchored = clock.t;
+        PadAnchor bare = p.anchor;
+        bare.offset = 0;
+        const std::string text = bare.text();
+        if (std::find(fired.begin(), fired.end(), text) == fired.end()) fired.push_back(text);
+    }
+    return fired;
+}
+
+bool PlayDetector::update(double t, u64 flips, u64 pad_reads)
+{
+    if (playing_) return true;
+    // The rates over the last second; the streak of seconds in which both were high enough.
+    window_.push_back({t, flips, pad_reads});
+    while (window_.size() > 2 && window_[1].t <= t - 1.0) window_.erase(window_.begin());
+    const Sample& first = window_.front();
+    const double span = t - first.t;
+    if (span < 0.95) return false;
+    const double fps = static_cast<double>(flips - first.flips) / span;
+    const double reads = static_cast<double>(pad_reads - first.reads) / span;
+    if (fps < 20 || reads < 10) {
+        streak_ = -1;
+        return false;
+    }
+    if (streak_ < 0) streak_ = first.t; // the second just measured began the streak
+    if (t - streak_ >= 3.0) {
+        playing_ = true;
+        since_ = t;
+    }
+    return playing_;
 }
 
 PadInput pad_state_at(const std::vector<PadPress>& presses, double t)

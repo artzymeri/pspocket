@@ -57,6 +57,7 @@
 #include "pspocket/loader/lle.hpp"
 #include "pspocket/loader/loader.hpp"
 #include "pspocket/loader/system.hpp"
+#include "pspocket/loader/watchdog.hpp"
 #include "pspocket/recomp/firmware.hpp"
 #include "pspocket/recomp/hash.hpp"
 #include "pspocket/lv2/kernel.hpp"
@@ -160,6 +161,8 @@ struct Session {
     // Documents/pspocket-trace, put there over USB, has the backend trace the next frame into Documents/trace-<flip>/.
     std::string documents;
     std::string trace_dir;
+    // Freezes and deadlocks reported with every thread's state (D-135, D-1043); last: it reads the kernel.
+    std::unique_ptr<loader::Watchdog> watchdog;
 };
 
 constexpr auto kRateInterval = std::chrono::seconds(5);
@@ -237,53 +240,39 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     signal(sig, SIG_DFL); // returning re-runs the access, which now crashes with a system crash report
 }
 
-// A frozen game: frames came, then none for 10 s. What every PPU thread and the RSX's FIFO wait on goes to the log,
-// once per freeze (D-135): the phone froze with nothing logged, and gone before a debugger could attach.
+// A game that stops making progress (D-135, D-1043): the shared watchdog (pspocket/loader/watchdog.hpp) reports a
+// freeze (frames came, then none for 10 s) or a deadlock (every PPU thread blocked for good, the SPUs and the RSX
+// idle, for 5 s): what every PPU thread and the RSX's FIFO wait on goes to the log, once per stall (the phone froze
+// with nothing logged, and gone before a debugger could attach). Its poll also saves where the PPU interpreter ran
+// code every minute, for the next preparation's continuations (D-255).
 void watch_for_freezes(Session* s)
 {
-    std::thread([s] {
-        constexpr auto kQuiet = std::chrono::seconds(10);
-        u64 seen = 0;
-        auto since = std::chrono::steady_clock::now();
-        bool reported = false;
-        u32 ticks = 0;
-        while (s->running.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            // Every minute: where the PPU interpreter ran code, for the next preparation's continuations (D-255).
-            if (++ticks % 30 == 0 && !s->coverage.empty()) {
-                if (const u32 added = ppu::save_landings(s->coverage + "/ppu-landings.txt"))
-                    PS_LOG_INFO(kChan, "{} new PPU landings saved: the next preparation translates them (D-255)", added);
-            }
-            const u64 flips = s->flips.load(std::memory_order_relaxed);
-            const auto now = std::chrono::steady_clock::now();
-            if (flips != seen) {
-                seen = flips;
-                since = now;
-                reported = false;
-                continue;
-            }
-            if (!flips || reported || now - since < kQuiet) continue;
-            reported = true;
-            lv2::ReportOptions options;
-            options.title = std::format("no frame for {:.0f} s after frame {}",
-                std::chrono::duration<double>(now - since).count(), flips);
-            options.describe_address = [s](u32 addr) -> std::string {
-                const hle::LinkedFunction* f = s->hle ? s->hle->linked_at(addr) : nullptr;
-                if (!f) return {};
-                return f->module + "::" + (f->name.empty() ? std::format("{:#010x}", f->nid) : f->name);
-            };
-            const std::string report = lv2::format_report(*s->kernel, options);
+    loader::WatchdogConfig config; // the freeze's 10 s and the deadlock's 5 s; no livelock check (no captures here)
+    s->watchdog = std::make_unique<loader::Watchdog>(*s->kernel, config,
+        [s](const loader::StallReport& r) {
+            if (!s->running.load(std::memory_order_relaxed)) return;
             // Line by line: the system log cuts long messages.
+            const std::string& report = r.report;
             usize at = 0;
             while (at < report.size()) {
                 const usize end = report.find('\n', at);
                 const usize n = (end == std::string::npos ? report.size() : end) - at;
-                if (n) PS_LOG_WARN(kChan, "freeze: {}", std::string_view(report).substr(at, n));
+                if (n) PS_LOG_WARN(kChan, "{}: {}", loader::stall_name(r.kind), std::string_view(report).substr(at, n));
                 if (end == std::string::npos) break;
                 at = end + 1;
             }
-        }
-    }).detach();
+        },
+        [s](u32 addr) -> std::string {
+            const hle::LinkedFunction* f = s->hle ? s->hle->linked_at(addr) : nullptr;
+            if (!f) return {};
+            return f->module + "::" + (f->name.empty() ? std::format("{:#010x}", f->nid) : f->name);
+        });
+    s->watchdog->set_tick([s, ticks = u32{0}]() mutable {
+        if (!s->running.load(std::memory_order_relaxed) || ++ticks % 120 != 0 || s->coverage.empty()) return;
+        if (const u32 added = ppu::save_landings(s->coverage + "/ppu-landings.txt"))
+            PS_LOG_INFO(kChan, "{} new PPU landings saved: the next preparation translates them (D-255)", added);
+    });
+    s->watchdog->start();
 }
 
 bool debugger_attached()

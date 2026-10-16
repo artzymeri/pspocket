@@ -36,6 +36,7 @@ struct ThreadSnapshot {
     s32 priority = 0;
     State state = State::Running;
     bool attached = false;   // a host thread with an lv2 identity: no guest stack, its registers are not read
+    bool interrupt = false;  // an interrupt thread (sys_interrupt_thread_establish): waits for its interrupt, not on lv2
     bool current = false;    // the thread that took the snapshot (its registers are exact)
     u32 syscall = kNoSyscall; // the syscall it is in; kNoSyscall in guest code and in HLE functions
     u64 exit_status = 0;     // Exited
