@@ -17129,3 +17129,14 @@ Mac.
   target up to 4 MB mirrored the block stays (runs mirror3, mirror4). Left as a switch, off.
 - The carry kernel's depth (D-1025) is now `precise::divide(d, 16777215)`: the kernels library is compiled with fast
   math, and its division put 0xff0000 back as 0xff0001 (the exact-mode test).
+
+## D-1032 · 2026-10-16 · The gate limits the alarms; phase 1 measured on the gate walk
+
+- games/gta5/gate.json `alarms_max`: reports_early, uninit_sampled, occlusion_overflow and dead_overlays at 0 (all 0
+  on the gate's prologue walk, with and without EDGE on the GPU); targets_lost and conditional_pending are not limited
+  (GTA V's scratch targets, D-1025; D-115's policy).
+- A/B on the gate walk, one session (128 s each, fps capped at 29.8 in all): D-1021 + D-1023 + D-1025 off
+  (PSPOCKET_RSX_EARLY_REPORTS=1, PSPOCKET_RSX_UNINIT_TARGETS=1, PSPOCKET_RSX_NO_CARRY=1): GPU 6.72 ms a frame in play,
+  76.7 passes, reports_early 16,702, targets_lost 32,507 (49.9 GB); on (three runs): GPU 7.11, 7.17 and 7.61 ms,
+  76.7 passes, reports_early 0, targets_lost about 12,600 (17.6 GB). The carrying costs about 0.4 ms of GPU a frame on
+  the Mac (13 to 19 targets a frame start from the bytes under them).

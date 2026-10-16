@@ -20,6 +20,7 @@
     "feedback_copies_max": 8,
     "readback_wait_ms_max": 1.0,
     "gpu_allocated_mb_max": 400,
-    "footprint_mb_max": 2500
+    "footprint_mb_max": 2500,
+    "alarms_max": {"reports_early": 0, "uninit_sampled": 0, "occlusion_overflow": 0, "dead_overlays": 0}
   }
 }
