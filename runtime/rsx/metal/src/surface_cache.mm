@@ -229,8 +229,14 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     // A removed surface's texture of this format and size, when one waits (what it holds is not used: the new surface
     // starts as one nobody wrote, cleared or loaded from guest memory), else a new one.
     id<MTLTexture> tex = nil;
-    for (auto it = impl.surface_texture_pool.begin(); impl.fast(kFastSurfacePool) && it != impl.surface_texture_pool.end();
-         ++it) {
+    // PSPOCKET_RSX_NO_SURFACE_POOL=1: every target gets a new texture (a test of whether a reused one's old pixels show,
+    // the user's striped sky of 2026-10-16).
+    static const bool no_pool = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_NO_SURFACE_POOL");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    for (auto it = impl.surface_texture_pool.begin();
+         !no_pool && impl.fast(kFastSurfacePool) && it != impl.surface_texture_pool.end(); ++it) {
         if ((*it).pixelFormat == pf && (*it).width == width && (*it).height == height) {
             tex = *it;
             impl.surface_texture_pool.erase(it);
