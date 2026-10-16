@@ -66,7 +66,7 @@ TransientAllocator::Allocation TransientAllocator::alloc(u32 size, u32 align)
     if (size > kChunkSize / 2) {
         // Large uploads get a buffer of their own (still retired with the command buffer).
         id<MTLBuffer> b = [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
-        in_use_.push_back(b);
+        own_.push_back(b); // not a chunk, whatever its length (one of exactly 4 MB was taken for one, D-1047)
         bytes_in_use_ += size;
         return {b, 0, static_cast<u8*>(b.contents)};
     }
@@ -94,18 +94,26 @@ void TransientAllocator::retire(id<MTLCommandBuffer> cb)
 {
     generation_++;
     bytes_in_use_ = 0;
-    if (in_use_.empty()) return;
+    if (in_use_.empty() && own_.empty()) return;
+    // The chunks come back for reuse (as many as kMaxFreeChunks), the large uploads' own buffers are released, when the
+    // command buffer completes. A buffer of its own whose length is a chunk's went back to the free list as one, and
+    // a new one was made for the next large upload: Assassin's Creed's garden, carrying 4 MB targets (D-1025), grew
+    // four buffers a frame until the run died at 56 GB (D-1047).
     auto chunks = std::make_shared<std::vector<id<MTLBuffer>>>(std::move(in_use_));
+    auto own = std::make_shared<std::vector<id<MTLBuffer>>>(std::move(own_));
     in_use_.clear();
+    own_.clear();
     current_ = nil;
     offset_ = 0;
     auto free_list = free_;
     auto mutex = free_mutex_;
     [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+        own->clear();
         std::lock_guard lock(*mutex);
         for (id<MTLBuffer> b : *chunks) {
-            if (b.length == kChunkSize) free_list->push_back(b);
+            if (free_list->size() < kMaxFreeChunks) free_list->push_back(b);
         }
+        chunks->clear();
     }];
 }
 
@@ -2517,6 +2525,19 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
 void MetalBackend::Impl::do_flip(const FlipRequest& request)
 {
     tick++;
+    static const bool memtrace = std::getenv("PSPOCKET_RSX_MEMTRACE") != nullptr; // D-1047: what holds the GPU's memory
+    if (memtrace) {
+        usize views = 0, conversions = 0;
+        for (const auto& sf : surfaces) {
+            views += sf->views.size();
+            conversions += sf->conversions.size();
+        }
+        PS_LOG_INFO(kChan, "memtrace flip {}: GPU {} MB, surfaces {} ({} views, {} conversions), surface pool {}, textures "
+            "{}, texture pool {}, deferred {}, transient {} in use, {} free, carried {}", stats.flips,
+            static_cast<u64>(device.currentAllocatedSize) >> 20, surfaces.size(), views, conversions,
+            surface_texture_pool.size(), textures.size(), texture_pool.size(), deferred.size(), transient.in_use(),
+            transient.free_chunks(), stats.targets_carried);
+    }
     end_pass_for(kEndFlip);
     finish_closing(false); // the frame's stores are counted in it (D-945)
     mirror_targets(); // D-1030

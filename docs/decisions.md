@@ -17208,3 +17208,33 @@ the default context is compared.
 - tests/rsx/test_metal.mm "a ZPASS report is ready only once the GPU has counted it" read a timestamp of 0 one run in
   three when it ran alone: the host clock starts at its first read, and the completion handler's read was the first.
   The test reads the clock first and checks the report's timestamp is past that.
+## D-1047 · 2026-10-17 · The transient allocator kept a large upload's own buffer of a chunk's length as a chunk (Assassin's Creed's garden leak); --max-footprint
+
+Assassin's Creed's first install into the garden (games/ac1/bench install-garden) died on main at a 56 GB footprint:
+from the garden's first seconds (about 105 s in) it grew about 1 GB a second, together with D-1025's alarm line ("7.00
+targets a frame started with the bytes of those under them"). A/B with the run stopped at a 6 GB footprint:
+PSPOCKET_RSX_NO_CARRY=1 stayed at 0.45 to 1.10 GB to its 300 s; with the carry, 0.99 GB then 4.27 GB and stopped at 6 GB
+at 108 s. vmmap at the burst: the IOAccelerator (graphics) regions 198, 582, 849, 1,331 in four seconds (about 3.5 MB
+each). PSPOCKET_RSX_MEMTRACE=1 (new: a line a flip with the GPU's allocated memory, surfaces, pools, textures, deferred
+actions and the transient allocator's chunks) found it: the free list of transient chunks grew by four a flip (151, 331,
+571, 811 free) while the frame used 13.
+
+- **The cause** (runtime/rsx/metal/src/metal_backend.mm, TransientAllocator): an allocation over half a chunk (2 MB) gets
+  a buffer of its own, kept with the chunks of the command buffer until it completes; there every buffer whose length
+  was a chunk's (4 MB) went back to the free list for reuse. A large upload of exactly 4 MB (a 1024x1024 or 1280x819
+  A8R8G8B8 target's staging copy or texels, a carry's) is one: it was kept as a chunk, never used again (large uploads
+  take buffers of their own), and the next frame's carries made new ones. Four 4 MB carries a frame at 60 fps: the 1 GB
+  a second.
+- **The fix**: the large uploads' own buffers are kept apart from the chunks and released when their command buffer
+  completes, whatever their length; the free list keeps 128 chunks (512 MB) at most and gives a larger peak back.
+  Assassin's Creed's run again (carry on, 330 s): to its timeout, footprint 0.45 to 1.30 GB, the GPU's memory 411 to 465
+  MB, the garden at 56 to 60 fps.
+- **--max-footprint GB** (pspocket-boot): the run stops once the process's footprint passes it, checked four times a
+  second; its summary's exit is "footprint" (scripts/triage.py's bucket of that name). A leak no longer fills the swap
+  and the disk (the Mac was at 6.7 GB free with 43 GB of swap).
+- Tests: tests/rsx/test_transient.mm (frames of four large uploads of exactly 4 MB, of 4 MB less a page, of 6 MB and
+  six small ones: the free list and the GPU's memory stay where they were after 200 frames; a command buffer of 150
+  chunks gives back all but 128). With the old allocator the free list reached 841 chunks and the test fails.
+- Found on the way: the test thread needs an autorelease pool for Metal's own objects to go (as the backend's draw,
+  clear and flip have); and Assassin's Creed's two 5 s windows at 2.2 and 0.8 fps of 2026-10-16 (D-1041) are not this
+  leak (the footprint was 0.5 GB then); one window at 5.8 fps showed in this run at about 200 s, still to look at.

@@ -60,15 +60,25 @@ public:
     u64 generation() const { return generation_; }
     // What the command buffer being recorded holds (chunks and buffers of its own) until it is retired (D-148).
     u64 bytes_in_use() const { return bytes_in_use_; }
+    // The chunks waiting to be reused, and those of the buffer being recorded (PSPOCKET_RSX_MEMTRACE, D-1047).
+    usize free_chunks() const
+    {
+        std::lock_guard lock(*free_mutex_);
+        return free_->size();
+    }
+    usize in_use() const { return in_use_.size() + own_.size(); }
 
 private:
     static constexpr u32 kChunkSize = 4u << 20;
+    // Chunks kept for reuse at most (D-1047): a peak above it is given back to the system.
+    static constexpr usize kMaxFreeChunks = 128;
     u64 generation_ = 0;
     u64 bytes_in_use_ = 0;
     id<MTLDevice> device_ = nil;
     id<MTLBuffer> current_ = nil;
     u32 offset_ = 0;
-    std::vector<id<MTLBuffer>> in_use_;
+    std::vector<id<MTLBuffer>> in_use_; // 4 MB chunks: back to the free list when their command buffer completes
+    std::vector<id<MTLBuffer>> own_;    // large uploads' own buffers: released then (D-1047)
     std::shared_ptr<std::mutex> free_mutex_ = std::make_shared<std::mutex>();
     std::shared_ptr<std::vector<id<MTLBuffer>>> free_ = std::make_shared<std::vector<id<MTLBuffer>>>();
 };

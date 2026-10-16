@@ -12,7 +12,7 @@ target_include_directories(test_rsx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(TARGET pspocket::rsx_metal)
     enable_language(OBJCXX)
     pspocket_add_test(test_rsx_metal
-        SOURCES test_metal.mm test_edge_metal.mm
+        SOURCES test_metal.mm test_edge_metal.mm test_transient.mm
         LIBS pspocket::rsx_metal)
     target_include_directories(test_rsx_metal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(test_rsx_metal PRIVATE -fobjc-arc)

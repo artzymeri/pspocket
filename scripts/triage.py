@@ -46,6 +46,9 @@ BUCKETS = {
                         "translate it: --ppu-landings FILE, then pspocket-prepare --ppu-continuations FILE (D-255)"),
     "stubs": (4, "functions answered as RPCS3's stubs", "check whether the game needs more than the stub's answer"),
     "slow": (4, "slow: frames under 25 a second for most of the run", "profile the scene (docs/improve.md)"),
+    "footprint": (1, "the memory footprint passed --max-footprint (a leak)",
+                  "the 5 s lines' memory says when it began to grow; the Metal backend's window lines (textures, "
+                  "surfaces, GPU MB) and alarms say what grew; A/B the switch of what changed (D-1047)"),
     "unknown_exit": (1, "the run ended without a summary or a reason", "rerun with --summary; look at the log's end"),
     "clean": (9, "nothing found", "none"),
 }
@@ -78,6 +81,8 @@ class Triage:
             self.add("fault", detail or "the run ended on a fault")
         elif exit_ == "fatal":
             self.add("fatal", detail or "the run ended on a fatal error")
+        elif exit_ == "footprint":
+            self.add("footprint", detail)
         elif exit_ in ("deadlock", "freeze", "livelock"):
             self.add(exit_, detail)
         elif exit_ not in ("timeout", "exited"):

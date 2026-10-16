@@ -60,6 +60,8 @@
 // summary. --stop-on-stall ends the run at the first (its summary's exit names it). The summary is written on every
 // way the run ends: its timeout, the game's exit, a fault, a fatal error, a stall; with the gaps by name, the
 // interpreters' shares, the milestones and the stalls. scripts/triage.py sorts a summary and its log into buckets.
+// --max-footprint GB stops the run (exit "footprint" in its summary) once the process's memory footprint passes GB,
+// checked four times a second: a leak ends the run before the host's swap fills its disk (D-1047).
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
 // as the phone does) instead of the translation built into this program: its PPU functions and SPU programs, for the
 // executable it was made from only; a library made for another runtime or executable stops the run. With
@@ -179,7 +181,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
-        "                     [--freeze S] [--deadlock S] [--livelock S] [--stop-on-stall]\n"
+        "                     [--freeze S] [--deadlock S] [--livelock S] [--stop-on-stall] [--max-footprint GB]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
         "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none] [--ppu-landings FILE]\n"
@@ -1084,6 +1086,7 @@ int main(int argc, char** argv)
     // The watchdog (D-1043): --freeze S, --deadlock S, --livelock S (0: that check off), --stop-on-stall.
     double freeze_s = 10, deadlock_s = 5, livelock_s = 0;
     bool stop_on_stall = false;
+    double max_footprint_gb = 0; // --max-footprint GB: the run stops when the process's footprint passes it (D-1047)
     hle::PadAnchor press_base; // a press file's "wait:" step (D-1042)
     const auto add_press = [&](std::string_view spec) {
         std::string error;
@@ -1200,6 +1203,10 @@ int main(int argc, char** argv)
             if (a == "--livelock" && livelock_s > 0) gpu = "metal"; // its frames' hashes come from the captures
         } else if (a == "--stop-on-stall") {
             stop_on_stall = true;
+        } else if (a == "--max-footprint") {
+            const char* v = value();
+            if (!v || std::atof(v) <= 0) return usage();
+            max_footprint_gb = std::atof(v);
         }
         else if (a == "--audio") audio = true;
         else if (a == "--spu-dump") { const char* v = value(); if (!v) return usage(); spu_dump = v; }
@@ -1798,6 +1805,20 @@ int main(int argc, char** argv)
             Clock::duration::zero())));
         const auto now = Clock::now();
         if (done || now >= deadline || stall_stop.load()) break;
+        if (max_footprint_gb > 0) { // a leak stops the run before the host swaps (D-1047)
+            if (const double gb = footprint_mb() / 1024; gb > max_footprint_gb) {
+                const std::string why = std::format("memory footprint {:.2f} GB over the --max-footprint {:.2f} GB",
+                    gb, max_footprint_gb);
+                PS_LOG_ERROR("boot", "{}: stopping the run", why);
+                {
+                    std::lock_guard lock(stall_mutex);
+                    stall_exit = "footprint";
+                    stall_detail = why;
+                }
+                stall_stop = true;
+                break;
+            }
+        }
         const u64 flips_now = kernel.rsx() ? kernel.rsx()->flip_count() : 0;
         if (log_first_calls) {
             std::erase_if(not_called_yet, [&](const hle::LinkedFunction* f) {
