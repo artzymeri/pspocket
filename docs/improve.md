@@ -7,6 +7,30 @@ and is struck through. Rule 8 holds: an optimization starts from a measurement a
 Main source so far: the iPhone 17 Pro Max session of 2026-10-05 17:13-17:18 (GTA V, D-144 and D-145 installed;
 2 performance and 4 efficiency cores, a GPU budget of 33 ms a frame at 30 fps).
 
+## The bulletproof plan (green-lit 2026-10-16)
+
+The user: problems must be found and fixed automatically, for any game. The plan
+(https://claude.ai/artifact/DDu44gkuiZwVis8DRH9GR1): five nets over about ten weeks, three agents and the main session.
+
+1. **Known fixes** (week 1): the sea (GET_REPORT's pad written before the count, GTA V's water skips itself), the sky
+   (targets sharing memory lose bytes; unwritten targets read stale pooled textures; visibility counters run out
+   silently) — agent h1; the waker-goes-first rule for every wake, thread start, flip pacing, GTA IV's cellGcmSys
+   0xb70b4ad3 (an alias of _cellGcmInitBody with the fifth argument) — agent h2.
+2. **Graphics reference**: alarm counters always on and gate-checked, an exact RSX mode (PSPOCKET_RSX_EXACT, Mac),
+   capture and replay with automatic bisection to the draw and the fast-path feature, fast/exact A/B draw signatures —
+   agent h1 after the fixes.
+3. **Shake mode**: seeded perturbation at about fifteen choke points, two labelled families, delta debugging;
+   first game-time press scripts, a Mac freeze/deadlock detector, the summary on every exit path, triage.py — agent h2.
+4. **Any game**: imports nothing answers named at load and the app refuses with a message (D-1061, done);
+   scripts/nid_audit.py sorts Sony's exports pspocket lacks by their code and finds aliases (D-1062, done: 8 aliases of
+   named functions, GTA IV's among them); next: the audit before play in the library, the aliases and constants
+   implemented, a list across every game, bringup.sh.
+5. **Bench and reports**: scripts/bench.py with GTA V's and Assassin's Creed's cases from saves and fresh installs,
+   checked by scripts/bench_check.py (D-1060, D-1063: partly black frames, new messages, CPU ms a frame against a
+   rolling baseline); FrameWatch detectors shared by the Mac and the phone (D-1064); the app's glitch reports with a
+   flag button, ios.sh pull-reports and pull-save (D-1065). Next: the backend's per-frame thumbnail feeding the
+   detectors (asked of h1), routes on game time (h2), the nightly run, more cases.
+
 ## The last 10% to a steady 30 (research, 2026-10-15 evening)
 
 After run 332 (EDGE on the GPU, D-990: busy city 27.1 fps, 159 ms of CPU a frame), two research tracks over the phone
