@@ -16776,3 +16776,115 @@ one worker thread ran all six fibers before the other thread entered cellFiberPp
 test's Shutdown came first, and the late RunFibers returned CELL_FIBER_ERROR_STAT, as Sony's does for a control no
 longer initialized. The library is right; the test now waits (up to 10 s) until the control word's worker count is 2
 before Finalize and Shutdown. 40 of 40 runs pass.
+## D-1021 · 2026-10-16 · ZPASS reports written whole once the GPU has counted, the ready word last
+
+- **The race** (research of 2026-10-16): `m_get_report` wrote a ZPASS_PIXEL_CNT report's timestamp and its pad (0)
+  when the method ran, through `defer()`, while the count came frames later from the render buffer's completion
+  handler. GTA V's queries (EBOOT 0xB21908 begin: count 0, pad 1 from the CPU; 0xB21A00 end; 0xB21AD0 "ready" iff
+  pad == 0) read such a report as counted and took its zero: the water module (0x116BE0C/0x116BEF4, 0x116BF58),
+  the coronas (0x110CC08) and the light shafts (0x11738C0) all decide on it.
+- **Now** the backend writes the whole 16-byte report in the completion handler: the timestamp (`Rsx::timestamp_ns()`
+  then), the count, and the pad last with a release store (`Backend::report_zpass(value_addr, whole)`). The front end
+  writes nothing for such a report. Non-ZPASS reports (ZCULL stats) and backends that do not count are as before.
+- `PSPOCKET_RSX_EARLY_REPORTS=1` (or `Config::early_reports`) keeps the old order, for A/B runs; the alarm
+  `reports_early` (D-1022) counts each report made ready before its count.
+- Measured on the skyfall-sea route from the user's save (run early1, the old order): **46,086 reports made ready
+  before their count** in 250 s (about 9 a frame); with the fix (runs fix1, fix3): 0.
+- **What it did not fix**: the black block over the near sea (the bench's r6 frame 5160) reproduces with F1 on (run
+  fix3 frames 5430/5460, and every trace-on-black run, D-1028): the water's depth pre-pass is drawn, the water
+  surface draws after it do not land on it (being investigated, see the report of this session). GTA V's GPU timer
+  (0xB4C120) now reads completion-time stamps: no fps change seen on the route (fix3: median 29.6 fps).
+- Test: metal e2e "a ZPASS report is ready only once the GPU has counted it, written whole" (both orders: the pad stays
+  1 until the GPU has run the draws; the old order makes it ready with the old zero and counts the alarm).
+
+## D-1022 · 2026-10-16 · RSX correctness alarms, always on
+
+- `pspocket/rsx/alarms.hpp`: relaxed atomic counters in the `Rsx` (`Rsx::alarms()`), bumped where the thing happens,
+  for what can show on screen as a wrong picture: `reports_early` (D-1021), `targets_lost` / `targets_lost_kb` (a
+  GPU-newer target removed with no copy of its bytes, or the part of it outside the target that took its memory,
+  D-1025), `uninit_sampled` (a target nobody drew or cleared sampled as a texture, D-1023), `conditional_pending` (a
+  conditional draw decided while its report was pending, D-115), `occlusion_overflow` (a query with no counter left,
+  D-1024), `dead_overlays` (a colour target laid over a compressed texture: memory the GPU cannot have written in that
+  form, the phone's DXT1 texture over a 32x16 target).
+- Reported in the backend's 300-frame line ("alarms (last 300): ..." with the targets carried a frame), in
+  `WindowStats::alarms`, in pspocket-boot's `--summary` (`"alarms"` totals and per window) and its end-of-run line
+  ("RSX alarms: ..."). `scripts/gate_check.py` checks `checks.alarms_max` limits of games/<title>/gate.json.
+- On the skyfall-sea route (fix3, 290 s): reports_early 0, uninit_sampled 0, occlusion_overflow 0, dead_overlays 0,
+  conditional_pending 2,125, targets_lost 79,466 (36 GB in all: the part of GTA V's overlapping scratch targets at
+  0xcd220000-0xcd5fffff outside the next target there, about 12 a frame; see D-1025).
+
+## D-1023 · 2026-10-16 · A target nobody drew yet is sampled as guest memory holds it
+
+- `bind_texture` sampled the texture of a target found at the address even when it was never drawn or cleared
+  (`Surface::initialized` false): a target made for draws that were all skipped (their programs compiling, D-158)
+  holds a removed target's pixels when its texture came from the pool (D-984). Such a target is now passed over and
+  the texture decoded from guest memory (with the GPU-newer targets there laid over, D-137, D-214).
+- `PSPOCKET_RSX_UNINIT_TARGETS=1` samples them as before; the alarm `uninit_sampled` counts it.
+- Test: metal e2e "a target nobody drew yet is sampled as guest memory holds it, not its pooled texture" (fails with
+  the switch: the pooled texture's red shows).
+
+## D-1024 · 2026-10-16 · Occlusion counters grow when a command buffer runs out
+
+- A render buffer had 4,096 counters (`kVisibilitySlots`); a query past them counted nothing and the draw it guarded
+  was skipped. Now a draw that would need a counter when none is left sends the buffer so far to the GPU (at the
+  draw's start, before it allocates anything in it) and the next buffers have twice the counters
+  (`MetalBackendConfig::occlusion_counters`, 4,096 to start); logged, and counted (`occlusion_overflow`, D-1022).
+  GTA V never ran out on the routes (0).
+- Test: metal e2e "occlusion queries past a command buffer's counters still count" (one counter to start, three
+  queries: all count the triangle).
+
+## D-1025 · 2026-10-16 · A new target over GPU-newer targets of other formats starts with their bytes
+
+- **The sky** (phone trace 2815, research of 2026-10-16): GTA V packs its depth into an A8B8G8R8 640x360 target at
+  0xcd260000 (#2787), then uses that memory as a Z24S8 depth buffer (#2806+). `get_depth_surface` evicted the colour
+  target and made a depth buffer cleared to 1.0: the clouds and sky were tested against nothing. The same memory holds
+  F16 320x180, A8B8G8R8 320x320 and 640x360 targets in one frame, each replacing the one before.
+- **Now** `get_color_surface` and `get_depth_surface` make the new target first, then (`carry_into`) lay the GPU-newer
+  targets it replaces over a staging copy of its memory with D-137's `rsx_*_to_memory` kernels (oldest first; guest
+  memory first unless one of them covers it all) and convert that into its texels on the GPU
+  (`rsx_memory_to_surface`, the inverse of `upload_surface_bytes`: depth as float plus stencil, then blits), then
+  evict them. The new target is initialised and newer on the GPU. A larger target over a smaller one of its format
+  (D-120's grow) goes the same way when the smaller one is newer on the GPU. `PSPOCKET_RSX_NO_CARRY=1`: off.
+- What lies outside the new target of a replaced one is still lost (the alarm counts it: about 12 a frame in GTA V,
+  0xcd260000's 640x360 replaced by 0xcd300000's 128x128 and the like). Writing those parts back would be a
+  readback a frame each; left for the exact mode (D-1030) to tell whether it matters.
+- On the route: 13 to 19 targets a frame carried; GPU time and passes within the run-to-run spread (fix3 10.2 ms,
+  87 passes; base2 10.5 ms, 88 passes).
+- Tests: metal e2e "a depth buffer made over a colour target holds the target's bytes" (0x11223344 cleared as
+  A8R8G8B8 reads back as depth 0x112233, stencil 0x44; cleared to 1.0 without the carry) and "a colour target over a
+  smaller one of another format carries its bytes, the rest from memory" (F16 halves 0x3C00 above, memory's bytes
+  below).
+
+## D-1026 · 2026-10-16 · A draw with a signed blend waits for its program instead of the interpreter
+
+- The shader interpreter (D-940) blends as Metal does; the signed equations (D-948) are blended in the translated
+  shader only, so the interpreter drew ADD_SIGNED as add (the bench's skyfall run: "blend equation 0xf006/0xf006
+  (signed) drawn as add (the shader interpreter's draw ...)", an RSX failure). Such a draw is now skipped while its
+  programs compile (counted with the draws waiting), as draws were before the interpreter; `force_interpreter`
+  still draws it.
+- Test: metal e2e "a draw with a signed blend equation waits for its program, not drawn by the interpreter".
+
+## D-1027 · 2026-10-16 · A 64x36 thumbnail of every flip from the GPU
+
+- `MetalBackendConfig::thumbnail` (`ThumbnailCallback = std::function<void(const u8* bgra64x36, u64 flip_index)>`,
+  `kThumbnailWidth` 64, `kThumbnailHeight` 36): set, every flip's presented image is box-filtered on the GPU
+  (`rsx_thumbnail`, 2,304 threads, each its box's mean, as pspocket-boot's compare_frame computed it on the CPU) into a
+  9 KB shared buffer handed over from the frame's completion handler. Nothing waits on the RSX thread: cheap enough
+  for every frame on the phone (the main session's glitch detectors read it, D-1064).
+- pspocket-boot's `--frame-jumps` uses it (the frames `--frame-every` names), so it no longer needs whole frames read
+  back; `--frames` still captures them.
+- Test: metal e2e "every flip gives a 64x36 thumbnail from the GPU, the image's box means" (the same bytes as the CPU's
+  box filter of the captured image).
+
+## D-1028 · 2026-10-16 · Finding a glitch's draw: the flip clock, trace on black, per-draw probes
+
+- `PSPOCKET_PRESS_CLOCK=flips`: pspocket-boot's scripted presses go by the game's frames (flips / 30), not the wall
+  clock, so a route lands nearer where it did when the Mac is loaded (the research bench's timed presses went
+  elsewhere as often as not; with the flip clock the skyfall-sea route reached the sea in 7 of 8 runs, on the wall clock in 2 of 4).
+- `PSPOCKET_TRACE_ON_BLACK=FLIP` (with `--frames`): the first thumbnail (D-1027) from FLIP on with two fifths of its
+  lower half exactly black and under a tenth of its upper half asks for a frame trace (`MetalBackend::trace_next_frame`)
+  into DIR/trace-<flip>.
+- `PSPOCKET_RSX_TRACE_PROBE=X,Y`: in a traced frame, after each draw, the pixel at (X, Y) of a 1280x720 screen
+  (scaled) of each of the draw's targets is read back and logged: the draw that made a pixel what it is.
+- The frame trace also names conditional-rendering skips (`Backend::draw_skipped`), the RSX's NV0039 and NV3089 copies
+  (`Backend::trace_note`), each draw's depth test, depth write, stencil and vertex program start.

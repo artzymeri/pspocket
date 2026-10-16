@@ -113,6 +113,8 @@ void TransientAllocator::retire(id<MTLCommandBuffer> cb)
 
 bool MetalBackend::Impl::init()
 {
+    visibility_slots = std::max<u32>(1, config.occlusion_counters); // D-1024
+    if (const char* v = std::getenv("PSPOCKET_RSX_NO_CARRY"); v && *v && std::strcmp(v, "0") != 0) carry_on = false; // D-1025
     device = config.device ? (__bridge id<MTLDevice>)config.device : MTLCreateSystemDefaultDevice();
     if (!device) {
         PS_LOG_ERROR(kChan, "no Metal device: the RSX backend drops all GPU work");
@@ -148,6 +150,10 @@ bool MetalBackend::Impl::init()
                                                                   error:&error];
     depth_memory_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_depth_to_memory"]
                                                                   error:&error];
+    memory_surface_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_memory_to_surface"]
+                                                                    error:&error];
+    thumbnail_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_thumbnail"]
+                                                               error:&error];
     if (!edge_init()) edge_pipeline = nil; // EDGE geometry stays on the SPUs (D-988)
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
@@ -155,7 +161,8 @@ bool MetalBackend::Impl::init()
     blit.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
     if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !decode3d_pipeline || !blit_pipeline ||
-        !color_memory_pipeline || !float_memory_pipeline || !depth_memory_pipeline) {
+        !color_memory_pipeline || !float_memory_pipeline || !depth_memory_pipeline || !memory_surface_pipeline ||
+        !thumbnail_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -298,8 +305,8 @@ id<MTLCommandBuffer> MetalBackend::Impl::render_buffer()
         render_cb.label = @"rsx render";
         stats.command_buffers++;
         // Its occlusion counters (D-102), zeroed: a pass only writes the counters it counted into.
-        visibility = [device newBufferWithLength:kVisibilitySlots * 8 options:MTLResourceStorageModeShared];
-        std::memset(visibility.contents, 0, kVisibilitySlots * 8);
+        visibility = [device newBufferWithLength:visibility_slots * 8 options:MTLResourceStorageModeShared];
+        std::memset(visibility.contents, 0, visibility_slots * 8);
         visibility_next = 0;
         pass_zpass_slot = -1;
     }
@@ -341,7 +348,11 @@ void MetalBackend::Impl::submit(bool wait)
                 u64 count = 0;
                 for (const VisibilitySlot& s : r.slots) count += static_cast<const u64*>(s.buffer.contents)[s.index];
                 const u32 value = static_cast<u32>(std::min<u64>(count, 0xFFFFFFFFull));
+                // The whole report (D-1021): {timestamp, count, pad} as RPCS3's get_report lays it out, the pad (the
+                // ready word GTA V polls) last, released after the rest.
+                if (r.whole) ps_write64(guest, r.value_addr - 8, Rsx::timestamp_ns());
                 __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr), ps_bswap32(value), __ATOMIC_RELEASE);
+                if (r.whole) __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr + 4), 0u, __ATOMIC_RELEASE);
                 std::lock_guard lock(in_flight->mutex);
                 if (auto it = in_flight->count.find(r.value_addr); it != in_flight->count.end() && --it->second == 0)
                     in_flight->count.erase(it);
@@ -1491,6 +1502,18 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         take_async();
     }
     decode_textures(state); // D-954
+    // Occlusion counters (D-102): a query with none left in this render buffer's visibility buffer would count nothing
+    // (and conditional rendering would skip what it guards). The buffer so far goes to the GPU, before this draw
+    // allocates anything in it, and the next one has twice the counters (D-1024).
+    if (zpass_on && render_cb && visibility_next >= visibility_slots && !(pass_started && pass_zpass_slot >= 0)) {
+        if (rsx) rsx->alarms().add(Alarm::OcclusionOverflow);
+        if (visibility_slots < (1u << 20)) {
+            visibility_slots *= 2;
+            PS_LOG_INFO(kChan, "occlusion queries: {} counters in one command buffer were not enough (flip {}): the "
+                "buffer goes to the GPU, the next ones have {}", visibility_slots / 2, stats.flips, visibility_slots);
+        }
+        submit(false);
+    }
 
     // ---- targets and programs ----
     PassTargets targets;
@@ -1606,6 +1629,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         interpret = true;
     }
     if (interpret && !interp_vp) return skip("");
+    // The interpreter blends as Metal can (D-940): a signed equation, which the translation blends in its shader
+    // (D-948), would be drawn as add. Such a draw waits for its programs, as draws did before the interpreter (D-1026).
+    if (interpret && fo.blend_in_shader && !force_interpreter) {
+        skip_reason = "signed blending waits for the program";
+        stats.draws_compiling++;
+        return skip("");
+    }
     // The units the programs sample and the attributes they read: the decoded programs' when the interpreter draws.
     const u32 fp_textures = interpret ? fprog->texture_mask : fp->shader.texture_mask;
     const u32 vp_textures = interpret ? interp_vp_textures : vp->shader.texture_mask;
@@ -1746,10 +1776,13 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             blend = std::format("eq {:#x}/{:#x} src {:#x}/{:#x} dst {:#x}/{:#x} mrt {:#x}", b.equation_rgb, b.equation_a,
                 b.sfactor_rgb, b.sfactor_a, b.dfactor_rgb, b.dfactor_a, b.enable_mrt);
         }
-        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{}{} ->{}; fp {:#010x}; mask {:x}{:x}{:x}{:x}; blend {};{}", ++trace_count,
-            static_cast<u32>(d.primitive), vertices,
+        const std::string zs = !ds.depth_test ? std::string("off")
+            : std::format("{:#x}{}", ds.depth_func, ds.depth_write ? "" : " no write");
+        PS_LOG_INFO("rsx.trace", "#{} draw prim {} x{}{} ->{}; fp {:#010x} vp {:#x}; mask {:x}{:x}{:x}{:x}; z {}{}; blend {};{}",
+            ++trace_count, static_cast<u32>(d.primitive), vertices,
             d.inline_words.empty() ? std::string() : std::format(" (inline array, {} words)", d.inline_words.size()),
-            describe_targets(targets), fp_ea, cm.mask[0], cm.mask[1], cm.mask[2], cm.mask[3], blend, trace_tex);
+            describe_targets(targets), fp_ea, state.reg(m::NV4097_SET_TRANSFORM_PROGRAM_START), cm.mask[0], cm.mask[1],
+            cm.mask[2], cm.mask[3], zs, ds.stencil_test ? "; stencil on" : "", blend, trace_tex);
     }
 
     // ---- vertex parameters: viewport transform into Metal NDC for this surface
@@ -2164,9 +2197,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     id<MTLRenderCommandEncoder> enc = start_encoder();
     // Occlusion counting (D-102): this pass's counter for the current query.
     if (zpass_on) {
-        if (pass_zpass_slot < 0 && visibility_next < kVisibilitySlots) {
+        if (pass_zpass_slot < 0 && visibility_next < visibility_slots) {
             pass_zpass_slot = static_cast<s32>(visibility_next++);
             zpass_slots.push_back({visibility, static_cast<u32>(pass_zpass_slot)});
+        } else if (pass_zpass_slot < 0 && rsx) {
+            rsx->alarms().add(Alarm::OcclusionOverflow); // D-1022: the query counts nothing in this pass
         }
         if (pass_zpass_slot >= 0 && encoder_zpass_slot != pass_zpass_slot) {
             [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:static_cast<NSUInteger>(pass_zpass_slot) * 8];
@@ -2557,6 +2592,24 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
             capture(static_cast<const u8*>(readback.contents), w, h, index);
         }];
     }
+    if (config.thumbnail) {
+        // The frame as 64x36, every flip (D-1027): a box filter on the GPU into a small shared buffer.
+        id<MTLBuffer> thumb = [device newBufferWithLength:kThumbnailWidth * kThumbnailHeight * 4
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLComputeCommandEncoder> te = [cb computeCommandEncoder];
+        [te setComputePipelineState:thumbnail_pipeline];
+        [te setTexture:output atIndex:0];
+        [te setBuffer:thumb offset:0 atIndex:0];
+        const u32 size[4] = {kThumbnailWidth, kThumbnailHeight, 0, 0};
+        [te setBytes:size length:sizeof(size) atIndex:1];
+        [te dispatchThreads:MTLSizeMake(kThumbnailWidth, kThumbnailHeight, 1) threadsPerThreadgroup:MTLSizeMake(8, 4, 1)];
+        [te endEncoding];
+        ThumbnailCallback callback = config.thumbnail;
+        const u64 index = request.flip_index;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusCompleted) callback(static_cast<const u8*>(thumb.contents), index);
+        }];
+    }
     frame_event_value++;
     [cb encodeSignalEvent:frame_event value:frame_event_value];
     if (trace_requested.exchange(false, std::memory_order_acq_rel) && !tracing) config.trace_frame = request.flip_index + 1;
@@ -2653,6 +2706,7 @@ void MetalBackend::draw(const RsxState& state)
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_draw(state);
+        if (impl_->tracing) impl_->trace_probe(); // PSPOCKET_RSX_TRACE_PROBE (D-1028)
         // A frame's uploads stay allocated until the GPU has run its command buffer: past the budget it goes now, so
         // the GPU starts on it and gives it back sooner (D-148).
         if (impl_->transient.bytes_in_use() > impl_->config.transient_budget) {
@@ -2726,6 +2780,11 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         w.surface_mb = static_cast<double>(m.surface_bytes()) / 1048576.0;
         w.gpu_allocated_mb = static_cast<double>(m.device.currentAllocatedSize) / 1048576.0;
         w.deferred_queue = m.deferred.size();
+        if (m.rsx) {
+            const AlarmCounts now = m.rsx->alarms().snapshot();
+            w.alarms = now - m.report_alarms;
+            m.report_alarms = now;
+        }
         PS_LOG_INFO(kChan, "per frame (last {}): GPU {:.2f} ms, {:.0f} draws, {:.0f} render passes (ended by {}; "
                            "attachments {:.1f} MB loaded, {:.1f} MB stored, {:.1f} MB not (the next pass clears them); "
                            "{:.1f} passes only clearing, {:.1f} MB stored by them; {:.1f} clears a later pass's load "
@@ -2754,6 +2813,15 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             w.feedback_copies, w.depth_bounds_draws, w.corner_textures,
             per_frame(m.stats.pooled_textures_taken, m.report_pooled), w.surface_reloads, w.gpu_wait_ms, w.gpu_allocated_mb,
             w.deferred_queue);
+        {
+            // The correctness alarms (D-1022): each line that is not zero, in the window.
+            std::string raised;
+            for (usize i = 0; i < kAlarmNames.size(); i++)
+                if (w.alarms.v[i]) raised += std::format("{}{} {}", raised.empty() ? "" : ", ", kAlarmNames[i], w.alarms.v[i]);
+            PS_LOG_INFO(kChan, "alarms (last {}): {}; {:.2f} targets a frame started with the bytes of those under them",
+                w.flips, raised.empty() ? "none" : raised, per_frame(m.stats.targets_carried, m.report_carried));
+            m.report_carried = m.stats.targets_carried;
+        }
         // The draws that sampled a target they drew to (D-947): copies made and why, copies kept as the texture
         // cache, the game's invalidations, and the draws behind most of them.
         if (w.feedback_copies + w.feedback_reused >= 1.0) {
@@ -2874,6 +2942,58 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
         m.report_draws = m.stats.draws;
         m.report_passes = m.stats.render_passes;
     }
+}
+
+// PSPOCKET_RSX_TRACE_PROBE=X,Y (a debugging aid, D-1028): in a traced frame, after each draw, the pixel at (X, Y) of a
+// 1280x720 screen (scaled to each target's size) of the draw's targets, read back at once: which draw made it what.
+void MetalBackend::Impl::trace_probe()
+{
+    static const std::pair<int, int> at = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_TRACE_PROBE");
+        int x = -1, y = -1;
+        if (v) std::sscanf(v, "%d,%d", &x, &y);
+        return std::pair<int, int>{x, y};
+    }();
+    if (at.first < 0 || (!draw_targets.color_count && !draw_targets.depth)) return;
+    end_pass_for(kEndFlush);
+    submit(true);
+    std::string line;
+    const auto probe = [&](Surface* s) {
+        if (!s || !s->initialized) return;
+        const u32 x = std::min<u32>(s->width - 1, static_cast<u32>(at.first) * s->width / 1280);
+        const u32 y = std::min<u32>(s->height - 1, static_cast<u32>(at.second) * s->height / 720);
+        u32 bpp = 4;
+        MTLBlitOption o = MTLBlitOptionNone;
+        switch (s->pixel_format) {
+        case MTLPixelFormatR8Unorm: bpp = 1; break;
+        case MTLPixelFormatRG8Unorm: case MTLPixelFormatDepth16Unorm: bpp = 2; break;
+        case MTLPixelFormatRGBA16Float: bpp = 8; break;
+        case MTLPixelFormatRGBA32Float: bpp = 16; break;
+        case MTLPixelFormatDepth32Float_Stencil8: o = MTLBlitOptionDepthFromDepthStencil; break;
+        default: break;
+        }
+        id<MTLBuffer> buf = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
+                   sourceSize:MTLSizeMake(1, 1, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:bpp
+      destinationBytesPerImage:bpp options:o];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const u8* b = static_cast<const u8*>(buf.contents);
+        line += std::format(" {:#010x}{}:", s->address, s->depth ? "(z)" : "");
+        if (s->depth && bpp == 4) {
+            float z;
+            std::memcpy(&z, b, 4);
+            line += std::format("{:.6f}", z);
+        } else {
+            for (u32 i = 0; i < bpp; i++) line += std::format("{:02x}", b[i]);
+        }
+    };
+    for (u32 i = 0; i < draw_targets.color_count; i++) probe(draw_targets.color[i]);
+    probe(draw_targets.depth);
+    PS_LOG_INFO("rsx.trace", "  probe ({},{}) after #{}:{}", at.first, at.second, trace_count, line);
 }
 
 void MetalBackend::sync()
@@ -3084,14 +3204,29 @@ void MetalBackend::clear_zpass()
     impl_->pass_zpass_slot = -1; // a new counter, even in the same pass
 }
 
-bool MetalBackend::report_zpass(u32 value_addr)
+bool MetalBackend::report_zpass(u32 value_addr, bool whole)
 {
     if (!impl_->device) return false;
-    impl_->pending_reports.push_back({value_addr, impl_->zpass_slots});
+    impl_->pending_reports.push_back({value_addr, impl_->zpass_slots, whole});
     impl_->stats.occlusion_reports++;
     std::lock_guard lock(impl_->reports_in_flight->mutex);
     impl_->reports_in_flight->count[value_addr]++;
     return true;
+}
+
+void MetalBackend::draw_skipped(const RsxState& state, std::string_view why)
+{
+    Impl& m = *impl_;
+    if (!m.tracing) return;
+    PS_LOG_INFO("rsx.trace", "#{} draw SKIPPED ({}): prim {} fp {:#x}", ++m.trace_count, why,
+        static_cast<u32>(state.draw.primitive), state.shader_program().offset);
+}
+
+bool MetalBackend::tracing() const { return impl_->tracing; }
+
+void MetalBackend::trace_note(std::string_view what)
+{
+    if (impl_->tracing) PS_LOG_INFO("rsx.trace", "  {}", what);
 }
 
 bool MetalBackend::report_pending(u32 value_addr)

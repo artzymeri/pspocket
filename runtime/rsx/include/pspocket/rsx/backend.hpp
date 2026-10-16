@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <optional>
+#include <string_view>
 
 #include "pspocket/core/types.hpp"
 #include "pspocket/rsx/state.hpp"
@@ -45,6 +46,12 @@ public:
 
     // A flip: present the display buffer. The backend ends the frame and hands the image to the host.
     virtual void flip(const FlipRequest& request, const RsxState& state) = 0;
+
+    // A draw the front end left out (conditional rendering's zero report, D-102), for the backend's frame trace.
+    virtual void draw_skipped(const RsxState& state, std::string_view why) { (void)state, (void)why; }
+    // The frame trace is on (tracing()): a line about something else the RSX did there (a memory copy).
+    virtual bool tracing() const { return false; }
+    virtual void trace_note(std::string_view what) { (void)what; }
 
     // Wait until every command submitted so far has finished on the GPU (NV4097_WAIT_FOR_IDLE, label writes when
     // Config::sync_on_label is set).
@@ -94,12 +101,14 @@ public:
     // and stencil tests on and off, NV4097_CLEAR_REPORT_VALUE(ZPASS_PIXEL_CNT) restarts the count, and
     // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) asks for the count since the last restart in the big-endian word at
     // value_addr: the backend writes it once the GPU has it and returns true, or returns false when it does not count
-    // (the front end then writes Config::fake_zpass_count).
+    // (the front end then writes Config::fake_zpass_count). `whole` (D-1021): the backend writes the whole 16-byte
+    // report then, the timestamp at value_addr - 8, the count, and the ready word (pad 0, at value_addr + 4) last, so a
+    // CPU that sees it ready sees the count; otherwise the front end writes the timestamp and pad when the method runs.
     virtual void set_zpass_counting(bool on) { (void)on; }
     virtual void clear_zpass() {}
-    virtual bool report_zpass(u32 value_addr)
+    virtual bool report_zpass(u32 value_addr, bool whole)
     {
-        (void)value_addr;
+        (void)value_addr, (void)whole;
         return false;
     }
     // A ZPASS_PIXEL_CNT report whose count has not reached value_addr yet (the GPU has not finished its draws): what is

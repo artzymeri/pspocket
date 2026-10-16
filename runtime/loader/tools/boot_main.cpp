@@ -680,28 +680,18 @@ void summary_sink(void*, log::Level level, std::string_view channel, std::string
     g_summary.messages[std::move(shape)]++;
 }
 
+#if defined(PSPOCKET_HAVE_METAL)
+rsx::metal::MetalBackend* g_metal = nullptr; // the run's backend, for PSPOCKET_TRACE_ON_BLACK (D-1028)
+#endif
+
 // A frame for --frame-jumps: its mean difference from the frame before, 64x36 box-filtered, over 25 a jump (run 088).
-[[maybe_unused]] void compare_frame(const u8* bgra, u32 w, u32 h, u64 flip) // Metal builds only
+// The thumbnail comes from the GPU (MetalBackendConfig::thumbnail, D-1027): BGRA8, each texel its box's mean.
+[[maybe_unused]] void compare_frame(const u8* bgra64x36, u64 flip) // Metal builds only
 {
     constexpr u32 kW = 64, kH = 36;
     std::vector<int> thumb(kW * kH * 3);
-    for (u32 ty = 0; ty < kH; ty++) {
-        const u32 y0 = ty * h / kH, y1 = std::max(y0 + 1, (ty + 1) * h / kH);
-        for (u32 tx = 0; tx < kW; tx++) {
-            const u32 x0 = tx * w / kW, x1 = std::max(x0 + 1, (tx + 1) * w / kW);
-            u64 sum[3] = {};
-            for (u32 y = y0; y < y1; y++) {
-                const u8* row = bgra + (static_cast<usize>(y) * w + x0) * 4;
-                for (u32 x = x0; x < x1; x++, row += 4) {
-                    sum[0] += row[0];
-                    sum[1] += row[1];
-                    sum[2] += row[2];
-                }
-            }
-            const u64 n = u64{y1 - y0} * (x1 - x0);
-            for (u32 c = 0; c < 3; c++) thumb[(ty * kW + tx) * 3 + c] = static_cast<int>(sum[c] / n);
-        }
-    }
+    for (u32 i = 0; i < kW * kH; i++)
+        for (u32 c = 0; c < 3; c++) thumb[i * 3 + c] = bgra64x36[i * 4 + c];
     u32 black = 0;
     for (usize i = 0; i < thumb.size(); i += 3) black += thumb[i] <= 4 && thumb[i + 1] <= 4 && thumb[i + 2] <= 4;
     const double black_share = static_cast<double>(black) / (kW * kH);
@@ -798,6 +788,12 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
     j += "  \"fps\": [";
     for (usize i = 0; i < g_summary.fps.size(); i++) j += std::format("{}{:.1f}", i ? ", " : "", g_summary.fps[i]);
     j += std::format("],\n  \"footprint_peak_mb\": {:.0f},\n", g_summary.peak_footprint_mb);
+    j += "  \"alarms\": {"; // D-1022
+    if (r) {
+        const rsx::AlarmCounts a = r->alarms().snapshot();
+        for (usize i = 0; i < a.v.size(); i++) j += std::format("{}{}: {}", i ? ", " : "", json_string(rsx::kAlarmNames[i]), a.v[i]);
+    }
+    j += "},\n";
     j += std::format("  \"unimplemented_syscalls\": {},\n  \"unimplemented_functions\": {},\n",
         kernel.unimplemented_count(), unimplemented_functions);
     j += std::format("  \"spu_loads\": {{\"lifted\": {}, \"interpreted\": {}, \"images_without_lifted\": {}}},\n",
@@ -824,13 +820,17 @@ bool write_summary(const std::string& path, bool exited, int status, double seco
                          "\"corner_textures\": {:.2f}, \"surface_reloads\": {:.2f}, \"gpu_wait_ms\": {:.2f}, "
                          "\"programs_made\": {}, \"pipelines_made\": {}, \"compile_ms\": {:.1f}, "
                          "\"draws_compiling\": {:.2f}, \"textures\": {}, "
-                         "\"surfaces\": {}, \"gpu_allocated_mb\": {:.0f}, \"deferred_queue\": {}}}",
+                         "\"surfaces\": {}, \"gpu_allocated_mb\": {:.0f}, \"deferred_queue\": {}, \"alarms\": [{}]}}",
             i ? "," : "", w.last_flip, w.gpu_ms, w.draws, w.render_passes, ends, w.attachment_load_mb,
             w.attachment_store_mb, w.attachment_store_skipped_mb, w.clears_folded, w.clears_waited, w.readbacks,
             w.readback_wait_ms,
             w.texture_checks, w.write_faults, w.feedback_copies, w.corner_textures, w.surface_reloads, w.gpu_wait_ms,
             w.programs_made, w.pipelines_made, w.compile_ms, w.draws_compiling, w.textures, w.surfaces, w.gpu_allocated_mb,
-            w.deferred_queue);
+            w.deferred_queue, [&] {
+                std::string a;
+                for (usize k = 0; k < w.alarms.v.size(); k++) a += std::format("{}{}", k ? ", " : "", w.alarms.v[k]);
+                return a;
+            }());
     }
 #endif
     j += "\n  ],\n  \"messages\": {";
@@ -1123,14 +1123,44 @@ int main(int argc, char** argv)
                     g_summary.windows.push_back(w);
                 };
             }
-            if (!frames_dir.empty() || frame_jumps) {
+            if (!frames_dir.empty()) {
                 mc.capture_every = frame_every;
                 mc.capture = [&](const u8* bgra, u32 w, u32 h, u64 flip) {
                     if (flip < frame_from) return;
-                    if (frame_jumps) compare_frame(bgra, w, h, flip);
-                    if (!frames_dir.empty())
-                        frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
+                    frame_writer.push(std::format("{}/frame-{:06}.png", frames_dir, flip), bgra, w, h);
                 };
+            }
+            // PSPOCKET_TRACE_ON_BLACK=FLIP (with --frames, a debugging aid, D-1028): the first frame from FLIP on whose
+            // thumbnail's lower half is two fifths exactly black and upper half under a tenth (GTA V's black sea) is
+            // followed by a frame trace, as --trace-frame makes it, into DIR/trace-<flip>.
+            static std::atomic<u64> trace_on_black{0}, traced_flip{0};
+            if (const char* v = std::getenv("PSPOCKET_TRACE_ON_BLACK"); v && !frames_dir.empty())
+                trace_on_black = std::max<u64>(1, std::strtoull(v, nullptr, 0));
+            if (frame_jumps || trace_on_black) { // the GPU's thumbnails (D-1027), the frames --frame-every names
+                mc.thumbnail = [&](const u8* bgra64x36, u64 flip) {
+                    if (frame_jumps && flip >= frame_from && flip % frame_every == 0) compare_frame(bgra64x36, flip);
+                    const u64 from = trace_on_black.load();
+                    if (!from || flip < from || traced_flip.load()) return;
+                    u32 low = 0, high = 0;
+                    for (u32 i = 0; i < 64 * 36; i++) {
+                        const bool black = !bgra64x36[i * 4] && !bgra64x36[i * 4 + 1] && !bgra64x36[i * 4 + 2];
+                        (i / 64 >= 18 ? low : high) += black;
+                    }
+                    if (low * 5 >= 64 * 18 * 2 && high * 10 < 64 * 18 && g_metal) {
+                        traced_flip = flip + 1;
+                        g_metal->trace_next_frame();
+                        std::printf("PSPOCKET_TRACE_ON_BLACK: flip %llu, %u of the lower half's 1152 thumbnail pixels "
+                            "black: the next frame is traced\n", static_cast<unsigned long long>(flip), low);
+                    }
+                };
+                if (trace_on_black && !trace_frame) {
+                    mc.trace_surface = [&frames_dir](const std::string& name, const u8* bgra, u32 w, u32 h) {
+                        const std::string dir = std::format("{}/trace-{}", frames_dir, traced_flip.load());
+                        std::error_code ec;
+                        std::filesystem::create_directories(dir, ec);
+                        write_png_rgb(dir + "/" + name + ".png", bgra, w, h, w * 4, true);
+                    };
+                }
             }
             if (!frames_dir.empty()) {
                 if (trace_frame) {
@@ -1145,6 +1175,7 @@ int main(int argc, char** argv)
             }
             auto backend = std::make_unique<rsx::metal::MetalBackend>(memory, *tracker, std::move(mc));
             if (!backend->valid()) return nullptr; // no Metal device: the null backend
+            g_metal = backend.get();
             return backend;
         };
     }
@@ -1436,6 +1467,13 @@ int main(int argc, char** argv)
     bool done = false;
     // Scripted presses (--press): which buttons are down is checked every 20 ms while any press is scheduled.
     std::string pad_text;
+    // PSPOCKET_PRESS_CLOCK=flips (D-1028): a press's time is in the game's frames, flips / 30, not the wall clock, so a
+    // route lands where it did whatever else slows the Mac down (the timed presses of the research bench went elsewhere
+    // as often as not).
+    const bool press_by_flips = [] {
+        const char* v = std::getenv("PSPOCKET_PRESS_CLOCK");
+        return v && std::string_view(v) == "flips";
+    }();
     for (;;) {
         auto until = std::min(next_rate, report_every_s > 0 ? std::min(deadline, next_report) : deadline);
         if (!presses.empty()) until = std::min(until, Clock::now() + std::chrono::milliseconds(20));
@@ -1444,7 +1482,9 @@ int main(int argc, char** argv)
         const auto now = Clock::now();
         if (done || now >= deadline) break;
         if (!presses.empty()) {
-            const double t = std::chrono::duration<double>(now - start).count();
+            rsx::Rsx* pr = press_by_flips ? kernel.rsx() : nullptr;
+            const double t = press_by_flips ? (pr ? static_cast<double>(pr->status().flips) / 30.0 : 0.0)
+                                            : std::chrono::duration<double>(now - start).count();
             std::string text; // the buttons down, which decide the controller's state
             for (const hle::PadPress& p : presses)
                 if (p.down_at(t) && text.find(p.button) == std::string::npos) text += (text.empty() ? "" : "+") + p.button;
@@ -1632,6 +1672,13 @@ int main(int argc, char** argv)
             static_cast<unsigned long long>(d.by_wait), static_cast<unsigned long long>(d.by_limit),
             static_cast<double>(d.ns) / 1e6, static_cast<unsigned long long>(d.barriers),
             static_cast<unsigned long long>(d.barrier_limit), static_cast<double>(d.barrier_ns) / 1e6);
+    }
+    if (rsx::Rsx* r = kernel.rsx()) { // the RSX's correctness alarms over the run (D-1022)
+        const rsx::AlarmCounts a = r->alarms().snapshot();
+        std::string line;
+        for (usize i = 0; i < a.v.size(); i++)
+            line += std::format("{}{} {}", i ? ", " : "", rsx::kAlarmNames[i], a.v[i]);
+        std::printf("RSX alarms: %s\n", line.c_str());
     }
     std::printf("unimplemented syscalls called: %llu\n", static_cast<unsigned long long>(kernel.unimplemented_count()));
     std::printf("unimplemented functions called: %zu\n", missing.size());

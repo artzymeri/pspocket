@@ -398,6 +398,8 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> decode3d_pipeline = nil; // rsx_decode_texture3d
     // D-137: a target's pixels as guest bytes into a texture's staging copy of memory (rsx_*_to_memory).
     id<MTLComputePipelineState> color_memory_pipeline = nil, float_memory_pipeline = nil, depth_memory_pipeline = nil;
+    id<MTLComputePipelineState> memory_surface_pipeline = nil; // D-1025: guest bytes into a target (rsx_memory_to_surface)
+    id<MTLComputePipelineState> thumbnail_pipeline = nil;      // D-1027: the presented image as 64x36 (rsx_thumbnail)
     u64 surface_serial = 0; // the last Surface::serial given
     id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
@@ -512,8 +514,10 @@ struct MetalBackend::Impl {
     struct PendingReport {
         u32 value_addr = 0;
         std::vector<VisibilitySlot> slots;
+        bool whole = false; // the timestamp and the ready word too, the ready word last (D-1021)
     };
     static constexpr u32 kVisibilitySlots = 4096;
+    u32 visibility_slots = kVisibilitySlots; // a render buffer's counters: doubled when a buffer runs out (D-1024)
 
     // GPU time of the render buffers (completion handlers add GPUEndTime - GPUStartTime), logged with the frame's draws
     // and passes every kGpuReportFlips flips: what a slower GPU (the iPhone's) has to fit in a frame.
@@ -577,6 +581,8 @@ struct MetalBackend::Impl {
     u64 report_draws_interpreted = 0;
     u64 report_feedback = 0, report_corners = 0, report_reloads = 0, report_gpu_wait_ns = 0;
     u64 report_pooled = 0; // D-956
+    AlarmCounts report_alarms{}; // D-1022
+    u64 report_carried = 0;      // D-1025
     u64 report_depth_bounds = 0; // D-261
     u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
     u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947
@@ -966,6 +972,7 @@ struct MetalBackend::Impl {
     void trace_targets_of(const PassTargets& t);
     static std::string describe_targets(const PassTargets& t);
     void trace_dump();
+    void trace_probe(); // PSPOCKET_RSX_TRACE_PROBE (D-1028)
 
     // ---- surfaces (surface_cache.mm) ----
     Surface* get_color_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool swizzled);
@@ -973,8 +980,10 @@ struct MetalBackend::Impl {
     Surface* find_surface(u32 address, bool depth) const;
     Surface* make_surface(u32 address, u32 pitch, u32 width, u32 height, u32 format, bool depth, bool swizzled,
         MTLPixelFormat pf);
+    // `made`: the new target (kept); `carried`: the victims whose bytes it took (D-1025): only what lies outside it is
+    // lost, which the alarm counts (D-1022).
     void evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
-        const Surface* keep_too = nullptr);
+        const Surface* keep_too = nullptr, const Surface* made = nullptr, const std::vector<Surface*>& carried = {});
     // D-122: the larger target a new one lies inside; the pixels between them before one is used; a write to one.
     Surface* find_parent(u32 address, u32 pitch, u32 width, u32 height, u32 format) const;
     void sync_surface(Surface& s);
@@ -1099,6 +1108,15 @@ struct MetalBackend::Impl {
     // encoding of that into `staging` (a copy of `size` bytes of guest memory from `ea`), on the render buffer.
     bool overlay_supported(const Surface& s);
     void encode_overlay(Surface& s, const TransientAllocator::Allocation& staging, u32 ea, u32 size);
+    // D-1025: a new target `s` over the memory of GPU-newer targets of other formats or sizes (`sources`, oldest
+    // first) starts with what that memory would hold on the RSX: guest memory, the sources laid over it (as a texture
+    // over them is decoded), into its texels, all on the GPU. False: a format this cannot do (nothing recorded).
+    bool carry_into(Surface& s, const std::vector<Surface*>& sources);
+    // The GPU-newer targets a new target at [address, rows of row_bytes `pitch` apart) lays over (D-1025): those
+    // evict_overlapping removes, and `also` (a smaller one at its start it grows over, D-120), oldest first.
+    std::vector<Surface*> carry_sources(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
+        const Surface* keep_too, Surface* also);
+    bool carry_on = true; // PSPOCKET_RSX_NO_CARRY=1: off, the targets' bytes are lost as before (D-1025)
     id<MTLSamplerState> sampler_for(const TextureInfo& t);
     id<MTLTexture> view_2d(id<MTLTexture> tex, u32 face, u32 level);
     bool read_texture(id<MTLTexture> tex, u32 face, u32 level, u32 w, u32 h, std::vector<std::array<float, 4>>& out);

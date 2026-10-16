@@ -130,6 +130,7 @@ void Rsx::submit_draw_clause()
     if (begin_prim == 0 || begin_prim > 10 || state_.draw.empty()) return;
     if (!render_enabled_) { // conditional rendering: the report said nothing passed
         conditional_skips_.fetch_add(1, std::memory_order_relaxed);
+        backend_.draw_skipped(state_, "conditional rendering: its report counted 0");
         return;
     }
     backend_.draw(state_);
@@ -290,9 +291,11 @@ void Rsx::m_get_report(u32 reg, u32 value)
     }
     u32 result = 0;
     bool later = false; // the backend writes the value when the GPU has counted
+    bool whole = false; // ... and the timestamp and the ready word with it (D-1021)
     switch (type) {
     case reports::kZpassPixelCount:
-        later = backend_.report_zpass(*ea + 8);
+        later = backend_.report_zpass(*ea + 8, !config_.early_reports);
+        whole = later && !config_.early_reports;
         if (!later) {
             fail(FailKind::Unsupported, reg,
                 std::format("NV4097_GET_REPORT: this backend does not count occlusion (ZPASS_PIXEL_CNT); reporting {}",
@@ -309,9 +312,16 @@ void Rsx::m_get_report(u32 reg, u32 value)
         break;
     }
     if (config_.sync_on_label) backend_.sync();
+    // The RSX writes a report once its pipeline has reached it, the count with it: GTA V's queries (0xB21AD0) take a
+    // report whose pad is 0 as ready and read its count. Written when the method ran and the count frames later, its
+    // water read a zero for "ready" and skipped the sea (the black and vanishing sea of 2026-10-16, D-1021). A count
+    // the backend writes whole is left to it.
+    if (whole) return;
     backend_.defer(*ea, 16, [this, e = *ea, later, result] {
         ps_write64(base(), e, timestamp_ns());
         if (!later) write32(e + 8, result);
+        // PSPOCKET_RSX_EARLY_REPORTS: ready before the count (the alarm, D-1022)
+        if (later && backend_.report_pending(e + 8)) alarms_.add(Alarm::ReportEarly);
         write32(e + 12, 0);
     });
 }
@@ -399,7 +409,9 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
             fifo_error(std::format("NV4097_SET_RENDER_ENABLE: bad report offset {:#x}", value & 0xffffff));
             return;
         }
-        render_enabled_ = backend_.report_pending(*ea + 8) || read32(*ea + 8) != 0;
+        const bool pending = backend_.report_pending(*ea + 8);
+        if (pending) alarms_.add(Alarm::ConditionalPending); // decided on a count not there yet (D-1022)
+        render_enabled_ = pending || read32(*ea + 8) != 0;
         return;
     }
     fail(FailKind::Unsupported, reg, std::format("NV4097_SET_RENDER_ENABLE: unknown render mode {}", mode));
@@ -501,6 +513,9 @@ void Rsx::m_nv0039_buffer_notify(u32 reg, u32)
         }
         backend_.invalidate_memory(d_ea, write_length);
     };
+    if (backend_.tracing())
+        backend_.trace_note(std::format("NV0039 copy {:#010x} (pitch {:#x}) -> {:#010x} (pitch {:#x}), {} lines of {} bytes",
+            s_ea, in_pitch, d_ea, out_pitch, line_count, line_length));
     // A render target newer on the GPU: copied there (GTA V copies an 80x45 corner of a target into a texture every
     // frame; waiting for the GPU to read it back cost the RSX thread 9 ms a frame, run 079), or else copied once the
     // GPU has it, without waiting (D-107).
@@ -641,6 +656,9 @@ void Rsx::m_nv3089_image_in(u32 reg, u32 value)
         return;
     }
 
+    if (backend_.tracing())
+        backend_.trace_note(std::format("NV3089 copy {:#010x} (pitch {:#x}) -> {:#010x} (pitch {:#x}), {}x{}", *src, in_pitch,
+            *dst, out_pitch, cols, rows));
     backend_.flush_memory(*src, read_length, "an NV3089 image copy");
     backend_.before_access(*dst, write_length, true);
     backend_.flush_memory(*dst, write_length, "an NV3089 copy over a render target"); // merged with it (D-110)

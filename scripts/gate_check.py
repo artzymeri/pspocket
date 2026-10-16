@@ -84,6 +84,13 @@ def main(argv):
     footprint = summary["footprint_peak_mb"]
     check("process memory, peak (MB)", f"{footprint:.0f}", f"<= {c['footprint_mb_max']}", footprint <= c["footprint_mb_max"])
 
+    # The RSX's correctness alarms over the run (D-1022): those the gate limits (most should stay at zero).
+    alarms = summary.get("alarms", {})
+    for name, limit in sorted(c.get("alarms_max", {}).items()):
+        value = alarms.get(name)
+        check(f"RSX alarm {name}", "missing" if value is None else value, f"<= {limit}",
+              value is not None and value <= limit)
+
     new_shapes = []
     if baseline_path:
         try:

@@ -27,6 +27,7 @@
 
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/types.hpp"
+#include "pspocket/rsx/alarms.hpp"
 #include "pspocket/rsx/backend.hpp"
 #include "pspocket/rsx/context.hpp"
 #include "pspocket/rsx/io_map.hpp"
@@ -76,6 +77,10 @@ struct Config {
     u32 max_wait_us = 200;
     // Value written for NV4097_GET_REPORT(ZPASS_PIXEL_CNT) while occlusion queries are not implemented.
     u32 fake_zpass_count = 0xFFFF;
+    // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) writes its timestamp and ready word (pad 0) when the method runs and the count
+    // later, as before D-1021 (a measuring aid; PSPOCKET_RSX_EARLY_REPORTS=1). Off: the backend writes the whole report
+    // once the GPU has counted, the ready word last, as the RSX does.
+    bool early_reports = false;
 };
 
 class Rsx {
@@ -194,6 +199,10 @@ public:
 
     // RSX timestamp in nanoseconds (reports, notifies).
     static u64 timestamp_ns();
+
+    // The always-on correctness alarms (D-1022), bumped by the front end and the backend from any thread.
+    Alarms& alarms() { return alarms_; }
+    const Alarms& alarms() const { return alarms_; }
 
 private:
     enum class Dispatch : u8 { Done, Blocked };
@@ -377,6 +386,7 @@ private:
     std::atomic<u64> draw_splits_{0};
     std::atomic<u64> data_epoch_{0};
     u32 epoch_put_ = ~0u;
+    Alarms alarms_;
     bool render_enabled_ = true; // NV4097_SET_RENDER_ENABLE: false while the report it names was zero (D-102)
     std::mutex fail_mutex_;
     std::unordered_set<std::string> reported_;

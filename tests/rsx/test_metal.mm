@@ -4273,6 +4273,7 @@ TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet renders,
     for (const auto& f : e.failures) INFO(f.message);
     CHECK(e.failures.empty());
     CHECK(e.rsx->status().conditional_skips == 0);
+    CHECK(e.rsx->alarms().get(Alarm::ConditionalPending) == 1); // decided on a count not there yet (D-1022)
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
     // Once counted (no draw: zero), the same test skips.
@@ -4284,6 +4285,250 @@ TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet renders,
     c.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
     CHECK(e.rsx->status().conditional_skips == 1);
+}
+
+TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, written whole (D-1021)")
+{
+    // GTA V's queries (0xB21908 begin: count 0, pad 1 by the CPU; 0xB21AD0 ready: pad 0) take a report whose pad is 0
+    // as counted. Its water module skipped the sea on a "ready" zero that came frames before the count (2026-10-16).
+    REQUIRE_METAL();
+    for (const bool early : {false, true}) {
+        INFO(std::format("PSPOCKET_RSX_EARLY_REPORTS {}", early));
+        if (early) setenv("PSPOCKET_RSX_EARLY_REPORTS", "1", 1);
+        E2E e;
+        unsetenv("PSPOCKET_RSX_EARLY_REPORTS");
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        const u32 report = e.config.layout.report_addr(0);
+        ps_write64(e.mem.base(), report, 0);
+        ps_write32(e.mem.base(), report + 8, 0); // the game's begin: count 0, pad 1
+        ps_write32(e.mem.base(), report + 12, 1);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+        b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+        b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+        draw_triangle(b);
+        b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x00);
+        b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        // Nothing went to the GPU yet (no flip, no sync): the count is not there.
+        CHECK(e.backend->report_pending(report + 8));
+        CHECK(ps_read32(e.mem.base(), report + 8) == 0);
+        if (!early) {
+            CHECK(ps_read64(e.mem.base(), report) == 0);
+            CHECK(ps_read32(e.mem.base(), report + 12) == 1); // not ready
+            CHECK(e.rsx->alarms().get(Alarm::ReportEarly) == 0);
+        } else {
+            CHECK(ps_read64(e.mem.base(), report) != 0);
+            CHECK(ps_read32(e.mem.base(), report + 12) == 0); // "ready" with the old zero: the race
+            CHECK(e.rsx->alarms().get(Alarm::ReportEarly) == 1);
+        }
+        e.backend->sync();
+        const u32 count = wait_report(e, 0, 0);
+        CHECK(count > 1000);
+        CHECK(ps_read32(e.mem.base(), report + 12) == 0);
+        CHECK(ps_read64(e.mem.base(), report) != 0);
+        CHECK_FALSE(e.backend->report_pending(report + 8));
+    }
+}
+
+TEST_CASE("metal e2e: occlusion queries past a command buffer's counters still count (D-1024)")
+{
+    // 4096 counters a command buffer: a query past them counted nothing, and a draw it guarded was skipped.
+    REQUIRE_METAL();
+    g_e2e_config = [](MetalBackendConfig& c) { c.occlusion_counters = 1; };
+    E2E e;
+    g_e2e_config = nullptr;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    for (u32 i = 0; i < 3; i++) ps_write32(e.mem.base(), e.config.layout.report_addr(i) + 8, 0xDEADBEEF);
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+    for (u32 i = 0; i < 3; i++) {
+        b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+        draw_triangle(b);
+        b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | (i * 16));
+    }
+    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    const u32 first = wait_report(e, 0, 0xDEADBEEF);
+    CHECK(first > 1000);
+    CHECK(wait_report(e, 1, 0xDEADBEEF) == first);
+    CHECK(wait_report(e, 2, 0xDEADBEEF) == first);
+    CHECK(e.rsx->alarms().get(Alarm::OcclusionOverflow) >= 1);
+}
+
+TEST_CASE("metal e2e: a depth buffer made over a colour target holds the target's bytes (D-1025)")
+{
+    // GTA V packs its depth into an A8B8G8R8 640x360 target (#2787), then tests against that memory as a Z24S8 buffer
+    // (#2806+): a new depth buffer cleared to 1.0 lost what the target held (the striped sky of 2026-10-16).
+    REQUIRE_METAL();
+    for (const bool carry : {true, false}) {
+        INFO(std::format("carry {}", carry));
+        if (!carry) setenv("PSPOCKET_RSX_NO_CARRY", "1", 1);
+        E2E e;
+        unsetenv("PSPOCKET_RSX_NO_CARRY");
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x11223344); // a r g b in memory: Z24S8 depth 0x112233, stencil 0x44
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_CONTEXT_DMA_ZETA, loc::kDmaFrameBuffer);
+        b.method(m::NV4097_SET_SURFACE_ZETA_OFFSET, kSurfaceOffset);
+        b.method(m::NV4097_SET_SURFACE_PITCH_Z, kW * 4);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_DEPTH_TEST_ENABLE, 1);
+        b.method(m::NV4097_SET_DEPTH_FUNC, static_cast<u32>(CompareFunc::Always));
+        b.method(m::NV4097_SET_DEPTH_MASK, 0);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const u32 word = ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + 5 * kW * 4 + 7 * 4);
+        if (carry) {
+            CHECK(word == 0x11223344);
+            CHECK(e.backend->stats().targets_carried == 1);
+            CHECK(e.rsx->alarms().get(Alarm::TargetLost) == 0);
+        } else {
+            CHECK(word == 0xFFFFFF00); // cleared to 1.0: the bytes lost
+            CHECK(e.rsx->alarms().get(Alarm::TargetLost) == 1);
+        }
+    }
+}
+
+TEST_CASE("metal e2e: a colour target over a smaller one of another format carries its bytes, the rest from memory (D-1025)")
+{
+    // GTA V's 0xcd260000: an F_W16Z16Y16X16 320x180 target, then an A8B8G8R8 640x360 one with the same pitch over it.
+    REQUIRE_METAL();
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    constexpr u32 kPitch = kW * 8; // the F16 target's rows, and as many bytes as 2 kW A8R8G8B8 pixels
+    for (u32 y = 0; y < kH; y++)
+        for (u32 x = 0; x < 2 * kW; x++) ps_write32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + y * kPitch + x * 4, 0x01020304);
+    auto b = e.at(0);
+    setup_surface_sized(b, kSurfaceOffset, kW, kH / 2, kPitch);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::F_W16Z16Y16X16) | (2u << 5) | (1u << 8));
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffffffff);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    // The A8R8G8B8 target over it, a draw that writes nothing (colour mask 0).
+    setup_surface_sized(b, kSurfaceOffset, 2 * kW, kH, kPitch);
+    b.method(m::NV4097_SET_SURFACE_FORMAT, static_cast<u32>(SurfaceColorFormat::A8R8G8B8) | (2u << 5) | (1u << 8));
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_COLOR_MASK, 0);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().targets_carried == 1);
+    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kPitch * kH));
+    const auto word = [&](u32 x, u32 y) { return ps_read32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + y * kPitch + x * 4); };
+    CHECK(word(3, 2) == 0x3C003C00);          // the F16 target's 1.0s, as its bytes
+    CHECK(word(2 * kW - 1, kH / 2 - 1) == 0x3C003C00);
+    CHECK(word(3, kH / 2) == 0x01020304);     // below it: what memory held
+    CHECK(e.rsx->alarms().get(Alarm::TargetLost) == 0);
+}
+
+TEST_CASE("metal e2e: a target nobody drew yet is sampled as guest memory holds it, not its pooled texture (D-1023)")
+{
+    // A target made for draws that were all skipped (their programs compiling, D-158) took a removed target's texture
+    // from the pool (D-984): sampled, it showed that one's pixels.
+    REQUIRE_METAL();
+    {
+        E2E e(0, {}, 1800, true, /*async_wait_ms=*/0.0, /*shader_interpreter=*/false);
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        for (u32 i = 0; i < kW * kH; i++) ps_write32(e.mem.base(), PS_MEM_RSX_LOCAL_BASE + kTexOffset + i * 4, 0x01020304);
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffff0000);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        bind_vertex_arrays(b);
+        // A B8 target over it (the A8R8G8B8 one goes to the pool), then an A8R8G8B8 one of its size at kTexOffset: both
+        // for draws skipped while their programs compile.
+        setup_surface_as(b, kSurfaceB, SurfaceColorFormat::B8, kW * 4);
+        set_fragment_program(b, kFpOffset, 0x40);
+        draw_triangle(b);
+        setup_surface(b, kTexOffset);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        e.backend->wait_for_async_compiles();
+        // Sampled into kSurfaceOffset (again while its pipeline still compiles).
+        u32 at = b.offset();
+        for (int tries = 0; tries < 4; tries++) {
+            const u64 compiling = e.backend->stats().draws_compiling;
+            auto c = e.at(at);
+            setup_surface(c, kSurfaceOffset);
+            c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+            c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+            set_fragment_program(c, kFp2Offset, 0x40);
+            bind_linear_texture(c, kTexOffset, tex::A8R8G8B8, kW * 4);
+            draw_triangle(c);
+            REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+            at = c.offset();
+            if (e.backend->stats().draws_compiling == compiling) break;
+            e.backend->wait_for_async_compiles();
+        }
+        for (const auto& f : e.failures) INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().draws_compiling >= 2);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0x01, 0x02, 0x03, 0x04});
+        CHECK(e.rsx->alarms().get(Alarm::UninitSampled) == 0);
+    }
+}
+
+TEST_CASE("metal e2e: a draw with a signed blend equation waits for its program, not drawn by the interpreter (D-1026)")
+{
+    // The interpreter (D-940) blends as Metal does: ADD_SIGNED drawn as add while GTA V's programs compiled (the
+    // bench's skyfall run, an RSX failure each time).
+    REQUIRE_METAL();
+    E2E e(0, {}, 1800, true, /*async_wait_ms=*/0.0, /*shader_interpreter=*/true);
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xf0100000, 0xf0100000, 0xf0100000});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff808080);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_BLEND_ENABLE, 1);
+    b.method(m::NV4097_SET_BLEND_EQUATION, 0xf006f006);
+    draw_triangle(b);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    for (const auto& f : e.failures) INFO(f.message);
+    CHECK(e.failures.empty());
+    CHECK(e.backend->stats().draws_interpreted == 0);
+    CHECK(e.backend->stats().draws_compiling == 1);
 }
 
 TEST_CASE("metal e2e: a swizzled 3D texture samples the slice its coordinate's z selects")
@@ -4599,6 +4844,63 @@ TEST_CASE("metal e2e: every Nth flip is also copied to the CPU (capture)")
     const auto& px = e.captures[0].second;
     CHECK(std::array<u8, 4>{px[(4 * 128 + 4) * 4], px[(4 * 128 + 4) * 4 + 1], px[(4 * 128 + 4) * 4 + 2], 0xff} ==
           std::array<u8, 4>{0xff, 0x00, 0x00, 0xff}); // the blue clear, in BGRA
+}
+
+TEST_CASE("metal e2e: every flip gives a 64x36 thumbnail from the GPU, the image's box means (D-1027)")
+{
+    REQUIRE_METAL();
+    using metal::kThumbnailWidth, metal::kThumbnailHeight;
+    std::mutex mutex;
+    std::vector<std::pair<u64, std::vector<u8>>> thumbs;
+    g_e2e_config = [&](MetalBackendConfig& c) {
+        c.thumbnail = [&](const u8* bgra, u64 flip) {
+            std::lock_guard lock(mutex);
+            thumbs.emplace_back(flip, std::vector<u8>(bgra, bgra + kThumbnailWidth * kThumbnailHeight * 4));
+        };
+    };
+    E2E e(1);
+    g_e2e_config = nullptr;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    for (u32 color : {0xff00ff00u, 0xff203040u}) {
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, color);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        draw_triangle(b);
+        b.method(m::GCM_FLIP_COMMAND, 0);
+    }
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    std::lock_guard lock(mutex);
+    std::lock_guard lock2(e.capture_mutex);
+    REQUIRE(thumbs.size() == 2);
+    REQUIRE(e.captures.size() == 2);
+    for (usize f = 0; f < 2; f++) {
+        CHECK(thumbs[f].first == f + 1);
+        // The CPU's box filter of the whole image (pspocket-boot's compare_frame before D-1027).
+        const std::vector<u8>& img = e.captures[f].second;
+        const u32 w = 128, h = 128;
+        u32 differ = 0;
+        for (u32 ty = 0; ty < kThumbnailHeight; ty++) {
+            const u32 y0 = ty * h / kThumbnailHeight, y1 = std::max(y0 + 1, (ty + 1) * h / kThumbnailHeight);
+            for (u32 tx = 0; tx < kThumbnailWidth; tx++) {
+                const u32 x0 = tx * w / kThumbnailWidth, x1 = std::max(x0 + 1, (tx + 1) * w / kThumbnailWidth);
+                for (u32 c = 0; c < 3; c++) {
+                    u64 sum = 0;
+                    for (u32 y = y0; y < y1; y++)
+                        for (u32 x = x0; x < x1; x++) sum += img[(y * w + x) * 4 + c];
+                    differ += thumbs[f].second[(ty * kThumbnailWidth + tx) * 4 + c] != sum / (u64{y1 - y0} * (x1 - x0));
+                }
+            }
+        }
+        CHECK(differ == 0);
+    }
+    CHECK(thumbs[1].second[0] == 0x40); // the second clear's blue, top-left
 }
 
 // ---- D-174: fragment program ops and texture controls, run on the GPU -------------------------------------------

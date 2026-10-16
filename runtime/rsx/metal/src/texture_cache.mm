@@ -7,6 +7,8 @@
 #include "metal_internal.hpp"
 
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <format>
 
 #include "pspocket/rsx/gcm.hpp"
@@ -126,6 +128,35 @@ id<MTLTexture> MetalBackend::Impl::view_2d(id<MTLTexture> tex, u32 face, u32 lev
 // D-137: the formats store_readback writes, as long as the backend is not told to write targets back instead.
 bool MetalBackend::Impl::overlay_supported(const Surface& s) { return config.overlay_targets && readback_supported(s); }
 
+// A target's format in guest memory as the overlay kernels name it: mode, bytes per pixel, the X formats' top bits.
+static void overlay_format(const Surface& s, OverlayParams& p)
+{
+    if (s.depth) {
+        const bool z16 = s.pixel_format == MTLPixelFormatDepth16Unorm;
+        p.mode = z16 ? kOvZ16 : kOvZ24S8;
+        p.bpp = z16 ? 2 : 4;
+        return;
+    }
+    p.bpp = surface_color_bpp(s.gcm_format);
+    switch (static_cast<SurfaceColorFormat>(s.gcm_format)) {
+    case SurfaceColorFormat::A8R8G8B8: p.mode = kOvARGB8; break;
+    case SurfaceColorFormat::X8R8G8B8_Z8R8G8B8: p.mode = kOvARGB8, p.alpha = 1; break;
+    case SurfaceColorFormat::X8R8G8B8_O8R8G8B8: p.mode = kOvARGB8, p.alpha = 2; break;
+    case SurfaceColorFormat::A8B8G8R8: p.mode = kOvABGR8; break;
+    case SurfaceColorFormat::X8B8G8R8_Z8B8G8R8: p.mode = kOvABGR8, p.alpha = 1; break;
+    case SurfaceColorFormat::X8B8G8R8_O8B8G8R8: p.mode = kOvABGR8, p.alpha = 2; break;
+    case SurfaceColorFormat::B8: p.mode = kOvB8; break;
+    case SurfaceColorFormat::G8B8: p.mode = kOvG8B8; break;
+    case SurfaceColorFormat::R5G6B5: p.mode = kOvR5G6B5; break;
+    case SurfaceColorFormat::X1R5G5B5_Z1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 1; break;
+    case SurfaceColorFormat::X1R5G5B5_O1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 2; break;
+    case SurfaceColorFormat::F_W16Z16Y16X16: p.mode = kOvF16x4; break;
+    case SurfaceColorFormat::F_W32Z32Y32X32: p.mode = kOvF32x4; break;
+    case SurfaceColorFormat::F_X32: p.mode = kOvF32; break;
+    default: PS_FATAL(kChan, "overlay_format: surface format {} has no overlay (overlay_supported)", s.gcm_format);
+    }
+}
+
 // The target's pixels into the staging copy of the guest memory a texture decodes, as store_readback would have put
 // them into guest memory (rsx_*_to_memory, kernels.hpp), on the render buffer after the passes that drew it (D-137).
 // The float formats are read through an integer view, so their bits arrive as they are.
@@ -142,35 +173,16 @@ void MetalBackend::Impl::encode_overlay(Surface& s, const TransientAllocator::Al
     p.log2_h = s.swizzled ? static_cast<u32>(std::countr_zero(s.height)) : 0;
     id<MTLComputePipelineState> pipeline = color_memory_pipeline;
     id<MTLTexture> src = s.texture, stencil = nil;
+    overlay_format(s, p);
     if (s.depth) {
-        const bool z16 = s.pixel_format == MTLPixelFormatDepth16Unorm;
-        p.mode = z16 ? kOvZ16 : kOvZ24S8;
-        p.bpp = z16 ? 2 : 4;
         pipeline = depth_memory_pipeline;
-        stencil = z16 ? dummy_stencil : [s.texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-    } else {
-        p.bpp = surface_color_bpp(s.gcm_format);
-        const auto bits = [&](MTLPixelFormat view) {
-            pipeline = float_memory_pipeline;
-            src = [s.texture newTextureViewWithPixelFormat:view];
-        };
-        switch (static_cast<SurfaceColorFormat>(s.gcm_format)) {
-        case SurfaceColorFormat::A8R8G8B8: p.mode = kOvARGB8; break;
-        case SurfaceColorFormat::X8R8G8B8_Z8R8G8B8: p.mode = kOvARGB8, p.alpha = 1; break;
-        case SurfaceColorFormat::X8R8G8B8_O8R8G8B8: p.mode = kOvARGB8, p.alpha = 2; break;
-        case SurfaceColorFormat::A8B8G8R8: p.mode = kOvABGR8; break;
-        case SurfaceColorFormat::X8B8G8R8_Z8B8G8R8: p.mode = kOvABGR8, p.alpha = 1; break;
-        case SurfaceColorFormat::X8B8G8R8_O8B8G8R8: p.mode = kOvABGR8, p.alpha = 2; break;
-        case SurfaceColorFormat::B8: p.mode = kOvB8; break;
-        case SurfaceColorFormat::G8B8: p.mode = kOvG8B8; break;
-        case SurfaceColorFormat::R5G6B5: p.mode = kOvR5G6B5; break;
-        case SurfaceColorFormat::X1R5G5B5_Z1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 1; break;
-        case SurfaceColorFormat::X1R5G5B5_O1R5G5B5: p.mode = kOvX1R5G5B5, p.alpha = 2; break;
-        case SurfaceColorFormat::F_W16Z16Y16X16: p.mode = kOvF16x4, bits(MTLPixelFormatRGBA16Uint); break;
-        case SurfaceColorFormat::F_W32Z32Y32X32: p.mode = kOvF32x4, bits(MTLPixelFormatRGBA32Uint); break;
-        case SurfaceColorFormat::F_X32: p.mode = kOvF32, bits(MTLPixelFormatR32Uint); break;
-        default: PS_FATAL(kChan, "encode_overlay: surface format {} has no overlay (overlay_supported)", s.gcm_format);
-        }
+        stencil = p.mode == kOvZ16 ? dummy_stencil : [s.texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+    } else if (p.mode == kOvF16x4 || p.mode == kOvF32x4 || p.mode == kOvF32) {
+        // their bits as they are, through an integer view
+        pipeline = float_memory_pipeline;
+        src = [s.texture newTextureViewWithPixelFormat:p.mode == kOvF16x4 ? MTLPixelFormatRGBA16Uint
+                                                       : p.mode == kOvF32x4 ? MTLPixelFormatRGBA32Uint
+                                                                            : MTLPixelFormatR32Uint];
     }
     end_pass_for(kEndTargetOverlay);
     id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
@@ -182,6 +194,105 @@ void MetalBackend::Impl::encode_overlay(Surface& s, const TransientAllocator::Al
     [enc dispatchThreads:MTLSizeMake(s.width, s.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     [enc endEncoding];
     stats.texture_overlays++;
+}
+
+std::vector<Surface*> MetalBackend::Impl::carry_sources(u32 address, u32 pitch, u32 row_bytes, u32 rows,
+    const Surface* keep, const Surface* keep_too, Surface* also)
+{
+    std::vector<Surface*> out;
+    if (!carry_on) return out;
+    for (const auto& c : surfaces) {
+        Surface* s = c.get();
+        if (s == keep || s == keep_too || draw_targets.contains(s)) continue;
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized) continue; // memory holds what it does
+        const u32 s_row = s->width * surface_bytes_per_pixel(s->gcm_format, s->depth);
+        if (s == also || surfaces_overlap(address, pitch, row_bytes, rows, s->address, s->pitch, s_row, s->height))
+            out.push_back(s);
+    }
+    if (also && also->gpu_newer && !also->cpu_newer && also->initialized && std::find(out.begin(), out.end(), also) == out.end())
+        out.push_back(also);
+    std::sort(out.begin(), out.end(), [](const Surface* a, const Surface* b) { return a->last_used < b->last_used; });
+    return out;
+}
+
+bool MetalBackend::Impl::carry_into(Surface& s, const std::vector<Surface*>& sources)
+{
+    if (sources.empty() || !overlay_supported(s)) return false;
+    for (const Surface* o : sources)
+        if (!overlay_supported(*o)) return false;
+    const u32 size = s.bytes();
+    if (!mem.is_committed(s.address) || !mem.is_committed(s.address + size - 1)) return false;
+    // The staging copy of its memory: from guest memory unless the sources cover every byte of it (one with its pitch
+    // over all its rows and columns: GTA V's depth packed into a target of its size).
+    const u32 row = s.width * surface_bytes_per_pixel(s.gcm_format, s.depth);
+    bool covered = false;
+    for (const Surface* o : sources) {
+        const u32 o_row = o->width * surface_bytes_per_pixel(o->gcm_format, o->depth);
+        covered |= !o->swizzled && !s.swizzled && o->pitch == s.pitch && o->address <= s.address &&
+            u64{s.address} + size <= u64{o->address} + o->bytes() && (s.address - o->address) % s.pitch + row <= o_row;
+    }
+    TransientAllocator::Allocation staging = transient.alloc(size, 256);
+    if (!covered) std::memcpy(staging.data, mem.host(s.address), size);
+    for (Surface* o : sources) {
+        sync_surface(*o); // what its children wrote (D-122)
+        encode_overlay(*o, staging, s.address, size);
+    }
+    OverlayParams p{};
+    p.width = s.width;
+    p.height = s.height;
+    p.pitch = s.pitch;
+    p.size = size;
+    p.swizzled = s.swizzled ? 1 : 0;
+    p.log2_w = s.swizzled ? static_cast<u32>(std::countr_zero(s.width)) : 0;
+    p.log2_h = s.swizzled ? static_cast<u32>(std::countr_zero(s.height)) : 0;
+    overlay_format(s, p);
+    const bool z24s8 = s.pixel_format == MTLPixelFormatDepth32Float_Stencil8;
+    u32 bpp = 4; // the Metal texture's bytes per texel, as upload_surface_bytes
+    switch (s.pixel_format) {
+    case MTLPixelFormatR8Unorm: bpp = 1; break;
+    case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatDepth16Unorm: bpp = 2; break;
+    case MTLPixelFormatRGBA16Float: bpp = 8; break;
+    case MTLPixelFormatRGBA32Float: bpp = 16; break;
+    default: break;
+    }
+    const u32 w = s.width, h = s.height, texel_row = w * bpp;
+    TransientAllocator::Allocation texels = transient.alloc(texel_row * h, 256);
+    TransientAllocator::Allocation stencil = transient.alloc(z24s8 ? w * h : 16, 256);
+    end_pass_for(kEndTargetOverlay);
+    id<MTLComputeCommandEncoder> enc = [render_buffer() computeCommandEncoder];
+    [enc setComputePipelineState:memory_surface_pipeline];
+    [enc setBuffer:staging.buffer offset:staging.offset atIndex:0];
+    [enc setBuffer:texels.buffer offset:texels.offset atIndex:1];
+    [enc setBuffer:stencil.buffer offset:stencil.offset atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [enc endEncoding];
+    id<MTLBlitCommandEncoder> blit = [render_buffer() blitCommandEncoder];
+    blit.label = @"rsx target carried over";
+    const auto copy = [&](const TransientAllocator::Allocation& a, u32 bytes_per_row, MTLBlitOption o) {
+        [blit copyFromBuffer:a.buffer
+                   sourceOffset:a.offset
+              sourceBytesPerRow:bytes_per_row
+            sourceBytesPerImage:static_cast<NSUInteger>(bytes_per_row) * h
+                     sourceSize:MTLSizeMake(w, h, 1)
+                      toTexture:s.texture
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)
+                        options:o];
+    };
+    copy(texels, texel_row, z24s8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone);
+    if (z24s8) copy(stencil, w, MTLBlitOptionStencilFromDepthStencil);
+    [blit endEncoding];
+    s.initialized = true;
+    s.gpu_newer = true; // what the sources held, newer than memory
+    s.cpu_newer = false;
+    s.generation++;
+    if (s.depth) s.stencil_generation++;
+    surface_written(s);
+    stats.targets_carried++;
+    return true;
 }
 
 const TextureLayout* MetalBackend::Impl::layout_for(const TextureInfo& t)
@@ -489,6 +600,14 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         if (target && pass_open && !pass_started && pass.contains(target)) end_pass_for(kEndFlush);
     };
     run_pending_clear(s);
+    // A target nobody drew or cleared yet holds nothing of its own: the texture is what guest memory holds there, not
+    // its texture's pixels (a removed target's, when the texture was taken from the pool, D-984) (D-1023).
+    // PSPOCKET_RSX_UNINIT_TARGETS=1 samples it as before (the alarm counts those, D-1022).
+    static const bool sample_uninit = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_UNINIT_TARGETS");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (s && !s->initialized && !sample_uninit) s = nullptr;
     if (s) check_cpu_writes(*s);
     if (s) s->last_frame = stats.flips; // sampled: in use (D-116)
     if (s && !s->cpu_newer) sync_surface(*s); // what its children or its parent wrote (D-122)
@@ -531,6 +650,9 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
             // others. Each pair of formats is logged once.
             const bool lay = s->gpu_newer && overlay_supported(*s);
             bind_source = lay ? "memory, target laid over" : "memory, target written back";
+            // A compressed texture over a target: memory the GPU cannot have rendered in that form, so streamed over a
+            // target whose memory the game reused (D-1022; the phone's DXT1 texture over a 32x16 target).
+            if (s->gpu_newer && fmt->block_texels == 4 && rsx) rsx->alarms().add(Alarm::DeadOverlay);
             if (reinterpretations.insert((u64{s->gcm_format} << 32) | (u64{t.base_format()} << 16) | (s->width & 0xFFFF))
                     .second) {
                 PS_LOG_INFO(kChan, "texture format {:#04x} ({}x{}) over a {}x{} render target of format {} at {:#010x}: "
@@ -543,6 +665,7 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
         }
     }
     if (s && !s->cpu_newer && fmt) {
+        if (!s->initialized && rsx) rsx->alarms().add(Alarm::UninitSampled); // D-1022
         stats.surface_samples++;
         check_guest(*s, t, unit);
         bind_source = "target";

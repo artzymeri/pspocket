@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
+#include "pspocket/rsx/alarms.hpp"
 #include "pspocket/rsx/backend.hpp"
 #include "pspocket/rsx/state.hpp"
 #include "pspocket/rsx/write_tracker.hpp"
@@ -50,6 +51,11 @@ using PresentCallback = std::function<void(const PresentFrame&)>;
 // A presented image on the CPU: BGRA8 bytes, rows top to bottom (width * 4 bytes each), and the flip it came from.
 // Called on a Metal completion thread once the GPU has finished the frame; the bytes are only valid during the call.
 using CaptureCallback = std::function<void(const u8* bgra, u32 width, u32 height, u64 flip_index)>;
+// A presented image as a 64x36 thumbnail (D-1027): BGRA8, rows top to bottom (256 bytes each), each texel the mean of
+// its box of the image (as pspocket-boot's compare_frame), and the flip it came from. Called on a Metal completion
+// thread once the GPU has finished the frame, for every flip; the bytes are only valid during the call.
+inline constexpr u32 kThumbnailWidth = 64, kThumbnailHeight = 36;
+using ThumbnailCallback = std::function<void(const u8* bgra64x36, u64 flip_index)>;
 // A render target at the end of a traced frame, as 8-bit BGRA: name says where it is and its format.
 using TraceSurfaceCallback = std::function<void(const std::string& name, const u8* bgra, u32 width, u32 height)>;
 
@@ -85,6 +91,7 @@ struct WindowStats {
     double texture_mb = 0, surface_mb = 0;
     double gpu_allocated_mb = 0;                // MTLDevice.currentAllocatedSize at its end
     u64 deferred_queue = 0;                     // deferred actions waiting at its end
+    AlarmCounts alarms{};                       // the correctness alarms raised in the window (D-1022)
 };
 using WindowCallback = std::function<void(const WindowStats&)>;
 
@@ -99,6 +106,9 @@ struct MetalBackendConfig {
     // dumps on the Mac).
     CaptureCallback capture;
     u32 capture_every = 0;
+    // Set: every flip's image downscaled on the GPU to kThumbnailWidth x kThumbnailHeight and handed to it (D-1027):
+    // cheap enough for every frame on the phone (a compute pass of 2,304 threads and a 9 KB shared buffer), no wait.
+    ThumbnailCallback thumbnail;
     // Debug trace of one frame (0: none), the draws between flips trace_frame - 1 and trace_frame: every clear and
     // draw is logged (channel rsx.trace: targets, programs, textures and where they come from, blending), and at its
     // flip every colour target it used goes to trace_surface (float formats clamped to [0, 1]).
@@ -131,6 +141,8 @@ struct MetalBackendConfig {
     // the target's pixels laid over a copy of the memory on the GPU (D-137). False (or PSPOCKET_RSX_WRITE_BACK_TARGETS
     // set): the target is written back first, a readback the RSX thread waits for, as before.
     bool overlay_targets = true;
+    // Occlusion counters in a command buffer's visibility buffer at first; doubled when one runs out (D-1024).
+    u32 occlusion_counters = 4096;
     // Called on the RSX thread with each report window (D-148).
     WindowCallback on_window;
     // What the command buffer being recorded may hold in transient uploads before it is submitted early (D-148): what
@@ -182,6 +194,7 @@ struct BackendStats {
     u64 textures_evicted = 0;    // cached textures freed after a minute unused (D-116)
     u64 surfaces_evicted = 0;    // surfaces freed after a minute unused, their memory holding what they did (D-116)
     u64 surfaces_grown = 0;      // larger targets made over smaller ones at their start, keeping their pixels (D-120)
+    u64 targets_carried = 0;     // new targets that started with the bytes of the GPU-newer ones under them (D-1025)
     u64 surface_textures_reused = 0; // surfaces made with a removed surface's texture of their format and size (D-984)
     u64 surface_corners = 0;     // textures sampled as the top-left corner of a larger target (D-120)
     u64 surface_children = 0;    // targets made inside a larger one, both kept (D-122)
@@ -246,7 +259,10 @@ public:
     void run_deferred(bool wait) override;
     void set_zpass_counting(bool on) override;
     void clear_zpass() override;
-    bool report_zpass(u32 value_addr) override;
+    bool report_zpass(u32 value_addr, bool whole) override;
+    void draw_skipped(const RsxState& state, std::string_view why) override;
+    bool tracing() const override;
+    void trace_note(std::string_view what) override;
     bool report_pending(u32 value_addr) override;
 
     const BackendStats& stats() const;

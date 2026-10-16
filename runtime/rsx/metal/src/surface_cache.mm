@@ -134,11 +134,11 @@ bool surfaces_overlap(u32 a, u32 a_pitch, u32 a_row, u32 a_rows, u32 b, u32 b_pi
 }
 
 void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes, u32 rows, const Surface* keep,
-    const Surface* keep_too)
+    const Surface* keep_too, const Surface* made, const std::vector<Surface*>& carried)
 {
     std::vector<Surface*> victims;
     for (const auto& s : surfaces) {
-        if (s.get() == keep || s.get() == keep_too) continue;
+        if (s.get() == keep || s.get() == keep_too || s.get() == made) continue;
         const u32 s_row = s->width * surface_bytes_per_pixel(s->gcm_format, s->depth);
         if (surfaces_overlap(address, pitch, row_bytes, rows, s->address, s->pitch, s_row, s->height)) victims.push_back(s.get());
     }
@@ -146,6 +146,30 @@ void MetalBackend::Impl::evict_overlapping(u32 address, u32 pitch, u32 row_bytes
         if (draw_targets.contains(s)) continue; // another attachment of the same draw (MRT): not a redefinition
         PS_LOG_DEBUG(kChan, "surface at {:#010x} ({}x{} fmt {}) replaced by a new surface at {:#010x}", s->address,
             s->width, s->height, s->gcm_format, address);
+        if (s->gpu_newer && !s->cpu_newer && s->initialized && rsx) {
+            // Its bytes were only on the GPU: gone (D-1022), but for what the new target took of them (D-1025).
+            u64 lost = s->bytes();
+            if (made && std::find(carried.begin(), carried.end(), s) != carried.end()) {
+                const u64 lo = std::max<u64>(s->address, made->address);
+                const u64 hi = std::min<u64>(u64{s->address} + s->bytes(), u64{made->address} + made->bytes());
+                lost -= hi > lo ? hi - lo : 0;
+            }
+            if (lost) {
+                rsx->alarms().add(Alarm::TargetLost);
+                rsx->alarms().add(Alarm::TargetLostKB, (lost + 1023) / 1024);
+                // Each pair of shapes once (32 at most): what was lost to what.
+                static std::unordered_set<u64> logged;
+                const u64 key = (u64{s->address} << 32) ^ (u64{s->gcm_format} << 24) ^ (u64{s->width} << 12) ^ s->height ^
+                    (u64{made ? made->gcm_format : 0xff} << 40) ^ (u64{made ? made->width : 0} << 48) ^ (s->depth ? 1ull << 63 : 0);
+                if (logged.size() < 32 && logged.insert(key).second) {
+                    PS_LOG_INFO(kChan, "target {:#010x} {}x{} fmt {}{} pitch {:#x}, newer on the GPU, removed for {:#010x} {}x{} "
+                        "fmt {}{} pitch {:#x}: {} bytes lost{} (flip {})", s->address, s->width, s->height, s->gcm_format,
+                        s->depth ? " depth" : "", s->pitch, address, made ? made->width : 0, made ? made->height : 0,
+                        made ? made->gcm_format : 0, made && made->depth ? " depth" : "", pitch, lost,
+                        made && lost < s->bytes() ? " (outside the new one)" : "", stats.flips);
+                }
+            }
+        }
         remove_surface(s);
     }
 }
@@ -313,10 +337,17 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
     }
     Surface* parent = swizzled || inner ? nullptr : find_parent(address, pitch, width, height, format);
     const u32 row = width * surface_color_bpp(format);
-    evict_overlapping(address, pitch ? pitch : row, row, height, inner, parent);
+    // What the GPU drew under it and memory does not hold yet, which it starts with (D-1025): made first, so no texture
+    // of theirs comes back to it from the pool before they are read.
+    std::vector<Surface*> carry =
+        parent ? std::vector<Surface*>{} : carry_sources(address, pitch ? pitch : row, row, height, nullptr, parent, inner);
     Surface* made = make_surface(address, pitch, width, height, format, false, swizzled, color_surface_format(format));
+    const bool carried = made && carry_into(*made, carry);
+    if (!carried) carry.clear();
+    evict_overlapping(address, pitch ? pitch : row, row, height, inner, parent, made, carry);
     if (inner) {
-        if (made && inner->initialized) grow_surface(*made, *inner);
+        if (made && inner->initialized && !carried) grow_surface(*made, *inner);
+        else if (carried) stats.surfaces_grown++; // grown on the GPU with the others under it (D-1025)
         remove_surface(inner);
     }
     if (parent && made) {
@@ -383,8 +414,14 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
         return s;
     }
     const u32 row = width * surface_bytes_per_pixel(format, true);
-    evict_overlapping(address, pitch ? pitch : row, row, height, nullptr);
-    return make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
+    // A depth buffer over a colour target holds its bytes (D-1025): GTA V packs its depth into an A8B8G8R8 target, then
+    // tests against that memory as a Z24S8 buffer (the clouds and sky through its half-size depth). Made anew, the
+    // buffer started cleared to 1.0 and the bytes were gone (the striped sky of 2026-10-16).
+    std::vector<Surface*> carry = carry_sources(address, pitch ? pitch : row, row, height, nullptr, nullptr, nullptr);
+    Surface* made = make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
+    if (!made || !carry_into(*made, carry)) carry.clear();
+    evict_overlapping(address, pitch ? pitch : row, row, height, nullptr, nullptr, made, carry);
+    return made;
 }
 
 id<MTLRenderPipelineState> MetalBackend::Impl::blit_pipeline_for(MTLPixelFormat format)

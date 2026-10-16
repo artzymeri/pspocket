@@ -319,6 +319,86 @@ kernel void rsx_depth_to_memory(depth2d<float, access::read> depth [[texture(0)]
     overlay_store(dst, p, gid, b);
 }
 
+// 5 and 6 bits to 8 as the CPU's upload_surface_bytes widens them (the BGRA8 copy R5G6B5 targets render to, D-112).
+static uchar bits5(uint v) { return uchar((v << 3) | (v >> 2)); }
+static uchar bits6(uint v) { return uchar((v << 2) | (v >> 4)); }
+
+// The inverse (D-1025): guest bytes in a target's own format (a staging copy of its memory, other targets laid over it
+// with the kernels above) to the texel bytes of its Metal texture, which a blit then copies in: what a target made over
+// the memory of others of other formats starts with on the GPU (GTA V packs its depth into an A8B8G8R8 target, then
+// tests against that memory as a Z24S8 buffer). Mirrors upload_surface_bytes (surface_cache.mm). Z24S8: the depth as
+// a float into `texels`, the stencil into `stencil`.
+kernel void rsx_memory_to_surface(device const uchar* src [[buffer(0)]], device uchar* texels [[buffer(1)]],
+                                  device uchar* stencil [[buffer(2)]], constant rsx_overlay_params& p [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height) return;
+    const uint o = p.swizzled != 0u ? morton(gid.x, gid.y, p.log2_w, p.log2_h) * p.bpp : gid.y * p.pitch + gid.x * p.bpp;
+    const uint i = gid.y * p.width + gid.x;
+    switch (p.mode) {
+    case kOvZ24S8: {
+        const uint v = ld32be(src, o);
+        const float z = float(v >> 8) / 16777215.0;
+        const uint bits = as_type<uint>(z);
+        texels[i * 4u] = uchar(bits); texels[i * 4u + 1u] = uchar(bits >> 8);
+        texels[i * 4u + 2u] = uchar(bits >> 16); texels[i * 4u + 3u] = uchar(bits >> 24);
+        stencil[i] = uchar(v);
+        break;
+    }
+    case kOvZ16: texels[i * 2u] = src[o + 1u]; texels[i * 2u + 1u] = src[o]; break;
+    case kOvB8: texels[i] = src[o]; break;
+    case kOvG8B8: texels[i * 2u] = src[o + 1u]; texels[i * 2u + 1u] = src[o]; break; // G B -> R(blue) G
+    case kOvR5G6B5:
+    case kOvX1R5G5B5: {
+        const uint v = ld16be(src, o);
+        device uchar* t = texels + i * 4u;
+        if (p.mode == kOvR5G6B5) {
+            t[0] = bits5(v & 31u); t[1] = bits6((v >> 5) & 63u); t[2] = bits5(v >> 11);
+        } else {
+            t[0] = bits5(v & 31u); t[1] = bits5((v >> 5) & 31u); t[2] = bits5((v >> 10) & 31u);
+        }
+        t[3] = p.alpha == 1u ? 0u : 255u;
+        break;
+    }
+    case kOvF16x4:
+        for (uint k = 0; k < 8u; k += 2u) { texels[i * 8u + k] = src[o + k + 1u]; texels[i * 8u + k + 1u] = src[o + k]; }
+        break;
+    case kOvF32x4:
+    case kOvF32: {
+        const uint n = p.mode == kOvF32x4 ? 16u : 4u;
+        for (uint k = 0; k < n; k += 4u)
+            for (uint b = 0; b < 4u; b++) texels[i * n + k + b] = src[o + k + 3u - b];
+        break;
+    }
+    default: { // kOvARGB8, kOvABGR8: the bytes reverse; the X8 forms' X reads as zero or one
+        device uchar* t = texels + i * 4u;
+        t[0] = src[o + 3u]; t[1] = src[o + 2u]; t[2] = src[o + 1u];
+        t[3] = p.alpha == 1u ? 0u : p.alpha == 2u ? 255u : src[o];
+        break;
+    }
+    }
+}
+
+// The presented image as a 64x36 thumbnail (D-1027): each texel the mean of its box of the image, BGRA8, alpha 255,
+// into a shared buffer the host reads once the frame has run (pspocket-boot's compare_frame computes the same on the CPU).
+kernel void rsx_thumbnail(texture2d<float, access::read> src [[texture(0)]], device uchar* out [[buffer(0)]],
+                          constant uint4& size [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint tw = size.x, th = size.y, w = src.get_width(), h = src.get_height();
+    if (gid.x >= tw || gid.y >= th) return;
+    const uint y0 = gid.y * h / th, y1 = max(y0 + 1u, (gid.y + 1u) * h / th);
+    const uint x0 = gid.x * w / tw, x1 = max(x0 + 1u, (gid.x + 1u) * w / tw);
+    uint3 sum = uint3(0);
+    for (uint y = y0; y < y1; y++)
+        for (uint x = x0; x < x1; x++) {
+            const float4 c = src.read(uint2(x, y));
+            sum += uint3(uint(rint(saturate(c.b) * 255.0)), uint(rint(saturate(c.g) * 255.0)), uint(rint(saturate(c.r) * 255.0)));
+        }
+    const uint n = (y1 - y0) * (x1 - x0);
+    device uchar* o = out + (gid.y * tw + gid.x) * 4u;
+    o[0] = uchar(sum.x / n); o[1] = uchar(sum.y / n); o[2] = uchar(sum.z / n); o[3] = 255u;
+}
+
 // Reads a texture back as float4 per texel (nearest sampling at texel centres: works for every format, BCn included).
 kernel void rsx_read_texture(texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]],
                              device float4* out [[buffer(0)]], constant uint4& size [[buffer(1)]],

@@ -165,6 +165,8 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     fifo_location_.store(config_.fifo_location, std::memory_order_release);
     return_stack_.reserve(config_.call_stack_depth);
     (void)handlers();
+    if (const char* e = std::getenv("PSPOCKET_RSX_EARLY_REPORTS"); e && *e && std::strcmp(e, "0") != 0)
+        config_.early_reports = true; // D-1021
     // PSPOCKET_RSX_CPU_AB=N[:MASK] (D-953): bit 32 of MASK (all by default) is the FIFO's argument runs (D-955).
     if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) {
         const char* mask = std::strchr(f, ':');
