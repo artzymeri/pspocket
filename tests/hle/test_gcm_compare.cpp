@@ -34,6 +34,7 @@ constexpr u32 kOutSize = 0x2000;
 constexpr u32 kCmdSize = 0x40000;
 constexpr u8 kFill = 0xA5;
 constexpr u64 kVoid = 1; // Op flag: the function returns nothing (its r3 is not compared)
+constexpr u64 kCtxArg = 0xC7C7C7C7; // an argument replaced by the default context's address at the call
 constexpr u32 kMaps = 0x01000000, kMapsSize = 0x00C00000; // 12 MB of main memory, MB-aligned
 
 // A call; with fn "=" a 32-bit store into guest memory first (args: address, value), "=di" into the driver
@@ -145,7 +146,10 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony, const I
             r.answers.push_back(0);
             continue;
         }
-        const u32 answer = call(op.fn, op.args);
+        std::vector<u64> args = op.args;
+        for (u64& v : args)
+            if (v == kCtxArg) v = ps_read32(base, kCtxPtr);
+        const u32 answer = call(op.fn, args);
         r.answers.push_back(op.flags & kVoid ? 0 : answer);
     }
     // Flips lv2 asked for run on the RSX thread: let them finish before looking.
@@ -171,7 +175,8 @@ Run run(const std::string& flash, const std::vector<Op>& ops, bool sony, const I
     return r;
 }
 
-void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what, const Init& init = {})
+void compare(const std::string& flash, const std::vector<Op>& ops, const std::string& what, const Init& init = {},
+    bool driver_info = true)
 {
     const Run mine = run(flash, ops, false, init);
     const Run sonys = run(flash, ops, true, init);
@@ -210,7 +215,8 @@ void compare(const std::string& flash, const std::vector<Op>& ops, const std::st
         if (x != y) UNSCOPED_INFO(std::format("{}: driver +{:#x}: ours {:#010x}, Sony's {:#010x}", what, 0x10B8 + i, x, y));
     }
     at = 0;
-    while (at < mine.driver.size() && mine.driver[at] == sonys.driver[at]) at++;
+    while (driver_info && at < mine.driver.size() && mine.driver[at] == sonys.driver[at]) at++;
+    if (!driver_info) at = mine.driver.size();
     const auto word = [](const std::vector<u8>& v, usize i) {
         i &= ~usize{3};
         return i + 4 <= v.size() ? ps_ld32(v.data() + i) : 0u;
@@ -357,6 +363,18 @@ TEST_CASE("cellGcmSys against libgcm_sys", "[hle][lle][gcm]")
                 {"_cellGcmSetFlipCommand2", {kOut + 0x800, 1}, kVoid}, {"cellGcmSetFlipImmediate", {0}},
                 {"cellGcmSetFlipImmediate", {9}}},
             "flips");
+    }
+
+    // D-1046: what cellGcmSetPrepareFlip answers on the default context: the flip ring's slot, not the id.
+    SECTION("flips: cellGcmSetPrepareFlip's answer")
+    {
+        compare(fl,
+            {{"cellGcmSetDisplayBuffer", {0, 0x100000, 0x1000, 1280, 720}}, {"cellGcmSetPrepareFlip", {kCtxArg, 0}},
+                {"cellGcmSetPrepareFlip", {kCtxArg, 0}}, {"cellGcmSetPrepareFlip", {kCtxArg, 0}},
+                {"cellGcmSetPrepareFlip", {kCtxArg, 8}}, {"cellGcmSetFlip", {kCtxArg, 0}}},
+            "prepare flip", {}, false);
+        // Not the driver information: the RSX runs what each wrote, pspocket's GCM_FLIP_COMMAND (RPCS3's, which
+        // queues the buffer on head 1 before it flips: flip flags 0xc0000001) and Sony's own words (0x80000000).
     }
 
     SECTION("tiles: set, invalidate")

@@ -17165,3 +17165,25 @@ Mac.
   76.7 passes, reports_early 16,702, targets_lost 32,507 (49.9 GB); on (three runs): GPU 7.11, 7.17 and 7.61 ms,
   76.7 passes, reports_early 0, targets_lost about 12,600 (17.6 GB). The carrying costs about 0.4 ms of GPU a frame on
   the Mac (13 to 19 targets a frame start from the bytes under them).
+
+## D-1046 · 2026-10-16 · cellGcmSetPrepareFlip as libgcm_sys: a full flip ring refused, the slot answered
+
+D-1044 left the full flip ring: pspocket wrote the flip and dropped the oldest queued slot, where the brief said
+libgcm_sys returns an error. Read in Sony's libgcm_sys (cellGcmSetPrepareFlip's entry at 0x2514; cellGcmSetFlip at
+0x23b4 wraps it): an id over 7 is CELL_GCM_ERROR_FAILURE; then the next slot is (write + 1) % 8 (0x10b0); when that
+is the oldest slot not yet flipped (the read index) the answer is CELL_GCM_ERROR_FAILURE with nothing written and the
+ring as it was (0x2594); otherwise the slot takes the id (0x25b4, 0x25b8) before the command is written (0x18bc), and
+the answer is the slot (r31), not the id as RPCS3's gcmSetPrepareFlip has it. Comparing it on a context the RSX never
+runs crashed in Sony's flush of that context (its callback 0), so the full ring is taken from the code; the answer on
+the default context is compared.
+
+- runtime/hle/src/cellGcmSys.cpp set_prepare_flip: the slot reserved first (a full ring: CELL_GCM_ERROR_FAILURE, a
+  warning, nothing written), then room, the command and put as before; cellGcmSetPrepareFlip answers the slot,
+  cellGcmSetFlip CELL_OK or the failure. A callback that fails still answers its own result (RPCS3's; Sony's 0x18bc
+  not read further).
+- Tests: tests/hle/test_gcm_sys.cpp (the slots; on a game's own context seven flips queue, the eighth and a
+  cellGcmSetFlip are refused with the context unchanged, the ring's buffers by index); tests/hle/test_gcm_compare.cpp
+  "flips: cellGcmSetPrepareFlip's answer" (three flips, an id of 8 and a cellGcmSetFlip on the default context, the
+  answers as Sony's; not the driver information there: pspocket's RSX runs its own GCM_FLIP_COMMAND, which queues the
+  buffer on head 1 first, RPCS3's way, flip flags 0xc0000001, where Sony's words leave 0x80000000). An argument value
+  kCtxArg in a compare step is the default context's address.

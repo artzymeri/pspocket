@@ -1016,35 +1016,35 @@ void cellGcmSetFlipMode(PPUContext& ctx, u32 mode)
     set_flip_mode(ctx, mode, 1);
 }
 
-// RPCS3 gcmSetPrepareFlip (the checked API, under cellGcmSetPrepareFlip and cellGcmSetFlip): a buffer id past 7 is
-// CELL_GCM_ERROR_FAILURE; room for the command, where a callback that fails is logged, nothing is written and its
-// result is returned as it is (RPCS3's not_an_error); then GCM_FLIP_COMMAND with the id. For the default context the
-// put register then advances by the command's 8 bytes, so the RSX runs it: RPCS3 adds to put, it does not set put
-// from current. Returns the id.
+// cellGcmSetPrepareFlip's body, as libgcm_sys's (0x2514, D-1046): a buffer id past 7 is CELL_GCM_ERROR_FAILURE; so is
+// a full ring of queued buffers (the next slot, (write + 1) % 8, being the oldest not yet flipped), with nothing written
+// and the ring as it was; otherwise the slot takes the id, then the command is written (room made first: a callback
+// that fails is logged, nothing is written and its result returned, RPCS3's not_an_error) and, for the default
+// context, put advances by its 8 bytes so the RSX runs it (RPCS3 adds to put; it does not set put from current).
+// Returns the slot (libgcm_sys's answer; RPCS3's gcmSetPrepareFlip returns the id).
 s32 set_prepare_flip(PPUContext& ctx, u32 context, u32 id, std::string_view what)
 {
     if (id > 7) return error(CELL_GCM_ERROR_FAILURE);
     if (!context_readable(ctx, context, what)) return error(CELL_GCM_ERROR_FAILURE);
     lv2::PpuThread& t = thread_of(ctx);
     u8* base = t.kernel.base();
+    GcmState& g = gcm();
+    s32 slot = 0;
+    {
+        std::lock_guard rl(g.ring_mutex);
+        slot = (g.ring_write + 1) % 8;
+        if (slot == g.ring_read) {
+            PS_LOG_WARN(kChan, "{}: libgcm_sys's flip ring is full (seven flips queued): CELL_GCM_ERROR_FAILURE", what);
+            return error(CELL_GCM_ERROR_FAILURE);
+        }
+        g.ring_write = slot;
+        g.ring[static_cast<u32>(slot)] = static_cast<u8>(id);
+    }
     if (const s32 res = make_room(ctx, base, context); res != 0) {
         PS_LOG_ERROR(kChan, "cellGcmSetPrepareFlip: callback failed ({:#010x})", static_cast<u32>(res));
         return res;
     }
     prepare_flip(base, context, id);
-    GcmState& g = gcm();
-    {
-        // libgcm_sys's ring of queued buffers (D-519): the next slot takes the id. libgcm_sys refuses a full ring
-        // (CELL_GCM_ERROR_FAILURE); here the flip command is written already, so the oldest slot is dropped instead.
-        std::lock_guard rl(g.ring_mutex);
-        const s32 next = (g.ring_write + 1) % 8;
-        if (next == g.ring_read) {
-            PS_LOG_WARN(kChan, "{}: eight flips queued; the oldest leaves libgcm_sys's flip ring", what);
-            g.ring_read = (g.ring_read + 1) % 8;
-        }
-        g.ring_write = next;
-        g.ring[static_cast<u32>(next)] = static_cast<u8>(id);
-    }
     if (context == g.context_addr) {
         for (u32 put = atomic_load_be32(base, g.control_addr);;) {
             const u32 seen = atomic_cas_be32(base, g.control_addr, put, put + 8);
@@ -1053,10 +1053,10 @@ s32 set_prepare_flip(PPUContext& ctx, u32 context, u32 id, std::string_view what
         }
         if (rsx::Rsx* rsx = t.kernel.rsx()) rsx->notify();
     }
-    return static_cast<s32>(id);
+    return slot;
 }
 
-// cellGcmSetPrepareFlip(context, id): RPCS3's returns gcmSetPrepareFlip's result: the id once the command is written.
+// cellGcmSetPrepareFlip(context, id): the ring slot once the command is written (libgcm_sys, D-1046).
 s32 cellGcmSetPrepareFlip(PPUContext& ctx, u32 context, u32 id)
 {
     return set_prepare_flip(ctx, context, id, "cellGcmSetPrepareFlip");

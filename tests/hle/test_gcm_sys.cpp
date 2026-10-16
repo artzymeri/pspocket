@@ -600,10 +600,11 @@ TEST_CASE("cellGcmSys: cellGcmSetPrepareFlip, cellGcmSetUserCommand and cellGcmS
     const auto current = [&] { return ps_read32(b, ctx + 0x8); };
     const auto put = [&] { return ps_read32(b, control); };
 
-    // cellGcmSetPrepareFlip returns the id; on the default context put moves past the command, so the RSX flips.
+    // cellGcmSetPrepareFlip returns the flip ring's slot (libgcm_sys, D-1046); on the default context put moves past
+    // the command, so the RSX flips.
     flush_to_current(f, g);
     const u32 c0 = current();
-    CHECK(g.call("cellGcmSetPrepareFlip", ctx, 3) == 3);
+    CHECK(g.call("cellGcmSetPrepareFlip", ctx, 3) == 1);
     CHECK(ps_read32(b, c0) == rsx::cmd::method_header(rsx::m::GCM_FLIP_COMMAND, 1));
     CHECK(ps_read32(b, c0 + 4) == 3);
     CHECK(current() == c0 + 8);
@@ -623,7 +624,7 @@ TEST_CASE("cellGcmSys: cellGcmSetPrepareFlip, cellGcmSetUserCommand and cellGcmS
         ps_write32(b, kOwn + 0xC, callback);
     };
     own_context(kOwnBuf, kOpdNeg);
-    CHECK(g.call("cellGcmSetPrepareFlip", kOwn, 2) == 2);
+    CHECK(g.call("cellGcmSetPrepareFlip", kOwn, 2) == 2); // slot 2
     CHECK(ps_read32(b, kOwnBuf + 4) == 2);
     CHECK(put() == c0 + 8 - kIo);
     own_context(kOwnEnd, kOpdNeg);
@@ -837,7 +838,7 @@ TEST_CASE("cellGcmSys: _cellGcmFunc12, debug level, second V frequency, immediat
     ps_write32(b, kOwnCtx + 4, kOwnBuf + 0x100);
     ps_write32(b, kOwnCtx + 8, kOwnBuf);
     ps_write32(b, kOwnCtx + 12, 0);
-    REQUIRE(g.call("cellGcmSetPrepareFlip", kOwnCtx, 3) == 3);
+    REQUIRE(g.call("cellGcmSetPrepareFlip", kOwnCtx, 3) == 1); // its slot
     CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 1) == 3);
     CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 2) == 0xFFFFFFFFFFFFFFFFull);
     const u64 flips = rsx->flip_count();
@@ -845,6 +846,16 @@ TEST_CASE("cellGcmSys: _cellGcmFunc12, debug level, second V frequency, immediat
     for (int i = 0; i < 2000 && rsx->flip_count() == flips; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     CHECK(rsx->flip_count() == flips + 1);
     CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 1) == 0xFFFFFFFFFFFFFFFFull); // flipped: no longer queued
+
+    // D-1046: the ring holds seven queued flips; the eighth is refused with nothing written and the ring as it was
+    // (libgcm_sys's cellGcmSetPrepareFlip at 0x2514: the next slot, (write + 1) % 8, the oldest not flipped).
+    for (u32 i = 0; i < 7; i++) CHECK(g.call("cellGcmSetPrepareFlip", kOwnCtx, i) == (2 + i) % 8);
+    const u32 own_current = ps_read32(b, kOwnCtx + 8);
+    CHECK(g.call("cellGcmSetPrepareFlip", kOwnCtx, 7) == kFailure);
+    CHECK(g.call("cellGcmSetFlip", kOwnCtx, 7) == kFailure);
+    CHECK(ps_read32(b, kOwnCtx + 8) == own_current);
+    CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 0) == 6);
+    CHECK(g.call("cellGcmGetDisplayBufferByFlipIndex", 7) == 5);
 
     // RPCS3's plain CELL_OKs.
     CHECK(g.call("cellGcmInitDefaultFifoMode", 0) == 0);
