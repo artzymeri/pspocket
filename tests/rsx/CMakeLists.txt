@@ -19,8 +19,9 @@ if(TARGET pspocket::rsx_metal)
     set_target_properties(test_rsx_metal PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF)
     # Every end-to-end draw again through the shader interpreter (D-940): the same pixels as the translation's. The
     # cases that count compiles are left out (the interpreter's functions are compiles of their own), and the signed
-    # blending the translation does in the shader (D-948: the interpreter's draws blend as Metal can).
+    # blending the translation does in the shader (D-948: the interpreter's draws blend as Metal can), and the draw
+    # that waits for its programs rather than use the interpreter (D-1026, D-1071).
     add_test(NAME test_rsx_metal_interpreted COMMAND test_rsx_metal "metal e2e:*" "~*(D-114)" "~*(D-158)" "~*(D-940)"
-        "~*(D-948)")
+        "~*(D-948)" "~*(D-1026)")
     set_tests_properties(test_rsx_metal_interpreted PROPERTIES ENVIRONMENT PSPOCKET_RSX_INTERPRETER=1)
 endif()
