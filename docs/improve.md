@@ -23,13 +23,17 @@ The user: problems must be found and fixed automatically, for any game. The plan
    first game-time press scripts, a Mac freeze/deadlock detector, the summary on every exit path, triage.py — agent h2.
 4. **Any game**: imports nothing answers named at load and the app refuses with a message (D-1061, done);
    scripts/nid_audit.py sorts Sony's exports pspocket lacks by their code and finds aliases (D-1062, done: 8 aliases of
-   named functions, GTA IV's among them); next: the audit before play in the library, the aliases and constants
-   implemented, a list across every game, bringup.sh.
+   named functions, GTA IV's among them); GTA IV's alias answered (D-1040), two more exact ones (D-1066: the cellGame
+   three wait for a game, their "mode" is decided in the system software); scripts/bringup.py, a new game's missing
+   imports sorted by their firmware code and a first boot's verdict in one report (D-1068). Next: a list across every
+   game (their EBOOTs from the phone), the audit shown in the app's library before play.
 5. **Bench and reports**: scripts/bench.py with GTA V's and Assassin's Creed's cases from saves and fresh installs,
    checked by scripts/bench_check.py (D-1060, D-1063: partly black frames, new messages, CPU ms a frame against a
    rolling baseline); FrameWatch detectors shared by the Mac and the phone (D-1064); the app's glitch reports with a
    flag button, ios.sh pull-reports and pull-save (D-1065). Next: the backend's per-frame thumbnail feeding the
-   detectors (asked of h1), routes on game time (h2), the nightly run, more cases.
+   detectors (asked of h1), routes on game time (h2). Done: Assassin's Creed's first install passes on the Mac (run
+   333); the bench runs every night at 03:00 from a launchd job and grows its baseline from clean nights (D-1067);
+   GTA V's rain-street and buzzard cases.
 
 ## The last 10% to a steady 30 (research, 2026-10-15 evening)
 
