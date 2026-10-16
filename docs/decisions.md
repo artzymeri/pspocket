@@ -16751,3 +16751,20 @@ to "your Mac at night").
 - Two more GTA V cases from the save: rain-street (six weather changes to rain, then the wet street and its sky:
   the sky flicker) and buzzard (the helicopter cheat, up over Rockford Hills and west to the water: the far city and
   the sea from above, the missing and black sea).
+
+## D-1068 · 2026-10-16 · scripts/bringup.py: a new game's first look in one command
+
+The bulletproof plan's net 4: what a game nobody has run yet needs, before anyone plays it.
+
+- scripts/bringup.py GAME.iso (or a decrypted EBOOT.elf) [--prepare] [--seconds S] [--no-boot]: the title from the
+  disc names inventory/<TITLE>/ and the EBOOT is decrypted there once; the imports nothing answers come from the
+  loader's own list (D-1061: no host function, RPCS3 stub or firmware module's export), each sorted by
+  scripts/nid_audit.py (alias, constant, void, thunk, code: D-1062); a first boot (120 s by default) on a copy of its
+  hdd0, from its library in inventory/<TITLE>/bench-library (--prepare makes or updates it with pspocket-prepare, as
+  the phone and the bench do) with SPU programs translated during the session, reports how it ended, fps, RSX
+  failures, unimplemented calls, the SPU programs lifted or interpreted and the most frequent warning shapes. The
+  report is inventory/<TITLE>/bringup.md (game-derived). Exit 0 when nothing is missing and the boot reached its
+  timeout cleanly.
+- Tried on Assassin's Creed: 759 imports, none missing; 45 s from its library, 18 fps in the loading screens, no RSX
+  failures, no unimplemented calls, 10,839 SPU program loads lifted and none interpreted. Without the library the
+  PPU code is interpreted (11 to 13 fps) and the report says so.
