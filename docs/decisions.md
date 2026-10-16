@@ -16626,3 +16626,22 @@ Michael's hallway about 42 s after the boot; cheats such as skyfall reach the ci
   interpreter (D-940) lacks D-948's signed blending. 26.6 fps, 82.8 ms of CPU a frame, 989 draws a frame.
 - Next: routes on game time (D-1040 on), the flicker and hitch detectors shared with the phone, the nightly run,
   more cases (rain, helicopter, night), Assassin's Creed's.
+
+## D-1062 · 2026-10-16 · Sony's exports pspocket lacks, each sorted by its code: aliases found automatically
+
+The bulletproof plan's net 4: unnamed NIDs identified from the firmware's own modules instead of by hand (GTA IV's
+0xb70b4ad3 took a research agent and ppu-dis to place, D-1061).
+
+- scripts/nid_audit.py: every decrypted firmware module (inventory/firmware/analysis/elf, ps3inspect --json), every
+  export pspocket's registry (pspocket-boot --hle-list) lacks, sorted by its first instructions: **alias** (register
+  set-up, then a plain branch into a body a named export of the library also branches to: named with what each sets),
+  **constant** (li r3,K; blr, or lis+ori), **void** (blr), **thunk** (into another library's import stub), **code**
+  (anything else, with its length). --imports LIB:NID ... for a game's; --json for every entry (inventory/, game-derived).
+- Over the installed 4.92 system software: 1,289 exports in 83 libraries lack a host function (many are internal
+  libraries games reach through others); 74 aliases, 11 constants, 3 void, 2 thunks, 1,199 code. Of the aliases, 8 share
+  a named export's body: cellGcmSys 0xb70b4ad3 (the body 0xcc0 shared with _cellGcmInitBody, which sets r7=1: what D-1061's
+  research found by hand), cellGame 0x47db7335, 0x5a067101 and 0x9c79f4f1 (cellGameGetParamString,
+  cellGameCreateGameData and cellGameSetParamString with r6 or r5 = 1 where those set 0), cellJpgDec 0xdb9affce,
+  sceNpCommerce2 0x6a53fdf9 and 0x9684d405, _cellAudio 0xcd7bc431 (cellAudioPortOpen's body).
+- These are the work queue for net 4: an alias is its named function with the argument fixed; a constant or void
+  export is an exact stub.
