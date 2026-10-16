@@ -328,9 +328,11 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
         }
         for (const auto& fn : lib.functions) {
             u32 descriptor = 0;
+            bool from_firmware = false;
             if (module) {
                 if (const auto it = module->functions.find({lib.name, fn.nid}); it != module->functions.end()) {
                     descriptor = it->second;
+                    from_firmware = true;
                     rep.functions_lle++;
                 } else {
                     PS_LOG_ERROR(kChan, "{}::{} ({:#010x}) is not in {}", lib.name, fn.resolved.name, fn.nid, module->file);
@@ -343,6 +345,7 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
             rep.functions_linked++;
             if (hle::registry().find(lib.name, fn.nid)) rep.functions_implemented++;
             else if (!module && hle::find_rpcs3_stub(lib.name, fn.nid)) rep.functions_stubbed++;
+            else if (!from_firmware) rep.missing.push_back({lib.name, std::string(fn.resolved.name), fn.nid});
         }
         for (const auto& var : lib.variables) {
             if (module) {
@@ -371,6 +374,9 @@ lv2::Result load(const Executable& exe_ref, lv2::Kernel& kernel, hle::HleProcess
     PS_LOG_INFO(kChan, "{} segments, {} imported functions ({} implemented, {} by {} firmware modules), {} unresolved "
                        "variables", rep.segments, rep.functions_linked, rep.functions_implemented, rep.functions_lle,
         rep.lle_modules, rep.variables_unresolved);
+    for (const auto& m : rep.missing) // D-1061: named at load, before anything runs
+        PS_LOG_ERROR(kChan, "nothing answers the imported function {}::{} ({:#010x}): a call to it fails", m.library,
+            m.name.empty() ? "?" : m.name, m.nid);
     if (report) *report = rep;
     return lv2::CELL_OK;
 }

@@ -95,6 +95,15 @@ struct LoadReport {
     u32 functions_lle = 0;         // linked to a firmware module's export
     u32 lle_modules = 0;           // firmware modules loaded
     u32 variables_unresolved = 0;
+    // Imported functions nothing answers (D-1061): no host implementation, no RPCS3 stub, no firmware module's export.
+    // A call to one returns CELL_ENOSYS; a game that set up its state through one (GTA IV's _cellGcmInitBody variant,
+    // 0xb70b4ad3) crashes later, far from it. The app refuses to start such a game unless asked (game.mm).
+    struct Missing {
+        std::string library;
+        std::string name; // empty when the NID has no known name
+        u32 nid = 0;
+    };
+    std::vector<Missing> missing;
 };
 
 class LleModules;

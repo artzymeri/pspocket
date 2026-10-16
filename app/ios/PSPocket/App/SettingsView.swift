@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var pickingFirmware = false
     /// Read by the runtime at the game's start (runtime/platform/ios/src/game.mm, set_env_from_settings; D-996).
     @AppStorage("edgeGPU") private var edgeGPU = false
+    @AppStorage("startMissing") private var startMissing = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -48,12 +49,14 @@ struct SettingsView: View {
                 }
                 Section {
                     Toggle("3D models on the GPU (EDGE)", isOn: $edgeGPU)
+                    Toggle("Start games with missing system functions", isOn: $startMissing)
                 } header: {
                     Text("Experiments")
                 } footer: {
                     Text("Moves the work of Sony's EDGE geometry (skinning, unpacking and culling the game's 3D "
                          + "models) from the processor to the graphics chip. Takes effect the next time a game "
-                         + "starts. Turn it off if models look wrong.")
+                         + "starts. Turn it off if models look wrong. A game that needs a system function pspocket "
+                         + "doesn't have yet doesn't start; the second switch starts it anyway (it may crash).")
                 }
                 Section("Diagnostics") {
                     NavigationLink(value: Page.selfTest) { Label("Self-test", systemImage: "checklist") }

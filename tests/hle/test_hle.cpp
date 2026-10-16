@@ -256,6 +256,16 @@ TEST_CASE("Loader: boot a synthetic executable to its first unimplemented import
                                                // cellGcmSetFlipMode and cellGcmGetConfiguration,
                                                // cellSysutil::cellSysutilRegisterCallback, sys_io::cellPadInit,
                                                // cellSpurs::cellSpursInitialize (D-171), sys_libc::memcpy (D-184)
+    // What nothing answers is named in the report (D-1061): synthLib's 0xDEADBEEF, and nothing pspocket has.
+    bool deadbeef = false;
+    for (const auto& m : report.missing) {
+        INFO(m.library << " " << m.nid);
+        CHECK((m.library == "synthLib" || !hle::registry().find(m.library, m.nid)));
+        deadbeef |= m.library == "synthLib" && m.nid == 0xDEADBEEF;
+    }
+    CHECK(deadbeef);
+    CHECK(report.missing.size() == report.functions_linked - report.functions_implemented - report.functions_stubbed -
+                                       report.functions_lle);
     // sys_libc::_Ctype is pspocket's own since D-515: its reference is patched with the variable's address.
     CHECK(report.variables_unresolved == 0);
     CHECK(ps_read32(p.memory.base(), x.var_ref_target) == p.hle->link_variable("sys_libc", 0xD97B0687));

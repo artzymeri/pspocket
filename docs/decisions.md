@@ -16583,3 +16583,22 @@ attributes at 0x0909C by format - 1: 1 at 0x09B90, 2 F32, 4 at 0x0997C, 6 at 0x0
   start at the thread's previous EDGE job's end; job_end reads the clock once.
 - Test: three threads publish 20,000 items each while one takes them by allocation as they come; every item taken
   once, an allocation published twice gives the later item and one replacement counted.
+
+## D-1061 · 2026-10-16 · Imports nothing answers named at load; the app does not start such a game
+
+The bulletproof plan's net 4 (the user green-lit it: https://claude.ai/artifact/DDu44gkuiZwVis8DRH9GR1), first step.
+GTA IV (BLUS30127) crashed at boot on the iPhone: it imports cellGcmSys 0xb70b4ad3 (an unnamed variant of
+_cellGcmInitBody, D-1040 on), the call answered CELL_ENOSYS, and the game crashed reading a GCM context never set up.
+The loader had warned ("the game imports 1 function(s) the host lacks") and gone on.
+
+- loader::LoadReport::missing: each imported function with no host implementation, no RPCS3 stub and no firmware
+  module's export (library, name if known, NID), each logged as an error at load ("nothing answers the imported
+  function ...").
+- The app (game.mm) does not start such a game: "This game needs N system function(s) pspocket doesn't have yet
+  (cellGcmSys 0xb70b4ad3). It won't start until they are added; Settings › Experiments can start it anyway." The
+  Experiments switch "Start games with missing system functions" sets PSPOCKET_START_MISSING (D-996's table).
+- GTA V (362 imports, with the GTA V subset of dev_flash and with the installed system software) and Assassin's Creed
+  (140) have none. Test: tests/hle "Loader: boot a synthetic executable ..." checks synthLib's 0xDEADBEEF is named and
+  the count agrees with the report's other counts.
+- Next in net 4: the same audit before a game runs (at preparation, in the library), unnamed NIDs identified from the
+  firmware's export tables (aliases like 0xb70b4ad3), and a list across every game.

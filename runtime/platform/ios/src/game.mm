@@ -372,6 +372,7 @@ void set_env_from_settings()
     };
     static const Switch kSwitches[] = {
         {@"edgeGPU", "PSPOCKET_EDGE_GPU", "1"}, // Sony's EDGE geometry on the GPU (D-987)
+        {@"startMissing", "PSPOCKET_START_MISSING", "1"}, // start a game whose imports pspocket lacks (D-1061)
     };
     for (const Switch& s : kSwitches) {
         if (![[NSUserDefaults standardUserDefaults] boolForKey:s.key] || std::getenv(s.name)) continue;
@@ -742,6 +743,21 @@ extern "C" int ps_game_boot(const ps_game_options* o, char* error, size_t error_
     loader::LoadReport report;
     if (const lv2::Result r = loader::load(*s->exe, *s->kernel, *s->hle, &report, s->lle.get()); r != lv2::CELL_OK) {
         return fail(error, error_size, std::string("loading the executable failed: ") + lv2::error_name(r));
+    }
+    // A system function the game imports that nothing answers (D-1061): the game would set up its state through it and
+    // crash later (GTA IV, run 333). It does not start, and says what it needs, unless Settings › Experiments asks to
+    // start such games anyway (PSPOCKET_START_MISSING).
+    if (!report.missing.empty() && !std::getenv("PSPOCKET_START_MISSING")) {
+        std::string list;
+        for (usize i = 0; i < report.missing.size() && i < 6; i++) {
+            const auto& m = report.missing[i];
+            list += std::format("{}{} {}", i ? ", " : "", m.library,
+                m.name.empty() ? std::format("{:#010x}", m.nid) : m.name);
+        }
+        if (report.missing.size() > 6) list += std::format(" and {} more", report.missing.size() - 6);
+        return fail(error, error_size, std::format("This game needs {} system function{} pspocket doesn't have yet "
+            "({}). It won't start until they are added; Settings › Experiments can start it anyway.",
+            report.missing.size(), report.missing.size() == 1 ? "" : "s", list));
     }
     if (s->lle) s->state.module_starts = s->lle->take_starts();
     // Modules the game loads while it runs (sys_prx_load_module, D-159).
