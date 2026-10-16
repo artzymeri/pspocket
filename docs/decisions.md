@@ -17086,6 +17086,11 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
   of a route and lists the programs one draws and the other does not.
 - Test: metal e2e "the exact mode has what the GPU drew in guest memory when a label lands" (a triangle in memory with
   no flush and no readback; a depth buffer made over the target starts with its bytes).
+- First A/B (the gate's prologue walk on the flip clock, fast 140 s against exact 1,200 s): the exact run reached
+  8,700 flips to the fast run's 3,900 (the prologue runs at 8 to 30 fps there), so the two covered different scenes and
+  25 of 125 programs differ by more than half (636 against 565 draws a frame); the exact run's alarms: conditional
+  draws decided while pending 0 (fast: 2,732). A per-window signature over the same flips is what a real comparison
+  needs (left to the capture and replay tool, E3/E4).
 
 ## D-1071 · 2026-10-16 · Signed blending also waits while the pipeline compiles
 

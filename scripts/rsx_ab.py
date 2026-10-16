@@ -23,7 +23,14 @@ def load(path):
 
 
 def main(argv):
-    args = [a for a in argv[1:] if not a.startswith("--")]
+    args, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+        elif a in ("--min", "--top"):
+            skip = True
+        else:
+            args.append(a)
     if len(args) != 2:
         print(__doc__)
         return 64
