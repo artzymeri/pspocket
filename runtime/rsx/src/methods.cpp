@@ -101,6 +101,9 @@ void Rsx::m_semaphore_release(u32 reg, u32 value)
 
 void Rsx::m_begin_end(u32, u32 value)
 {
+    if (backend_.tracing())
+        backend_.trace_note(std::format("SET_BEGIN_END {:#x}{} (get {:#x})", value,
+            !value && !state_.in_begin_end ? ", no BEGIN before it" : "", get()));
     // RPCS3 nv4097.cpp set_begin_end (upper bits ignored)
     const u32 prim = value & 0xff;
     if (prim != 0) {
@@ -129,7 +132,12 @@ void Rsx::m_begin_end(u32, u32 value)
 void Rsx::submit_draw_clause()
 {
     const u32 begin_prim = static_cast<u32>(state_.draw.primitive);
-    if (begin_prim == 0 || begin_prim > 10 || state_.draw.empty()) return;
+    if (begin_prim == 0 || begin_prim > 10 || state_.draw.empty()) {
+        if (backend_.tracing())
+            backend_.trace_note(std::format("a draw left out: primitive {}, {} (get {:#x})", begin_prim,
+                state_.draw.empty() ? "no vertices" : "an invalid primitive", get()));
+        return;
+    }
     if (!render_enabled_) { // conditional rendering: the report said nothing passed
         conditional_skips_.fetch_add(1, std::memory_order_relaxed);
         backend_.draw_skipped(state_, "conditional rendering: its report counted 0");
@@ -411,6 +419,7 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
     // later passes shaded black or red (the iPhone's slower GPU, characters' clothes). RPCS3 defers the evaluation to
     // the GPU instead.
     const u32 mode = value >> 24;
+    if (backend_.tracing()) backend_.trace_note(std::format("SET_RENDER_ENABLE {:#x} (get {:#x})", value, get()));
     if (mode == 1) {
         render_enabled_ = true;
         return;

@@ -354,7 +354,12 @@ void MetalBackend::Impl::submit(bool wait)
             for (const PendingReport& r : *reports) {
                 u64 count = 0;
                 for (const VisibilitySlot& s : r.slots) count += static_cast<const u64*>(s.buffer.contents)[s.index];
-                const u32 value = static_cast<u32>(std::min<u64>(count, 0xFFFFFFFFull));
+                // PSPOCKET_RSX_ZPASS_AT_LEAST=N (a debugging aid): every count at least N (everything visible).
+                static const u64 at_least = [] {
+                    const char* v = std::getenv("PSPOCKET_RSX_ZPASS_AT_LEAST");
+                    return v ? std::strtoull(v, nullptr, 0) : 0ull;
+                }();
+                const u32 value = static_cast<u32>(std::min<u64>(std::max(count, at_least), 0xFFFFFFFFull));
                 // The whole report (D-1021): {timestamp, count, pad} as RPCS3's get_report lays it out, the pad (the
                 // ready word GTA V polls) last, released after the rest.
                 if (r.whole) ps_write64(guest, r.value_addr - 8, Rsx::timestamp_ns());
@@ -2263,6 +2268,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     if (tracing && zalways_fp && fprog && fprog->hash == zalways_fp && ds.depth_test) {
         ds_bound.depth_func = static_cast<u32>(CompareFunc::Always);
         ds_bound.depth_write = true;
+        if (std::getenv("PSPOCKET_RSX_TRACE_ZALWAYS_NO_STENCIL")) ds_bound.stencil_test = false;
     }
     if (id<MTLDepthStencilState> depth = depth_state_for(ds_bound); es.depth != depth) {
         [enc setDepthStencilState:depth];
@@ -3046,6 +3052,17 @@ void MetalBackend::Impl::trace_probe()
             float z;
             std::memcpy(&z, b, 4);
             line += std::format("{:.6f}", z);
+            // and its stencil
+            id<MTLBuffer> sb = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> scb = [queue commandBuffer];
+            id<MTLBlitCommandEncoder> sblit = [scb blitCommandEncoder];
+            [sblit copyFromTexture:s->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
+                        sourceSize:MTLSizeMake(1, 1, 1) toBuffer:sb destinationOffset:0 destinationBytesPerRow:1
+          destinationBytesPerImage:1 options:MTLBlitOptionStencilFromDepthStencil];
+            [sblit endEncoding];
+            [scb commit];
+            [scb waitUntilCompleted];
+            line += std::format(" s{:02x}", static_cast<const u8*>(sb.contents)[0]);
         } else {
             for (u32 i = 0; i < bpp; i++) line += std::format("{:02x}", b[i]);
         }

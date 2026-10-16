@@ -17062,6 +17062,8 @@ phone found them first. Shake mode makes such races show in a few runs on the Ma
   FIFO jumps, calls and returns, ZPASS enables, clears and each GET_REPORT with its count (waited for, in the traced
   frame only) (`Backend::trace_note`), and each draw's fragment program hash, depth test and write, stencil state,
   polygon offset, cull face and whether it is counted by an occlusion query.
+- The trace also names every SET_BEGIN_END, a draw the front end leaves out (no vertices), SET_RENDER_ENABLE, and the
+  probe a depth buffer's stencil. `PSPOCKET_RSX_ZPASS_AT_LEAST=N`: every occlusion count at least N (all visible).
 - `PSPOCKET_SKIP_VTF_FP_AT=EA`: draws with the fragment program at EA that sample a vertex texture are skipped;
   `PSPOCKET_RSX_TRACE_ZALWAYS_FP=HASH`: in a traced frame, draws with that fragment program pass the depth test and
   write their depth, so the probe shows where and how deep they land.
