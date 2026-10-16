@@ -16645,3 +16645,21 @@ The bulletproof plan's net 4: unnamed NIDs identified from the firmware's own mo
   sceNpCommerce2 0x6a53fdf9 and 0x9684d405, _cellAudio 0xcd7bc431 (cellAudioPortOpen's body).
 - These are the work queue for net 4: an alias is its named function with the argument fixed; a constant or void
   export is an exact stub.
+
+## D-1064 · 2026-10-16 · Glitch detectors on frame thumbnails, shared by the Mac and the iPhone
+
+The bulletproof plan's net 5: the detectors that turn "the user saw a glitch" into an event, the same code for the
+bench and the app's reports. pspocket/loader/frame_watch.hpp (FrameWatch), plain C++, fed each presented frame's 64x36
+thumbnail and its time:
+
+- partly black: a fifth to 95% of the thumbnail exactly black (0, 0, 0) two frames in a row (D-1060's measure: the
+  black sea 56%, a night street 2.5%; a whole black frame is a fade);
+- flicker: A, B, A: a frame over 20 of 255 from the one before and the next under a third of that from the one before
+  it (a cut is A, B, B);
+- hitch: over 500 ms between frames while the game flipped 10 a second or more;
+- frozen: the same picture (under 0.5 apart) for 10 s while frames come;
+- flagged: the player's own button.
+Events are counted always and reported once per kind every 2 minutes; the last 32 thumbnails are kept for a report.
+Test: tests/hle test_frame_watch.cpp (synthetic thumbnails: a night scene, a half black frame twice, a fade, A-B-A
+against a cut, a gap of 800 ms, 11 s of one picture). Next: fed by the Metal backend's per-frame thumbnail (asked of
+the graphics track), in pspocket-boot's summary and the app's reports.

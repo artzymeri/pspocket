@@ -1,10 +1,36 @@
 {
   "title": "BLES01807",
+  "data": "gta5",
   "about": "GTA V's bench (D-1060): scenes from the user's save; routes on the wall clock until the press scripts follow game time. Budgets are CPU ms a frame (median of the busy 5 s windows), set from the first nights.",
   "cases": [
-    {"name": "house-idle", "save": "michael-house", "route": "house-idle.route", "timeout": 150, "from_s": 60},
-    {"name": "street", "save": "michael-house", "route": "street.route", "timeout": 160, "from_s": 70},
-    {"name": "skyfall-sea", "save": "michael-house", "route": "skyfall-sea.route", "timeout": 250, "from_s": 120}
+    {
+      "name": "house-idle",
+      "save": "michael-house",
+      "route": "house-idle.route",
+      "timeout": 150,
+      "from_s": 60
+    },
+    {
+      "name": "street",
+      "save": "michael-house",
+      "route": "street.route",
+      "timeout": 160,
+      "from_s": 70
+    },
+    {
+      "name": "skyfall-sea",
+      "save": "michael-house",
+      "route": "skyfall-sea.route",
+      "timeout": 250,
+      "from_s": 120
+    }
   ],
-  "modes": {"edge-off": {"PSPOCKET_EDGE_GPU": "0"}, "edge-on": {"PSPOCKET_EDGE_GPU": "1"}}
+  "modes": {
+    "edge-off": {
+      "PSPOCKET_EDGE_GPU": "0"
+    },
+    "edge-on": {
+      "PSPOCKET_EDGE_GPU": "1"
+    }
+  }
 }

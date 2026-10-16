@@ -1,0 +1,13 @@
+{
+  "title": "BLES00158",
+  "data": "BLES00158",
+  "about": "Assassin's Creed's bench (D-1063): its first install from an empty game folder (the iPhone's freeze, D-999) and the Animus training from its save; run from a library pspocket-prepare makes, as the phone does, with the installed system software (its ATRAC decoder is a firmware file the game loads itself, D-998).",
+  "flash": "inventory/firmware/installed/dev_flash",
+  "library": {"spu_images": "spu-images"},
+  "modes": {"default": {}},
+  "cases": [
+    {"name": "install-garden", "press": "walk-garden.txt", "timeout": 330, "from_s": 120,
+     "fresh": ["game/BLES00158/USRDIR/*", "home/00000001/savedata/BLES00158*"]},
+    {"name": "training", "press": "walk-training.txt", "timeout": 570, "from_s": 300}
+  ]
+}
