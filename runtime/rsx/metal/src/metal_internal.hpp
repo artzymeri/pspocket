@@ -736,6 +736,16 @@ struct MetalBackend::Impl {
 
     // Caches
     std::vector<std::unique_ptr<Surface>> surfaces;
+    u64 surfaces_version = 1; // bumped as surfaces are made and removed (their ranges never change)
+    // D-1056: the surfaces' byte ranges by start, each with the highest end up to it, for the reads below.
+    struct SurfaceSpan {
+        u64 lo = 0, hi = 0, reach = 0;
+        Surface* s = nullptr;
+    };
+    std::vector<SurfaceSpan> surface_spans;
+    u64 spans_version = 0;
+    std::vector<Surface*> stale_scratch;
+    bool stale_sync = true; // PSPOCKET_RSX_NO_STALE_SYNC=1: the reads below only count the alarm (tests, A/B)
     // Textures of surfaces removed, for the next surface of the same format and size (D-984): GTA V's 640x360
     // target and the 320x180 F16 one over the same memory replace each other every frame, a new texture each time.
     // At most kSurfacePoolMax, oldest dropped first; emptied by trim().
@@ -1055,6 +1065,11 @@ struct MetalBackend::Impl {
     void run_deferred(bool wait, usize count = ~usize{0});
     void end_pass_over(u32 addr, u32 size); // a target there with only a clear so far: its pass ends (it is newer then)
     void check_cpu_writes(Surface& s);      // a watched copy destination the CPU wrote since: guest memory is newer
+    // A read of guest memory [addr, addr + size) that does not take the GPU's copy of a target (D-1056): every
+    // GPU-newer target with pixel bytes there, drawn or sampled in the last two flips and not in `handled`, is written
+    // back first; one that cannot be counts the stale_gpu_reads alarm. Older ones are left (their memory is taken as
+    // reused). True when any was found.
+    bool sync_gpu_held(u32 addr, u32 size, const char* why, const std::vector<Surface*>& handled = {});
     // PSPOCKET_RSX_CHECK_SURFACES (a diagnostic): each surface keeps a hash of its guest memory from when it was made or
     // last written back; a texture sampled from a surface whose memory changed since (a CPU or SPU write the backend
     // was not told of) is logged.

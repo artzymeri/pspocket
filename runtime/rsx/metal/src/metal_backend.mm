@@ -274,6 +274,8 @@ bool MetalBackend::Impl::init()
             pass_times->timestamps ? "yes" : "no", pass_times->gpu_tick_ns);
     }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
+    if (const char* v = std::getenv("PSPOCKET_RSX_NO_STALE_SYNC"); v && *v && std::strcmp(v, "0") != 0)
+        stale_sync = false; // D-1056's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
     if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK") || exact) feedback_cached = false;   // D-947's comparison, D-1029
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
@@ -1939,6 +1941,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             const auto ea = rsx->translate(ia.offset + r.first * isize, ia.location, bytes);
             if (!ea || !guest_ok(*ea, bytes)) return skip(std::format("index array at {:#x} is not mapped", ia.offset));
             before_access(*ea, bytes, false); // a deferred copy to it lands first (D-107)
+            // Indices the GPU drew (render to index buffer): scanned here, so written back first (D-1056).
+            sync_gpu_held(*ea, bytes, "an index array");
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
             bool has_all_ones = false;
@@ -2614,7 +2618,9 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
         if (Surface* s = find_surface(ea, false); s && !s->cpu_newer) {
             source = s->texture;
         } else if (request.buffer->width && request.buffer->height) {
-            // Not rendered by the GPU: show what the CPU put in guest memory (A8R8G8B8, linear).
+            // Not rendered by the GPU: show what the CPU put in guest memory (A8R8G8B8, linear), with what targets
+            // inside it (not at its start, or of another format) drew written back first (D-1056).
+            sync_gpu_held(ea, request.buffer->pitch * request.buffer->height, "a display buffer shown from memory");
             TextureInfo t;
             t.format = tex::A8R8G8B8 | tex::kLinearFlag;
             t.width = static_cast<u16>(request.buffer->width);

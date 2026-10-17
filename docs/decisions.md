@@ -17485,3 +17485,43 @@ on a semaphore acquire after 611 of 999. The causes and the changes:
 - Test: tests/rsx/test_metal.mm "vertex arrays over a target read what the GPU drew there". A target is cleared on the
   GPU while its memory holds stale colours, and a triangle takes its vertex colours from that memory. It is checked
   with the overlay and with the write-back.
+
+## D-1056 · 2026-10-17 · Every read of guest memory a GPU-held target may be newer over: audited; the stale_gpu_reads alarm
+
+After the skyfall's vertex-fetch miss (D-1055, fixed in D-1034), every path where the Metal backend or the RSX front
+end reads guest memory was checked for what it does about a target the GPU drew since memory last held it:
+
+| Path | Before | Now |
+| --- | --- | --- |
+| Vertex arrays | copied from memory, no check | D-1034: GPU-newer targets laid over the copy (written back without overlays; one neither can write counts the alarm) |
+| Index arrays | `before_access` only (queued copies) | written back first (`sync_gpu_held`): the indices are scanned on the CPU |
+| Textures, linear, the same pitch | laid over (D-137, D-214) | as before |
+| Textures over a target of another pitch, or swizzled; swizzled, cube or volume textures over targets not at their start; vertex textures (D-093) through the same bind | left: memory alone (D-214, after run 132) | live targets written back first; old ones left (below) |
+| Compressed textures over a target | left; `dead_overlays` counts one at the start | as before: the GPU cannot draw DXT, so the memory was reused |
+| Display buffer shown from memory (no target at its start) | decoded from memory alone | targets inside it written back first |
+| NV0039 / NV3089 copies, NV308A writes | `flush_memory` / `flush_memory_later` / `copy_on_gpu` over source and destination (D-107, D-110) | as before |
+| Reports and zcull (conditional rendering, GET_REPORT) | the backend writes them whole at completion; `report_pending` (D-1021) | as before |
+| Inline arrays, immediate data, transform constants and program | in the FIFO, not memory | n/a |
+| Fragment program bytes and constants | read from memory each draw | n/a: no game draws into its shaders |
+| A target reloaded from memory the CPU wrote (`cpu_newer`) over other targets | carry (D-1025), `targets_lost` | as before (who wrote last is not known there) |
+| EDGE inputs | read by the SPU job (its DMA), not the backend | out of the backend: a CPU or SPU read of a GPU-held target is plan F5 (the mirror, D-1030) |
+
+- `Impl::sync_gpu_held(addr, size, why, handled)`: the surfaces' byte ranges, sorted with a running end (rebuilt when
+  surfaces are made or removed), give the targets over a read in a binary search. A target counts when it is
+  GPU-newer, not CPU-newer (`check_cpu_writes`), not in `handled` (what the path laid over), and has pixel bytes in
+  the range, not only the gaps of a wider pitch. A live one (drawn or sampled in the last two flips: the GPU wrote
+  that memory last, as the RSX's writes reach memory) is written back. An older one is left and counted in
+  `stale_left`: its memory is taken as reused, the run-132 case. The D-214 test now has both: the live target is
+  written back, the old one is left.
+- **Alarm `stale_gpu_reads`**: a read under a live GPU-held target that was not brought over (a format the write-back
+  does not support, or `PSPOCKET_RSX_NO_STALE_SYNC=1`, the A/B switch that only counts). games/gta5/gate.json limits it
+  to 0. Stats: `stale_synced` and `stale_left`. Each write-back is in the readback log, "for an index array", "for a
+  texture" or "for a display buffer shown from memory".
+- Tests (Metal e2e, each with the sync and with `PSPOCKET_RSX_NO_STALE_SYNC=1`, where the alarm counts):
+  - an index array in a target's memory is written back before its indices are read;
+  - a display buffer shown from memory gets a target drawn over its lower half;
+  - a linear texture of half the pitch inside a target is written back when the target is live, left when it is old
+    (D-214's test).
+- Not measured on a game yet (no game runs until h1's D-1034 is gated). The cost is one binary search per index
+  array, texture bind and memory flip, and a write-back only where a live target lies under the read. The gate's
+  readback limits will show a path that does it every frame.

@@ -21,12 +21,13 @@ enum class Alarm : u8 {
     ConditionalPending, // a conditional draw (NV4097_SET_RENDER_ENABLE mode 2) decided while its report was pending
     OcclusionOverflow,  // an occlusion query that found no free counter in its command buffer's visibility buffer
     DeadOverlay,        // a colour target laid over a compressed (DXT) texture: memory the GPU cannot have written as such
+    StaleGpuRead,       // guest memory read where a target the GPU drew lately holds newer bytes, not brought over (D-1056)
     Count
 };
 
 inline constexpr std::array<std::string_view, static_cast<usize>(Alarm::Count)> kAlarmNames = {
     "reports_early", "targets_lost", "targets_lost_kb", "uninit_sampled", "conditional_pending", "occlusion_overflow",
-    "dead_overlays"};
+    "dead_overlays", "stale_gpu_reads"};
 
 struct AlarmCounts {
     std::array<u64, static_cast<usize>(Alarm::Count)> v{};

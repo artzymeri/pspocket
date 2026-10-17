@@ -572,7 +572,8 @@ void MetalBackend::Impl::vertex_targets(const std::vector<DrawScratch::Span>& sp
         for (const auto& sp : spans) hit = hit || covers(o, sp);
         if (!hit) continue;
         if (overlay_supported(*o)) found.push_back(o);
-        else write_back(*o, "a vertex array"); // into guest memory, before the copies are made (a wait)
+        else if (!write_back(*o, "a vertex array") && rsx) // into guest memory, before the copies are made (a wait)
+            rsx->alarms().add(Alarm::StaleGpuRead);              // a format neither can write: stale (D-1056)
     }
     std::sort(found.begin(), found.end(), [](const Surface* a, const Surface* b) { return a->last_used < b->last_used; });
 }
@@ -814,6 +815,12 @@ id<MTLTexture> MetalBackend::Impl::bind_texture(const TextureInfo& t, u32 unit, 
     if (layout && !layout->swizzled && layout->format->block_texels == 1 && !layout->volume && !layout->cubemap)
         lays = overlays_for(*ea, layout->total_size, layout->levels[0].pitch, overlay);
     else if (overlay) lays.push_back(overlay);
+    // What no overlay covers (D-1056): a swizzled, cube or volume texture over targets not at its start, a linear one
+    // over a target of another pitch or swizzled, a vertex texture (D-093) over any of those. The live ones (drawn or
+    // sampled in the last two flips: the GPU wrote that memory last) are written back before the decode reads memory
+    // (the cached copy is then dirty); the alarm counts any that cannot be. Not for a compressed texture: the GPU
+    // cannot have drawn one, so a target under it is memory the game reused (run 132, the dead_overlays alarm).
+    if (layout && layout->format->block_texels == 1) sync_gpu_held(*ea, layout->total_size, "a texture", lays);
     const u64 key = texture_key(t, *ea, false);
     CachedTexture* entry = nullptr;
     const u64 epoch = check_epoch();

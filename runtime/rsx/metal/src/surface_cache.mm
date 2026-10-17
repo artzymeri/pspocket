@@ -116,6 +116,7 @@ void MetalBackend::Impl::remove_surface(Surface* s)
         if (surface_texture_pool.size() > kSurfacePoolMax) surface_texture_pool.pop_front();
     }
     std::erase_if(surfaces, [s](const std::unique_ptr<Surface>& p) { return p.get() == s; });
+    surfaces_version++;
 }
 
 // Two surfaces overlap where their pixels do. Surfaces that share a pitch can interleave in memory row by row without
@@ -298,6 +299,7 @@ Surface* MetalBackend::Impl::make_surface(u32 address, u32 pitch, u32 width, u32
     }
     impl.surfaces_at[address].push_back(s.get()); // D-953
     impl.surfaces.push_back(std::move(s));
+    impl.surfaces_version++;
     return impl.surfaces.back().get();
 }
 
@@ -912,6 +914,66 @@ void MetalBackend::Impl::check_guest(const Surface& s, const TextureInfo& t, u32
             "memory changed since it was made or written back: a write the backend was not told of", unit,
             t.base_format(), t.width, t.height, s.address, s.width, s.height, s.gcm_format, s.depth ? " depth" : "");
     }
+}
+
+bool MetalBackend::Impl::sync_gpu_held(u32 addr, u32 size, const char* why, const std::vector<Surface*>& handled)
+{
+    if (!size || surfaces.empty()) return false;
+    if (spans_version != surfaces_version) {
+        surface_spans.clear();
+        for (const auto& p : surfaces) surface_spans.push_back({p->address, u64{p->address} + p->bytes(), 0, p.get()});
+        std::sort(surface_spans.begin(), surface_spans.end(), [](const SurfaceSpan& x, const SurfaceSpan& y) {
+            return x.lo < y.lo;
+        });
+        u64 reach = 0;
+        for (SurfaceSpan& sp : surface_spans) sp.reach = reach = std::max(reach, sp.hi);
+        spans_version = surfaces_version;
+    }
+    const u64 a = addr, b = a + size;
+    auto it = std::lower_bound(surface_spans.begin(), surface_spans.end(), b,
+        [](const SurfaceSpan& x, u64 v) { return x.lo < v; });
+    stale_scratch.clear();
+    while (it != surface_spans.begin()) {
+        --it;
+        if (it->reach <= a) break; // nothing at or before it reaches the read
+        if (it->hi <= a) continue;
+        Surface* s = it->s;
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized) continue;
+        if (std::find(handled.begin(), handled.end(), s) != handled.end()) continue;
+        // Its pixel bytes, not the gaps of a pitch wider than its rows.
+        if (!s->swizzled && s->pitch) {
+            const u64 row = u64{s->width} * surface_bytes_per_pixel(s->gcm_format, s->depth);
+            const u64 from = std::max(a, it->lo);
+            const u64 col = (from - it->lo) % s->pitch;
+            if (row < s->pitch && b - from < s->pitch && col >= row && col + (b - from) <= s->pitch) continue;
+        }
+        stale_scratch.push_back(s);
+    }
+    bool any = false;
+    for (Surface* s : stale_scratch) { // acted on apart: a write-back must not change the list walked
+        check_cpu_writes(*s);
+        if (s->cpu_newer || !s->gpu_newer) continue;
+        if (s->last_frame + 2 < stats.flips) {
+            stats.stale_left++;
+            continue;
+        }
+        any = true;
+        if (stale_sync) {
+            sync_surface(*s); // what its children wrote (D-122)
+            if (write_back(*s, why)) {
+                stats.stale_synced++;
+                continue;
+            }
+        }
+        if (rsx) rsx->alarms().add(Alarm::StaleGpuRead);
+        static std::unordered_set<u64> logged;
+        if (logged.size() < 64 && logged.insert((u64{s->address} << 16) ^ std::hash<std::string_view>{}(why)).second) {
+            PS_LOG_WARN(kChan, "stale GPU read: {} at {:#010x} (+{:#x}) reads memory under the {} {:#010x} {}x{} format "
+                "{:#x}, newer on the GPU{}", why, addr, size, s->depth ? "depth buffer" : "target", s->address, s->width,
+                s->height, s->gcm_format, stale_sync ? " (not written back)" : " (PSPOCKET_RSX_NO_STALE_SYNC)");
+        }
+    }
+    return any;
 }
 
 void MetalBackend::Impl::check_cpu_writes(Surface& s)

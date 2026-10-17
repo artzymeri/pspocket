@@ -203,6 +203,9 @@ struct BackendStats {
     u64 surfaces_grown = 0;      // larger targets made over smaller ones at their start, keeping their pixels (D-120)
     u64 targets_mirrored = 0;    // targets written into guest memory on the GPU at a flip (PSPOCKET_RSX_MIRROR, D-1030)
     u64 targets_carried = 0;     // new targets that started with the bytes of the GPU-newer ones under them (D-1025)
+    // Reads of guest memory under a GPU-newer target (D-1056): the target written back first (a live one), or left
+    // (one not drawn or sampled for two flips: its memory taken as reused, as run 132's streamed texture).
+    u64 stale_synced = 0, stale_left = 0;
     u64 surface_textures_reused = 0; // surfaces made with a removed surface's texture of their format and size (D-984)
     u64 surface_corners = 0;     // textures sampled as the top-left corner of a larger target (D-120)
     u64 surface_children = 0;    // targets made inside a larger one, both kept (D-122)

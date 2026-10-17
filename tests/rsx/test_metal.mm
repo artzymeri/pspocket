@@ -3568,33 +3568,48 @@ TEST_CASE("metal e2e: a texture over two depth buffers side by side shows both, 
     CHECK(guest_pixel(e, kSurfaceOffset, 48, 48) == (std::array<u8, 4>{0xff, 0xff, 0x00, 0x00})); // u 0.75: the right
 }
 
-TEST_CASE("metal e2e: a texture with its own layout inside a target's memory is not laid over by it (D-214)")
+TEST_CASE("metal e2e: a texture with its own layout inside a target's memory: not laid over; the target written back "
+          "when it is live, left when it is old (D-214, D-1056)")
 {
     // Run 132: a compressed texture inside a big depth buffer's memory. Only targets in the texture's own rows (the
-    // same pitch) are laid over; this one is decoded from memory alone, as before.
+    // same pitch) are laid over. A target of another layout under the texture that the GPU drew in the last two flips
+    // wrote that memory last (as the RSX's writes reach memory): it is written back first (D-1056). One older than
+    // that is taken as memory the game reused: the texture is memory alone, as before.
     REQUIRE_METAL();
-    E2E e;
-    e.put_local_bytes(kFp2Offset, fp_texture());
-    write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
-    auto b = e.at(0);
-    setup_surface(b, kSurfaceB); // kW x kH, pitch kW * 4
-    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffff0000);
-    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
-    setup_surface(b, kSurfaceOffset);
-    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00808080);
-    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
-    upload_vertex_program(b);
-    set_fragment_program(b, kFp2Offset, 0x40);
-    bind_vertex_arrays(b);
-    bind_linear_texture(b, kSurfaceB + 4096, tex::A8R8G8B8, kW * 2, kW / 2, kH / 2); // half the pitch, inside it
-    draw_triangle(b);
-    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
-    CHECK(e.failures.empty());
-    CHECK(e.backend->stats().texture_overlays == 0);
-    CHECK(e.backend->stats().textures_from_target == 0);
-    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
-    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0x00, 0x00, 0x00, 0x00})); // memory: zeros
+    for (const int mode : {0, 1, 2}) { // live; old; live, with PSPOCKET_RSX_NO_STALE_SYNC (the alarm alone)
+        const bool live = mode != 1, sync = mode != 2;
+        INFO((live ? "drawn this frame" : "drawn three flips before") << (sync ? "" : ", no sync"));
+        if (!sync) ::setenv("PSPOCKET_RSX_NO_STALE_SYNC", "1", 1);
+        E2E e;
+        ::unsetenv("PSPOCKET_RSX_NO_STALE_SYNC");
+        e.put_local_bytes(kFp2Offset, fp_texture());
+        write_triangle(e, {0xffffffff, 0xffffffff, 0xffffffff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB); // kW x kH, pitch kW * 4
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xffff0000);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00808080);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        if (!live)
+            for (int i = 0; i < 3; i++) b.method(m::GCM_FLIP_COMMAND, 0);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFp2Offset, 0x40);
+        bind_vertex_arrays(b);
+        bind_linear_texture(b, kSurfaceB + 4096, tex::A8R8G8B8, kW * 2, kW / 2, kH / 2); // half the pitch, inside it
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().texture_overlays == 0);
+        CHECK(e.backend->stats().textures_from_target == 0);
+        CHECK(e.backend->stats().stale_synced == (live && sync ? 1u : 0u));
+        CHECK(e.backend->stats().stale_left == (live ? 0u : 1u));
+        CHECK(e.rsx->alarms().get(Alarm::StaleGpuRead) == (sync ? 0u : 1u));
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        if (live && sync) CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0xff, 0xff, 0x00, 0x00})); // red
+        else CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == (std::array<u8, 4>{0x00, 0x00, 0x00, 0x00})); // memory
+    }
 }
 
 TEST_CASE("metal e2e: a Z24S8 depth buffer read as a texture of another size is laid over memory on the GPU, as a "
@@ -7085,5 +7100,72 @@ TEST_CASE("PSPOCKET_RSX_WRITEBACK_AT writes back the targets over its ranges aft
         e.backend->sync();
         if (over_target) CHECK(clears_in_memory(e, 0xff102030) > 0);
         else CHECK(clears_in_memory(e, 0xff102030) == 0);
+    }
+}
+
+TEST_CASE("metal e2e: an index array the GPU drew is written back before its indices are read; without, the alarm "
+          "counts it (D-1056)")
+{
+    // Render to index buffer: a target's memory read as an index array. The indices are scanned on the CPU (the vertex
+    // range), so a GPU-newer target there goes to memory first.
+    REQUIRE_METAL();
+    for (const bool sync : {true, false}) {
+        INFO((sync ? "synced" : "PSPOCKET_RSX_NO_STALE_SYNC"));
+        if (!sync) ::setenv("PSPOCKET_RSX_NO_STALE_SYNC", "1", 1);
+        E2E e;
+        ::unsetenv("PSPOCKET_RSX_NO_STALE_SYNC");
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB); // the index buffer's memory, drawn by the GPU: words 0x00000001, indices 0 and 1
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0x00000001);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_INDEX_ARRAY_ADDRESS, {kSurfaceB, loc::kLocal | (1u << 4)}); // 16-bit indices
+        b.method(m::NV4097_SET_BEGIN_END, static_cast<u32>(Primitive::Triangles));
+        b.method(m::NV4097_DRAW_INDEX_ARRAY, (2u << 24) | 0);
+        b.method(m::NV4097_SET_BEGIN_END, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.backend->stats().stale_synced == (sync ? 1u : 0u));
+        CHECK(e.rsx->alarms().get(Alarm::StaleGpuRead) == (sync ? 0u : 1u));
+        CHECK(e.local32(kSurfaceB) == (sync ? 0x00000001u : 0u)); // what the indices were read from
+    }
+}
+
+TEST_CASE("metal e2e: a display buffer shown from memory gets what a target inside it drew; without the sync, the "
+          "alarm counts it (D-1056)")
+{
+    // No target at the display buffer's start: the flip shows memory, with a target drawn over its lower half (the
+    // same pitch, 32 rows in) written back first.
+    REQUIRE_METAL();
+    for (const bool sync : {true, false}) {
+        INFO((sync ? "synced" : "PSPOCKET_RSX_NO_STALE_SYNC"));
+        if (!sync) ::setenv("PSPOCKET_RSX_NO_STALE_SYNC", "1", 1);
+        E2E e;
+        ::unsetenv("PSPOCKET_RSX_NO_STALE_SYNC");
+        e.rsx->set_display_buffer(0, {kSurfaceB, kW * 4, kW, kH});
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB + 32 * kW * 4); // rows 32-95 of the buffer's memory: its lower half and beyond
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::GCM_FLIP_COMMAND, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        e.backend->sync();
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+        CHECK(e.failures.empty());
+        CHECK(e.rsx->alarms().get(Alarm::StaleGpuRead) == (sync ? 0u : 1u));
+        REQUIRE(e.present_pixels.size() == 1);
+        const std::vector<u8>& px = e.present_pixels[0]; // BGRA, 128x128
+        const auto at = [&](u32 x, u32 y) { return std::array<u8, 3>{px[(y * 128 + x) * 4], px[(y * 128 + x) * 4 + 1],
+                                                px[(y * 128 + x) * 4 + 2]}; };
+        CHECK(at(64, 32) == (std::array<u8, 3>{0, 0, 0}));                           // the upper half: memory, zeros
+        CHECK(at(64, 96) == (sync ? std::array<u8, 3>{0, 0xff, 0} : std::array<u8, 3>{0, 0, 0})); // the target's green
     }
 }
