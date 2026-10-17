@@ -558,23 +558,21 @@ void MetalBackend::Impl::vertex_targets(const std::vector<DrawScratch::Span>& sp
     std::vector<Surface*>& found = vertex_overlay_scratch;
     found.clear();
     if (spans.empty()) return;
-    const u32 lo = spans.front().ea;
-    u32 hi = 0;
-    for (const auto& sp : spans) hi = std::max(hi, sp.end);
-    const auto covers = [&](const Surface* o, const DrawScratch::Span& sp) {
-        return u64{o->address} < sp.end && sp.ea < u64{o->address} + o->bytes();
-    };
-    for (const auto& c : surfaces) {
-        Surface* o = c.get();
-        if (!o->gpu_newer || o->cpu_newer || !o->initialized) continue;
-        if (u64{o->address} + o->bytes() <= lo || o->address >= hi) continue;
-        bool hit = false;
-        for (const auto& sp : spans) hit = hit || covers(o, sp);
-        if (!hit) continue;
-        if (overlay_supported(*o)) found.push_back(o);
-        else if (!write_back(*o, "a vertex array") && rsx) // into guest memory, before the copies are made (a wait)
-            rsx->alarms().add(Alarm::StaleGpuRead);              // a format neither can write: stale (D-1056)
-    }
+    for (const auto& sp : spans) gpu_held_over(sp.ea, sp.end - sp.ea, found);
+    // D-1056's rule: a target neither drawn nor sampled in the last two flips is memory the game reused since.
+    std::erase_if(found, [&](Surface* o) {
+        check_cpu_writes(*o);
+        if (o->cpu_newer || !o->gpu_newer) return true;
+        if (o->last_frame + 2 < stats.flips) {
+            stats.stale_left++;
+            return true;
+        }
+        if (overlay_supported(*o)) return false;
+        sync_surface(*o); // what its children wrote (D-122)
+        if (!write_back(*o, "a vertex array") && rsx) // into guest memory, before the copies are made (a wait)
+            rsx->alarms().add(Alarm::StaleGpuRead);   // a format neither can write: stale (D-1056)
+        return true;
+    });
     std::sort(found.begin(), found.end(), [](const Surface* a, const Surface* b) { return a->last_used < b->last_used; });
 }
 
@@ -583,6 +581,7 @@ void MetalBackend::Impl::overlay_vertex_targets(const std::vector<DrawScratch::S
 {
     for (Surface* o : vertex_overlay_scratch) {
         if (!o->gpu_newer) continue;
+        o->last_frame = stats.flips; // read: live, as a sampled target is (D-1056's two flips count from here)
         sync_surface(*o); // what its children wrote (D-122)
         for (const auto& sp : spans) {
             if (!(u64{o->address} < sp.end && sp.ea < u64{o->address} + o->bytes())) continue;

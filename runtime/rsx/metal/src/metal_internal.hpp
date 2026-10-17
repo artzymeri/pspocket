@@ -1071,6 +1071,9 @@ struct MetalBackend::Impl {
     // back first; one that cannot be counts the stale_gpu_reads alarm. Older ones are left (their memory is taken as
     // reused). True when any was found.
     bool sync_gpu_held(u32 addr, u32 size, const char* why, const std::vector<Surface*>& handled = {});
+    // The GPU-newer targets with pixel bytes in [addr, addr + size), from the surfaces' range index, added to `out` once
+    // each (D-1056's lookup; the vertex arrays' too, D-1034).
+    void gpu_held_over(u32 addr, u32 size, std::vector<Surface*>& out);
     // PSPOCKET_RSX_CHECK_SURFACES (a diagnostic): each surface keeps a hash of its guest memory from when it was made or
     // last written back; a texture sampled from a surface whose memory changed since (a CPU or SPU write the backend
     // was not told of) is logged.

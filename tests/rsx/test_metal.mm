@@ -4359,6 +4359,22 @@ TEST_CASE("metal e2e: vertex arrays over a target read what the GPU drew there (
         CHECK(mid[2] < 16);
         CHECK(mid[3] > 240);
         if (overlay) CHECK(e.backend->stats().vertex_overlays >= 1);
+        if (!overlay) continue;
+        // Read again over five flips with no new drawing into it: the reads keep the target live (D-1056's two flips
+        // count from the last read; the water patch reads the simulation's targets on frames it does not draw them).
+        auto c = e.at(0x8000);
+        for (int flip = 0; flip < 5; flip++) {
+            c.method(m::GCM_FLIP_COMMAND, 0);
+            c.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff202020u);
+            c.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+            draw_triangle(c);
+        }
+        REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto later = guest_pixel(e, kSurfaceOffset, 32, 40);
+        CHECK(later[1] > 240);
+        CHECK(later[2] < 16);
+        CHECK(e.backend->stats().vertex_overlays >= 6);
     }
 }
 

@@ -17550,3 +17550,17 @@ end reads guest memory was checked for what it does about a target the GPU drew 
   and the binary search runs in both. The differences are run-to-run noise. The repeated on run lies between the first
   on run and the off run: AC's garden moves by about 8 % between runs, and GTA V's RSX time per draw goes the other way.
   D-1056 costs nothing seen in these scenes. Its alarm and stats stay on to show a game that does read there.
+## D-1035 · 2026-10-17 · The vertex arrays' targets from D-1056's range index; a read keeps a target live
+
+- `Impl::gpu_held_over(addr, size, out)` is D-1056's lookup, moved out of `sync_gpu_held`: the GPU-newer targets with
+  pixel bytes in a range, found in the sorted range index. `sync_gpu_held` and D-1034's `vertex_targets` both use it.
+  `vertex_targets` no longer walks every surface on every draw.
+- The vertex path takes D-1056's rule: a target neither drawn nor read in the last two flips is memory the game has
+  reused (`stale_left`). A vertex read keeps its target live (`last_frame`, as a sampled target is). Without that,
+  the rule broke the fix: with the rule alone, the skyfall's block came back for a frame at flip 5496 (run vfix3,
+  52% black). At the water's edge the game draws the simulation's targets less often than its patch reads them.
+  With the read counted, every frame from 5400 to 5560 is clean, in steps of 6 flips (vfix4) and of 2 flips (vfix5,
+  81 frames).
+- Test: "vertex arrays over a target read what the GPU drew there" also reads the target over five flips with no new
+  drawing into it, and still gets the GPU's bytes. Without the read counted, the reads after the second flip get the
+  stale memory.

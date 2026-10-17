@@ -916,9 +916,9 @@ void MetalBackend::Impl::check_guest(const Surface& s, const TextureInfo& t, u32
     }
 }
 
-bool MetalBackend::Impl::sync_gpu_held(u32 addr, u32 size, const char* why, const std::vector<Surface*>& handled)
+void MetalBackend::Impl::gpu_held_over(u32 addr, u32 size, std::vector<Surface*>& out)
 {
-    if (!size || surfaces.empty()) return false;
+    if (!size || surfaces.empty()) return;
     if (spans_version != surfaces_version) {
         surface_spans.clear();
         for (const auto& p : surfaces) surface_spans.push_back({p->address, u64{p->address} + p->bytes(), 0, p.get()});
@@ -932,14 +932,12 @@ bool MetalBackend::Impl::sync_gpu_held(u32 addr, u32 size, const char* why, cons
     const u64 a = addr, b = a + size;
     auto it = std::lower_bound(surface_spans.begin(), surface_spans.end(), b,
         [](const SurfaceSpan& x, u64 v) { return x.lo < v; });
-    stale_scratch.clear();
     while (it != surface_spans.begin()) {
         --it;
         if (it->reach <= a) break; // nothing at or before it reaches the read
         if (it->hi <= a) continue;
         Surface* s = it->s;
         if (!s->gpu_newer || s->cpu_newer || !s->initialized) continue;
-        if (std::find(handled.begin(), handled.end(), s) != handled.end()) continue;
         // Its pixel bytes, not the gaps of a pitch wider than its rows.
         if (!s->swizzled && s->pitch) {
             const u64 row = u64{s->width} * surface_bytes_per_pixel(s->gcm_format, s->depth);
@@ -947,8 +945,15 @@ bool MetalBackend::Impl::sync_gpu_held(u32 addr, u32 size, const char* why, cons
             const u64 col = (from - it->lo) % s->pitch;
             if (row < s->pitch && b - from < s->pitch && col >= row && col + (b - from) <= s->pitch) continue;
         }
-        stale_scratch.push_back(s);
+        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
     }
+}
+
+bool MetalBackend::Impl::sync_gpu_held(u32 addr, u32 size, const char* why, const std::vector<Surface*>& handled)
+{
+    stale_scratch.clear();
+    gpu_held_over(addr, size, stale_scratch);
+    std::erase_if(stale_scratch, [&](Surface* s) { return std::find(handled.begin(), handled.end(), s) != handled.end(); });
     bool any = false;
     for (Surface* s : stale_scratch) { // acted on apart: a write-back must not change the list walked
         check_cpu_writes(*s);
