@@ -594,6 +594,7 @@ struct MetalBackend::Impl {
     u64 report_pooled = 0; // D-956
     AlarmCounts report_alarms{}; // D-1022
     u64 report_carried = 0;      // D-1025
+    u64 report_stale_synced = 0, report_stale_left = 0; // D-1056
     u64 report_depth_bounds = 0; // D-261
     u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
     u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947

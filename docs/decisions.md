@@ -17525,3 +17525,28 @@ end reads guest memory was checked for what it does about a target the GPU drew 
 - Not measured on a game yet (no game runs until h1's D-1034 is gated). The cost is one binary search per index
   array, texture bind and memory flip, and a write-back only where a live target lies under the read. The gate's
   readback limits will show a path that does it every frame.
+
+## D-1057 · 2026-10-17 · D-1056 measured: no read under a GPU-newer target in GTA V's skyfall or Assassin's Creed's garden
+
+- The backend's 300-frame alarms line now also gives D-1056's reads a frame: written back first (`stale_synced`) and
+  left as old (`stale_left`). `scripts/bench.py --boot-arg ARG` (repeatable) passes arguments on to pspocket-boot (the
+  runs below: `--max-footprint 6`).
+- Runs (the bench, a fresh hdd0 each; GTA V's skyfall-sea in edge-off mode on the flips clock, D-1028; Assassin's
+  Creed's install-garden, a fresh install then the Animus garden), the sync on and with `PSPOCKET_RSX_NO_STALE_SYNC=1`:
+
+| Run | fps (median) | RSX ms a frame | RSX µs a draw | Written back | Left | stale_gpu_reads |
+| --- | --- | --- | --- | --- | --- | --- |
+| GTA V skyfall-sea, on | 29.8 | 9.73 | 6.46 | 0 | 0 | 0 |
+| GTA V skyfall-sea, off | 29.8 | 8.23 | 7.24 | 0 | 0 | 0 |
+| AC garden (all), on | 32.1 | 18.91 | 13.84 | 0 | 0 | 0 |
+| AC garden (all), off | 33.8 | 17.55 | 13.25 | 0 | 0 | 0 |
+| AC garden (events), on | 32.9 | 17.50 | 12.93 | 0 | 0 | 0 |
+| AC garden (events), on, again | 35.6 | 16.40 | 12.36 | 0 | 0 | 0 |
+| AC garden (events), off | 37.5 | 15.81 | 11.69 | 0 | 0 | 0 |
+
+  (GTA V from 40 s: its draws per window match until about 135 s, then the falls differ. AC from 120 s.)
+- Neither game read memory under a GPU-newer target on the paths D-1056 added: no write-back, no target left, no
+  alarm, in every window. So the two modes did the same work: `PSPOCKET_RSX_NO_STALE_SYNC` only skips the write-back,
+  and the binary search runs in both. The differences are run-to-run noise. The repeated on run lies between the first
+  on run and the off run: AC's garden moves by about 8 % between runs, and GTA V's RSX time per draw goes the other way.
+  D-1056 costs nothing seen in these scenes. Its alarm and stats stay on to show a game that does read there.

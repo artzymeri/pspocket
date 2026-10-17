@@ -2927,9 +2927,13 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             std::string raised;
             for (usize i = 0; i < kAlarmNames.size(); i++)
                 if (w.alarms.v[i]) raised += std::format("{}{} {}", raised.empty() ? "" : ", ", kAlarmNames[i], w.alarms.v[i]);
-            PS_LOG_INFO(kChan, "alarms (last {}): {}; {:.2f} targets a frame started with the bytes of those under them",
-                w.flips, raised.empty() ? "none" : raised, per_frame(m.stats.targets_carried, m.report_carried));
+            PS_LOG_INFO(kChan, "alarms (last {}): {}; {:.2f} targets a frame started with the bytes of those under them; "
+                "{:.2f} reads a frame under a GPU-newer target written back first, {:.2f} left (old, D-1056)",
+                w.flips, raised.empty() ? "none" : raised, per_frame(m.stats.targets_carried, m.report_carried),
+                per_frame(m.stats.stale_synced, m.report_stale_synced), per_frame(m.stats.stale_left, m.report_stale_left));
             m.report_carried = m.stats.targets_carried;
+            m.report_stale_synced = m.stats.stale_synced;
+            m.report_stale_left = m.stats.stale_left;
         }
         // The draws that sampled a target they drew to (D-947): copies made and why, copies kept as the texture
         // cache, the game's invalidations, and the draws behind most of them.

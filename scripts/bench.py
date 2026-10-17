@@ -3,7 +3,7 @@
 hdd0 (from a save, or fresh for a first install), as the phone runs it, then checked by scripts/bench_check.py.
 
     scripts/bench.py [CASE ...] [--game gta5|ac1|all] [--mode M|all] [--accept | --accept-clean] [--keep-frames N]
-                     [--out DIR] [--nightly]
+                     [--out DIR] [--nightly] [--boot-arg ARG]...
 
 cases.json:
     "data": the inventory/ folder of the game's data (decrypt/EBOOT.elf, disc.iso, hdd0, shaders, saves/)
@@ -99,6 +99,7 @@ def run_case(game, spec, case, mode, out, lib, a):
            "--summary", os.path.join(run, "summary.json")]
     if lib:
         cmd += ["--game-library", lib]
+    cmd += a.boot_arg or []
     os.makedirs(os.path.join("inventory", "bench", "spu-translate", game), exist_ok=True)
     print(f"==> {game} {case['name']} ({mode}): {case['timeout']} s", flush=True)
     with open(os.path.join(run, "run.log"), "w") as f:
@@ -126,6 +127,7 @@ def main(argv):
     ap.add_argument("--keep-frames", type=int, default=6)
     ap.add_argument("--out")
     ap.add_argument("--nightly", action="store_true")
+    ap.add_argument("--boot-arg", action="append", help="passed on to pspocket-boot (repeatable, e.g. --boot-arg=--max-footprint --boot-arg=6)")
     a = ap.parse_args(argv[1:])
     os.chdir(ROOT)
     if a.nightly:
