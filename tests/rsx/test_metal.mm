@@ -714,6 +714,11 @@ struct E2E {
     std::vector<metal::PresentFrame> presents;
     std::vector<std::vector<u8>> present_pixels; // BGRA8 of each presented frame
     std::mutex capture_mutex;
+    // The present hook's read-backs: each frame's completion handler fills its place under present_mutex (a later
+    // frame's emplace_back may move the vector meanwhile), and ~E2E waits for those still to run, so none writes into
+    // the fixture after it is gone (D-1054: the pixels of a finished test's frame landed in the next test's heap).
+    std::mutex present_mutex;
+    std::atomic<u32> presents_pending{0};
     std::vector<std::pair<u64, std::vector<u8>>> captures; // (flip index, BGRA8) from the capture hook
     static constexpr u32 kCmdEa = 0x00200000;
     static constexpr u32 kReadbackEa = 0x00400000; // main memory, IO 0x00100000
@@ -743,12 +748,22 @@ struct E2E {
                        sourceSize:MTLSizeMake(t.width, t.height, 1) toBuffer:buf destinationOffset:0
            destinationBytesPerRow:t.width * 4 destinationBytesPerImage:t.width * t.height * 4];
             [blit endEncoding];
-            const usize index = present_pixels.size();
-            present_pixels.emplace_back();
-            auto* store = &present_pixels;
+            usize index = 0;
+            {
+                std::lock_guard lock(present_mutex);
+                index = present_pixels.size();
+                present_pixels.emplace_back();
+            }
+            presents_pending.fetch_add(1, std::memory_order_acq_rel);
+            E2E* self = this;
             const usize bytes = t.width * t.height * 4;
             [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
-                (*store)[index].assign(static_cast<const u8*>(buf.contents), static_cast<const u8*>(buf.contents) + bytes);
+                {
+                    std::lock_guard lock(self->present_mutex);
+                    self->present_pixels[index].assign(static_cast<const u8*>(buf.contents),
+                        static_cast<const u8*>(buf.contents) + bytes);
+                }
+                self->presents_pending.fetch_sub(1, std::memory_order_acq_rel); // the last touch of the fixture
             }];
         };
         mc.capture_every = capture_every;
@@ -772,6 +787,14 @@ struct E2E {
         PS_CHECK(rsx->io_map().map(0x100000, kReadbackEa, 0x100000));
         rsx->set_fifo_pointers(0, 0);
     }
+    ~E2E()
+    {
+        if (backend) backend->sync();
+        while (presents_pending.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    E2E(const E2E&) = delete;
+    E2E& operator=(const E2E&) = delete;
 
     CommandBuilder at(u32 offset) { return CommandBuilder(mem.base(), kCmdEa + offset, offset); }
     Rsx::RunStatus submit(const CommandBuilder& b)
@@ -6954,5 +6977,50 @@ TEST_CASE("rsx capture: a capture past its size cap stops, its manifest incomple
     std::string error;
     REQUIRE(read_capture_info(dir, info, &error));
     CHECK_FALSE(info.complete);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("rsx capture: an unarmed capture waits for its trigger, then records the frames after it (D-1054)")
+{
+    REQUIRE_METAL();
+    const std::string dir = capture_dir("armed");
+    std::vector<u8> after_trigger;
+    {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+        CaptureOptions o;
+        o.dir = dir;
+        o.frames = 1;
+        o.armed = false; // pspocket-boot --rsx-capture-on: a detector arms it
+        CaptureWriter w(e.mem, *e.tracker, o);
+        e.rsx->set_capture(&w);
+        u32 at = capture_frame(e, 0, 0xff102030, 0xff0000ff);
+        at = capture_frame(e, at, 0xff203040, 0xff00ff00);
+        CHECK(w.phase() == CaptureWriter::Phase::Waiting); // two flips past from_flip 0: still waiting
+        CHECK(w.arm(0));
+        CHECK_FALSE(w.arm(0)); // once only
+        at = capture_frame(e, at, 0xff304050, 0xffff0000);
+        capture_frame(e, at, 0xff405060, 0xffffffff);
+        e.rsx->set_capture(nullptr);
+        INFO(w.summary());
+        CHECK(w.phase() == CaptureWriter::Phase::Done);
+        CHECK(w.summary().find("from flip 2") != std::string::npos);
+        e.backend->sync();
+        REQUIRE(e.present_pixels.size() == 4);
+        after_trigger = e.present_pixels[2];
+    }
+    CaptureInfo info;
+    std::string error;
+    REQUIRE(read_capture_info(dir, info, &error));
+    CHECK(info.complete);
+    CHECK(info.from_flip == 2);
+    E2E r;
+    ReplayResult result;
+    REQUIRE(replay_capture(dir, r.mem, *r.tracker, *r.rsx, {}, result, &error));
+    CHECK(result.deviations == 0);
+    r.backend->sync();
+    REQUIRE(r.present_pixels.size() == 1);
+    CHECK(r.present_pixels[0] == after_trigger);
     std::filesystem::remove_all(dir);
 }

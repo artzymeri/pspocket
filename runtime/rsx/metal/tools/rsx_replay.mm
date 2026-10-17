@@ -1,7 +1,7 @@
 // rsx-replay: an RSX capture (pspocket-boot --rsx-capture, pspocket/rsx/capture.hpp, D-1053) run through the RSX and
 // the Metal backend alone: no game, no lv2, the same frames every run.
 //
-//   rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet]
+//   rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet] [--verbose]
 //
 // Prints one line a flip: its index in the capture and a hash of the presented frame (the backend's output, read
 // back), then a summary. --frames DIR saves each as DIR/frame-NNN.png. --draws FILE writes, after every draw and
@@ -146,18 +146,19 @@ private:
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--quiet]\n");
+        std::fprintf(stderr, "usage: rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet] [--verbose]\n");
         return 2;
     }
     const std::string dir = argv[1];
     std::string frames_dir, draws_path;
-    bool quiet = false;
+    bool quiet = false, verbose = false;
     u64 describe = 0;
     for (int i = 2; i < argc; i++) {
         const std::string_view a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames_dir = argv[++i];
         else if (a == "--draws" && i + 1 < argc) draws_path = argv[++i];
         else if (a == "--quiet") quiet = true;
+        else if (a == "--verbose") verbose = true;
         else if (a == "--describe" && i + 1 < argc) describe = std::strtoull(argv[++i], nullptr, 0);
         else {
             std::fprintf(stderr, "rsx-replay: unknown option %s\n", argv[i]);
@@ -210,7 +211,9 @@ int main(int argc, char** argv)
         Observer observer(*backend, mem, draws, describe);
         Rsx rsx(mem, observer, info.config);
         ReplayResult result;
-        if (!replay_capture(dir, mem, tracker, rsx, {}, result, &error)) {
+        ReplayOptions ro;
+        ro.verbose = verbose;
+        if (!replay_capture(dir, mem, tracker, rsx, ro, result, &error)) {
             std::fprintf(stderr, "rsx-replay: %s\n", error.c_str());
             return 2;
         }
@@ -227,10 +230,14 @@ int main(int argc, char** argv)
                 if (al.v[i]) line += std::format(" {} {}", kAlarmNames[i], al.v[i]);
             std::printf("alarms:%s\n", line.empty() ? " none" : line.c_str());
         }
-        std::printf("replayed %s: %llu records, %llu flips, %llu words; %llu deviations%s%s\n", dir.c_str(),
-            static_cast<unsigned long long>(result.events), static_cast<unsigned long long>(result.flips),
+        std::printf("replayed %s: %llu records (%llu written early), %llu flips, %llu words; %llu deviations%s%s\n",
+            dir.c_str(), static_cast<unsigned long long>(result.events), static_cast<unsigned long long>(result.early),
+            static_cast<unsigned long long>(result.flips),
             static_cast<unsigned long long>(result.words), static_cast<unsigned long long>(result.deviations),
             result.deviations ? ", the first: " : "", result.first_deviation.c_str());
+        if (result.path_deviations)
+            std::printf("%llu records ended elsewhere in the FIFO than the capture's, the first: %s\n",
+                static_cast<unsigned long long>(result.path_deviations), result.first_path_deviation.c_str());
         return result.deviations ? 1 : 0;
     }
 }

@@ -62,6 +62,8 @@
 // interpreters' shares, the milestones and the stalls. scripts/triage.py sorts a summary and its log into buckets.
 // --rsx-capture DIR records what the RSX reads from the flip --rsx-capture-from N on, for --rsx-capture-frames N
 // frames (1), at most --rsx-capture-max-mb MB (2048): rsx-replay DIR runs it alone (D-1053, pspocket/rsx/capture.hpp).
+// --rsx-capture-on KIND (with --summary) starts it instead at the first glitch of that kind the frame detectors see
+// (partly-black, flicker, hitch, frozen, flagged) from flip --rsx-capture-from on (D-1054): the frames after a wrong one.
 // --max-footprint GB stops the run (exit "footprint" in its summary) once the process's memory footprint passes GB,
 // checked four times a second: a leak ends the run before the host's swap fills its disk (D-1047).
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
@@ -188,6 +190,8 @@ int usage()
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
         "                     [--spu-translate DIR] [--prx-dump DIR] [--modules-library DIR|none] [--ppu-landings FILE]\n"
+        "                     [--rsx-capture DIR] [--rsx-capture-from FLIP] [--rsx-capture-frames N]\n"
+        "                     [--rsx-capture-max-mb MB] [--rsx-capture-on partly-black|flicker|hitch|frozen|flagged]\n"
         "       pspocket-boot --probe-disc IMAGE.iso\n"
         "       pspocket-boot --hle-list\n");
     return 64;
@@ -713,6 +717,12 @@ struct RunSummary {
 };
 RunSummary g_summary;
 
+// --rsx-capture-on KIND (D-1054): the capture waits for the first glitch of that kind (a FrameWatch event) at or after
+// --rsx-capture-from, then starts at the RSX's next step boundary.
+std::atomic<rsx::CaptureWriter*> g_capture_trigger{nullptr};
+std::string g_capture_on;
+u64 g_capture_on_from = 0;
+
 // What the summary needs from main, so that a fault, a fatal error or a stall writes it too (D-1043).
 struct RunContext {
     std::string summary_path;
@@ -1222,6 +1232,10 @@ int main(int argc, char** argv)
             if (!v) return usage();
             rsx_capture_dir = v;
             gpu = "metal";
+        } else if (a == "--rsx-capture-on") {
+            const char* v = value();
+            if (!v) return usage();
+            g_capture_on = v;
         } else if (a == "--rsx-capture-from" || a == "--rsx-capture-frames" || a == "--rsx-capture-max-mb") {
             const char* v = value();
             if (!v || std::atoll(v) < 0) return usage();
@@ -1256,10 +1270,26 @@ int main(int argc, char** argv)
         else return usage();
     }
     if (!elf_path) return usage();
+    if (!g_capture_on.empty()) { // D-1054: the detectors run with the summary
+        bool known = false;
+        for (auto k : {loader::FrameWatch::Kind::PartlyBlack, loader::FrameWatch::Kind::Flicker,
+                 loader::FrameWatch::Kind::Hitch, loader::FrameWatch::Kind::Frozen, loader::FrameWatch::Kind::Flagged})
+            known |= g_capture_on == loader::FrameWatch::name(k);
+        if (!known || summary_path.empty() || rsx_capture_dir.empty()) {
+            std::fprintf(stderr, "pspocket-boot: --rsx-capture-on KIND needs --rsx-capture and --summary; KIND is "
+                                 "partly-black, flicker, hitch, frozen or flagged\n");
+            return 64;
+        }
+    }
     if (!summary_path.empty()) log::set_sink(summary_sink, nullptr); // warnings and errors counted by shape
     if (!summary_path.empty()) // called under g_summary.mutex, from the thumbnail callback
         g_summary.watch.on_event = [](const loader::FrameWatch::Event& e) {
             g_summary.glitches.push_back(e);
+            if (!g_capture_on.empty() && g_capture_on == loader::FrameWatch::name(e.kind) && e.flip >= g_capture_on_from) {
+                if (rsx::CaptureWriter* c = g_capture_trigger.load(); c && c->arm(0))
+                    std::printf("rsx capture: armed by the %s frame at flip %llu\n", g_capture_on.c_str(),
+                        static_cast<unsigned long long>(e.flip));
+            }
             std::printf("glitch: %s at flip %llu (%.2f)\n", loader::FrameWatch::name(e.kind),
                 static_cast<unsigned long long>(e.flip), e.value);
         };
@@ -1361,7 +1391,10 @@ int main(int argc, char** argv)
             co.from_flip = rsx_capture_from;
             co.frames = rsx_capture_frames;
             co.max_bytes = rsx_capture_max_mb << 20;
+            co.armed = g_capture_on.empty();
             rsx_capture = std::make_unique<rsx::CaptureWriter>(memory, *tracker, co);
+            g_capture_on_from = rsx_capture_from;
+            g_capture_trigger = rsx_capture.get();
         }
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;

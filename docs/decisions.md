@@ -17371,3 +17371,57 @@ again, with the fast paths switched off one by one.
   between frames: two replays present the same pixels as the capture's frames, no deviation; a capture past its cap:
   incomplete, its manifest says so).
 - Not in a capture: EDGE's GPU work items (they come from SPU jobs, not RSX memory): capture with PSPOCKET_EDGE_GPU=0.
+
+## D-1054 · 2026-10-17 · RSX captures that replay GTA V's skyfall: put before pages, the replay's own writes first, a glitch trigger
+
+What the first skyfall captures showed (D-1053's capture, GTA V's skyfall-sea route, `PSPOCKET_EDGE_GPU=0`): the
+replays stalled. One parked on a jump to itself after 163 of 363 records and presented 7 of 15 frames; another blocked
+on a semaphore acquire after 611 of 999. The causes and the changes:
+
+- **Put is read before the pages.** The record took the pages written since the last step boundary, then read put.
+  The CPU writes commands and then moves put, so a put it moved between the two named commands whose words reached
+  the replay a record late (a record whose step ran 1679 words of stale commands, then the replay went elsewhere). Put
+  is now read first: every command before it is in the pages harvested after it.
+- **Pages are watched again before they are read.** A page made writable by its first fault takes later stores
+  without a fault, so a store between the read and the new watch would never have been recorded. The block is now
+  watched again first and read after it.
+- **The replay's own deferred writes land before each record's pages** (`run_deferred(true)`). Labels and semaphores
+  released behind the GPU (D-1029) were in the capture's memory before the CPU wrote what the record holds. In the
+  replay, the RSX's release of 0 at semaphore 0x40300470 landed over the CPU's 1, and the acquire after it never passed.
+- **The next record's pages come early.** A step the capture's RSX ran on through something it saw during the step
+  (an SPU job's PUT over the jump-to-self it was coming to, commands put moved past) has those stores only in the next
+  record. When the replay blocks or idles short of the capture's words, it lets its deferred writes land and runs on.
+  If it is still short, it writes the next record's pages and put and runs to the words the capture processed.
+- **Stores with no fault.** `PSPOCKET_RSX_CAPTURE_CHECK=1` hashes the pages around the FIFO's get at every step
+  boundary and records (and logs) any that changed with no store seen: 1 to 9 a capture on the skyfall. The GPU's
+  target overlays (D-1027) write guest memory after their `notify_write`, so a page read between the two is stale until
+  the next store. Such a page is the replay's own GPU output, except where the FIFO reads it.
+- `rsx-replay` reports the early records, says where the RSX stopped at the first deviation (get, put, the capture's
+  next get, the semaphore or jump it is blocked on), counts records that end at another FIFO position with the same
+  words ("path deviations"), and takes `--verbose` (each early try).
+- Result: the 40-frame capture from flip 5410 (996 records, 1.16 GB) replays all 40 flips with 0 deviations and 1 early
+  record. 47 records end a word or two off the capture's get, all after early pages. Two fragment programs the live run
+  never decoded are reported, from those early pages.
+- `pspocket-boot --rsx-capture DIR --rsx-capture-on KIND` (with `--summary`; KIND is a frame detector's kind, D-1064:
+  partly-black, flicker, hitch, frozen, flagged). The capture waits for the first such event at or after
+  `--rsx-capture-from`, then starts at the next step boundary (`CaptureOptions::armed = false`,
+  `CaptureWriter::arm(flip)`, once only). The manifest's `from_flip` and the summary give the flip it started after.
+- Route runs for a capture use `PSPOCKET_PRESS_CLOCK=flips` (D-1028). A capture slows the game, and on the wall clock the
+  route then presses elsewhere: the morning's skyfall cheat at 125 s fell in shader-compile windows of 10-15 fps and
+  never took. On flips the skyfall starts at flip 3960, the near sea's black block comes at 5430-5446 (5 %, then 14 %,
+  of the frame), and the player drowns from 6200.
+- **The block and the capture.** Without a capture (a control on the flips clock, frames every 2), the block starts at
+  flip 5428 (4 % of the frame), grows to 62 % by 5472 and is gone by 5500. The bench's r6 (5160) and fix3 (5430/5460)
+  saw it too. It showed in none of three runs whose capture started at 5410 or 5426. In the triggered run the capture
+  started at 5447, inside the block, and the block was gone by 5450. A capture's start writes back every target the
+  GPU holds (7665 readbacks, a 0.5 s hitch), and that takes the block away. So the block's bytes come from somewhere
+  that reads memory where a GPU-held target was never written back, or from the timing the hitch changes; the
+  write-back is the likelier of the two. A capture as it stands cannot hold the block: its start removes it.
+- The Metal e2e fixture's present hook read each frame back in a completion handler. That handler indexed
+  `present_pixels` while a later frame's `emplace_back` could move it, and it ran after the fixture was gone when a
+  test did not sync: a finished test's pixels were written into freed heap and crashed the next test's
+  `MetalBackend::init` inside the driver's pipeline compile (4 runs in 30, in one random order). The handlers now fill
+  their place under a mutex, and `~E2E` waits for any still pending: 0 crashes in 30.
+- Test: "rsx capture: an unarmed capture waits for its trigger, then records the frames after it". Two frames pass
+  unrecorded, then arm(0); the next frame is captured from flip 2 and replays to its pixels, and a second arm is
+  refused. The capture's races are between the CPU, the SPUs and the RSX thread: no synthetic test reproduces them.

@@ -82,6 +82,14 @@ CaptureWriter::CaptureWriter(GuestMemory& mem, WriteTracker& tracker, CaptureOpt
     : mem_(mem), tracker_(tracker), options_(std::move(options))
 {
     page_size_ = static_cast<u32>(GuestMemory::host_page_size());
+    if (options_.armed) start_at_.store(options_.from_flip, std::memory_order_relaxed);
+    if (const char* v = std::getenv("PSPOCKET_RSX_CAPTURE_CHECK")) check_ = *v && *v != '0';
+}
+
+bool CaptureWriter::arm(u64 flip)
+{
+    u64 expected = ~0ull;
+    return start_at_.compare_exchange_strong(expected, flip, std::memory_order_acq_rel);
 }
 
 CaptureWriter::~CaptureWriter()
@@ -138,7 +146,8 @@ bool CaptureWriter::start(Rsx& rsx)
         m << std::format("fifo_location {}\n", static_cast<u32>(rsx.fifo_location_.load(std::memory_order_acquire)));
         m << std::format("page_size {}\n", page_size_);
         m << std::format("get {:#x}\nput {:#x}\n", rsx.get_.load(std::memory_order_relaxed), rsx.read_put());
-        m << std::format("from_flip {}\nframes {}\n", options_.from_flip, options_.frames);
+        started_after_ = rsx.flips_.load(std::memory_order_relaxed);
+        m << std::format("from_flip {}\nframes {}\n", started_after_, options_.frames);
         for (const auto& [ea, size] : regions_) m << std::format("region {:#x} {:#x}\n", ea, size);
         for (u32 page = 0; page < IoMap::kIoPages; page++) {
             if (const auto ea = rsx.io_map_.io_to_ea(page * IoMap::kPageSize))
@@ -201,6 +210,12 @@ void CaptureWriter::harvest(std::vector<std::pair<u32, u64>>& out)
 {
     for (Block& b : blocks_) {
         if (!tracker_.is_dirty(b.watch)) continue;
+        // Watched again before the pages are read (D-1054): a page made writable by its first fault takes the stores
+        // after it without a fault, so a store between the read and a watch taken after it would be lost for good
+        // (GTA V's jump-to-self released by a store into a command buffer page written all frame: the replay stayed
+        // parked). Taken first, a store after the read faults and comes in the next record.
+        tracker_.unwatch(b.watch);
+        b.watch = tracker_.watch(b.ea, b.size);
         for (Page& p : b.pages) {
             const u64 g = tracker_.page_generation(p.ea);
             if (g == p.generation && tracker_.protection()) continue;
@@ -211,8 +226,32 @@ void CaptureWriter::harvest(std::vector<std::pair<u32, u64>>& out)
             p.hash = hash ? store_blob(data, page_size_) : 0;
             out.emplace_back(p.ea, p.hash);
         }
-        tracker_.unwatch(b.watch);
-        b.watch = tracker_.watch(b.ea, b.size);
+    }
+}
+
+// Debugging the capture (PSPOCKET_RSX_CAPTURE_CHECK=1): the pages around the FIFO's get hashed at every step boundary,
+// dirty or not; one whose bytes changed with no store seen is logged (and recorded).
+void CaptureWriter::check_around(Rsx& rsx, std::vector<std::pair<u32, u64>>& out)
+{
+    const auto ea = rsx.fifo_address(rsx.get_.load(std::memory_order_relaxed));
+    if (!ea) return;
+    const u32 lo = (*ea & ~(page_size_ - 1)) - page_size_, hi = lo + 4 * page_size_;
+    for (Block& b : blocks_) {
+        if (b.ea + b.size <= lo || b.ea >= hi) continue;
+        for (Page& p : b.pages) {
+            if (p.ea < lo || p.ea >= hi) continue;
+            if (std::any_of(out.begin(), out.end(), [&](const auto& e) { return e.first == p.ea; })) continue;
+            const u8* data = mem_.host(p.ea);
+            const u64 hash = all_zero(data, page_size_) ? 0 : WriteTracker::content_hash(data, page_size_) ^ page_size_;
+            if (hash == p.hash) continue;
+            missed_++;
+            if (missed_ <= 20)
+                PS_LOG_WARN(kChan, "capture: page {:#x} changed with no store seen (get {:#x}, generation {} as recorded {}, "
+                    "block dirty {})", p.ea, rsx.get_.load(std::memory_order_relaxed), tracker_.page_generation(p.ea),
+                    p.generation, tracker_.is_dirty(b.watch));
+            p.hash = hash ? store_blob(data, page_size_) : 0;
+            out.emplace_back(p.ea, p.hash);
+        }
     }
 }
 
@@ -245,7 +284,8 @@ void CaptureWriter::before_step(Rsx& rsx)
     Phase ph = phase();
     if (ph == Phase::Done || ph == Phase::Failed) return;
     if (ph == Phase::Waiting) {
-        if (rsx.flips_.load(std::memory_order_relaxed) < options_.from_flip) return;
+        const u64 at = start_at_.load(std::memory_order_acquire);
+        if (at == ~0ull || rsx.flips_.load(std::memory_order_relaxed) < at) return;
         // A boundary with no packet, call or wait open.
         if (rsx.packet_remaining_ || !rsx.return_stack_.empty() ||
             rsx.block_reason_.load(std::memory_order_relaxed) != Rsx::BlockReason::None ||
@@ -270,9 +310,14 @@ void CaptureWriter::before_step(Rsx& rsx)
         finish(rsx, true, {});
         return;
     }
-    // The record of the step that ran last, then this one's: its pages, put.
+    // The record of the step that ran last, then this one's: its pages, put. Put is read before the pages (D-1054):
+    // the CPU writes the commands, then moves put, so every command before this put is in the pages harvested after
+    // it. Read after them, a put the CPU moved in between gave the replay commands whose words came a record late
+    // (GTA V's skyfall: a record whose step ran 1679 words of stale commands, then the replay parked elsewhere).
+    const u32 put = rsx.read_put();
     std::vector<std::pair<u32, u64>> pages;
     harvest(pages);
+    if (check_) check_around(rsx, pages);
     // A new IO mapping: not followed (the capture would miss what it maps).
     u32 sig = 0;
     for (u32 page = 0; page < IoMap::kIoPages; page++)
@@ -282,7 +327,6 @@ void CaptureWriter::before_step(Rsx& rsx)
         return;
     }
     const u64 words = rsx.words_.load(std::memory_order_relaxed);
-    const u32 put = rsx.read_put();
     if (have_current_ && pages.empty() && put == current_.put && words == current_.words &&
         current_.flip_requests.empty() && !current_.reset && current_.flips == 0) {
         return; // nothing new: the same record goes on
@@ -349,10 +393,11 @@ void CaptureWriter::finish(Rsx&, bool complete, std::string why)
 
 std::string CaptureWriter::summary() const
 {
-    return std::format("RSX capture {}: {} ({} flips, {} records, {} pages written, {:.1f} MB of blobs){}{}",
+    return std::format("RSX capture {}: {} (from flip {}: {} flips, {} records, {} pages written, {:.1f} MB of blobs{}){}{}",
         options_.dir,
-        phase() == Phase::Done ? "complete" : phase() == Phase::Failed ? "incomplete" : "not finished", flips_,
-        events_written_, pages_written_, static_cast<double>(blob_bytes_) / 1048576.0, why_.empty() ? "" : ": ", why_);
+        phase() == Phase::Done ? "complete" : phase() == Phase::Failed ? "incomplete" : "not finished", started_after_, flips_,
+        events_written_, pages_written_, static_cast<double>(blob_bytes_) / 1048576.0,
+        check_ ? std::format(", {} pages changed with no store seen", missed_) : std::string(), why_.empty() ? "" : ": ", why_);
 }
 
 // ---- reader -------------------------------------------------------------------------------------------------------
@@ -545,23 +590,70 @@ bool replay_capture(const std::string& dir, GuestMemory& mem, WriteTracker& trac
     }
     const u64 base_words = rsx.words_.load(std::memory_order_relaxed);
     keep_outputs = true;
+    std::vector<bool> applied(records.size(), false);
     for (usize i = 0; i < records.size(); i++) {
         const Record& r = records[i];
-        for (const auto& [ea, hash] : r.pages)
-            if (!write_page(ea, hash)) return fail(std::format("{}: record {}'s page {:#x} has no blob", dir, i, ea));
+        // The replay's own deferred writes (labels and semaphores released behind the GPU, D-1029, readbacks) land
+        // before the record's pages (D-1054): the capture's RSX had them in memory before the CPU wrote what the
+        // record holds (GTA V's skyfall: the RSX's release of 0 at a semaphore landed over the CPU's 1, which the
+        // replay had already written, and the acquire after it never passed).
+        rsx.backend_.run_deferred(true);
+        if (!applied[i])
+            for (const auto& [ea, hash] : r.pages)
+                if (!write_page(ea, hash)) return fail(std::format("{}: record {}'s page {:#x} has no blob", dir, i, ea));
+        applied[i] = true;
         ps_write32(mem.base(), put_addr, r.put);
         if (r.reset) rsx.set_fifo_pointers(r.reset_get, r.reset_put);
         for (const auto& [head, value] : r.requests) rsx.request_flip(head, value);
         const u64 target = i + 1 < records.size() ? records[i + 1].words : r.words;
-        const u64 done = rsx.words_.load(std::memory_order_relaxed) - base_words;
-        if (target > done || !r.requests.empty() || r.reset) {
-            const u64 budget = target > done ? target - done : 0;
-            rsx.run_until_idle(budget ? budget : 0);
+        const auto words_done = [&] { return rsx.words_.load(std::memory_order_relaxed) - base_words; };
+        if (target > words_done() || !r.requests.empty() || r.reset) {
+            const u64 budget = target > words_done() ? target - words_done() : 0;
+            Rsx::RunStatus st = rsx.run_until_idle(budget ? budget : 0);
+            // Short of the capture's words, blocked or idle (D-1054). What released the capture's RSX may be the
+            // replay's own work that has landed since (a semaphore release behind the GPU: run_until_idle ran the
+            // deferred writes when it stopped), so the RSX goes on first. Or it is what the capture's RSX saw during
+            // this step (a job's PUT over the jump-to-self it was coming to, commands the CPU wrote and moved put past
+            // while the step ran), which reached the capture's records only at the next step boundary: the next
+            // record's pages and put are written then, and the RSX runs on to the words it processed.
+            for (u32 tries = 0; tries < 4 && words_done() < target &&
+                 (st == Rsx::RunStatus::Blocked || st == Rsx::RunStatus::Idle);
+                 tries++) {
+                if (options.verbose)
+                    PS_LOG_INFO(kChan, "replay: record {} try {}: {} of {} words, status {}, get {:#x}", i, tries,
+                        words_done(), target, static_cast<int>(st), rsx.get_.load(std::memory_order_relaxed));
+                if (tries > 0 && i + 1 < records.size() && !applied[i + 1]) {
+                    for (const auto& [ea, hash] : records[i + 1].pages)
+                        if (!write_page(ea, hash))
+                            return fail(std::format("{}: record {}'s page {:#x} has no blob", dir, i + 1, ea));
+                    ps_write32(mem.base(), put_addr, records[i + 1].put);
+                    applied[i + 1] = true;
+                    result.early++;
+                } else if (tries > 0) {
+                    break;
+                }
+                st = rsx.run_until_idle(target - words_done());
+            }
         }
-        const u64 now = rsx.words_.load(std::memory_order_relaxed) - base_words;
+        const u64 now = words_done();
+        if (const u32 g = rsx.get_.load(std::memory_order_relaxed);
+            i + 1 < records.size() && now == target && g != records[i + 1].get && !result.path_deviations++) {
+            result.first_path_deviation = std::format("record {}: get {:#x} after its {} words, the capture's {:#x}", i, g,
+                target, records[i + 1].get);
+        }
         if (now != target) {
             if (!result.deviations++) {
-                result.first_deviation = std::format("record {}: {} words processed, the capture {}", i, now, target);
+                const Rsx::Status st = rsx.status();
+                std::string why = st.block == Rsx::BlockReason::Semaphore
+                    ? std::format(", blocked on a semaphore acquire of {:#x} at {:#x} (context {:#x}, address {}) holding {:#x}",
+                          st.block_value, st.semaphore_offset, st.semaphore_context,
+                          st.semaphore_addr ? std::format("{:#x}", *st.semaphore_addr) : std::string("none"),
+                          st.semaphore_value)
+                    : st.block == Rsx::BlockReason::JumpToSelf ? std::format(", parked on a jump to itself ({:#x})", st.block_value)
+                    : "";
+                result.first_deviation = std::format("record {}: {} words processed, the capture {}; get {:#x} put {:#x} "
+                    "(the capture's next: get {:#x}){}", i, now, target, st.get, st.put,
+                    i + 1 < records.size() ? records[i + 1].get : r.get, why);
             }
             if (options.verbose) PS_LOG_WARN(kChan, "replay of {}: record {}: {} words, the capture {}", dir, i, now, target);
         }

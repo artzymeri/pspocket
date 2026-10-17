@@ -25,7 +25,8 @@
 //
 // Replay (replay_capture): commits the regions, writes the image, restores the IO map, the display buffers, the state
 // and get, then for each record writes its pages, put, the flips asked for and the resets, and runs the RSX for as many
-// words as the capture did until the next record (Rsx::run_until_idle). The backend runs in the caller's mode (fast,
+// words as the capture did until the next record (Rsx::run_until_idle); when it blocks short of them, the next record's
+// pages first (a store the capture's RSX saw within a step: D-1054). The backend runs in the caller's mode (fast,
 // or PSPOCKET_RSX_EXACT=1). Pages a store reached during a step reach the replay at the next record, as the capture
 // saw them: a race between the CPU and the RSX within one step is replayed one way, always the same.
 
@@ -46,6 +47,7 @@ struct CaptureOptions {
     u64 from_flip = 0;            // the capture starts after this flip (the RSX's count)
     u32 frames = 1;               // and records this many flips
     u64 max_bytes = 2048ull << 20; // blobs past this: the capture stops, incomplete
+    bool armed = true;            // false: from_flip waits for arm() (a trigger: a detector that saw the frame wrong)
 };
 
 class CaptureWriter {
@@ -60,6 +62,10 @@ public:
     void note_flip_requests(const std::vector<std::pair<u32, u32>>& requests);
     void note_fifo_reset(u32 get, u32 put);
     void after_flip(Rsx& rsx);
+
+    // A trigger (D-1054): start after flip `flip` (or the next step boundary, if the RSX is past it) and record the
+    // frames asked for. Once only; any thread. False when the capture was armed already.
+    bool arm(u64 flip);
 
     enum class Phase : u8 { Waiting, Recording, Done, Failed };
     Phase phase() const { return phase_.load(std::memory_order_acquire); }
@@ -89,6 +95,7 @@ private:
 
     bool start(Rsx& rsx);
     void harvest(std::vector<std::pair<u32, u64>>& out);
+    void check_around(Rsx& rsx, std::vector<std::pair<u32, u64>>& out);
     u64 store_blob(const u8* data, u32 size); // its hash; written once
     void write_event(const Event& e);
     void finish(Rsx& rsx, bool complete, std::string why);
@@ -98,6 +105,7 @@ private:
     WriteTracker& tracker_;
     CaptureOptions options_;
     std::atomic<Phase> phase_{Phase::Waiting};
+    std::atomic<u64> start_at_{~0ull}; // the flip the capture starts after: options_.from_flip, or arm()'s
     std::vector<Block> blocks_;
     std::vector<std::pair<u32, u32>> regions_; // ea, size
     std::unordered_map<u64, u64> blob_offsets_; // hash -> offset in blobs.bin
@@ -108,9 +116,11 @@ private:
     Event current_;
     bool have_current_ = false;
     bool finishing_ = false; // the last flip made: the next step boundary closes the capture
-    u64 events_written_ = 0, pages_written_ = 0, flips_ = 0, start_words_ = 0;
+    u64 events_written_ = 0, pages_written_ = 0, flips_ = 0, start_words_ = 0, started_after_ = 0;
     u32 io_signature_ = 0;
     std::string why_;
+    bool check_ = false; // PSPOCKET_RSX_CAPTURE_CHECK
+    u64 missed_ = 0;
 };
 
 struct ReplayOptions {
@@ -120,7 +130,10 @@ struct ReplayOptions {
 struct ReplayResult {
     u64 events = 0, flips = 0, words = 0;
     u64 deviations = 0; // records after which the RSX had not processed the words the capture had
+    u64 early = 0;      // records whose pages were written early: the RSX blocked on a store the capture saw mid-step
     std::string first_deviation;
+    u64 path_deviations = 0; // records after which the words were the capture's but get was not (another path taken)
+    std::string first_path_deviation;
 };
 
 // The capture's manifest and state, for the replay harness to build its Rsx with (its layout, local memory, FIFO
