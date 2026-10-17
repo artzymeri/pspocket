@@ -7244,3 +7244,33 @@ TEST_CASE("metal e2e: a display buffer shown from memory gets what a target insi
         CHECK(at(64, 96) == (sync ? std::array<u8, 3>{0, 0xff, 0} : std::array<u8, 3>{0, 0, 0})); // the target's green
     }
 }
+
+TEST_CASE("metal e2e: a target in main memory is in guest memory after the flip, for the CPU and SPUs that read it "
+          "(D-1059)")
+{
+    // GTA V's CPU reads 1x1 targets in main memory (its exposure), an SPU job a 128x128 depth buffer there: on the PS3
+    // the RSX draws into that memory. The fast mode mirrors such targets into memory at each flip;
+    // PSPOCKET_RSX_NO_MAIN_MIRROR=1 leaves them on the GPU, as before.
+    REQUIRE_METAL();
+    for (const bool mirror : {true, false}) {
+        INFO((mirror ? "mirrored" : "PSPOCKET_RSX_NO_MAIN_MIRROR"));
+        if (!mirror) ::setenv("PSPOCKET_RSX_NO_MAIN_MIRROR", "1", 1);
+        E2E e;
+        auto b = e.at(0);
+        setup_surface(b, 0x100000); // IO offset 0x100000: main memory at E2E::kReadbackEa
+        b.method(m::NV4097_SET_CONTEXT_DMA_COLOR_A, loc::kDmaHostBuffer);
+        b.method(m::NV4097_SET_SURFACE_CLIP_HORIZONTAL, {16u << 16, 16u << 16});
+        b.method(m::NV4097_SET_SURFACE_PITCH_A, 16u * 4);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff336699);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        b.method(m::GCM_FLIP_COMMAND, 0);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        e.backend->sync();
+        ::unsetenv("PSPOCKET_RSX_NO_MAIN_MIRROR");
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+        CHECK(e.failures.empty());
+        const u32 word = ps_read32(e.mem.base(), E2E::kReadbackEa + 5 * 64 + 5 * 4);
+        CHECK(word == (mirror ? 0xff336699u : 0u));
+        CHECK(e.backend->stats().targets_mirrored == (mirror ? 1u : 0u));
+    }
+}

@@ -634,6 +634,37 @@ bool replay_capture(const std::string& dir, GuestMemory& mem, WriteTracker& trac
                 }
                 st = rsx.run_until_idle(target - words_done());
             }
+            // Still parked on a jump to itself the capture's RSX went past: the store that released it reached no
+            // record in time (a store the write tracking did not see; D-1054's PSPOCKET_RSX_CAPTURE_CHECK records the
+            // pages around get). The first later record whose copy of that page releases it gives the page (the
+            // block's commands come with their first word) (D-1059).
+            for (u32 tries = 0; tries < 4 && words_done() < target && st == Rsx::RunStatus::Blocked; tries++) {
+                const Rsx::Status bs = rsx.status();
+                if (bs.block != Rsx::BlockReason::JumpToSelf) break;
+                const auto fea = rsx.fifo_address(bs.get);
+                if (!fea) break;
+                const u32 pea = *fea & ~(page - 1);
+                bool found = false;
+                for (usize j = i + 1; j < records.size() && j <= i + 256 && !found; j++) {
+                    for (const auto& [ea, hash] : records[j].pages) {
+                        if (ea != pea) continue;
+                        const auto it = blobs.at.find(hash);
+                        const u32 word = !hash ? 0u
+                            : it == blobs.at.end() ? bs.block_value
+                            : ps_read32(blobs.bytes.data() + it->second.first, *fea - pea);
+                        if (word == bs.block_value) continue;
+                        if (!write_page(ea, hash)) return fail(std::format("{}: record {}'s page {:#x} has no blob", dir, j, ea));
+                        found = true;
+                        result.lookahead++;
+                        if (options.verbose)
+                            PS_LOG_INFO(kChan, "replay: record {}: the jump to itself at {:#x} released from record {}'s page", i,
+                                bs.get, j);
+                        break;
+                    }
+                }
+                if (!found) break;
+                st = rsx.run_until_idle(target - words_done());
+            }
         }
         const u64 now = words_done();
         if (const u32 g = rsx.get_.load(std::memory_order_relaxed);

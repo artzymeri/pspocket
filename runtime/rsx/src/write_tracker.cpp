@@ -1,7 +1,9 @@
 #include "pspocket/rsx/write_tracker.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
+#include <pthread.h>
 #include <thread>
 #include <sys/mman.h>
 
@@ -21,18 +23,24 @@ WriteTracker::WriteTracker(GuestMemory& mem)
       page_count_(GuestMemory::kGuestSize / GuestMemory::host_page_size()),
       generation_(new std::atomic<u32>[page_count_]),
       watchers_(new std::atomic<u16>[page_count_]),
-      state_(new std::atomic<u16>[page_count_])
+      state_(new std::atomic<u16>[page_count_]),
+      read_armed_(new std::atomic<u8>[page_count_]),
+      read_watched_(new std::atomic<u8>[page_count_]),
+      read_hits_(new ReadHit[kMaxReadHits])
 {
     for (u64 i = 0; i < page_count_; i++) {
         generation_[i].store(0, std::memory_order_relaxed);
         watchers_[i].store(0, std::memory_order_relaxed);
         state_[i].store(kUnprotected, std::memory_order_relaxed);
+        read_armed_[i].store(0, std::memory_order_relaxed);
+        read_watched_[i].store(0, std::memory_order_relaxed);
     }
 }
 
 WriteTracker::~WriteTracker()
 {
     uninstall();
+    watch_reads({}); // no page left inaccessible
     // Leave no page read-only behind us.
     for (u64 p = 0; p < page_count_; p++) {
         if ((state_[p].load(std::memory_order_relaxed) & kStateMask) == kProtected) {
@@ -215,12 +223,103 @@ void WriteTracker::notify_write(u32 addr, u32 size)
     for (u64 p = first; p <= last; p++) generation_[p].fetch_add(1, std::memory_order_acq_rel);
 }
 
+void WriteTracker::set_owner_thread()
+{
+    owner_thread_.store(reinterpret_cast<u64>(pthread_self()), std::memory_order_release);
+}
+
+void WriteTracker::watch_reads(const std::vector<std::pair<u32, u32>>& ranges)
+{
+    // What the write tracking wants of a page: read-only while it is protected, else writable.
+    const auto restore = [&](u64 p) {
+        const u16 s = settled_state(p) & kStateMask;
+        mem_.protect(static_cast<u32>(p << page_shift_), page_size_, s == kProtected ? Prot::Read : Prot::ReadWrite);
+    };
+    std::vector<u64> next;
+    for (const auto& [addr, size] : ranges) {
+        if (!size) continue;
+        const u64 first = addr >> page_shift_, last = (u64{addr} + size - 1) >> page_shift_;
+        for (u64 p = first; p <= last && p < page_count_; p++)
+            if (mem_.is_committed(static_cast<u32>(p << page_shift_))) next.push_back(p);
+    }
+    std::sort(next.begin(), next.end());
+    next.erase(std::unique(next.begin(), next.end()), next.end());
+    // Pages out of the set since the call before: out of the watch now (a fault taken while one was inaccessible
+    // has been handled by now).
+    for (u64 p : read_leaving_)
+        if (!std::binary_search(next.begin(), next.end(), p)) read_watched_[p].store(0, std::memory_order_release);
+    read_leaving_.clear();
+    for (u64 p : read_pages_) { // the last call's pages not armed again: as the write tracking wants them
+        if (std::binary_search(next.begin(), next.end(), p)) continue;
+        u8 armed = 1;
+        if (read_armed_[p].compare_exchange_strong(armed, 2, std::memory_order_acq_rel)) {
+            restore(p);
+            read_armed_[p].store(0, std::memory_order_release);
+        }
+        read_leaving_.push_back(p);
+    }
+    // Every page armed again (the write tracking's own protection changes may have opened one), in runs.
+    for (usize i = 0; i < next.size();) {
+        usize j = i;
+        while (j + 1 < next.size() && next[j + 1] == next[j] + 1) j++;
+        for (usize k = i; k <= j; k++) {
+            read_watched_[next[k]].store(1, std::memory_order_release);
+            read_armed_[next[k]].store(1, std::memory_order_release);
+        }
+        mem_.protect(static_cast<u32>(next[i] << page_shift_), (j - i + 1) * page_size_, Prot::None);
+        i = j + 1;
+    }
+    read_pages_ = std::move(next);
+}
+
+std::vector<WriteTracker::ReadHit> WriteTracker::take_read_hits(u64* total)
+{
+    const u32 n = std::min(read_hit_count_.exchange(0, std::memory_order_acq_rel), kMaxReadHits);
+    std::vector<ReadHit> out(read_hits_.get(), read_hits_.get() + n);
+    if (total) *total = read_hits_total_.exchange(0, std::memory_order_acq_rel);
+    return out;
+}
+
+// A fault on a page armed for reads (D-1059): disarmed, its protection as the write tracking wants it, and the
+// access retried; a hit unless the owner thread made it. Async-signal-safe.
+bool WriteTracker::handle_read_fault(u64 page, u32 addr)
+{
+    // 1: armed (inaccessible); 2: a thread is restoring it (the access retries until it has); 0: the write tracking's
+    // own protection (a fault there is the write tracking's).
+    u8 armed = 1;
+    if (!read_armed_[page].compare_exchange_strong(armed, 2, std::memory_order_acq_rel)) return armed == 2;
+    const u16 s = settled_state(page) & kStateMask;
+    ::mprotect(mem_.base() + (page << page_shift_), page_size_, s == kProtected ? PROT_READ : PROT_READ | PROT_WRITE);
+    read_armed_[page].store(0, std::memory_order_release);
+    const u64 self = reinterpret_cast<u64>(pthread_self());
+    if (self != owner_thread_.load(std::memory_order_acquire)) {
+        read_hits_total_.fetch_add(1, std::memory_order_relaxed);
+        const u32 i = read_hit_count_.fetch_add(1, std::memory_order_acq_rel);
+        if (i < kMaxReadHits) read_hits_[i] = {addr, self};
+    }
+    return true;
+}
+
 bool WriteTracker::handle_fault(const void* host_addr)
+{
+    if (handle_write_fault(host_addr)) return true;
+    // A page in the read watch's set whose fault came while it was inaccessible and found it restored by another
+    // thread (and not the write tracking's): accessible now, the access is retried (D-1059).
+    const auto a = reinterpret_cast<uintptr_t>(host_addr);
+    const auto b = reinterpret_cast<uintptr_t>(mem_.base());
+    if (a < b || a - b >= GuestMemory::kGuestSize) return false;
+    const u64 page = (a - b) >> page_shift_;
+    return read_watched_[page].load(std::memory_order_acquire) && mem_.is_committed(static_cast<u32>(page << page_shift_));
+}
+
+bool WriteTracker::handle_write_fault(const void* host_addr)
 {
     const auto a = reinterpret_cast<uintptr_t>(host_addr);
     const auto b = reinterpret_cast<uintptr_t>(mem_.base());
     if (a < b || a - b >= GuestMemory::kGuestSize) return false;
     const u64 page = (a - b) >> page_shift_;
+    const bool read_watched = read_watched_[page].load(std::memory_order_acquire) != 0; // D-1059
+    if (read_watched && handle_read_fault(page, static_cast<u32>(a - b))) return true;
     // Writable already (resolved, released) means the store runs again: not for a page freed since (no access to it
     // can succeed; it goes on to the crash handler).
     const bool committed = mem_.is_committed(static_cast<u32>(page << page_shift_));

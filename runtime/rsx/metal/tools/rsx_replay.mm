@@ -405,8 +405,10 @@ int main(int argc, char** argv)
                 if (al.v[i]) line += std::format(" {} {}", kAlarmNames[i], al.v[i]);
             std::printf("alarms:%s\n", line.empty() ? " none" : line.c_str());
         }
-        std::printf("replayed %s: %llu records (%llu written early), %llu flips, %llu words; %llu deviations%s%s\n",
+        std::printf("replayed %s: %llu records (%llu written early, %llu jumps released from later ones), %llu flips, %llu "
+            "words; %llu deviations%s%s\n",
             dir.c_str(), static_cast<unsigned long long>(result.events), static_cast<unsigned long long>(result.early),
+            static_cast<unsigned long long>(result.lookahead),
             static_cast<unsigned long long>(result.flips),
             static_cast<unsigned long long>(result.words), static_cast<unsigned long long>(result.deviations),
             result.deviations ? ", the first: " : "", result.first_deviation.c_str());

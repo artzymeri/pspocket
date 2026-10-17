@@ -17690,3 +17690,40 @@ cheaply, so a bad frame found afterwards can be compared with the frames around 
     likely while the detailed models that replace it were not ready yet (streaming timing) or because of a
     visibility decision. Open: which game system picks the LOD, and whether our file and decompression timing, or a
     lifted function, makes it fall back.
+
+## D-1059 · 2026-10-17 · CPU and SPU reads of GPU-held targets (plan F5): measured, main-memory targets mirrored at each flip
+
+- **Measuring** (`PSPOCKET_RSX_WATCH_CPU_READS=1`, protection mode, a dev aid that costs a lot of CPU): at each flip, the
+  pages of the targets the GPU drew or sampled in the last two flips and holds newer than memory become inaccessible
+  (`WriteTracker::watch_reads`) until their next access. An access from any thread but the RSX thread is a hit,
+  recorded by the fault handler (address and thread; async-signal-safe, three states a page so that racing faults
+  retry instead of crashing). A hit in a target's pixel bytes (not beside it in the same 16 KB page) counts the new
+  alarm `cpu_reads_gpu_targets`, and the first one at each target is logged with the thread.
+  - Measured on GTA V's skyfall-sea route (edge-off, flips clock): 8,754 in 7,050 flips, about 1.2 a frame, from four
+    targets, all in main memory:
+    - the 1x1 F_W32Z32Y32X32 targets at 0x10530000, 0x10530400 and 0x10530800, read by the RAGE RenderThread (its
+      exposure, by the look of them);
+    - a 128x128 B8 target at 0x13114000, read by the main thread;
+    - a 128x128 depth buffer at 0x11030000, read by an SPU (an SPURS job's DMA).
+  - Assassin's Creed's garden (fresh install): none in a target's bytes. The two page hits were beside targets: a
+    depth buffer's page touched by its HDD copy thread, and an SPU.
+  - Without the mirror, those readers found what memory held: what the GPU drew there frames before, or nothing.
+- **Fixed**: every GPU-newer target in main memory (outside the RSX's local memory) of at most 1 MB is laid into
+  guest memory on the GPU at each flip, through D-1029's windows (now for any committed guest memory, not local memory
+  alone), with nothing waiting. A reader finds what the GPU drew a frame late at most, which is the PS3's order for a
+  CPU that reads after a fence. With it, the skyfall route counts `cpu_reads_gpu_targets` 0 (the touches of those
+  targets go to the stat `cpu_reads_mirrored`). `PSPOCKET_RSX_NO_MAIN_MIRROR=1` switches it off, and under
+  `PSPOCKET_GPU_AB` it is the change.
+  - The gate walk's same-run A/B (`PSPOCKET_GPU_AB=30`) in play: GPU 6.96 and 7.40 ms a frame with it, 7.40 and 7.33
+    without; the RSX thread 9.03 and 8.47 ms with it, 9.22 and 8.41 without. That is no cost.
+  - The skyfall frames at 2,400 and 5,100 show the same exposure with and without it.
+- **Capture replays**: a replay parked on a jump to itself that its record's pages (and the next record's) do not
+  release takes the page from the first later record whose copy releases it (`ReplayResult::lookahead`). The store
+  that released it reached no record: one the write tracking did not see, which a capture made with
+  `PSPOCKET_RSX_CAPTURE_CHECK=1` (D-1054) records. h1's rain-street capture (no check) now replays all 100 flips but
+  drifts from record 171; it is being taken again with the check.
+- Tests:
+  - test_write_tracker: a read of an armed page by another thread is a hit at its address and the owner's is not; a
+    page also write-watched is read-only again after its hit (a store dirties the watch); a page left out of the set
+    reads without a hit.
+  - Metal e2e: a target in main memory is in guest memory after the flip, and not with `PSPOCKET_RSX_NO_MAIN_MIRROR`.

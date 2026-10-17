@@ -247,3 +247,56 @@ TEST_CASE("protection mode: a store into a watched range is always seen while ot
     tracker.unwatch(w);
     tracker.uninstall();
 }
+
+TEST_CASE("read watching: another thread's read of an armed page is a hit, the owner's is not, and the page keeps the "
+          "write tracking's protection (D-1059)")
+{
+    GuestMemory mem;
+    REQUIRE(mem.reserve());
+    const u32 page = static_cast<u32>(GuestMemory::host_page_size());
+    const u32 base = PS_MEM_RSX_LOCAL_BASE + 0x200000;
+    REQUIRE(mem.commit(base, 4 * page));
+    mem.write<u32>(base, 0x11);
+    mem.write<u32>(base + page, 0x22);
+    mem.write<u32>(base + 2 * page, 0x33);
+    WriteTracker tracker(mem);
+    tracker.set_protection(true);
+    tracker.install();
+    struct sigaction sa {};
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
+
+    auto w = tracker.watch(base + page, 4); // page 1 also write-watched: read-only once its read is seen
+    tracker.set_owner_thread();
+    tracker.watch_reads({{base, 3 * page}}); // pages 0-2
+    u32 seen = 0;
+    std::thread other([&] { seen = mem.read<u32>(base + page) + mem.read<u32>(base + 2 * page); });
+    other.join();
+    CHECK(seen == 0x55);
+    CHECK(mem.read<u32>(base) == 0x11); // the owner's: not a hit
+    u64 total = 0;
+    const auto hits = tracker.take_read_hits(&total);
+    CHECK(total == 2);
+    REQUIRE(hits.size() == 2);
+    CHECK(((hits[0].addr == base + page && hits[1].addr == base + 2 * page) ||
+           (hits[1].addr == base + page && hits[0].addr == base + 2 * page)));
+    // Page 1 is read-only again (its write watch): a store there is the write tracking's fault, the watch dirty.
+    CHECK_FALSE(tracker.is_dirty(w));
+    mem.write<u32>(base + page, 0x44);
+    CHECK(tracker.is_dirty(w));
+    // Armed again, then disarmed by a call without it: reads go through without a hit.
+    tracker.watch_reads({{base + 3 * page, page}});
+    std::thread again([&] { seen = mem.read<u32>(base + 2 * page); });
+    again.join();
+    tracker.take_read_hits(&total);
+    CHECK(total == 0);
+    tracker.watch_reads({});
+    tracker.unwatch(w);
+    sigaction(SIGSEGV, &g_prev_segv, nullptr);
+    sigaction(SIGBUS, &g_prev_bus, nullptr);
+    CHECK(g_unexpected.load() == 0);
+    tracker.uninstall();
+}

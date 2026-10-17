@@ -812,6 +812,14 @@ struct MetalBackend::Impl {
     u64 spans_version = 0;
     std::vector<Surface*> stale_scratch;
     bool stale_sync = true; // PSPOCKET_RSX_NO_STALE_SYNC=1: the reads below only count the alarm (tests, A/B)
+    // PSPOCKET_RSX_WATCH_CPU_READS (D-1059): the targets whose pages are watched until the next flip.
+    void watch_cpu_reads();
+    static constexpr u32 kMainMirrorBytes = 1u << 20;
+    bool main_mirrored(const Surface& s) const;
+    bool main_mirror = true; // PSPOCKET_RSX_NO_MAIN_MIRROR=1: off
+    bool read_watch_owner = false;
+    std::vector<SurfaceSpan> read_watch_spans;
+    std::unordered_set<u64> read_watch_logged;
     // Textures of surfaces removed, for the next surface of the same format and size (D-984): GTA V's 640x360
     // target and the 320x180 F16 one over the same memory replace each other every frame, a new texture each time.
     // At most kSurfacePoolMax, oldest dropped first; emptied by trim().

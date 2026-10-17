@@ -20,6 +20,8 @@
 
 #include <atomic>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "pspocket/core/guest_memory.hpp"
 #include "pspocket/core/types.hpp"
@@ -72,6 +74,21 @@ public:
     void uninstall();
 
     u64 faults_handled() const { return faults_.load(std::memory_order_relaxed); }
+
+    // Read watching (D-1059, a measurement; protection mode only): the pages of `ranges` are made inaccessible until
+    // their next access. An access from any thread but the owner (the RSX thread, whose own reads and write-backs are
+    // the backend's business) is a hit: kept (the first kMaxReadHits, address and thread) and counted; the page goes
+    // back to what the write tracking wants of it and the access is retried. Each call replaces the last one's pages.
+    // Called from the owner thread.
+    void watch_reads(const std::vector<std::pair<u32, u32>>& ranges);
+    void set_owner_thread();
+    struct ReadHit {
+        u32 addr = 0;   // the guest address the access faulted at
+        u64 thread = 0; // pthread_t of the reader
+    };
+    static constexpr u32 kMaxReadHits = 256;
+    // Hits since the last call (at most kMaxReadHits kept; `total` counts every one).
+    std::vector<ReadHit> take_read_hits(u64* total);
     u64 page_generation(u32 addr) const;
     static u64 content_hash(const u8* data, usize size);
 
@@ -111,6 +128,16 @@ private:
     std::unique_ptr<std::atomic<u16>[]> state_;
     std::atomic<bool> protection_{false};
     std::atomic<u64> faults_{0};
+    // Read watching (D-1059): pages armed (1) until their first access; the armed list (owner thread); the hits.
+    std::unique_ptr<std::atomic<u8>[]> read_armed_;
+    std::unique_ptr<std::atomic<u8>[]> read_watched_; // in the current set: a fault there retries until restored
+    std::vector<u64> read_pages_, read_leaving_;
+    std::atomic<u64> owner_thread_{0};
+    std::unique_ptr<ReadHit[]> read_hits_;
+    std::atomic<u32> read_hit_count_{0};
+    std::atomic<u64> read_hits_total_{0};
+    bool handle_read_fault(u64 page, u32 addr);
+    bool handle_write_fault(const void* host_addr);
 };
 
 } // namespace pspocket::rsx

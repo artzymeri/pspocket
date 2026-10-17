@@ -131,6 +131,7 @@ struct ReplayResult {
     u64 events = 0, flips = 0, words = 0;
     u64 deviations = 0; // records after which the RSX had not processed the words the capture had
     u64 early = 0;      // records whose pages were written early: the RSX blocked on a store the capture saw mid-step
+    u64 lookahead = 0;  // jumps to themselves released from a later record's page (a store no record had in time)
     std::string first_deviation;
     u64 path_deviations = 0; // records after which the words were the capture's but get was not (another path taken)
     std::string first_path_deviation;

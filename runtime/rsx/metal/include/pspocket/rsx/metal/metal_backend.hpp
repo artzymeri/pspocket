@@ -212,6 +212,10 @@ struct BackendStats {
     u64 stale_synced = 0, stale_left = 0;
     // Conditional rendering decided on the GPU (D-1058): the predicates set up, and the draw calls made under one.
     u64 gpu_predicates = 0, predicated_draws = 0;
+    // PSPOCKET_RSX_WATCH_CPU_READS (D-1059): first touches of watched pages by the CPU or SPUs, and of them those in a
+    // GPU-held target's pixel bytes.
+    u64 cpu_page_touches = 0, cpu_reads_gpu_targets = 0;
+    u64 cpu_reads_mirrored = 0; // ... of main-memory targets mirrored at each flip (D-1059): a frame late at most
     u64 surface_textures_reused = 0; // surfaces made with a removed surface's texture of their format and size (D-984)
     u64 surface_corners = 0;     // textures sampled as the top-left corner of a larger target (D-120)
     u64 surface_children = 0;    // targets made inside a larger one, both kept (D-122)

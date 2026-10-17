@@ -297,6 +297,8 @@ bool MetalBackend::Impl::init()
     }
     if (const char* v = std::getenv("PSPOCKET_RSX_NO_STALE_SYNC"); v && *v && std::strcmp(v, "0") != 0)
         stale_sync = false; // D-1056's comparison
+    if (const char* v = std::getenv("PSPOCKET_RSX_NO_MAIN_MIRROR"); v && *v && std::strcmp(v, "0") != 0)
+        main_mirror = false; // D-1059's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
     if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK") || exact) feedback_cached = false;   // D-947's comparison, D-1029
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
@@ -3026,11 +3028,67 @@ void MetalBackend::clear(u32 mask, const RsxState& state)
     }
 }
 
+// PSPOCKET_RSX_WATCH_CPU_READS=1 (D-1059, a measurement; protection mode): at each flip, the pages of the targets the
+// GPU drew or sampled in the last two flips and holds newer than memory become inaccessible to all but the RSX thread
+// until their next access; what the CPU (a PPU thread) or an SPU (its DMA) touched since the last flip is counted
+// (cpu_reads_gpu_targets) and the first of each target logged with the thread. The bytes they found there were what
+// memory held, not what the GPU drew (plan F5).
+void MetalBackend::Impl::watch_cpu_reads()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_WATCH_CPU_READS");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (!on || !tracker.protection()) return;
+    if (!read_watch_owner) {
+        tracker.set_owner_thread();
+        read_watch_owner = true;
+    }
+    u64 total = 0;
+    const std::vector<WriteTracker::ReadHit> hits = tracker.take_read_hits(&total);
+    stats.cpu_page_touches += total;
+    // A hit is the first access to a watched page since the flip; one in a target's pixel bytes (not beside it in the
+    // same 16 KB page) is the CPU reading or writing what the GPU drew: the alarm.
+    for (const WriteTracker::ReadHit& h : hits) {
+        const Surface* hit = nullptr;
+        for (const SurfaceSpan& sp : read_watch_spans) {
+            if (h.addr < sp.lo || h.addr >= sp.hi) continue;
+            const Surface* s = sp.s;
+            const u64 row = u64{s->width} * surface_bytes_per_pixel(s->gcm_format, s->depth);
+            if (s->swizzled || !s->pitch || (h.addr - sp.lo) % s->pitch < row) hit = s;
+        }
+        if (!hit) continue;
+        if (main_mirrored(*hit) && overlay_supported(*hit)) { // in memory a frame late at most (D-1059)
+            stats.cpu_reads_mirrored++;
+            continue;
+        }
+        if (rsx) rsx->alarms().add(Alarm::CpuReadsGpuTarget);
+        stats.cpu_reads_gpu_targets++;
+        if (read_watch_logged.size() >= 64 || !read_watch_logged.insert(hit->address).second) continue;
+        char name[64] = "?";
+        pthread_getname_np(reinterpret_cast<pthread_t>(h.thread), name, sizeof name);
+        PS_LOG_WARN(kChan, "the CPU touched a target the GPU holds newer: {:#010x} in the {} {:#010x} {}x{} format {:#x}, "
+            "thread \"{}\" (flip {}, D-1059)", h.addr, hit->depth ? "depth buffer" : "target", hit->address, hit->width,
+            hit->height, hit->gcm_format, name, stats.flips);
+    }
+    // The pages to watch until the next flip; the targets they belong to, for the hits then.
+    std::vector<std::pair<u32, u32>> ranges;
+    read_watch_spans.clear();
+    for (const auto& p : surfaces) {
+        const Surface* s = p.get();
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized || s->last_frame + 2 < stats.flips) continue;
+        ranges.emplace_back(s->address, s->bytes());
+        read_watch_spans.push_back({s->address, u64{s->address} + s->bytes(), 0, p.get()});
+    }
+    tracker.watch_reads(ranges);
+}
+
 void MetalBackend::flip(const FlipRequest& request, const RsxState&)
 {
     if (!impl_->device) return;
     @autoreleasepool {
         impl_->do_flip(request);
+        impl_->watch_cpu_reads();
     }
     // PSPOCKET_RSX_EXACT_FROM=FLIP (D-1033): the exact mode from that frame on, so a route reaches its scene at speed and
     // the scene runs exact (pass merging and the feedback cache go off with it).
@@ -3353,16 +3411,25 @@ void MetalBackend::sync()
 // the GPU, in the frame's own command buffer (nothing waits): the CPU reading what the GPU drew finds it there a frame
 // later, as it would have found it at once on the PS3 (GTA V's CPU reads its water simulation's output, and computes
 // the heights its water draws from). They stay newer on the GPU: guest memory gets them only when the frame has run.
+// A target in main memory (outside the RSX's local memory) of at most kMainMirrorBytes, mirrored into guest memory at
+// each flip in the fast mode (D-1059): the game's CPU and SPUs read such targets (GTA V's 1x1 exposure targets, a
+// 128x128 B8 one, an SPU job's 128x128 depth buffer), as on the PS3, where the RSX draws into that memory.
+bool MetalBackend::Impl::main_mirrored(const Surface& s) const
+{
+    return main_mirror && ab_on() && (s.address < PS_MEM_RSX_LOCAL_BASE || s.address >= PS_MEM_RSX_LOCAL_BASE + PS_MEM_RSX_LOCAL_SIZE) &&
+           s.bytes() <= kMainMirrorBytes;
+}
+
 void MetalBackend::Impl::mirror_targets()
 {
     static const u64 limit = [] {
         const char* v = std::getenv("PSPOCKET_RSX_MIRROR");
         return v ? std::strtoull(v, nullptr, 0) * 1024 : 0ull;
     }();
-    if (!limit && !exact) return;
     for (const auto& c : surfaces) {
         Surface* s = c.get();
-        if (!s->gpu_newer || s->cpu_newer || !s->initialized || (!exact && s->bytes() > limit)) continue;
+        if (!s->gpu_newer || s->cpu_newer || !s->initialized) continue;
+        if (!exact && s->bytes() > limit && !main_mirrored(*s)) continue;
         if (s->mirror_generation == s->generation + (s->stencil_generation << 32)) continue; // not drawn since
         if (!overlay_supported(*s)) continue;
         u32 base = 0;
@@ -3376,12 +3443,13 @@ void MetalBackend::Impl::mirror_targets()
         encode_overlay(*s, target, base, size);
         s->mirror_generation = s->generation + (s->stencil_generation << 32);
         stats.targets_mirrored++;
+        tracker.notify_write(s->address, s->bytes()); // textures over it decode again
     }
 }
 
 id<MTLBuffer> MetalBackend::Impl::guest_window(u32 addr, u32 size, u32& base)
 {
-    if (addr < PS_MEM_RSX_LOCAL_BASE || u64{addr} + size > u64{PS_MEM_RSX_LOCAL_BASE} + PS_MEM_RSX_LOCAL_SIZE) return nil;
+    if (!size) return nil;
     const u64 page = GuestMemory::host_page_size();
     const u64 lo = addr & ~(page - 1), hi = (u64{addr} + size + page - 1) & ~(page - 1);
     for (const GuestWindow& w : guest_windows) {
