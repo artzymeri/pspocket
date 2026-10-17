@@ -27,15 +27,18 @@
 // and queue handler (the head). Tile, Z-cull and flip mode (vsync) settings reach lv2, but the RSX front end does not
 // use them yet.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "gcm_api.hpp"
 #include "guest.hpp"
@@ -658,7 +661,29 @@ u32 cellGcmGetReportDataLocation(PPUContext& ctx, u32 index, u32 location)
 
 u64 cellGcmGetTimeStampLocation(PPUContext& ctx, u32 index, u32 location)
 {
-    return ps_read64(thread_of(ctx).kernel.base(), report_address(ctx, index, location));
+    const u64 t = ps_read64(thread_of(ctx).kernel.base(), report_address(ctx, index, location));
+    // PSPOCKET_GCM_TIMESTAMP_LOG=1 (a debugging aid, D-1074): the differences of timestamps read in pairs (index, then
+    // index + 1: a GPU timer's start and end, GTA V's 0xB4C120), summed up every 600 pairs.
+    static const bool log_pairs = std::getenv("PSPOCKET_GCM_TIMESTAMP_LOG") != nullptr;
+    if (log_pairs) [[unlikely]] {
+        thread_local u32 last_index = ~0u;
+        thread_local u64 last_t = 0;
+        thread_local std::vector<s64> deltas;
+        if (index == last_index + 1) {
+            deltas.push_back(static_cast<s64>(t - last_t));
+            if (deltas.size() == 600) {
+                std::vector<s64> d = deltas;
+                std::sort(d.begin(), d.end());
+                const usize nonpositive = static_cast<usize>(std::count_if(d.begin(), d.end(), [](s64 x) { return x <= 0; }));
+                PS_LOG_INFO("cellGcmSys", "timestamp pairs (600): {} not after their start; ns p10 {} p50 {} p90 {} max {}",
+                    nonpositive, d[60], d[300], d[540], d.back());
+                deltas.clear();
+            }
+        }
+        last_index = index;
+        last_t = t;
+    }
+    return t;
 }
 
 // RPCS3 cellGcmGetTimeStamp, cellGcmGetReport and cellGcmGetReportDataAddress: the same report entries in local memory

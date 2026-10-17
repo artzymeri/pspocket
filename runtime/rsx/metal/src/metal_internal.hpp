@@ -573,8 +573,12 @@ struct MetalBackend::Impl {
         u32 value_addr = 0;
         std::vector<VisibilitySlot> slots;
         bool whole = false; // the timestamp and the ready word too, the ready word last (D-1021)
+        u64 method_ns = 0;  // when the RSX ran the GET_REPORT (PSPOCKET_RSX_REPORT_TIME=method, D-1074)
+        u64 at_draw = 0;    // stats.draws then: its place in the render buffer's GPU time (D-1074)
     };
     static constexpr u32 kVisibilitySlots = 4096;
+    u64 render_cb_first_draw = 0; // stats.draws when the render buffer was made (D-1074)
+    std::shared_ptr<std::atomic<u64>> last_report_ns = std::make_shared<std::atomic<u64>>(0); // reports' times only rise
     u32 visibility_slots = kVisibilitySlots; // a render buffer's counters: doubled when a buffer runs out (D-1024)
 
     // GPU time of the render buffers (completion handlers add GPUEndTime - GPUStartTime), logged with the frame's draws

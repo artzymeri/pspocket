@@ -4494,6 +4494,36 @@ TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, 
     }
 }
 
+TEST_CASE("metal e2e: two reports of one command buffer have rising timestamps (D-1074)")
+{
+    // GTA V times its GPU passes by the timestamps of two reports (0xB4C120: end - start, 0 ms when the end is not
+    // after the start). Written at the buffer's completion, both had one time.
+    REQUIRE_METAL();
+    const u64 before = Rsx::timestamp_ns();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    const u32 r0 = e.config.layout.report_addr(0), r1 = e.config.layout.report_addr(1);
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+    b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x00); // the timer's start
+    for (int i = 0; i < 20; i++) draw_triangle(b);
+    b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x10); // its end
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    e.backend->sync();
+    for (int i = 0; i < 1000 && (e.backend->report_pending(r0 + 8) || e.backend->report_pending(r1 + 8)); i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const u64 t0 = ps_read64(e.mem.base(), r0), t1 = ps_read64(e.mem.base(), r1);
+    INFO(std::format("t0 {} t1 {}", t0, t1));
+    CHECK(t0 > before);
+    CHECK(t1 > t0);
+}
+
 TEST_CASE("metal e2e: occlusion queries past a command buffer's counters still count (D-1024)")
 {
     // 4096 counters a command buffer: a query past them counted nothing, and a draw it guarded was skipped.

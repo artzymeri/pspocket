@@ -741,6 +741,18 @@ void Rsx::do_flip(u32 buffer_id)
 {
     if (flip_pacing_.load(std::memory_order_relaxed) && vsync_.load(std::memory_order_relaxed)) wait_for_vblank();
     const u64 index = flips_.fetch_add(1, std::memory_order_relaxed) + 1;
+    // PSPOCKET_LOG_SLOW_FLIPS=MS (a debugging aid, D-1074): each flip that comes MS or more after the one before.
+    static const double slow_ms = [] {
+        const char* v = std::getenv("PSPOCKET_LOG_SLOW_FLIPS");
+        return v ? std::atof(v) : 0.0;
+    }();
+    if (slow_ms > 0) [[unlikely]] {
+        static u64 last_ns = 0;
+        const u64 now = timestamp_ns();
+        if (last_ns && static_cast<double>(now - last_ns) >= slow_ms * 1e6)
+            PS_LOG_INFO(kChan, "flip {} after {:.1f} ms", index, static_cast<double>(now - last_ns) / 1e6);
+        last_ns = now;
+    }
     backend_.flip(FlipRequest{buffer_id, display_buffer(buffer_id), index}, state_);
     static const u64 exact_from = [] { // the backend's PSPOCKET_RSX_EXACT_FROM (D-1033): conditional draws wait too
         const char* v = std::getenv("PSPOCKET_RSX_EXACT_FROM");

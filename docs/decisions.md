@@ -17764,3 +17764,40 @@ Work in progress: held for the freeze at GTA V's front door (D-1091).
     other frame in the 10 GTA V and 4 AC runs passes.
   - Test: test_frame_watch, a one-frame change of 19 is flicker, a faint one of 11 is not.
 - games/ac1x (h2's local copy of the AC cases, committed by mistake with D-1056) is out of the repository again.
+
+## D-1074 · 2026-10-17 · Report timestamps from the GPU's time; GTA V's sky wedge and its timing (open)
+
+- **Timestamps** (metal_backend.mm, the occlusion reports' completion handler). Since D-1021 a whole report is
+  written when its render buffer completes, and its timestamp was the handler's time: every report of a buffer had
+  the same time. Now each report's timestamp is where it fell in that buffer's GPU execution (GPUStartTime to
+  GPUEndTime), placed by the draws encoded before it, then mapped to Rsx::timestamp_ns through mach time. Timestamps
+  never decrease across reports (a shared last value, +1 ns at least). `PSPOCKET_RSX_REPORT_TIME=gpu` (default),
+  `method` (when the RSX ran the GET_REPORT) or `done` (the handler's time, now ordered).
+- **Why it matters**: GTA V times GPU passes with report pairs (0xB4C120 issues GET_REPORT type 1 at index i and
+  i + 1, then reads both through cellGcmGetTimeStampLocation: (t1 - t0) * 1e-6 ms, 0 when t1 <= t0). 0xE8BA48
+  averages two such timers into a GPU-load state of 0, 2 or 3 (thresholds 0.8, 2 and 3 ms). With the handler's time
+  every pair read 0. Measured with `PSPOCKET_GCM_TIMESTAMP_LOG=1` (pair differences, 600 at a time) on rain-street:
+  done 0 (1 ns once ordered), gpu p50 38 µs and p90 0.1 to 0.17 ms, method p50 0.5 to 1.7 µs. So the state stays 0
+  in all three.
+- **The sky wedge** (D-1036, D-1038: a far-LOD mesh drawn for one frame with the camera inside it). It shows during
+  rain-street's right-stick turn (flips 3648 to 3768). Share of runs with at least one wedge, each checked by eye,
+  rain-street on the flip clock:
+
+  | arm | runs with a wedge | fps, flips 2900-3800 |
+  |---|---|---|
+  | handler time (`done`, before this change) | 5 of 5 | about 29 |
+  | handler time, slow flips logged | 5 of 6 | about 29 |
+  | gpu (new default) | 3 of 6 | about 29 |
+  | method | 1 of 6 | about 27.6 |
+  | RSX slowed (shake S11 60000:3000, `done`) | 3 of 6 | 24 to 30 |
+
+  - No flip took 45 ms or more next to a wedge (`PSPOCKET_LOG_SLOW_FLIPS=MS`), so it is not a hitch.
+  - Slowing the RSX does not remove it, so wall time per frame is not the cause either.
+  - Slow file reads (S12) move the route itself and cannot be compared.
+  - Open: method time's lower rate (being re-measured), and which game system picks the far LOD for that frame. In
+    cap4's frame 15 the game also skips 4 occlusion probes (abd449a846bf6eb0), the water pre-pass and about 15
+    single-draw passes: a different render path for that frame.
+- Seen once in passing: yellow blocks in the lower part of a dark frame (run rs5, flip 5068, RSX slowed), like the
+  pre-D-1025 build's (D-1037).
+- Tests: "two reports of one command buffer have rising timestamps" (the start and end of a 20-draw stretch: t1 > t0
+  > the test's start).

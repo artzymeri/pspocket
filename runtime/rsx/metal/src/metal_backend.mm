@@ -3,6 +3,8 @@
 
 #include "metal_internal.hpp"
 
+#include <mach/mach_time.h>
+
 #include <cstdlib>
 
 #include <algorithm>
@@ -20,6 +22,17 @@
 #include "pspocket/core/memory_map.h"
 #include "pspocket/rsx/gcm.hpp"
 #include "pspocket/rsx/index_scan.hpp"
+
+// Seconds on mach_absolute_time's clock, as CACurrentMediaTime and MTLCommandBuffer.GPUStartTime count them (D-1074).
+static double host_media_seconds()
+{
+    static const double tick = [] {
+        mach_timebase_info_data_t tb{};
+        mach_timebase_info(&tb);
+        return static_cast<double>(tb.numer) / static_cast<double>(tb.denom) * 1e-9;
+    }();
+    return static_cast<double>(mach_absolute_time()) * tick;
+}
 
 namespace pspocket::rsx::metal {
 
@@ -343,6 +356,7 @@ id<MTLCommandBuffer> MetalBackend::Impl::render_buffer()
     if (!render_cb) {
         render_cb = [queue commandBuffer];
         render_cb.label = @"rsx render";
+        render_cb_first_draw = stats.draws;
         stats.command_buffers++;
         // Its occlusion counters (D-102), zeroed: a pass only writes the counters it counted into.
         visibility = [device newBufferWithLength:visibility_slots * 8 options:MTLResourceStorageModeShared];
@@ -383,7 +397,30 @@ void MetalBackend::Impl::submit(bool wait)
         pending_reports.clear();
         u8* const guest = mem.base();
         auto in_flight = reports_in_flight;
-        [render_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
+        id<MTLCommandBuffer> rcb = render_buffer();
+        const u64 first_draw = render_cb_first_draw, last_draw = stats.draws;
+        auto last_ns = last_report_ns;
+        [rcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            // The reports' timestamps (D-1074): where each was in the buffer's GPU time, by the draws before it, as
+            // the RSX writes a report when its pipeline reaches it. GTA V times its GPU passes with them (0xB4C120:
+            // the difference of two reports, scaled), and steers its rendering by the result. The completion
+            // handler's own time gave every report of a buffer one time: passes took 0 or a whole buffer.
+            const double gs = done.GPUStartTime, ge = done.GPUEndTime;
+            const u64 now_ns = Rsx::timestamp_ns();
+            const double now_s = host_media_seconds(); // the clock of GPUStartTime (CACurrentMediaTime's)
+            static const std::string_view mode = [] {
+                const char* v = std::getenv("PSPOCKET_RSX_REPORT_TIME");
+                return std::string_view(v ? v : "gpu");
+            }();
+            const auto report_ns = [&](const PendingReport& r) -> u64 {
+                if (mode == "method") return r.method_ns;
+                if (mode == "done" || !(ge > gs && gs > 0)) return now_ns;
+                const double span = static_cast<double>(last_draw > first_draw ? last_draw - first_draw : 1);
+                const double f = std::clamp(static_cast<double>(r.at_draw - std::min(r.at_draw, first_draw)) / span, 0.0, 1.0);
+                const double ago = now_s - (gs + (ge - gs) * f);
+                const u64 back = ago > 0 ? static_cast<u64>(ago * 1e9) : 0;
+                return back < now_ns ? now_ns - back : now_ns;
+            };
             for (const PendingReport& r : *reports) {
                 u64 count = 0;
                 for (const VisibilitySlot& s : r.slots) count += static_cast<const u64*>(s.buffer.contents)[s.index];
@@ -395,7 +432,19 @@ void MetalBackend::Impl::submit(bool wait)
                 const u32 value = static_cast<u32>(std::min<u64>(std::max(count, at_least), 0xFFFFFFFFull));
                 // The whole report (D-1021): {timestamp, count, pad} as RPCS3's get_report lays it out, the pad (the
                 // ready word GTA V polls) last, released after the rest.
-                if (r.whole) ps_write64(guest, r.value_addr - 8, Rsx::timestamp_ns());
+                // PSPOCKET_RSX_REPORT_TIME=gpu (default), method (when the RSX ran the GET_REPORT) or done (the
+                // handler's time, as before D-1074). Never earlier than a report written before it.
+                if (r.whole) {
+                    u64 t = report_ns(r), prev = last_ns->load(std::memory_order_relaxed);
+                    while (true) {
+                        const u64 want = std::max(t, prev + 1);
+                        if (last_ns->compare_exchange_weak(prev, want, std::memory_order_relaxed)) {
+                            t = want;
+                            break;
+                        }
+                    }
+                    ps_write64(guest, r.value_addr - 8, t);
+                }
                 __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr), ps_bswap32(value), __ATOMIC_RELEASE);
                 if (r.whole) __atomic_store_n(reinterpret_cast<u32*>(guest + r.value_addr + 4), 0u, __ATOMIC_RELEASE);
                 std::lock_guard lock(in_flight->mutex);
@@ -3750,7 +3799,7 @@ void MetalBackend::clear_zpass()
 bool MetalBackend::report_zpass(u32 value_addr, bool whole)
 {
     if (!impl_->device) return false;
-    impl_->pending_reports.push_back({value_addr, impl_->zpass_slots, whole});
+    impl_->pending_reports.push_back({value_addr, impl_->zpass_slots, whole, Rsx::timestamp_ns(), impl_->stats.draws});
     impl_->report_slots[value_addr] = impl_->zpass_slots; // what a predicate on it sums (D-1058)
     impl_->stats.occlusion_reports++;
     std::lock_guard lock(impl_->reports_in_flight->mutex);
