@@ -12,7 +12,11 @@ cases.json:
                inventory/<data>/bench-library, as the phone does; absent: the build's own translation (GTA V)
     "modes": {name: {ENV: value}}
     "cases": [{"name", "timeout", "from_s", "route" (a scripts/route.py file) or "press" (a press file),
-               "save" (inventory/<data>/saves/<name>, savedata dirs) or "fresh": [hdd0 paths to empty first]}]
+               "save" (inventory/<data>/saves/<name>, savedata dirs) or "fresh": [hdd0 paths to empty first],
+               "clock": "flips" (the default: the presses' seconds are the game's frames / 30, so a case reaches the
+               same scenes every run whatever slows the Mac, D-1090) or "wall"}]
+Each run also writes thumbs.bin (pspocket-boot --thumbs: every frame's 64x36 thumbnail): scripts/bench_compare.py
+compares two runs of a case at the same flips, scripts/flicker_tune.py runs FrameWatch's flicker test over them.
 Outputs (game data, gitignored): inventory/bench/<stamp>/<game>-<case>-<mode>/ and index.html. --nightly refuses a
 busy Mac (another pspocket-boot or ninja, load average over 4, under 15 GB free) and keeps it awake.
 """
@@ -91,12 +95,14 @@ def run_case(game, spec, case, mode, out, lib, a):
     else:
         shutil.copy(os.path.join("games", game, case["press"]), press)
     env = dict(os.environ, **spec.get("modes", {}).get(mode, {}))
+    if case.get("clock", spec.get("clock", "flips")) == "flips":
+        env["PSPOCKET_PRESS_CLOCK"] = "flips" # the same scenes every run (D-1090)
     cmd = [BOOT, os.path.join(data, "decrypt", "EBOOT.elf"), "--gpu", "metal", "--timeout", str(case["timeout"]),
            "--hdd0", hdd0, "--bdvd", os.path.join(data, "disc.iso"),
            "--flash", spec.get("flash", "inventory/firmware/dev_flash"), "--shader-cache", shaders,
            "--async-shaders", "4", "--spu-translate", os.path.join("inventory", "bench", "spu-translate", game),
            "--press-file", press, "--frames", os.path.join(run, "frames"), "--frame-every", "60", "--frame-jumps",
-           "--summary", os.path.join(run, "summary.json")]
+           "--summary", os.path.join(run, "summary.json"), "--thumbs", os.path.join(run, "thumbs.bin")]
     if lib:
         cmd += ["--game-library", lib]
     cmd += a.boot_arg or []

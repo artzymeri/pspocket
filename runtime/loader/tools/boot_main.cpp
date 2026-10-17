@@ -45,7 +45,9 @@
 // makes in DIR and makes the ones recorded there before ahead, on background threads, while the game loads (D-114; game
 // data: keep it in inventory/, scripts/ios.sh puts it in the app).
 // --press-file FILE reads presses from FILE, as --press takes them (whitespace or lines apart; # starts a comment): a
-// scripted walk (games/<title>/walk-*.txt). --frame-jumps compares each saved frame (every --frame-every, from
+// scripted walk (games/<title>/walk-*.txt). --thumbs FILE writes every presented frame's 64x36 thumbnail (the GPU's,
+// D-1027) to FILE, its flip (u64) then 64x36 BGRA, for scripts/bench_compare.py and scripts/flicker_tune.py (D-1090).
+// --frame-jumps compares each saved frame (every --frame-every, from
 // --frame-from) with the one before as 64x36 thumbnails and counts the jumps (mean difference over 25 of 255, big over
 // 60): the colour flicker of run 088 in a number, without writing a frame (--frames still saves them); and the dark
 // frames, a third of the thumbnail black (D-951). --summary FILE writes the run as JSON when it ends (scripts/gate.sh
@@ -186,6 +188,7 @@ int usage()
         "                     [--press BUTTON@START[+EVERY][:HOLD]]...\n"
         "                     [--audio] [--spu-dump DIR] [--trace-frame N] [--rsx-recover] [--shader-cache DIR]\n"
         "                     [--press-file FILE] [--frame-jumps] [--summary FILE.json] [--game-library FILE]\n"
+        "                     [--thumbs FILE]\n"
         "                     [--freeze S] [--deadlock S] [--livelock S] [--stop-on-stall] [--max-footprint GB]\n"
         "                     [--builtin-spu] [--no-lle] [--lle LIBRARY]... [--lle-load LIBRARY]...\n"
         "                     [--async-shaders MS] [--watch ADDR] [--system-library DIR|none]\n"
@@ -1103,6 +1106,7 @@ int main(int argc, char** argv)
     std::vector<std::string> lle_force; // --lle LIBRARY: that library from its firmware module whatever the host has
     std::vector<std::string> lle_load;  // --lle-load LIBRARY: its module (and theirs) loaded and started at boot
     [[maybe_unused]] bool frame_jumps = false;
+    [[maybe_unused]] std::string thumbs_path; // --thumbs (D-1090)
     std::string summary_path;
     // The watchdog (D-1043): --freeze S, --deadlock S, --livelock S (0: that check off), --stop-on-stall.
     double freeze_s = 10, deadlock_s = 5, livelock_s = 0;
@@ -1216,6 +1220,11 @@ int main(int argc, char** argv)
             press_base = {};
         } else if (a == "--frame-jumps") {
             frame_jumps = true;
+            gpu = "metal";
+        } else if (a == "--thumbs") {
+            const char* v = value();
+            if (!v) return usage();
+            thumbs_path = v;
             gpu = "metal";
         } else if (a == "--summary") {
             const char* v = value();
@@ -1445,8 +1454,15 @@ int main(int argc, char** argv)
             static std::atomic<u64> trace_on_black{0}, traced_flip{0};
             if (const char* v = std::getenv("PSPOCKET_TRACE_ON_BLACK"); v && !frames_dir.empty())
                 trace_on_black = std::max<u64>(1, std::strtoull(v, nullptr, 0));
-            if (frame_jumps || trace_on_black || !summary_path.empty()) { // the GPU's thumbnails (D-1027)
+            static std::FILE* thumbs_file = nullptr; // --thumbs (D-1090)
+            if (!thumbs_path.empty()) thumbs_file = std::fopen(thumbs_path.c_str(), "wb");
+            if (frame_jumps || trace_on_black || !summary_path.empty() || thumbs_file) { // the GPU's thumbnails (D-1027)
                 mc.thumbnail = [&](const u8* bgra64x36, u64 flip) {
+                    if (thumbs_file) {
+                        std::fwrite(&flip, sizeof flip, 1, thumbs_file);
+                        std::fwrite(bgra64x36, 1, 64 * 36 * 4, thumbs_file);
+                        std::fflush(thumbs_file);
+                    }
                     if (!summary_path.empty()) { // the glitch detectors (D-1070)
                         const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch()).count());

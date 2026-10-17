@@ -17727,3 +17727,40 @@ cheaply, so a bad frame found afterwards can be compared with the frames around 
     page also write-watched is read-only again after its hit (a store dirties the watch); a page left out of the set
     reads without a hit.
   - Metal e2e: a target in main memory is in guest memory after the flip, and not with `PSPOCKET_RSX_NO_MAIN_MIRROR`.
+
+## D-1090 · 2026-10-17 · A deterministic bench: presses on the flip clock, thumbnails per run, FrameWatch's flicker retuned (WIP)
+
+Work in progress: held for the freeze at GTA V's front door (D-1091).
+- **The flip clock by default.** scripts/bench.py runs every case with `PSPOCKET_PRESS_CLOCK=flips` (D-1028), unless
+  the case says `"clock": "wall"`: a press's seconds are the game's frames / 30, so a route presses at the same frames
+  however fast the Mac runs. scripts/route.py's documentation says so.
+- **Assassin's Creed's install-garden** presses from an anchor (games/ac1/bench/garden.txt): the end of the first
+  install, the game's first cellSpursShutdownTaskset (frame 2,050 and 105 s in, in one run). The install takes a
+  different number of frames each run (its disc reads), and on the frame clock alone the menus came at other frames.
+  Start at 60 s, which answers the install's prompt, stays before the anchor. Not yet checked twice; the training
+  case has no anchor yet. walk-garden.txt and walk-training.txt keep their wall-clock seconds for scripts/shake.sh.
+- **Thumbnails**: `pspocket-boot --thumbs FILE` writes every presented frame's 64x36 thumbnail with its flip, and the
+  bench keeps thumbs.bin in each run.
+  - `scripts/bench_compare.py RUN_A RUN_B [--scene] [--slack N]` compares two runs at the same flips: the picture
+    (64x36), or the scene (8x4 block means), optionally against the closest frame within N.
+  - `scripts/flicker_tune.py RUN... [--grid] [--list] [--known FLIP...]` runs FrameWatch's flicker test over them.
+- **How deterministic** (every GTA V case twice, edge-off, flip clock):
+  - Up to about flip 1,800 the two runs are the same picture, with a thumbnail difference median under 1.5. That
+    covers the boot, the save's load and the hallway (in the world at flip 1,050 in both).
+  - From the first walk (about flip 1,800-2,500) they drift apart. At scene level they stay alike for a while: the
+    same door, the same garden, the same sky. In the picture they differ (Michael's place, cars, weather, the idle
+    camera). The game reads time from the clock, so its frames advance by real time, and its AI and randomness
+    differ. A press clock cannot fix that. A virtual timebase tied to the flips would be the next step.
+  - Assassin's Creed's two passes parted at the install (flip 1,951), hence the anchor.
+- **FrameWatch's flicker test retuned** (frame_watch.hpp, from these runs): over 15 of 255 (was 20), and the frame
+  after back under 0.4 of it (was a third).
+  - The test finds the runs' four one-frame glitches, which came in one pass each, not the other:
+    - GTA V's buzzard case, flip 3,014: a yellow flash over the map, 19.7 and 19.1 of 255, missed at 20;
+    - the buzzard case, flip 2,206: a frame from another camera, 33 of 255, the next 11.0 from the first, missed at a
+      third;
+    - the street case, flip 2,533: a darker frame, 21;
+    - skyfall-sea, flip 5,484: the sea's lower half black for a frame, 60.
+  - It skips the loading screen's two faint flashes that come in every run (flips 177 and 185, 9.6 and 11.2). No
+    other frame in the 10 GTA V and 4 AC runs passes.
+  - Test: test_frame_watch, a one-frame change of 19 is flicker, a faint one of 11 is not.
+- games/ac1x (h2's local copy of the AC cases, committed by mistake with D-1056) is out of the repository again.

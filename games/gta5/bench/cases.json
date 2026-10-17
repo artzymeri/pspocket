@@ -1,7 +1,7 @@
 {
   "title": "BLES01807",
   "data": "gta5",
-  "about": "GTA V's bench (D-1060): scenes from the user's save; routes on the wall clock until the press scripts follow game time. Budgets are CPU ms a frame (median of the busy 5 s windows), set from the first nights.",
+  "about": "GTA V's bench (D-1060): scenes from the user's save; routes in game time, the flip clock (D-1090): the same scenes every run. Budgets are CPU ms a frame (median of the busy 5 s windows), set from the first nights.",
   "cases": [
     {
       "name": "house-idle",

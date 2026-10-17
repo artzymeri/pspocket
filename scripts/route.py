@@ -11,7 +11,10 @@ Route lines ('#' starts a comment):
     with BTN S    BTN held S seconds from now; the clock stays (held together with the next step)
     tap BTN       BTN for 0.25 s; the clock moves on 0.6 s
 Buttons are pad_script's names (cross, circle, square, triangle, l1, l2, r1, r2, up, down, left, right, start, select,
-ls-up, rs-left, ...). The presses are timed by the wall clock until the press scripts follow game time.
+ls-up, rs-left, ...). The seconds are game time: scripts/bench.py runs a case with PSPOCKET_PRESS_CLOCK=flips (D-1090),
+where pspocket-boot counts a press's seconds as the game's frames / 30 (D-1028), so "at 125" is the 3,750th frame
+whatever the Mac's speed and a route reaches the same scenes every run. A case with "clock": "wall" in its cases.json
+times them by the wall clock since the boot instead.
 """
 import os
 import sys

@@ -6,9 +6,11 @@
 //   partly black  a fifth to 95% of the thumbnail exactly black (all three channels 0) for two frames in a row: a
 //                 surface nothing drew (the research bench's black sea: 56%, whole rows). Rendering with fog and light
 //                 all but never gives 0 over an area (a night street from the air: 2.5%); a whole black frame is a fade.
-//   flicker       A, B, A: a frame far from the one before (mean difference over 20 of 255) and the next close to the
-//                 one before that again (under a third of it): something drawn in every other frame. A camera cut is
-//                 A, B, B.
+//   flicker       A, B, A: a frame far from the one before (mean difference over 15 of 255) and the next close to the
+//                 one before that again (under 0.4 of it): something drawn in one frame. A camera cut is A, B, B.
+//                 Tuned on the bench's runs (D-1090): it finds GTA V's one-frame glitches there (a yellow flash over
+//                 the map at 19 of 255, a frame from another camera at 33 with the next 11 from the first, a darker
+//                 frame at 21, the sea's black half at 60) and not the loading screen's two faint flashes (9 to 12).
 //   hitch         over 500 ms between two frames while the game was flipping at least 10 a second.
 //   frozen        the same picture (mean difference under 0.5) for 60 s while frames keep coming: the game stuck
 //                 drawing one frame (a loop that still flips).
@@ -39,7 +41,7 @@ public:
 
     struct Config {
         double black_min = 0.2, black_max = 0.95;
-        double flicker_diff = 20, flicker_back = 1.0 / 3;
+        double flicker_diff = 15, flicker_back = 0.4; // D-1090
         u64 hitch_ns = 500'000'000;
         u64 frozen_ns = 60'000'000'000; // a loading screen holds still 10 s and more (Assassin's Creed's, D-1070)
         u64 min_gap_ns = 120'000'000'000; // one event per kind every 2 minutes

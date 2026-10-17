@@ -6,7 +6,7 @@
   "library": {"spu_images": "spu-images"},
   "modes": {"default": {}},
   "cases": [
-    {"name": "install-garden", "press": "walk-garden.txt", "timeout": 330, "from_s": 120,
+    {"name": "install-garden", "press": "bench/garden.txt", "timeout": 360, "from_s": 120,
      "fresh": ["game/BLES00158/USRDIR/*", "home/00000001/savedata/BLES00158*"]},
     {"name": "training", "press": "walk-training.txt", "timeout": 570, "from_s": 300}
   ]

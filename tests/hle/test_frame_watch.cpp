@@ -66,6 +66,18 @@ TEST_CASE("frame watch: a surface nothing drew, flicker, hitches, a frozen pictu
         CHECK(got.size() == 1); // rate-limited: counted, not reported again
         CHECK(w.counts[static_cast<usize>(FrameWatch::Kind::Flicker)] >= 2);
     }
+    SECTION("the bench's thresholds (D-1090): a one-frame change of 19 is flicker, a faint one of 11 is not")
+    {
+        for (int i = 0; i < 5; i++) feed(filled(100));
+        feed(filled(111)); // a loading screen's faint flash
+        feed(filled(101));
+        CHECK(got.empty());
+        for (int i = 0; i < 3; i++) feed(filled(100));
+        feed(filled(119)); // GTA V's yellow flash over the map: 19 of 255 a frame, then back
+        feed(filled(101));
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].kind == FrameWatch::Kind::Flicker);
+    }
     SECTION("over half a second between frames while flipping is a hitch; a frozen picture after 60 s, not after 10 (a loading screen)")
     {
         for (int i = 0; i < 60; i++) feed(scene(i % 2 ? 20 : 22));

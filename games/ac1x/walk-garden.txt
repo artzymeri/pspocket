@@ -1,5 +1,0 @@
-# Assassin's Creed (BLES00158): through the start screens into the first level (the Animus garden tutorial), then a
-# walk with the left stick and a turn of the camera (runs 099, 109). Button presses only (pspocket/hle/pad_script.hpp),
-# timed in seconds from the boot: pspocket-boot --press-file reads it.
-start@60 start@75 cross@100 start@130 cross@160 cross@200 cross@240 cross@280
-ls-up@300:8 ls-left@309:2 ls-up@312:8 rs-right@321:2 ls-up@324:10 ls-right@335:3 ls-up@339:10

@@ -1,0 +1,9 @@
+# Assassin's Creed (BLES00158), the bench's install-garden (D-1090): walk-garden.txt's presses on game time, counted
+# from the end of the first install (the game's first cellSpursShutdownTaskset: frame 2,050 of a run of 2026-10-17,
+# 105 s in), so the menus and the garden come at the same frames whatever the install's speed. Seconds are the
+# flip clock's (scripts/bench.py runs cases with PSPOCKET_PRESS_CLOCK=flips). Start at 60 s answers the install's
+# prompt, before the anchor.
+start@60
+wait:call:cellSpursShutdownTaskset
+start@6.7 cross@31.7 start@61.7 cross@91.7 cross@131.7 cross@171.7 cross@211.7 ls-up@231.7:8
+ls-left@240.7:2 ls-up@243.7:8 rs-right@252.7:2 ls-up@255.7:10 ls-right@266.7:3 ls-up@270.7:10
