@@ -691,6 +691,17 @@ const ps_spu_program* identify_program(u8* base, const SpuImage& image, u64* has
 
 void attach_identified(SPUContext& ctx, const ps_spu_program* program, const SpuImage& image, u64 hash, u64 additions)
 {
+    // PSPOCKET_SPU_INTERPRET=1 (a debugging aid, D-1094): every SPU program on the interpreter, the oracle, and none
+    // translated during the session: whether a game's fault is in its SPU programs' translation (GTA IV's car falling
+    // through the city on the iPhone).
+    static const bool interpret_all = [] {
+        const char* v = std::getenv("PSPOCKET_SPU_INTERPRET");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (interpret_all) {
+        ps_spu_attach_program_at(&ctx, nullptr, image.ls_start);
+        return;
+    }
     ps_spu_attach_program_at(&ctx, program, image.ls_start);
     if (!program) spu::set_pending_home(&ctx, hash, image.ls_start, image.size, relocatable(image.kind), additions);
 }

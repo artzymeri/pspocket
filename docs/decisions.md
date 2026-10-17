@@ -17836,3 +17836,10 @@ then none) never applied, and its threads poll with timeouts, so it was no deadl
 (60 s; 0 off) reports once, as a freeze ("freeze: no first frame N s after the start"), with the same thread report
 (what every PPU thread and the RSX wait on) on the Mac and in the phone's log. A test; the other watchdog tests set it
 off.
+
+## D-1094 · 2026-10-17 · PSPOCKET_SPU_INTERPRET: every SPU program on the interpreter
+
+A debugging aid for the iPhone (Documents/pspocket-env.txt) and the Mac: attach_identified attaches no lifted program
+and sets no pending home, so every SPU program runs on the interpreter (the oracle) and nothing is translated during
+the session. One run tells whether a game's fault comes from its SPU programs' translation: GTA IV's car falls
+through the city on the iPhone once the game runs translated at 30 fps.
