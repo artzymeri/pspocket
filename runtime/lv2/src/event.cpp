@@ -154,12 +154,14 @@ Result EventFlag::wait(Waiter& w, u64 bitptn, u32 mode, u64 timeout_us, u64& res
     if (type == SYS_SYNC_WAITER_SINGLE && !waiters.empty()) return err(CELL_EPERM);
     w.want[0] = bitptn;
     w.want[1] = mode;
+    trace('w', bitptn, pattern); // D-1091
     prepare_wait(w);
     waiters.push(&w);
     u64 timeout_pattern = 0;
     const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::EventFlag, id}, [&](bool) {
         if (!waiters.remove(&w)) return CancelResult::Woken;
         timeout_pattern = pattern;
+        trace('T', bitptn, pattern);
         return CancelResult::Removed;
     });
     switch (ws) {
@@ -206,6 +208,7 @@ void EventFlag::set(u64 bitptn)
         }
     }
     pattern = to_write;
+    trace('S', bitptn, (u64{static_cast<u32>(satisfied.size())} << 56) | (pattern & 0x00FFFFFFFFFFFFFFull)); // D-1091
     for (Waiter* w : satisfied) {
         waiters.remove(w);
         wake(*w, CELL_OK);
@@ -216,6 +219,7 @@ void EventFlag::clear(u64 bitptn)
 {
     std::lock_guard lk(lock);
     pattern &= bitptn;
+    trace('C', bitptn, pattern); // D-1091
 }
 
 u32 EventFlag::cancel()

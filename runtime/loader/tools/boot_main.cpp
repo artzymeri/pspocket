@@ -1314,6 +1314,13 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(e.flip), e.value);
         };
 
+    lv2::set_report_extra([] { // the native SPURS's state and the backend's in every report (D-1091)
+        std::string s = hle::spurs_state_report();
+#if defined(PSPOCKET_HAVE_METAL)
+        if (g_metal) s += g_metal->state_text();
+#endif
+        return s;
+    });
     std::vector<u8> bytes;
     if (!read_file(elf_path, bytes)) {
         std::fprintf(stderr, "pspocket-boot: cannot read %s\n", elf_path);

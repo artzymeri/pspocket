@@ -271,7 +271,11 @@ Result Semaphore::wait(Waiter& w, u64 timeout_us)
 {
     std::unique_lock lk(lock);
     if (dead) return err(CELL_ESRCH);
-    if (value-- > 0) return CELL_OK;
+    if (value-- > 0) {
+        trace('t', static_cast<u64>(value + 1), 0); // D-1091: taken without waiting
+        return CELL_OK;
+    }
+    trace('w', static_cast<u64>(static_cast<s64>(value)), 0);
     prepare_wait(w);
     waiters.push(&w);
     const WaitStatus ws = park(w, lk, timeout_us, {WaitKind::Semaphore, id}, [&](bool) {
@@ -305,6 +309,7 @@ Result Semaphore::post(s32 count)
     const s32 old = value;
     value += count;
     const s32 to_wake = std::min(std::max(-old, 0), count);
+    trace('P', static_cast<u64>(count), (u64{static_cast<u32>(to_wake)} << 32) | static_cast<u32>(value)); // D-1091
     for (s32 i = 0; i < to_wake; i++) {
         Waiter* w = waiters.pop(protocol);
         if (!w) break;

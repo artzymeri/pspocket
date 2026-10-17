@@ -36,6 +36,7 @@
 #include "pspocket/spu/registry.hpp"
 #include "pspocket/spu/runtime.h"
 #include "spurs_native.hpp"
+#include "pspocket/spu/diag.hpp"
 
 #if defined(__APPLE__)
 #include <pthread/qos.h>
@@ -367,6 +368,22 @@ void Worker::body()
 
 // Every 5 s, from the first worker: the SPU time each workload took, by its name, and what was idle (D-131). The
 // iPhone's SPU workers are its biggest load; this says which of the game's systems the time went to.
+std::string Scheduler::describe_workers() const
+{
+    std::string s;
+    for (const auto& w : workers_) {
+        u32 cmd = 0, ea = 0, size = 0, pc = 0;
+        const u64 n = ps_spu_last_dma(const_cast<SPUContext*>(&w->ctx), &cmd, &ea, &size, &pc);
+        s += std::format("  SPU {}: workload {:#x}, {} DMAs, the last {:#x} at SPU pc {:#07x}: {:#x} bytes at {:#010x}", w->spu_num,
+            w->current_wid, n, cmd, pc, size, ea);
+        if (ea && ea + 16 <= 0xFFFFFFF0u && kernel.memory().is_committed(ea))
+            s += std::format(" holding {:08x} {:08x} {:08x} {:08x}", ps_read32(base, ea), ps_read32(base, ea + 4),
+                ps_read32(base, ea + 8), ps_read32(base, ea + 12));
+        s += "\n";
+    }
+    return s;
+}
+
 void Scheduler::report_time(u64 now_ns)
 {
     constexpr u64 kPeriodNs = 5'000'000'000ull;

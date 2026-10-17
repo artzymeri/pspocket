@@ -17843,3 +17843,28 @@ A debugging aid for the iPhone (Documents/pspocket-env.txt) and the Mac: attach_
 and sets no pending home, so every SPU program runs on the interpreter (the oracle) and nothing is translated during
 the session. One run tells whether a game's fault comes from its SPU programs' translation: GTA IV's car falls
 through the city on the iPhone once the game runs translated at 30 fps.
+
+## D-1095 · 2026-10-17 · Stall reports show the SPURS state, the SPUs' last DMAs and lv2 sync histories; D-1091 measured
+
+The diagnostics behind D-1091's hunt, all in the stall report pspocket-boot prints (watchdog, deadlock stop):
+- every native SPURS instance (`hle::spurs_state_report`): its workloads (state, ready count, contention, signal),
+  each job chain's pc, the commands at it decoded, and its last three visits (which SPU, how long ago, what it read);
+- each SPU's last DMA (command, EA, size, SPU pc) and the 16 bytes at that EA (`ps_spu_last_dma` in
+  pspocket/spu/diag.hpp, not runtime.h: the lifted code's ABI is unchanged). GTA V's freeze showed its EDGE jobs
+  polling RSX labels 67 to 69 and a GraphicsMain job label 64 so;
+- the Metal backend's held work (D-1091's `MetalBackend::state_text`), through `lv2::set_report_extra`, which appends
+  such text to every report;
+- `PSPOCKET_SYNC_TRACE=1`: each semaphore and event flag keeps its last 32 operations (semaphore post, take, wait;
+  event flag set, clear, wait, timeout; the thread and the values), listed under each thread waiting on it: who set or
+  posted last, which wake never came.
+- scripts/bench.py runs `PSPOCKET_BENCH_BOOT` when set, instead of build/host's pspocket-boot: runs from a copy while
+  build/host is rebuilt.
+
+D-1091 measured to the end (the street case, edge-off, flip clock, `--max-footprint 6`, the stall stop, another process
+replaying the gate capture on the GPU in a loop throughout; shake mode's legal points had not raised the rate, 0 of 12):
+- Without the submit: 8 of 27 runs froze (3 of 11 alone, 3 of 8 and 2 of 8 in two interleaved A/Bs on one binary).
+- A submit at every wait: 0 of 23, but 5% fewer flips (3,969 against 4,196 in 160 s).
+- At 3 ms (main's D-1091): 0 of 18 (0 of 8 in the A/B, whose other arm froze 2 of 8, then 0 of 10), with 4,083 flips
+  against 4,114 in the A/B: no cost seen.
+- D-1021 (adc8a5b, 2026-10-16), which made a report's ready word wait for its render buffer, is older than every main
+  the bisect list named: not a regression of the night's work. The bisect was not run.

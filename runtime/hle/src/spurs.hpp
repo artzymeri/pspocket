@@ -305,6 +305,9 @@ struct Instance {
     bool helper_failed = false;
 };
 
+// A job chain for a stall's report (spurs_jobchain.cpp, D-1091).
+std::string describe_chain(u8* base, u32 jc, u64 now_ns);
+
 struct SpursHost {
     std::mutex mutex;
     std::map<u32, Instance> instances;

@@ -1229,6 +1229,38 @@ bool JobChainPolicy::run_job(const Job& job)
 
 } // namespace
 
+// A job chain for a stall's report (D-1091): its pc and the commands there, its flags, ready count and error, and its
+// last visits.
+std::string describe_chain(u8* base, u32 jc, u64 now)
+{
+    const u64 pc = ps_read64(base, jc + jc_off::pc);
+    std::string s = std::format("      chain {:#010x}: pc {:#x}, halted {}, flags {:#04x}{}, busy {:#04x}, ready count {}, lowered {:#04x}, "
+        "urgent {}, error {:#x}", jc, pc, ps_read8(base, jc + jc_off::isHalted), ps_read8(base, jc + jc_off::flags),
+        (ps_read8(base, jc + jc_off::flags) & jc_off::flagGuardWait) ? " (waits on a guard)" : "", ps_read8(base, jc + jc_off::busy),
+        ps_read8(base, jc + jc_off::readyCount), ps_read8(base, jc + jc_off::lowered), ps_read8(base, jc + jc_off::urgentList),
+        ps_read64(base, jc + jc_off::error));
+    if (!(pc >> 32) && pc) {
+        s += "\n        commands at pc:";
+        for (u32 i = 0; i < 4; i++) {
+            const u64 c = ps_read64(base, static_cast<u32>(pc) + 8 * i);
+            const u32 op = (c & 7) == kOpLong ? static_cast<u32>(c & 0x7F) : static_cast<u32>(c & 7);
+            const char* what = (c & kJtsBit) ? "JTS" : c && (c & 7) == kOpJob ? "JOB"
+                : op == kOpSync ? "SYNC" : op == kOpNext ? "NEXT" : op == kOpCall ? "CALL" : op == kOpFlush ? "FLUSH"
+                : op == kOpJobList ? "JOBLIST" : op == kGuard ? "GUARD" : op == kEnd ? "END" : op == kRet ? "RET"
+                : op == kSetLabel ? "LABEL" : op == kOpResetPc ? "RESET_PC" : "?";
+            s += std::format(" {:016x} {}", c, what);
+        }
+    }
+    VisitLog& log = visit_log(jc);
+    const u32 n = log.next.load(std::memory_order_relaxed);
+    for (u32 k = n > 3 ? n - 3 : 0; k < n; k++) {
+        const Visit& v = log.ring[k % log.ring.size()];
+        s += std::format("\n        visit {} by SPU {}, {:.3f} s ago: pc {:#x} -> {:#x}, {} commands read, {} jobs", k, v.spu,
+            static_cast<double>(now - v.time_ns) / 1e9, v.pc_before, v.pc_after, v.read, v.jobs);
+    }
+    return s;
+}
+
 void run_jobchain(Worker& w, u32 wid, u32 job_chain)
 {
     JobChainPolicy(w, wid, job_chain).run();

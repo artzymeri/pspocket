@@ -26,7 +26,9 @@
 
 #include "guest.hpp"
 #include "spurs.hpp"
+#include "spurs_native.hpp"
 #include "pspocket/core/log.hpp"
+#include "pspocket/core/timebase.h"
 #include "pspocket/hle/hle.hpp"
 #include "pspocket/hle/process.hpp"
 #include "pspocket/lv2/errors.hpp"
@@ -4916,6 +4918,37 @@ void register_cellSpurs(Registry& r)
         PS_HLE_FUNC(0xD86380D8, cellSpursGetJobPipelineInfo),
         PS_HLE_FUNC(0x31F5196B, cellSpursRemoveSystemWorkloadForUtility),
     });
+}
+
+std::string spurs_state_report()
+{
+    HleProcess* p = HleProcess::current();
+    if (!p) return {};
+    spurs::SpursHost& h = p->state<spurs::SpursHost>();
+    std::unique_lock lock(h.mutex, std::try_to_lock); // a stalled thread may hold it: then say so
+    if (!lock.owns_lock()) return "SPURS: its host lock is held, no state\n";
+    u8* base = p->kernel().base();
+    const u64 now = ps_host_now_ns();
+    std::string s;
+    for (const auto& [addr, inst] : h.instances) {
+        s += std::format("SPURS {:#010x}: {} SPUs{}, workload flag {:#x}, signals {:04x} {:04x}\n", addr, inst.nspus,
+            inst.second ? " (SPURS2)" : "", ps_read32(base, addr + spurs::spurs_off::wklFlag),
+            ps_read16(base, addr + spurs::wkl_off::signal1), ps_read16(base, addr + spurs::wkl_off::signal2));
+        for (const auto& [wid, w] : inst.workloads) {
+            const u32 sh = spurs::wkl_nibble_shift(inst.second, wid);
+            const u8 cur = static_cast<u8>((ps_read8(base, addr + spurs::wkl_off::currentContention + (wid & 15)) >> sh) & 0xF);
+            const u8 max = static_cast<u8>((ps_read8(base, addr + spurs::wkl_off::maxContention + (wid & 15)) >> sh) & 0xF);
+            s += std::format("  workload {} {} ({}): state {}, status {:#x}, ready count {}, contention {} of {}{}\n", wid,
+                w.name.empty() ? "-" : w.name,
+                w.kind == spurs::Workload::Kind::JobChain ? "job chain" : w.kind == spurs::Workload::Kind::Taskset ? "taskset" : "custom",
+                ps_read8(base, addr + spurs::wkl_state(wid)), ps_read8(base, addr + spurs::wkl_status(wid)),
+                ps_read8(base, addr + spurs::wkl_ready(wid)), cur, max,
+                (ps_read16(base, addr + spurs::wkl_signal_of(wid)) & spurs::wkl_signal_bit(wid)) ? ", signalled" : "");
+            if (w.kind == spurs::Workload::Kind::JobChain && w.arg) s += spurs::describe_chain(base, w.arg, now) + "\n";
+        }
+        if (inst.scheduler) s += inst.scheduler->describe_workers();
+    }
+    return s;
 }
 
 } // namespace pspocket::hle

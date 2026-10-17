@@ -14,11 +14,13 @@
 //   the same lock, whether it is still queued (it removes itself and times out) or was already woken.
 //   While it waits, a Waiter also says what it waits on (WaitKind and object ID), for thread reports (report.hpp).
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "pspocket/core/types.hpp"
@@ -47,6 +49,20 @@ enum : s32 {
     SYS_SYNC_NOT_CARE = 0x3,
 };
 
+// PSPOCKET_SYNC_TRACE=1 (D-1091, a diagnostic): each semaphore and event flag keeps its last operations (what, by which
+// PPU thread, the values), for a stall's report: who set or posted last, who waited, which wake never came.
+struct SyncOp {
+    u64 ns = 0;
+    u32 thread = 0; // the PPU thread, 0 for an SPU or a host thread
+    char what = 0;  // event flag: S set, C clear, w wait, T timed out; semaphore: P post, t taken at once, w wait
+    u64 a = 0, b = 0;
+};
+struct SyncHistory {
+    std::array<SyncOp, 32> ring{};
+    u32 next = 0;
+};
+bool sync_trace_on();
+
 class Object {
 public:
     Object() = default;
@@ -62,6 +78,11 @@ public:
     u32 id = 0;        // first ID the object was registered under
     u64 ipc_key = 0;   // process-shared objects (lv2_obj::create)
     u32 refs = 0;      // IDs referring to this object (more than one only through an IPC key); guarded by lock
+    std::unique_ptr<SyncHistory> history; // PSPOCKET_SYNC_TRACE: guarded by lock
+
+    // Under lock.
+    void trace(char what, u64 a, u64 b);
+    std::string trace_text() const; // the history, oldest first, one line each (indented)
 };
 
 struct IdSpec {

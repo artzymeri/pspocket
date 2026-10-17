@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BOOT = "build/host/runtime/loader/pspocket-boot"
+BOOT = os.environ.get("PSPOCKET_BENCH_BOOT") or "build/host/runtime/loader/pspocket-boot" # another build: bisecting (D-1091)
 PREPARE = "build/host/runtime/prepare/pspocket-prepare"
 
 

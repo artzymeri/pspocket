@@ -7,13 +7,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <format>
 #include <filesystem>
 #include <setjmp.h>
 #include <thread>
 
 #include "internal.hpp"
 #include "pspocket/core/chaos.hpp"
+#include "pspocket/core/timebase.h"
 #include "spu.hpp"
 #include "pspocket/ppu/interpreter.hpp"
 #include "pspocket/ppu/runtime.h"
@@ -101,6 +104,37 @@ const char* error_name(Result r)
 }
 
 // ------------------------------------------------------------------------------------------------- IdTable
+
+bool sync_trace_on()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("PSPOCKET_SYNC_TRACE");
+        return v && *v && v[0] != '0';
+    }();
+    return on;
+}
+
+void Object::trace(char what, u64 a, u64 b)
+{
+    if (!sync_trace_on()) return;
+    if (!history) history = std::make_unique<SyncHistory>();
+    const PpuThread* t = current_thread();
+    history->ring[history->next++ % history->ring.size()] = {ps_host_now_ns(), t ? t->id : 0u, what, a, b};
+}
+
+std::string Object::trace_text() const
+{
+    if (!history) return {};
+    std::string s;
+    const u64 now = ps_host_now_ns();
+    const u32 n = history->next, first = n > history->ring.size() ? n - static_cast<u32>(history->ring.size()) : 0;
+    for (u32 k = first; k < n; k++) {
+        const SyncOp& o = history->ring[k % history->ring.size()];
+        s += std::format("\n        {:8.3f} s ago, thread {:#x}: {} {:#x} {:#x}", static_cast<double>(now - o.ns) / 1e9,
+            o.thread, o.what, o.a, o.b);
+    }
+    return s;
+}
 
 IdTable::IdTable(IdSpec spec) : spec_(spec), slots_(spec.count) {}
 

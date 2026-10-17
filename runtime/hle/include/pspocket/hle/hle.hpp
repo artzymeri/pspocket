@@ -228,4 +228,8 @@ void thunk(PPUContext& ctx, u8* base)
 // Registry::add_variables(module, {PS_HLE_VAR(0x12345678, _Stdin, 4, 4, init_stdin), ...})
 #define PS_HLE_VAR(nid, name, size, align, init) ::pspocket::hle::Variable{{}, #name, nid, size, align, init}
 
+// The native SPURS instances for a stall's report (D-1091): each workload's name, kind, state, ready count, contention
+// and signal, and each job chain's pc, the commands there, its flags and its last visits. "" without SPURS.
+std::string spurs_state_report();
+
 } // namespace pspocket::hle

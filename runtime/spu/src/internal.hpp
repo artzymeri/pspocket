@@ -25,6 +25,9 @@ struct ps_spu_host {
     std::atomic<bool> stop_requested{false};
     std::atomic<pspocket::u32> status{PS_SPU_STATUS_STOPPED};
     ps_spu_pending_home pending;
+    // The last DMA it made (D-1091, for a stall's report): written by its own thread, read racily.
+    std::atomic<pspocket::u32> last_cmd{0}, last_ea{0}, last_size{0}, last_pc{0};
+    std::atomic<pspocket::u64> dmas{0};
 };
 
 namespace pspocket::spu::detail {

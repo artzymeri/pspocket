@@ -262,6 +262,13 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
         return 0;
     const int r = transfer_unobserved(ctx, pc, cmd, lsa, eal, size);
     if (!r && size) observe(ctx, pc, cmd, lsa, eal, size);
+    if (ps_spu_host* h = ctx->host) { // D-1091
+        h->last_cmd.store(cmd, std::memory_order_relaxed);
+        h->last_ea.store(eal, std::memory_order_relaxed);
+        h->last_size.store(size, std::memory_order_relaxed);
+        h->last_pc.store(pc, std::memory_order_relaxed);
+        h->dmas.fetch_add(1, std::memory_order_relaxed);
+    }
     return r;
 }
 

@@ -194,6 +194,9 @@ public:
     bool in_b(u64 now_ns) const { return ab_period_ns && ((now_ns / ab_period_ns) & 1) != 0; }
     void report_time(u64 now_ns);
     u64 last_report_ns = 0; // the reporting worker's
+    // Each worker for a stall's report (D-1091): its workload and its last DMA (command, EA, size, SPU pc, the first
+    // 16 bytes there now), with how many it has made.
+    std::string describe_workers() const;
 
 private:
     std::vector<std::unique_ptr<Worker>> workers_;

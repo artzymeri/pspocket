@@ -77,5 +77,7 @@ struct ReportOptions {
 // The report as text: a header with counts, one block per thread (ID, name, priority, state and where; what it waits
 // on; its backtrace), then the RSX's FIFO (get, put, words, flips, and what it is blocked on).
 std::string format_report(Kernel& kernel, const ReportOptions& options = {});
+// More for every report, after the RSX (pspocket-boot: the native SPURS instances' state, D-1091). Set once at start.
+void set_report_extra(std::function<std::string()> extra);
 
 } // namespace pspocket::lv2

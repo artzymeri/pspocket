@@ -114,8 +114,9 @@ std::string describe_wait(Kernel::Impl& s, const Waiter& w, WaitOn on, const Thr
         const auto sem = s.objects.get<Semaphore>(on.id);
         if (!sem) return gone();
         std::lock_guard lk(sem->lock);
-        return std::format("semaphore {:#x}{}: count {} (max {}), {}{}", on.id, quoted_name(sem->name),
-            std::max(sem->value, 0), sem->max, count(sem->waiters.size(), "waiter"), woken(sem->waiters.contains(&w)));
+        return std::format("semaphore {:#x}{}: count {} (max {}), {}{}{}", on.id, quoted_name(sem->name),
+            std::max(sem->value, 0), sem->max, count(sem->waiters.size(), "waiter"), woken(sem->waiters.contains(&w)),
+            sem->trace_text());
     }
     case WaitKind::EventQueue: {
         const auto q = s.objects.get<EventQueue>(on.id);
@@ -133,8 +134,8 @@ std::string describe_wait(Kernel::Impl& s, const Waiter& w, WaitOn on, const Thr
                 f->pattern);
         }
         // want[] is written under the flag's lock before the waiter queues.
-        return std::format("event flag {:#x}{}: wants {:#x} ({}), pattern {:#x}, {}", on.id, quoted_name(f->name),
-            w.want[0], flag_mode(w.want[1]), f->pattern, count(f->waiters.size(), "waiter"));
+        return std::format("event flag {:#x}{}: wants {:#x} ({}), pattern {:#x}, {}{}", on.id, quoted_name(f->name),
+            w.want[0], flag_mode(w.want[1]), f->pattern, count(f->waiters.size(), "waiter"), f->trace_text());
     }
     case WaitKind::LwMutex: {
         const auto m = s.objects.get<LwMutex>(on.id);
@@ -404,6 +405,16 @@ std::vector<ThreadSnapshot> snapshot_threads(Kernel& kernel, usize max_frames)
     return out;
 }
 
+namespace {
+std::function<std::string()>& report_extra()
+{
+    static std::function<std::string()> extra;
+    return extra;
+}
+} // namespace
+
+void set_report_extra(std::function<std::string()> extra) { report_extra() = std::move(extra); }
+
 std::string format_report(Kernel& kernel, const ReportOptions& options)
 {
     const std::vector<ThreadSnapshot> threads = snapshot_threads(kernel, options.max_frames);
@@ -430,6 +441,7 @@ std::string format_report(Kernel& kernel, const ReportOptions& options)
         }
     }
     out += rsx_text(kernel);
+    if (report_extra()) out += report_extra()();
     out += "==== end of thread report ====\n";
     return out;
 }

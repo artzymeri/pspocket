@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "internal.hpp"
+#include "pspocket/spu/diag.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/spu/fp.h"
 #include "pspocket/spu/interpreter.hpp"
@@ -281,6 +282,17 @@ ps_spu_fn* build_table(const ps_spu_program* program)
 }
 
 } // namespace
+
+uint64_t ps_spu_last_dma(SPUContext* ctx, uint32_t* cmd, uint32_t* ea, uint32_t* size, uint32_t* pc)
+{
+    ps_spu_host* h = ctx ? ctx->host : nullptr;
+    if (!h) return 0;
+    *cmd = h->last_cmd.load(std::memory_order_relaxed);
+    *ea = h->last_ea.load(std::memory_order_relaxed);
+    *size = h->last_size.load(std::memory_order_relaxed);
+    *pc = h->last_pc.load(std::memory_order_relaxed);
+    return h->dmas.load(std::memory_order_relaxed);
+}
 
 void ps_spu_register_program(ps_spu_program* program)
 {
