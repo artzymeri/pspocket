@@ -1,6 +1,8 @@
 #include "pspocket/core/chaos.hpp"
 #include "pspocket/rsx/rsx.hpp"
 
+#include "pspocket/rsx/capture.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -513,6 +515,7 @@ Rsx::RunStatus Rsx::step(u64 max_words)
     // Deferred readbacks and what follows them (D-107): what the GPU has finished runs first. The thread keeps running
     // them while it waits for commands (wait_for_work), without waiting for the GPU.
     backend_.run_deferred(false);
+    if (CaptureWriter* c = capture_.load(std::memory_order_acquire)) [[unlikely]] c->before_step(*this); // D-1053
     return step_commands(max_words);
 }
 
@@ -524,10 +527,13 @@ Rsx::RunStatus Rsx::step_commands(u64 max_words)
             std::lock_guard lock(flip_requests_mutex_);
             requests.swap(flip_requests_);
         }
+        if (CaptureWriter* c = capture_.load(std::memory_order_acquire)) [[unlikely]] c->note_flip_requests(requests);
         for (const auto& [head, value] : requests) m_driver_flip(m::GCM_FLIP_HEAD + (head & 1), value);
     }
     if (fifo_reset_.load(std::memory_order_acquire)) {
         const u64 gp = pending_get_put_.load(std::memory_order_relaxed);
+        if (CaptureWriter* c = capture_.load(std::memory_order_acquire)) [[unlikely]]
+            c->note_fifo_reset(static_cast<u32>(gp), static_cast<u32>(gp >> 32));
         // From another thread (set_fifo_pointers): the control registers are this thread's to write, before put is
         // read against the new get.
         if (reset_writes_registers_.load(std::memory_order_relaxed)) write_get_put(gp);

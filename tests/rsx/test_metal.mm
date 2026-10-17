@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "pspocket/core/log.hpp"
+#include "pspocket/rsx/capture.hpp"
 #include "pspocket/rsx/metal/metal_backend.hpp"
 #include "pspocket/rsx/shader/msl.hpp"
 #include "pspocket/rsx/shader/interp.hpp"
@@ -6849,4 +6850,109 @@ TEST_CASE("metal bench: render passes, attachment traffic and GPU time of a fram
     }
     e.backend->sync();
     CHECK(e.failures.empty());
+}
+
+namespace {
+
+// Frames for the capture round trip: a clear, then a triangle whose colours the "CPU" changes between frames, a flip.
+u32 capture_frame(E2E& e, u32 at, u32 clear, u32 color)
+{
+    write_triangle(e, {color, color, color});
+    auto b = e.at(at);
+    setup_surface(b, kSurfaceOffset);
+    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, clear);
+    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    draw_triangle(b);
+    b.method(m::GCM_FLIP_COMMAND, 0);
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    return b.offset();
+}
+
+std::string capture_dir(const char* name)
+{
+    const auto dir = std::filesystem::temp_directory_path() / std::format("pspocket-capture-{}-{}", name, getpid());
+    std::filesystem::remove_all(dir);
+    return dir.string();
+}
+
+} // namespace
+
+TEST_CASE("rsx capture: frames captured mid-run replay to the same pixels, every time (D-1053)")
+{
+    REQUIRE_METAL();
+    const std::string dir = capture_dir("roundtrip");
+    std::vector<std::vector<u8>> captured;
+    {
+        E2E e;
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+        CaptureOptions o;
+        o.dir = dir;
+        o.from_flip = 1; // after the first frame: the capture starts with a target the GPU drew
+        o.frames = 2;
+        CaptureWriter w(e.mem, *e.tracker, o);
+        e.rsx->set_capture(&w);
+        u32 at = capture_frame(e, 0, 0xff102030, 0xff0000ff);
+        at = capture_frame(e, at, 0xff203040, 0xff00ff00);
+        at = capture_frame(e, at, 0xff304050, 0xffff0000);
+        capture_frame(e, at, 0xff405060, 0xffffffff); // after the capture's two frames: not in it
+        e.rsx->set_capture(nullptr);
+        INFO(w.summary());
+        CHECK(w.phase() == CaptureWriter::Phase::Done);
+        e.backend->sync();
+        REQUIRE(e.present_pixels.size() == 4);
+        captured = {e.present_pixels[1], e.present_pixels[2]};
+    }
+    CaptureInfo info;
+    std::string error;
+    REQUIRE(read_capture_info(dir, info, &error));
+    CHECK(info.complete);
+    CHECK(info.frames == 2);
+    for (int run = 0; run < 2; run++) {
+        INFO("replay " << run);
+        E2E r;
+        ReplayResult result;
+        REQUIRE(replay_capture(dir, r.mem, *r.tracker, *r.rsx, {}, result, &error));
+        INFO(error << " " << result.first_deviation);
+        CHECK(result.deviations == 0);
+        CHECK(result.flips == 2);
+        r.backend->sync();
+        REQUIRE(r.present_pixels.size() == 2);
+        CHECK(r.present_pixels[0] == captured[0]);
+        CHECK(r.present_pixels[1] == captured[1]);
+        for (const auto& f : r.failures) UNSCOPED_INFO(f.message);
+        CHECK(r.failures.empty());
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("rsx capture: a capture past its size cap stops, its manifest incomplete (D-1053)")
+{
+    REQUIRE_METAL();
+    const std::string dir = capture_dir("cap");
+    E2E e;
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+    for (u32 i = 0; i < 64; i++) fill_random(e.mem, PS_MEM_RSX_LOCAL_BASE + 0x400000 + i * 0x10000, 0x10000, i);
+    CaptureOptions o;
+    o.dir = dir;
+    o.from_flip = 0;
+    o.frames = 5;
+    o.max_bytes = 1u << 20; // the 4 MB of random pages alone pass it
+    CaptureWriter w(e.mem, *e.tracker, o);
+    e.rsx->set_capture(&w);
+    const u32 at = capture_frame(e, 0, 0xff102030, 0xff0000ff); // the FIFO's setup taken: the capture starts next
+    capture_frame(e, at, 0xff203040, 0xff00ff00);
+    e.rsx->set_capture(nullptr);
+    INFO(w.summary());
+    CHECK(w.phase() == CaptureWriter::Phase::Failed);
+    CHECK(w.summary().find("cap") != std::string::npos);
+    CaptureInfo info;
+    std::string error;
+    REQUIRE(read_capture_info(dir, info, &error));
+    CHECK_FALSE(info.complete);
+    std::filesystem::remove_all(dir);
 }

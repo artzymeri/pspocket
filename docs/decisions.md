@@ -17331,3 +17331,43 @@ games/ac1/walk-training.txt, 570 s.
 - With D-1050's install runs (legal 1, 2; adversarial 11, 12; all points 3 to 6): eleven Assassin's Creed runs under
   shake mode, none failed; the only failures found are D-999's race with the waker rule taken away (D-1050), which the
   nightly guard now watches (D-1051).
+
+## D-1053 · 2026-10-17 · RSX capture and replay; scripts/rsx_bisect.py
+
+The plan's net 2 (E3, E4): a frame that shows wrong becomes a folder the RSX and its backend can run alone, again and
+again, with the fast paths switched off one by one.
+
+- **Capture** (pspocket/rsx/capture.hpp, runtime/rsx/src/capture.cpp; `pspocket-boot --rsx-capture DIR
+  --rsx-capture-from FLIP --rsx-capture-frames N --rsx-capture-max-mb MB`, Metal): at the first step boundary of the
+  RSX thread after flip FLIP with no packet, call or wait open, the backend writes back what only the GPU holds
+  (Backend::flush_memory over every region), then every non-zero page of local memory, the RSX's context memory and
+  the IO-mapped main memory goes into the image (each content once, content-addressed, in blobs.bin), the register file
+  and vertex program state into state.bin, the layout, IO map, display buffers, FIFO location, get and put into
+  manifest.txt; the pages are watched through the write tracker (blocks of four pages). Then before each step of the
+  RSX thread a record: the words processed, put, every watched page a store reached and whose bytes changed, and the
+  flips asked for outside the FIFO and the FIFO resets the step takes; the FIFO's words are memory, so jumps, calls and
+  returns replay as they ran. It ends at the step after its N-th flip, or at the size cap (manifest "incomplete"; the
+  IO map changing ends it too); the size is logged.
+- **Replay** (replay_capture; the tool `rsx-replay DIR [--frames DIR] [--draws FILE] [--describe N]`): the regions
+  committed, the image and state restored, then per record its pages, put, flip requests and resets, and the RSX run
+  for as many words as the capture's (Rsx::run_until_idle); a record that ends at other words is a deviation. The RSX's
+  own outputs (notifies and reports) are not overwritten by the records after the image: the replay's GPU writes
+  them. It prints a hash of each presented frame, the RSX alarms and the deviations; --frames saves PNGs, --draws a
+  hash of each colour target after each draw and clear (written back: slow), --describe what a draw had bound.
+- **scripts/rsx_bisect.py CAPTURE**: mode A (as the environment is) against B (PSPOCKET_RSX_EXACT=1), with --draws:
+  the frames, A's own determinism over two runs, the first draw whose targets differ (described), and each of the
+  backend's switches added to A (NO_CARRY, NO_SURFACE_POOL, NO_PASS_MERGING, WRITE_BACK_TARGETS, STRICT_FEEDBACK,
+  INTERPRETER, NO_DEPTH_CLAMP, EARLY_REPORTS, UNINIT_TARGETS) and whether it makes A match B from there.
+- **GTA V's gate walk, flips 2400 and 2401**: 4 regions, 16,610 pages in the image (255 MB), 139 records, 2,757 pages
+  written, 298 MB in all, the run's CPU unchanged otherwise. Replays: 0 deviations, 565,248 words, 12 s; the frames
+  as the game's (the bank's lobby). Exact mode: the same two frames every run; the interpreter's: the same every run;
+  the fast mode: frame 2 the same every run, frame 1 one of a few (26 pixels, at most 7 levels apart), with the
+  replay's alarm conditional_pending 2: two conditional draws decided while their reports were in flight, a race the
+  fast path has in the game too (the exact mode waits for them). No switch removes it (rsx_bisect's runs).
+  rsx_bisect there: A and B present the same frames with --draws (its write-backs after each draw settle the GPU), the
+  first target hash that differs is draw 2's (a 2x multisampled 128x128 depth pre-pass, colour mask 0: the target's
+  write-back, not its pixels); no switch changes it.
+- Tests: tests/rsx/test_metal.mm (two frames captured after a first one, the CPU changing the triangle's colours
+  between frames: two replays present the same pixels as the capture's frames, no deviation; a capture past its cap:
+  incomplete, its manifest says so).
+- Not in a capture: EDGE's GPU work items (they come from SPU jobs, not RSX memory): capture with PSPOCKET_EDGE_GPU=0.

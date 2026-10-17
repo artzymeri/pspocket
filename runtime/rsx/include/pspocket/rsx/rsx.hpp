@@ -36,6 +36,11 @@
 
 namespace pspocket::rsx {
 
+class CaptureWriter;
+class WriteTracker;
+struct ReplayOptions;
+struct ReplayResult;
+
 enum class FailPolicy : u8 {
     Abort, // log at fatal level and abort (dev builds)
     Log,   // log at error level and carry on (release builds; tests)
@@ -88,6 +93,10 @@ struct Config {
 };
 
 class Rsx {
+    friend class CaptureWriter; // D-1053: the capture reads the parser's state, the replay restores it
+    friend bool replay_capture(const std::string& dir, GuestMemory& mem, WriteTracker& tracker, Rsx& rsx,
+        const ReplayOptions& options, ReplayResult& result, std::string* error);
+
 public:
     Rsx(GuestMemory& mem, Backend& backend, Config config = {});
     ~Rsx();
@@ -135,6 +144,8 @@ public:
         return {flips_held_.load(std::memory_order_relaxed), flips_held_ns_.load(std::memory_order_relaxed),
             flips_held_timeouts_.load(std::memory_order_relaxed)};
     }
+    // An RSX capture (D-1053, capture.hpp): its hooks run on the RSX thread from the next step on; nullptr: none.
+    void set_capture(CaptureWriter* capture) { capture_.store(capture, std::memory_order_release); }
     // A buffer lv2 queued on a head (0x103), for a later flip of "the last queued" (GCM_FLIP_HEAD's 0xf).
     void note_queued(u32 head, u32 buffer_id) { last_queued_[head & 7].store(buffer_id, std::memory_order_relaxed); }
 
@@ -337,6 +348,7 @@ private:
     // FIFO state. Owned by the thread driving the FIFO; get_ is atomic so other threads can read it.
     std::atomic<u32> get_{0};
     std::atomic<FifoLocation> fifo_location_{FifoLocation::Auto};
+    std::atomic<CaptureWriter*> capture_{nullptr}; // D-1053
     u32 packet_reg_ = 0;
     u32 packet_inc_ = 0;
     u32 packet_remaining_ = 0;

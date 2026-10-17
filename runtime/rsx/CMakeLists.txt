@@ -8,6 +8,7 @@ add_library(pspocket_rsx STATIC
     src/methods.cpp
     src/null_backend.cpp
     src/rsx.cpp
+    src/capture.cpp
     src/shader/fp.cpp
     src/shader/interp.cpp
     src/shader/msl.cpp
@@ -39,4 +40,10 @@ if(APPLE)
         OBJCXX_EXTENSIONS OFF)
     pspocket_set_warnings(pspocket_rsx_metal)
     add_library(pspocket::rsx_metal ALIAS pspocket_rsx_metal)
+    # An RSX capture replayed through the Metal backend alone (D-1053).
+    add_executable(rsx-replay metal/tools/rsx_replay.mm)
+    target_link_libraries(rsx-replay PRIVATE pspocket::rsx_metal)
+    target_compile_options(rsx-replay PRIVATE -fobjc-arc)
+    set_target_properties(rsx-replay PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF)
+    pspocket_set_warnings(rsx-replay)
 endif()

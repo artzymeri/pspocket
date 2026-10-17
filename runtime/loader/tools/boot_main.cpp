@@ -60,6 +60,8 @@
 // summary. --stop-on-stall ends the run at the first (its summary's exit names it). The summary is written on every
 // way the run ends: its timeout, the game's exit, a fault, a fatal error, a stall; with the gaps by name, the
 // interpreters' shares, the milestones and the stalls. scripts/triage.py sorts a summary and its log into buckets.
+// --rsx-capture DIR records what the RSX reads from the flip --rsx-capture-from N on, for --rsx-capture-frames N
+// frames (1), at most --rsx-capture-max-mb MB (2048): rsx-replay DIR runs it alone (D-1053, pspocket/rsx/capture.hpp).
 // --max-footprint GB stops the run (exit "footprint" in its summary) once the process's memory footprint passes GB,
 // checked four times a second: a leak ends the run before the host's swap fills its disk (D-1047).
 // --game-library FILE runs the game's translated code from a game library (route B, D-152: pspocket-prepare makes one
@@ -126,6 +128,7 @@
 #include "pspocket/hle/audio.hpp"
 #include "pspocket/hle/spu_programs.hpp"
 #include "pspocket/loader/watchdog.hpp"
+#include "pspocket/rsx/capture.hpp"
 #include "pspocket/hle/input.hpp"
 #include "pspocket/hle/pad_script.hpp"
 #include "pspocket/hle/process.hpp"
@@ -1094,6 +1097,10 @@ int main(int argc, char** argv)
     double freeze_s = 10, deadlock_s = 5, livelock_s = 0;
     bool stop_on_stall = false;
     double max_footprint_gb = 0; // --max-footprint GB: the run stops when the process's footprint passes it (D-1047)
+    // --rsx-capture DIR [--rsx-capture-from FLIP] [--rsx-capture-frames N] [--rsx-capture-max-mb MB] (D-1053)
+    [[maybe_unused]] std::string rsx_capture_dir;
+    [[maybe_unused]] u64 rsx_capture_from = 0, rsx_capture_max_mb = 2048;
+    [[maybe_unused]] u32 rsx_capture_frames = 1;
     hle::PadAnchor press_base; // a press file's "wait:" step (D-1042)
     const auto add_press = [&](std::string_view spec) {
         std::string error;
@@ -1210,6 +1217,18 @@ int main(int argc, char** argv)
             if (a == "--livelock" && livelock_s > 0) gpu = "metal"; // its frames' hashes come from the captures
         } else if (a == "--stop-on-stall") {
             stop_on_stall = true;
+        } else if (a == "--rsx-capture") {
+            const char* v = value();
+            if (!v) return usage();
+            rsx_capture_dir = v;
+            gpu = "metal";
+        } else if (a == "--rsx-capture-from" || a == "--rsx-capture-frames" || a == "--rsx-capture-max-mb") {
+            const char* v = value();
+            if (!v || std::atoll(v) < 0) return usage();
+            const u64 n = static_cast<u64>(std::atoll(v));
+            if (a == "--rsx-capture-from") rsx_capture_from = n;
+            else if (a == "--rsx-capture-frames") rsx_capture_frames = static_cast<u32>(std::max<u64>(n, 1));
+            else rsx_capture_max_mb = std::max<u64>(n, 1);
         } else if (a == "--max-footprint") {
             const char* v = value();
             if (!v || std::atof(v) <= 0) return usage();
@@ -1319,6 +1338,7 @@ int main(int argc, char** argv)
     FrameWriter frame_writer(frames_dir.empty() ? 0 : 3);
 #if defined(PSPOCKET_HAVE_METAL)
     std::unique_ptr<rsx::WriteTracker> tracker;
+    std::unique_ptr<rsx::CaptureWriter> rsx_capture; // D-1053: before the kernel, so it outlives the RSX thread
     if (gpu == "metal") {
         if (!frames_dir.empty()) {
             std::error_code ec;
@@ -1334,6 +1354,14 @@ int main(int argc, char** argv)
         if (!std::getenv("PSPOCKET_RSX_HASH_TEXTURES") && !debugger_attached()) {
             tracker->install();
             tracker->set_protection(true);
+        }
+        if (!rsx_capture_dir.empty()) {
+            rsx::CaptureOptions co;
+            co.dir = rsx_capture_dir;
+            co.from_flip = rsx_capture_from;
+            co.frames = rsx_capture_frames;
+            co.max_bytes = rsx_capture_max_mb << 20;
+            rsx_capture = std::make_unique<rsx::CaptureWriter>(memory, *tracker, co);
         }
         cfg.rsx_backend = [&]() -> std::unique_ptr<rsx::Backend> {
             rsx::metal::MetalBackendConfig mc;
@@ -1764,6 +1792,7 @@ int main(int argc, char** argv)
     // Game time for the presses' anchors (D-1042) and the milestones: the first frame, play, each anchor.
     hle::PlayDetector play;
     bool first_frame = false;
+    [[maybe_unused]] bool rsx_capture_attached = false;
     const auto linked_named = [&](std::string_view name) {
         std::vector<const hle::LinkedFunction*> out;
         for (const auto* f : hle.linked())
@@ -1827,6 +1856,12 @@ int main(int argc, char** argv)
             }
         }
         const u64 flips_now = kernel.rsx() ? kernel.rsx()->flip_count() : 0;
+#if defined(PSPOCKET_HAVE_METAL)
+        if (rsx_capture && kernel.rsx() && !rsx_capture_attached) { // D-1053: once the game has its RSX
+            kernel.rsx()->set_capture(rsx_capture.get());
+            rsx_capture_attached = true;
+        }
+#endif
         if (log_first_calls) {
             std::erase_if(not_called_yet, [&](const hle::LinkedFunction* f) {
                 if (!f->calls.load(std::memory_order_relaxed)) return false;
@@ -2067,6 +2102,9 @@ int main(int argc, char** argv)
         std::printf("  %8llu  %s::%s (0x%08X)\n", static_cast<unsigned long long>(f->calls.load()), f->module.c_str(),
             f->name.empty() ? "?" : f->name.c_str(), f->nid);
     watchdog.stop();
+#if defined(PSPOCKET_HAVE_METAL)
+    if (rsx_capture) std::printf("%s\n", rsx_capture->summary().c_str()); // D-1053
+#endif
     if (chaos::any()) { // shake mode (D-1045)
         const chaos::Counts c = chaos::counts();
         std::printf("shake mode: %s\n", chaos::description().c_str());

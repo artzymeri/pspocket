@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "pspocket/core/log.hpp"
+#include "pspocket/rsx/capture.hpp"
 #include "pspocket/rsx/gcm.hpp"
 #include "pspocket/rsx/method_names.hpp"
 #include "pspocket/rsx/rsx.hpp"
@@ -736,6 +737,7 @@ void Rsx::do_flip(u32 buffer_id)
     }();
     if (exact_from && index >= exact_from) config_.exact = true;
     if (on_flip) on_flip(buffer_id);
+    if (CaptureWriter* c = capture_.load(std::memory_order_acquire)) [[unlikely]] c->after_flip(*this); // D-1053
 }
 
 void Rsx::m_flip_command(u32, u32 value)
