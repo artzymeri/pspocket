@@ -17662,3 +17662,31 @@ cheaply, so a bad frame found afterwards can be compared with the frames around 
   which it reads a frame late. With D-1021 that count arrives whole and the flare looks like a flare. With early
   reports, the "ready" came with a stale count, which explains early1's saturated colours.
 - Taken as the game's own lag unless the exact mode (D-1029) shows the flare there too, which is not yet checked.
+
+## D-1038 · 2026-10-17 · rsx-replay --dump-draw; GTA V's sky wedge is a far LOD mesh drawn across the camera plane
+
+- `rsx-replay CAPTURE --dump-draw F:K` prints the K-th draw of presented frame F (draws only; a frame trace's "#N"
+  also counts clears):
+  - its index range;
+  - its vertex program (disassembled) and the constants the program reads;
+  - for each vertex array it reads: the per-component range of the vertices the draw uses, the count of values that
+    are not finite, and the vertices furthest out.
+- GTA V's grey wedge across the sky (D-1036), from a capture that holds it. The capture is rain-street, flips 3700 to
+  3800, with PSPOCKET_RSX_CAPTURE_CHECK=1 (cap4: the wedge at 3715 and 3758). The replay is deterministic: 0
+  deviations and the wedge in replay frame 15.
+  - The frame trace's pixel probe at (150,150): the sky's draws (32a1caebabc80f48, then the clouds 2eec694992dc3eed
+    and 5e1988ea5b9667e3) never reach that pixel. Before them, a draw of fragment program f0de183c8cd8dbd3 (the
+    far-LOD meshes, 3231 indices, stencil written 0) covers it flat grey, and the sky's stencil test (EQUAL 7) then
+    leaves it.
+  - The mesh is in frame 15 only (not in 14 or 16). Its vertex program divides by w itself (RCP R0.w, then o[0].w =
+    1, o[0].z near the far plane), with c[8..11] as the transform. Its vertices are finite and in range, but their w
+    crosses 0 (about -1137 to +2238 over the mesh). Part of the mesh is behind the camera, the division flips it, and
+    it spans the sky.
+  - The replay draws the same frame with every backend switch: exact mode, the shader interpreter, no carry, no
+    surface pool, no pass merging, write-back targets, strict feedback, uninitialised targets. The game-run A/B agrees:
+    the exact mode from flip 3600 also shows the wedge (run ex4, 3713 and 3721). So the backend draws what the game
+    sends.
+  - The cause is upstream, in the game's choice to draw that far LOD for one frame with the camera inside it, most
+    likely while the detailed models that replace it were not ready yet (streaming timing) or because of a
+    visibility decision. Open: which game system picks the LOD, and whether our file and decompression timing, or a
+    lifted function, makes it fall back.

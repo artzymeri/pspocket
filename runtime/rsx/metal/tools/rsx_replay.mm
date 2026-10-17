@@ -32,6 +32,7 @@
 #import <Metal/Metal.h>
 
 #include "pspocket/core/guest_memory.hpp"
+#include "pspocket/rsx/shader/ir.hpp"
 #include "pspocket/core/log.hpp"
 #include "pspocket/core/memory_map.h"
 #include "pspocket/core/png.hpp"
@@ -58,11 +59,22 @@ public:
         : b_(inner), mem_(mem), out_(out), describe_(describe)
     {
     }
-    void attach(Rsx& rsx) override { b_.attach(rsx); }
+    void attach(Rsx& rsx) override
+    {
+        rsx_ = &rsx;
+        b_.attach(rsx);
+    }
     void draw(const RsxState& s) override
     {
+        frame_draws_++;
+        if (dump_frame_ && flips_seen_ + 1 == dump_frame_ && frame_draws_ == dump_draw_) dump(s);
         b_.draw(s);
         note("draw", s);
+    }
+    void set_dump(u64 frame, u64 draw)
+    {
+        dump_frame_ = frame;
+        dump_draw_ = draw;
     }
     void clear(u32 mask, const RsxState& s) override
     {
@@ -81,6 +93,8 @@ public:
             }
         }
         b_.flip(r, s);
+        flips_seen_++;
+        frame_draws_ = 0;
     }
     void set_sync(u64 lo, u64 hi)
     {
@@ -137,6 +151,106 @@ private:
                 static_cast<unsigned long long>(fnv(mem_.host(ea), bytes)));
         }
     }
+    // --dump-draw F:K (D-1038): the K-th draw of presented frame F, its index range and each vertex array read as the
+    // vertex fetch reads it: per component the range and the values that are not finite, and the vertices furthest out.
+    void dump(const RsxState& s) const
+    {
+        const DrawClause& d = s.draw;
+        std::printf("dump: frame %llu draw %llu: primitive %u, %zu ranges, %zu inline words, %zu elements\n",
+            static_cast<unsigned long long>(dump_frame_), static_cast<unsigned long long>(dump_draw_),
+            static_cast<u32>(d.primitive), d.ranges.size(), d.inline_words.size(), d.array_elements.size());
+        if (!rsx_) return;
+        const IndexArrayInfo ia = s.index_array();
+        const bool indexed = d.command == DrawCommand::Indexed;
+        const u32 base_index = s.vertex_data_base_index();
+        std::vector<u32> vertices;
+        for (const DrawRange& r : d.ranges) {
+            for (u32 i = 0; i < r.count; i++) {
+                if (!indexed) {
+                    vertices.push_back(r.first + i);
+                    continue;
+                }
+                const u32 isize = ia.u16_indices ? 2 : 4;
+                const auto ea = rsx_->translate(ia.offset + (r.first + i) * isize, ia.location, isize);
+                if (!ea) continue;
+                const u32 raw = isize == 2 ? ps_read16(mem_.base(), *ea) : ps_read32(mem_.base(), *ea);
+                vertices.push_back((raw + base_index) & 0xfffff);
+            }
+        }
+        if (indexed) {
+            const auto ea = rsx_->translate(ia.offset, ia.location);
+            std::printf("  indices: %s at %#x (ea %#x), base index %u\n", ia.u16_indices ? "u16" : "u32", ia.offset,
+                ea.value_or(0), base_index);
+        }
+        // The vertex program and the constants it reads (a relative read: all of them, here the first 16 past its base).
+        if (auto vp = shader::decode_vertex_program(s.transform_program.data(), kMaxVertexProgramInstructions,
+                s.transform_program_start())) {
+            std::printf("  vertex program at %u, %zu instructions:\n%s", vp->start, vp->instructions.size(),
+                shader::disassemble(*vp).c_str());
+            std::vector<u16> used;
+            for (const auto& in : vp->instructions) {
+                const bool reads = std::any_of(in.src.begin(), in.src.end(),
+                    [](const shader::VpSource& x) { return x.type == shader::VpRegType::Constant; });
+                if (reads && std::find(used.begin(), used.end(), in.constant) == used.end()) used.push_back(in.constant);
+            }
+            std::sort(used.begin(), used.end());
+            for (u16 c : used) {
+                const float4& v = s.transform_constants[c];
+                std::printf("  c[%u] = %g %g %g %g\n", c, static_cast<double>(v[0]), static_cast<double>(v[1]),
+                    static_cast<double>(v[2]), static_cast<double>(v[3]));
+            }
+        }
+        if (vertices.empty()) return;
+        const auto [lo, hi] = std::minmax_element(vertices.begin(), vertices.end());
+        std::printf("  %zu vertices referenced, indices %u..%u\n", vertices.size(), *lo, *hi);
+        const u32 inputs = s.vertex_attrib_input_mask();
+        for (u32 a = 0; a < kVertexAttributeCount; a++) {
+            const VertexArrayInfo v = s.vertex_array(a);
+            if (!v.enabled() || !(inputs & (1u << a))) continue;
+            const u32 base = (s.vertex_data_base_offset() + v.offset) & 0x0fffffff;
+            const auto ea0 = rsx_->translate(base, v.location);
+            std::printf("  attribute %u: type %u size %u stride %u offset %#x (ea %#x) frequency %u\n", a,
+                static_cast<u32>(v.type), v.size, v.stride, v.offset, ea0.value_or(0), v.frequency);
+            if (!ea0) continue;
+            std::array<float, 4> mn{}, mx{};
+            mn.fill(INFINITY);
+            mx.fill(-INFINITY);
+            u32 bad = 0;
+            std::vector<std::pair<float, u32>> far;
+            for (u32 vi : vertices) {
+                const u32 ea = *ea0 + (v.stride ? vi * v.stride : 0);
+                std::array<float, 4> c{0, 0, 0, 1};
+                for (u32 k = 0; k < v.size && k < 4; k++) {
+                    switch (v.type) {
+                    case VertexType::F: c[k] = std::bit_cast<float>(ps_read32(mem_.base(), ea + k * 4)); break;
+                    case VertexType::S1: c[k] = static_cast<float>(static_cast<s16>(ps_read16(mem_.base(), ea + k * 2))) / 32767.f; break;
+                    case VertexType::S32K: c[k] = static_cast<float>(static_cast<s16>(ps_read16(mem_.base(), ea + k * 2))); break;
+                    case VertexType::UB: case VertexType::UB256: c[k] = static_cast<float>(mem_.host(ea)[k]); break;
+                    default: c[k] = 0; break;
+                    }
+                }
+                float mag = 0;
+                for (u32 k = 0; k < v.size && k < 4; k++) {
+                    if (!std::isfinite(c[k])) {
+                        bad++;
+                        continue;
+                    }
+                    mn[k] = std::min(mn[k], c[k]);
+                    mx[k] = std::max(mx[k], c[k]);
+                    mag = std::max(mag, std::fabs(c[k]));
+                }
+                far.emplace_back(mag, vi);
+            }
+            std::printf("   ");
+            for (u32 k = 0; k < v.size && k < 4; k++) std::printf(" [%g, %g]", static_cast<double>(mn[k]), static_cast<double>(mx[k]));
+            std::printf("; %u not finite\n", bad);
+            std::sort(far.begin(), far.end(), std::greater<>());
+            far.erase(std::unique(far.begin(), far.end()), far.end());
+            std::printf("    furthest:");
+            for (usize i = 0; i < far.size() && i < 4; i++) std::printf(" v%u %g", far[i].second, static_cast<double>(far[i].first));
+            std::printf("\n");
+        }
+    }
     // --describe N: what draw or clear N had bound.
     void describe(const char* what, const RsxState& s) const
     {
@@ -172,6 +286,8 @@ private:
     std::FILE* out_;
     u64 describe_ = 0;
     u64 n_ = 0;
+    Rsx* rsx_ = nullptr;
+    u64 flips_seen_ = 0, frame_draws_ = 0, dump_frame_ = 0, dump_draw_ = 0;
     std::FILE* pages_ = nullptr;
     u64 sync_lo_ = ~0ull, sync_hi_ = 0;
     u32 local_size_ = 0;
@@ -183,7 +299,7 @@ private:
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet] [--verbose]\n");
+        std::fprintf(stderr, "usage: rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--dump-draw F:K] [--quiet] [--verbose]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -192,6 +308,7 @@ int main(int argc, char** argv)
     u64 trace_frame = 0;
     bool quiet = false, verbose = false;
     u64 describe = 0;
+    u64 dump_frame = 0, dump_draw = 0;
     for (int i = 2; i < argc; i++) {
         const std::string_view a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames_dir = argv[++i];
@@ -206,6 +323,11 @@ int main(int argc, char** argv)
             sync_hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 0) : sync_lo;
         }
         else if (a == "--describe" && i + 1 < argc) describe = std::strtoull(argv[++i], nullptr, 0);
+        else if (a == "--dump-draw" && i + 1 < argc) { // F:K, the K-th draw of presented frame F (D-1038)
+            char* end = nullptr;
+            dump_frame = std::strtoull(argv[++i], &end, 0);
+            dump_draw = end && *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 0;
+        }
         else {
             std::fprintf(stderr, "rsx-replay: unknown option %s\n", argv[i]);
             return 2;
@@ -257,6 +379,7 @@ int main(int argc, char** argv)
             return 2;
         }
         Observer observer(*backend, mem, draws, describe);
+        observer.set_dump(dump_frame, dump_draw);
         std::FILE* pages = pages_path.empty() ? nullptr : std::fopen(pages_path.c_str(), "w");
         if (pages) observer.set_pages(pages, info.config.local_memory_size);
         observer.set_sync(sync_lo, sync_hi);
