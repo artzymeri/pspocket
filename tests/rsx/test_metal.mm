@@ -7304,3 +7304,52 @@ TEST_CASE("metal e2e: a target in main memory is in guest memory after the flip,
         CHECK(e.backend->stats().targets_mirrored == (mirror ? 1u : 0u));
     }
 }
+
+TEST_CASE("metal e2e: a ZPASS report becomes ready while the RSX thread waits long for the guest, with no flip to submit "
+          "it (D-1091)")
+{
+    // GTA V's front door: the RSX parks on a jump to itself until the graphics jobs write their command blocks over it,
+    // and what those jobs wait for comes after a report the RSX has passed. The report's ready word is written when
+    // its render buffer completes (D-1021), and nothing submitted that buffer while the RSX waited: the run froze. The
+    // RSX thread now submits it once a wait has lasted Config::long_wait_us. PSPOCKET_RSX_NO_WAIT_SUBMIT=1 keeps the old
+    // behaviour: the report stays unready.
+    REQUIRE_METAL();
+    for (const bool submit : {true, false}) {
+        INFO((submit ? "submitted at the wait" : "PSPOCKET_RSX_NO_WAIT_SUBMIT"));
+        if (!submit) ::setenv("PSPOCKET_RSX_NO_WAIT_SUBMIT", "1", 1);
+        E2E e;
+        ::unsetenv("PSPOCKET_RSX_NO_WAIT_SUBMIT");
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        const u32 report = e.config.layout.report_addr(0);
+        ps_write32(e.mem.base(), report + 8, 0xDEADBEEF);
+        ps_write32(e.mem.base(), report + 12, 1); // not ready
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+        b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+        b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+        draw_triangle(b);
+        b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x00);
+        b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+        const u32 park = b.offset();
+        b.jump(park); // parked here until the guest patches the word
+        ps_write32(e.mem.base(), e.config.layout.put_addr(), b.offset());
+        e.rsx->start();
+        bool ready = false;
+        for (int i = 0; i < (submit ? 2000 : 300) && !ready; i++) {
+            ready = __atomic_load_n(reinterpret_cast<const u32*>(e.mem.host(report + 12)), __ATOMIC_ACQUIRE) == 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(e.rsx->status().block == Rsx::BlockReason::JumpToSelf);
+        CHECK(ready == submit);
+        if (submit) CHECK(ps_read32(e.mem.base(), report + 8) > 1000u); // the triangle's samples
+        if (submit) CHECK(e.backend->stats().wait_submits >= 1);
+        e.rsx->stop();
+    }
+}

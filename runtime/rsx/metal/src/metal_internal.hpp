@@ -647,6 +647,7 @@ struct MetalBackend::Impl {
     u64 report_carried = 0;      // D-1025
     u64 report_stale_synced = 0, report_stale_left = 0; // D-1056
     u64 report_gpu_predicates = 0, report_predicated_draws = 0; // D-1058
+    u64 report_wait_submits = 0;                                // D-1091
     u64 report_depth_bounds = 0; // D-261
     u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
     u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947
@@ -821,6 +822,7 @@ struct MetalBackend::Impl {
     static constexpr u32 kMainMirrorBytes = 1u << 20;
     bool main_mirrored(const Surface& s) const;
     bool main_mirror = true; // PSPOCKET_RSX_NO_MAIN_MIRROR=1: off
+    bool wait_submit = true; // PSPOCKET_RSX_NO_WAIT_SUBMIT=1: off (D-1091)
     bool read_watch_owner = false;
     std::vector<SurfaceSpan> read_watch_spans;
     std::unordered_set<u64> read_watch_logged;

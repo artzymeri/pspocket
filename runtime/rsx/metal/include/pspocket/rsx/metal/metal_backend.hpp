@@ -212,6 +212,7 @@ struct BackendStats {
     u64 stale_synced = 0, stale_left = 0;
     // Conditional rendering decided on the GPU (D-1058): the predicates set up, and the draw calls made under one.
     u64 gpu_predicates = 0, predicated_draws = 0;
+    u64 wait_submits = 0; // render buffers submitted in long RSX waits, for their reports (D-1091)
     // PSPOCKET_RSX_WATCH_CPU_READS (D-1059): first touches of watched pages by the CPU or SPUs, and of them those in a
     // GPU-held target's pixel bytes.
     u64 cpu_page_touches = 0, cpu_reads_gpu_targets = 0;
@@ -287,6 +288,10 @@ public:
     bool report_pending(u32 value_addr) override;
     bool predicate_on_gpu(u32 value_addr) override; // D-1058
     void end_predicate() override;
+    void long_wait() override; // D-1091
+    // For a stall's report (D-1091; any thread, read without the RSX thread's locks: a diagnostic): the reports not yet
+    // in a committed render buffer, the reports in flight by value address, the deferred actions queued.
+    std::string state_text();
 
     const BackendStats& stats() const;
     // Any thread: frees what can be made again (textures and surfaces unused for 60 flips, finished readbacks) at the

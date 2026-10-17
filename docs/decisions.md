@@ -17801,3 +17801,18 @@ Work in progress: held for the freeze at GTA V's front door (D-1091).
   pre-D-1025 build's (D-1037).
 - Tests: "two reports of one command buffer have rising timestamps" (the start and end of a 20-draw stretch: t1 > t0
   > the test's start).
+
+## D-1091 · 2026-10-17 · A long RSX wait submits the render buffer holding ZPASS reports (GTA V's front-door freeze)
+
+Agent h2's hunt (its clone holds the full write-up and diagnostics, to be merged): GTA V froze as Michael walked out of
+the front door, 1 run in 10 on a quiet Mac and 3 in 11 with another job on the GPU (2 of 2 in the first bench pass):
+the RSX parked on the frame's jump to itself (FIFO 0x00b1ee10), RenderThread in sys_event_flag_wait, the EDGE and
+GraphicsMain SPU jobs busy-polling memory for a value that never came. Since D-1021 a ZPASS report's whole record,
+ready word last, is written when its render buffer completes; with the RSX parked waiting for the guest and no flip or
+budget submit, that buffer was never submitted, so the reports the jobs waited for never became ready.
+- Rsx::wait_for_work calls Backend::long_wait once a wait has lasted Config::long_wait_us (3 ms; GTA V parks about 27
+  times a frame for 0.5 ms each, below it; PSPOCKET_RSX_LONG_WAIT_US); the Metal backend then submits the open render
+  buffer when it holds reports (stats wait_submits, in the 300-frame alarms line). PSPOCKET_RSX_NO_WAIT_SUBMIT=1 keeps
+  the old behaviour. A Metal test: a report's ready word arrives while the RSX waits, with no flip.
+- h2's runs under GPU load: 0 of 15 froze with it, 3 of 11 without (its one-binary interleaved A/B was cut short).
+  Taken into main ahead of h2's other changes for the iPhone install.

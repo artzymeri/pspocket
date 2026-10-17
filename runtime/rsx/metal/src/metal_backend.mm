@@ -312,6 +312,8 @@ bool MetalBackend::Impl::init()
         stale_sync = false; // D-1056's comparison
     if (const char* v = std::getenv("PSPOCKET_RSX_NO_MAIN_MIRROR"); v && *v && std::strcmp(v, "0") != 0)
         main_mirror = false; // D-1059's comparison
+    if (const char* v = std::getenv("PSPOCKET_RSX_NO_WAIT_SUBMIT"); v && *v && std::strcmp(v, "0") != 0)
+        wait_submit = false; // D-1091's comparison: reports held until the next submit, as before
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
     if (std::getenv("PSPOCKET_RSX_STRICT_FEEDBACK") || exact) feedback_cached = false;   // D-947's comparison, D-1029
     if (!config.shader_cache.empty() || !config.shader_seeds.empty()) {
@@ -3244,11 +3246,14 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
                 if (w.alarms.v[i]) raised += std::format("{}{} {}", raised.empty() ? "" : ", ", kAlarmNames[i], w.alarms.v[i]);
             PS_LOG_INFO(kChan, "alarms (last {}): {}; {:.2f} targets a frame started with the bytes of those under them; "
                 "{:.2f} reads a frame under a GPU-newer target written back first, {:.2f} left (old, D-1056); "
-                "{:.2f} conditional renders a frame decided on the GPU, {:.2f} draw calls under them (D-1058)",
+                "{:.2f} conditional renders a frame decided on the GPU, {:.2f} draw calls under them (D-1058); "
+                "{:.2f} render buffers a frame submitted in long RSX waits, for their reports (D-1091)",
                 w.flips, raised.empty() ? "none" : raised, per_frame(m.stats.targets_carried, m.report_carried),
                 per_frame(m.stats.stale_synced, m.report_stale_synced), per_frame(m.stats.stale_left, m.report_stale_left),
                 per_frame(m.stats.gpu_predicates, m.report_gpu_predicates),
-                per_frame(m.stats.predicated_draws, m.report_predicated_draws));
+                per_frame(m.stats.predicated_draws, m.report_predicated_draws),
+                per_frame(m.stats.wait_submits, m.report_wait_submits));
+            m.report_wait_submits = m.stats.wait_submits;
             m.report_gpu_predicates = m.stats.gpu_predicates;
             m.report_predicated_draws = m.stats.predicated_draws;
             m.report_carried = m.stats.targets_carried;
@@ -3846,6 +3851,32 @@ bool MetalBackend::predicate_on_gpu(u32 value_addr)
     }
     m.stats.gpu_predicates++;
     return true;
+}
+
+// The RSX has waited for the guest a while (D-1091): ZPASS reports registered since the last submit complete only with
+// their render buffer, and the guest may be waiting for one before it gives the RSX more (a whole report's ready word,
+// D-1021): the buffer goes to the GPU now. Not at every wait: GTA V's ~27 short parks a frame would each split a pass.
+void MetalBackend::long_wait()
+{
+    if (!impl_->wait_submit || !impl_->device || impl_->pending_reports.empty()) return;
+    @autoreleasepool {
+        impl_->submit(false);
+        impl_->stats.wait_submits++;
+    }
+}
+
+// For the watchdog's stall report (D-1091), from its thread: the counts are read without the RSX thread's order, which
+// is parked or stuck when a report is asked for; a dev aid only.
+std::string MetalBackend::state_text()
+{
+    std::string s = std::format("RSX backend: {} report(s) not yet submitted, {} deferred action(s) queued, render buffer {}",
+        impl_->pending_reports.size(), impl_->deferred.size(), impl_->render_cb ? "open" : "none");
+    std::lock_guard lock(impl_->reports_in_flight->mutex);
+    s += std::format(", {} report address(es) in flight:", impl_->reports_in_flight->count.size());
+    u32 n = 0;
+    for (const auto& [addr, count] : impl_->reports_in_flight->count)
+        if (n++ < 16) s += std::format(" {:#010x}x{}", addr, count);
+    return s + "\n";
 }
 
 void MetalBackend::end_predicate()

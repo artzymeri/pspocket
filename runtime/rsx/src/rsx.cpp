@@ -173,6 +173,8 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
     if (const char* e = std::getenv("PSPOCKET_RSX_EARLY_REPORTS"); e && *e && std::strcmp(e, "0") != 0)
         config_.early_reports = true; // D-1021
     if (const char* e = std::getenv("PSPOCKET_RSX_EXACT"); e && *e && std::strcmp(e, "0") != 0) config_.exact = true;
+    if (const char* e = std::getenv("PSPOCKET_RSX_LONG_WAIT_US"); e && *e)
+        config_.long_wait_us = static_cast<u32>(std::strtoul(e, nullptr, 0)); // D-1091
     // PSPOCKET_RSX_CPU_AB=N[:MASK] (D-953): bit 32 of MASK (all by default) is the FIFO's argument runs (D-955).
     if (const char* f = std::getenv("PSPOCKET_RSX_CPU_AB")) {
         const char* mask = std::strchr(f, ':');
@@ -885,8 +887,15 @@ void Rsx::wait_for_work(RunStatus why)
     // Sleep with exponential backoff; never spin (plan section 6 "Threading": busy waits waste a core).
     auto backoff = std::chrono::microseconds(config_.min_wait_us);
     const auto max_backoff = std::chrono::microseconds(config_.max_wait_us);
+    bool long_wait = false;
     while (!blocked_condition_cleared()) {
         backend_.run_deferred(false); // a label the CPU waits for may be behind a deferred readback (D-107)
+        // A report's ready word the guest waits for before it gives the RSX more may be held in a render buffer that
+        // nothing else submits while the RSX waits: GTA V's front door froze so (D-1091).
+        if (!long_wait && ps_host_now_ns() - t0 >= u64{config_.long_wait_us} * 1000) {
+            backend_.long_wait();
+            long_wait = true;
+        }
         std::unique_lock lock(wake_mutex_);
         wake_cv_.wait_for(lock, backoff, [this] { return wake_pending_; });
         wake_pending_ = false;

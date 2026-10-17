@@ -81,6 +81,10 @@ struct Config {
     // thread early.
     u32 min_wait_us = 10;
     u32 max_wait_us = 200;
+    // A wait this long hands the backend what it holds back that the guest may be waiting for (Backend::long_wait,
+    // D-1091). GTA V's RSX parks on a jump to itself about 27 times a frame for 0.5 ms each: past them.
+    // PSPOCKET_RSX_LONG_WAIT_US sets it.
+    u32 long_wait_us = 3000;
     // Value written for NV4097_GET_REPORT(ZPASS_PIXEL_CNT) while occlusion queries are not implemented.
     u32 fake_zpass_count = 0xFFFF;
     // NV4097_GET_REPORT(ZPASS_PIXEL_CNT) writes its timestamp and ready word (pad 0) when the method runs and the count

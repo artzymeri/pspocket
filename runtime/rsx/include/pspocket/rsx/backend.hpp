@@ -127,6 +127,9 @@ public:
         return false;
     }
     virtual void end_predicate() {}
+    // The RSX thread has waited Config::long_wait_us (the FIFO empty, or blocked on what the guest must do): work the
+    // backend holds back that the guest may be waiting for goes to the GPU now (D-1091). Once a wait.
+    virtual void long_wait() {}
 };
 
 } // namespace pspocket::rsx
