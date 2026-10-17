@@ -721,6 +721,7 @@ RunSummary g_summary;
 // --rsx-capture-from, then starts at the RSX's next step boundary.
 std::atomic<rsx::CaptureWriter*> g_capture_trigger{nullptr};
 std::string g_capture_on;
+std::string g_drawlog_dir; // PSPOCKET_RSX_DRAWLOG_RING: the summary's folder, for the ring at each glitch (D-1036)
 u64 g_capture_on_from = 0;
 
 // What the summary needs from main, so that a fault, a fatal error or a stall writes it too (D-1043).
@@ -1282,9 +1283,19 @@ int main(int argc, char** argv)
         }
     }
     if (!summary_path.empty()) log::set_sink(summary_sink, nullptr); // warnings and errors counted by shape
+    if (!summary_path.empty() && std::getenv("PSPOCKET_RSX_DRAWLOG_RING")) {
+        const auto dir = std::filesystem::path(summary_path).parent_path();
+        g_drawlog_dir = dir.empty() ? std::string(".") : dir.string();
+    }
     if (!summary_path.empty()) // called under g_summary.mutex, from the thumbnail callback
         g_summary.watch.on_event = [](const loader::FrameWatch::Event& e) {
             g_summary.glitches.push_back(e);
+            // The draw log's last frames, the glitch's among them (D-1036).
+            if (!g_drawlog_dir.empty() && g_metal) {
+                const std::string path = std::format("{}/drawlog-{}-{}.txt", g_drawlog_dir,
+                    loader::FrameWatch::name(e.kind), e.flip);
+                if (g_metal->dump_drawlog(path)) std::printf("draw log: %s\n", path.c_str());
+            }
             if (!g_capture_on.empty() && g_capture_on == loader::FrameWatch::name(e.kind) && e.flip >= g_capture_on_from) {
                 if (rsx::CaptureWriter* c = g_capture_trigger.load(); c && c->arm(0))
                     std::printf("rsx capture: armed by the %s frame at flip %llu\n", g_capture_on.c_str(),

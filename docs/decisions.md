@@ -17619,3 +17619,32 @@ end reads guest memory was checked for what it does about a target the GPU drew 
     the report shows exactly when its count is non-zero, against a wrong older count in memory; fast mode decides on
     the GPU (one predicate, no CPU skip, no alarm) before and after the count arrives, exact mode on the CPU;
   - the occlusion test: its conditional draws are decided on the GPU with the same pixels.
+## D-1036 · 2026-10-17 · The draw log: light per-draw records for glitches that last one frame
+
+A glitch that lasts one frame (GTA V's grey wedge across the sky) is over before a detector can start a frame trace,
+and a capture's start writes every target back, which changes the scene (D-1054). The draw log records every draw
+cheaply, so a bad frame found afterwards can be compared with the frames around it.
+- Each draw gets a fixed-size record, filled where the frame trace formats its line and formatted only when written:
+  - program: fragment program hash, vertex program start;
+  - targets: colour and depth targets with format and size, colour mask;
+  - state: depth, stencil, blend and cull state, whether occlusion is counted;
+  - up to 20 textures, each with its address, format, size and source (memory, target, converted, laid, written
+    back, corner, depth);
+  - for an indexed draw, a hash of the index bytes it copied, and a hash of the vertex bytes;
+  - a skipped draw, with the reason.
+- `PSPOCKET_RSX_DRAWLOG=FROM-TO:FILE` keeps frames FROM to TO in memory and writes them to FILE once TO is reached
+  (one pause after the window, none inside it). `PSPOCKET_RSX_DRAWLOG_RING=N` keeps the last N frames.
+  `MetalBackend::dump_drawlog` writes the ring, and pspocket-boot calls it for each FrameWatch glitch into the
+  summary's folder (`drawlog-<kind>-<flip>.txt`). On the rain-street route the range takes about 0.2 KB a draw and
+  76 MB for 360 frames.
+- Test: "the draw log's ring holds each frame's draws" (three frames, a ring of two: frames 2 and 3, each with its
+  draw and its target).
+- First use, GTA V's sky wedge on rain-street:
+  - A one-frame flat grey polygon across the sky, in front of the sky and behind the trees. It comes at the same
+    point of the route, flips 3770 to 3772 (runs dl1, dlb5, dlh2, skyd-on2), and also at 3712 and 3747. About one
+    run in two has one.
+  - The bad frame's draws (dlh2 3772) against 3771 and 3773: every program is there, and four occlusion probes
+    (abd449a846bf6eb0) and four 128x128 shadow-map draws (64450bf999d9b9e3) are missing, which is the game's own
+    choice for that frame.
+  - No static draw's index or vertex bytes differ from both neighbours. The wedge's draw is not found yet; next is a
+    capture from flip 3700 replayed with --draws.

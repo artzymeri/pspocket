@@ -291,6 +291,9 @@ public:
     // Any thread: traces the frame after the next flip as MetalBackendConfig::trace_frame does (the iOS app, when a
     // trace is asked for over USB: D-947).
     void trace_next_frame();
+    // Any thread: writes the draw log's ring (PSPOCKET_RSX_DRAWLOG_RING=N, D-1036) to `path`, the oldest frame first;
+    // false when the ring is off or empty.
+    bool dump_drawlog(const std::string& path);
     // The draws drawn so far by fragment program (its content hash), at the last 300-frame report, most first: a run's
     // draw signature, which scripts/rsx_ab.py compares between the fast and the exact modes (D-1029).
     struct DrawSignature {

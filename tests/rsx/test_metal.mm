@@ -4,6 +4,7 @@
 // culling, texturing, render-to-texture, readback through NV0039, flip and present).
 
 #include <catch_amalgamated.hpp>
+#include <fstream>
 
 #import <Metal/Metal.h>
 
@@ -4352,6 +4353,36 @@ TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet is decid
             CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) ==
                   (visible ? std::array<u8, 4>{0xff, 0xff, 0x00, 0x00} : std::array<u8, 4>{0, 0, 0, 0}));
         }
+}
+
+TEST_CASE("metal e2e: the draw log's ring holds each frame's draws (D-1036)")
+{
+    REQUIRE_METAL();
+    setenv("PSPOCKET_RSX_DRAWLOG_RING", "2", 1);
+    E2E e;
+    unsetenv("PSPOCKET_RSX_DRAWLOG_RING");
+    e.put_local_bytes(kFpOffset, fp_color(false));
+    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+    auto b = e.at(0);
+    setup_surface(b, kSurfaceOffset);
+    upload_vertex_program(b);
+    set_fragment_program(b, kFpOffset, 0x40);
+    bind_vertex_arrays(b);
+    for (int frame = 0; frame < 3; frame++) { // three frames of one draw each: the ring keeps the last two
+        draw_triangle(b);
+        b.method(m::GCM_FLIP_COMMAND, 0);
+    }
+    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+    const std::string path = (std::filesystem::temp_directory_path() / "pspocket-drawlog-test.txt").string();
+    REQUIRE(e.backend->dump_drawlog(path));
+    std::ifstream in(path);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::filesystem::remove(path);
+    INFO(text);
+    CHECK(text.find("frame 1:") == std::string::npos);
+    CHECK(text.find("frame 2: 1 draws") != std::string::npos);
+    CHECK(text.find("frame 3: 1 draws") != std::string::npos);
+    CHECK(text.find(std::format("-> {:#010x}", PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset)) != std::string::npos);
 }
 
 TEST_CASE("metal e2e: vertex arrays over a target read what the GPU drew there (render to vertex buffer, D-1034)")

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <map>
@@ -398,6 +399,51 @@ struct MetalBackend::Impl {
     };
     std::vector<TracedTexture> trace_textures;
     const char* bind_source = ""; // how bind_texture served the last texture (for the trace)
+
+    // ---- the draw log (D-1036): light records of every draw, for one-frame glitches ----
+    // PSPOCKET_RSX_DRAWLOG=FROM-TO:FILE writes the frames FROM..TO to FILE as they end; PSPOCKET_RSX_DRAWLOG_RING=N
+    // keeps the last N frames for dump_drawlog (pspocket-boot calls it when its frame watch sees a glitch). Fixed-size
+    // records filled where the frame trace formats its lines, formatted only when written: the run keeps its timing.
+    struct DrawRecord {
+        struct Tex {
+            u32 addr = 0;
+            u16 fmt = 0, w = 0, h = 0;
+            u8 unit = 0, source = 0; // source: kSrc* below
+        };
+        u32 index = 0, prim = 0, vertices = 0, vp_start = 0;
+        u64 fp_hash = 0;
+        std::array<u32, 4> color{};
+        u32 color_count = 0, color_fmt = 0, depth = 0, width = 0, height = 0;
+        u32 mask = 0, z = 0, stencil = 0, blend = 0, blend_factors = 0, cull = 0;
+        u64 ihash = 0, vhash = 0; // the index and vertex bytes the draw copied from guest memory
+        u32 ibytes = 0, vbytes = 0;
+        bool counted = false;
+        const char* skipped = nullptr; // why the backend skipped it (a static text), or nullptr
+        u32 tex_count = 0;
+        std::array<Tex, 20> tex{};
+    };
+    enum : u8 { kSrcNone, kSrcMemory, kSrcTarget, kSrcConverted, kSrcLaid, kSrcWrittenBack, kSrcCorner, kSrcDepth,
+        kSrcDisabled, kSrcOther };
+    struct DrawLogFrame {
+        u64 flip = 0;
+        std::vector<DrawRecord> draws;
+    };
+    bool drawlog_on = false;
+    u64 drawlog_from = 0, drawlog_to = 0;
+    std::string drawlog_path;
+    usize drawlog_ring = 0;
+    DrawLogFrame drawlog_cur;
+    std::vector<DrawRecord::Tex> drawlog_tex; // this draw's textures, as they are bound
+    u64 drawlog_ihash = 0, drawlog_vhash = 0; // this draw's copies
+    u32 drawlog_ibytes = 0, drawlog_vbytes = 0;
+    static u64 drawlog_hash(u64 h, const u8* p, usize n);
+    std::deque<DrawLogFrame> drawlog_frames; // the ring, under drawlog_mutex
+    std::vector<DrawLogFrame> drawlog_range; // PSPOCKET_RSX_DRAWLOG's frames until its last
+    std::mutex drawlog_mutex;
+    DrawRecord* drawlog_record(); // the draw's record, nullptr when the log is off for this frame
+    static u8 drawlog_source(const char* bind_source);
+    void drawlog_flip(u64 flip); // the frame ends: to the file or the ring
+    static void write_drawlog_frame(std::FILE* f, const DrawLogFrame& frame);
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;

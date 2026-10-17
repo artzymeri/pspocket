@@ -280,6 +280,21 @@ bool MetalBackend::Impl::init()
         tracing = true;
         PS_LOG_INFO("rsx.trace", "frame 1 begins");
     }
+    // The draw log (D-1036): PSPOCKET_RSX_DRAWLOG=FROM-TO:FILE, or PSPOCKET_RSX_DRAWLOG_RING=N for dump_drawlog.
+    if (const char* v = std::getenv("PSPOCKET_RSX_DRAWLOG")) {
+        char* end = nullptr;
+        drawlog_from = std::strtoull(v, &end, 0);
+        drawlog_to = end && *end == '-' ? std::strtoull(end + 1, &end, 0) : drawlog_from;
+        if (end && *end == ':') drawlog_path = end + 1;
+        drawlog_on = !drawlog_path.empty();
+        if (drawlog_on) {
+            if (std::FILE* f = std::fopen(drawlog_path.c_str(), "w")) std::fclose(f);
+        }
+    }
+    if (const char* v = std::getenv("PSPOCKET_RSX_DRAWLOG_RING")) {
+        drawlog_ring = std::strtoull(v, nullptr, 0);
+        drawlog_on = drawlog_on || drawlog_ring;
+    }
     if (const char* v = std::getenv("PSPOCKET_RSX_NO_STALE_SYNC"); v && *v && std::strcmp(v, "0") != 0)
         stale_sync = false; // D-1056's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
@@ -1514,8 +1529,16 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // A skipped draw names why in the frame trace too (D-084): a draw the trace does not show cannot be told apart from
     // one the game never made.
     const char* skip_reason = "";
+    drawlog_ihash = drawlog_vhash = 0;
+    drawlog_ibytes = drawlog_vbytes = 0;
     auto skip = [&](std::string why) {
         stats.draws_skipped++;
+        if (drawlog_on) [[unlikely]] {
+            if (DrawRecord* r = drawlog_record()) {
+                r->prim = static_cast<u32>(d.primitive);
+                r->skipped = why.empty() ? (*skip_reason ? skip_reason : "?") : "unsupported";
+            }
+        }
         if (tracing) {
             PS_LOG_INFO("rsx.trace", "#{} draw SKIPPED ({}{}) ->{}", ++trace_count, why.empty() ? skip_reason : why.c_str(),
                 why.empty() && !*skip_reason ? "?" : "", describe_targets(draw_targets));
@@ -1705,6 +1728,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
     // ---- textures: resolved before the pass opens (copying a bound render target may end a pass) ----
     std::array<id<MTLTexture>, kFragmentTextureCount> bound{};
     std::string trace_tex;
+    drawlog_tex.clear();
     shader::MslFsParams fs{};
     // Blending in the shader (D-948): the translation's only; the interpreter's draws blend as Metal can.
     shader_blend = interpret ? 0 : fo.blend_in_shader;
@@ -1737,6 +1761,9 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             zs->last_used = tick;
             zs->last_frame = stats.flips;
             stats.surface_samples++;
+            if (drawlog_on && drawlog_tex.size() < 20) [[unlikely]]
+                drawlog_tex.push_back({zs->address, static_cast<u16>(ti.base_format()), static_cast<u16>(ti.width),
+                    static_cast<u16>(ti.height), static_cast<u8>(t), kSrcDepth});
             if (tracing) {
                 trace_tex += std::format(" t{} {:#010x} fmt {:#04x} {}x{} (depth buffer, sampled)", t, zs->address,
                     ti.base_format(), ti.width, ti.height);
@@ -1745,6 +1772,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         }
         bool ok = true;
         id<MTLTexture> tex = ti.enabled ? bind_texture(ti, t, ok) : nil;
+        if (drawlog_on && drawlog_tex.size() < 20) [[unlikely]]
+            drawlog_tex.push_back({rsx->translate(ti.offset, ti.location).value_or(0), static_cast<u16>(ti.base_format()),
+                static_cast<u16>(ti.width), static_cast<u16>(ti.height), static_cast<u8>(t),
+                static_cast<u8>(ti.enabled ? drawlog_source(bind_source) : kSrcDisabled)});
         if (tracing) {
             trace_tex += std::format(" t{} {:#010x} fmt {:#04x} {}x{}{} ({})", t,
                 rsx->translate(ti.offset, ti.location).value_or(0), ti.base_format(), ti.width, ti.height,
@@ -1787,6 +1818,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         const MTLTextureType wanted = vt.cubemap && vt.dimension == 2 ? MTLTextureTypeCube
                                     : vt.dimension == 3               ? MTLTextureType3D
                                                                       : MTLTextureType2D;
+        if (drawlog_on && drawlog_tex.size() < 20) [[unlikely]]
+            drawlog_tex.push_back({rsx->translate(vt.offset, vt.location).value_or(0), static_cast<u16>(vt.base_format()),
+                static_cast<u16>(vt.width), static_cast<u16>(vt.height), static_cast<u8>(16 + t),
+                static_cast<u8>(vt.enabled ? drawlog_source(bind_source) : kSrcDisabled)});
         vbound[t] = tex && tex.textureType == wanted ? tex
                   : wanted == MTLTextureTypeCube      ? dummy_cube
                   : wanted == MTLTextureType3D        ? dummy_volume
@@ -1798,6 +1833,34 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         }
     }
 
+    if (drawlog_on) [[unlikely]] {
+        if (DrawRecord* r = drawlog_record()) {
+            const BlendInfo b = state.blend();
+            const ColorMaskInfo cm = state.color_mask();
+            r->prim = static_cast<u32>(d.primitive);
+            for (const DrawRange& dr : d.ranges) r->vertices += dr.count;
+            r->vertices += static_cast<u32>(d.array_elements.size()) + d.immediate_vertex_count +
+                static_cast<u32>(d.inline_words.size());
+            r->vp_start = state.reg(m::NV4097_SET_TRANSFORM_PROGRAM_START);
+            r->fp_hash = fprog ? fprog->hash : 0;
+            r->color_count = targets.color_count;
+            for (u32 i = 0; i < targets.color_count && i < 4; i++) r->color[i] = targets.color[i] ? targets.color[i]->address : 0;
+            r->color_fmt = targets.color_count && targets.color[0] ? targets.color[0]->gcm_format : 0;
+            r->depth = targets.depth ? targets.depth->address : 0;
+            r->width = targets.width, r->height = targets.height;
+            r->mask = (cm.mask[0] ? 8u : 0u) | (cm.mask[1] ? 4u : 0u) | (cm.mask[2] ? 2u : 0u) | (cm.mask[3] ? 1u : 0u);
+            r->z = (ds.depth_test ? 0x80000000u : 0u) | (ds.depth_write ? 0x40000000u : 0u) | (ds.depth_func & 0xffff);
+            r->stencil = ds.stencil_test ? (0x80000000u | ((ds.front.func & 0xfff) << 16) | (ds.front.ref & 0xff)) : 0u;
+            r->blend = (b.enable || b.enable_mrt) ? (0x80000000u | (b.equation_rgb & 0xffff)) : 0u;
+            r->blend_factors = ((b.sfactor_rgb & 0xffff) << 16) | (b.dfactor_rgb & 0xffff);
+            r->cull = raster.cull_enable ? raster.cull_face : 0u;
+            r->counted = zpass_on;
+            r->ihash = drawlog_ihash, r->vhash = drawlog_vhash;
+            r->ibytes = drawlog_ibytes, r->vbytes = drawlog_vbytes;
+            r->tex_count = static_cast<u32>(std::min<usize>(drawlog_tex.size(), r->tex.size()));
+            for (u32 i = 0; i < r->tex_count; i++) r->tex[i] = drawlog_tex[i];
+        }
+    }
     if (tracing) {
         trace_targets_of(targets);
         const BlendInfo b = state.blend();
@@ -1951,6 +2014,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             sync_gpu_held(*ea, bytes, "an index array");
             u8* dst = index_data.data + at;
             std::memcpy(dst, mem.host(*ea), bytes);
+            if (drawlog_on) [[unlikely]] {
+                drawlog_ihash = drawlog_hash(drawlog_ihash, dst, bytes);
+                drawlog_ibytes += bytes;
+            }
             bool has_all_ones = false;
             if (fast(kFastIndexScan)) { // in NEON (D-957)
                 IndexScan scan{min_vi, max_vi, false};
@@ -2113,6 +2180,10 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             before_access(sp.ea, sp.end - sp.ea, false);
             std::memcpy(vertex_data.data + sp.offset, mem.host(sp.ea), sp.end - sp.ea);
             stats.vertex_bytes_copied += sp.end - sp.ea;
+            if (drawlog_on) [[unlikely]] {
+                drawlog_vhash = drawlog_hash(drawlog_vhash, vertex_data.data + sp.offset, sp.end - sp.ea);
+                drawlog_vbytes += sp.end - sp.ea;
+            }
         }
         overlay_vertex_targets(spans, vertex_data);
         for (const Copy& c : copies) {
@@ -2719,6 +2790,7 @@ void MetalBackend::Impl::do_flip(const FlipRequest& request)
     }
     frame_event_value++;
     [cb encodeSignalEvent:frame_event value:frame_event_value];
+    if (drawlog_on) drawlog_flip(request.flip_index); // D-1036
     if (trace_requested.exchange(false, std::memory_order_acq_rel) && !tracing) config.trace_frame = request.flip_index + 1;
     if (config.trace_frame && request.flip_index + 1 == config.trace_frame) {
         tracing = true;
@@ -2809,6 +2881,116 @@ MetalBackend::DrawSignature MetalBackend::draw_signature() const
 
 void MetalBackend::trim_memory() { impl_->trim_requested.store(true, std::memory_order_release); }
 void MetalBackend::trace_next_frame() { impl_->trace_requested.store(true, std::memory_order_release); }
+
+// ---- the draw log (D-1036) ----
+
+MetalBackend::Impl::DrawRecord* MetalBackend::Impl::drawlog_record()
+{
+    // Around the range (drawlog_flip keeps the frames in it by their flip index).
+    if (!drawlog_ring && (drawlog_path.empty() || stats.flips + 2 < drawlog_from || stats.flips > drawlog_to + 1))
+        return nullptr;
+    DrawRecord& r = drawlog_cur.draws.emplace_back();
+    r = DrawRecord{};
+    r.index = static_cast<u32>(drawlog_cur.draws.size());
+    return &r;
+}
+
+u64 MetalBackend::Impl::drawlog_hash(u64 h, const u8* p, usize n)
+{
+    if (!h) h = 0xcbf29ce484222325ull;
+    usize i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+u8 MetalBackend::Impl::drawlog_source(const char* s)
+{
+    const std::string_view v = s ? s : "";
+    if (v == "memory") return kSrcMemory;
+    if (v == "target") return kSrcTarget;
+    if (v == "target, converted") return kSrcConverted;
+    if (v == "memory, target laid over") return kSrcLaid;
+    if (v == "memory, target written back") return kSrcWrittenBack;
+    if (v == "target corner") return kSrcCorner;
+    return kSrcOther;
+}
+
+void MetalBackend::Impl::write_drawlog_frame(std::FILE* f, const DrawLogFrame& frame)
+{
+    static const char* const kSources[] = {"-", "memory", "target", "converted", "laid", "written back", "corner",
+        "depth", "disabled", "other"};
+    std::fprintf(f, "frame %llu: %zu draws\n", static_cast<unsigned long long>(frame.flip), frame.draws.size());
+    for (const DrawRecord& r : frame.draws) {
+        if (r.skipped) {
+            std::fprintf(f, "#%u SKIPPED (%s) prim %u\n", r.index, r.skipped, r.prim);
+            continue;
+        }
+        std::string line = std::format("#{} prim {} x{} fp {:016x} vp {:#x} ->", r.index, r.prim, r.vertices, r.fp_hash,
+            r.vp_start);
+        for (u32 i = 0; i < r.color_count && i < 4; i++) line += std::format(" {:#010x}", r.color[i]);
+        line += std::format(" fmt {} {}x{} z {:#010x}; mask {:x}; zs {:#x}; stencil {:#x}; blend {:#x} {:#x}; cull {:#x}{}",
+            r.color_fmt, r.width, r.height, r.depth, r.mask, r.z, r.stencil, r.blend, r.blend_factors, r.cull,
+            r.counted ? "; counted" : "");
+        if (r.ibytes) line += std::format("; idx {} {:016x}", r.ibytes, r.ihash);
+        if (r.vbytes) line += std::format("; vtx {} {:016x}", r.vbytes, r.vhash);
+        for (u32 i = 0; i < r.tex_count; i++) {
+            const DrawRecord::Tex& t = r.tex[i];
+            line += std::format(" | {}{} {:#010x} {:#x} {}x{} {}", t.unit >= 16 ? "vt" : "t", t.unit >= 16 ? t.unit - 16 : t.unit,
+                t.addr, t.fmt, t.w, t.h, t.source < std::size(kSources) ? kSources[t.source] : "?");
+        }
+        std::fprintf(f, "%s\n", line.c_str());
+    }
+}
+
+void MetalBackend::Impl::drawlog_flip(u64 flip)
+{
+    drawlog_cur.flip = flip;
+    // The range: kept in memory and written once it ends (formatting each frame as it ends would slow the frames
+    // looked at).
+    if (!drawlog_path.empty() && !drawlog_cur.draws.empty() && flip >= drawlog_from && flip <= drawlog_to)
+        drawlog_range.push_back(drawlog_cur); // a copy: the ring may keep the frame too
+    if (!drawlog_path.empty() && flip >= drawlog_to && !drawlog_range.empty()) {
+        if (std::FILE* f = std::fopen(drawlog_path.c_str(), "w")) {
+            for (const auto& frame : drawlog_range) write_drawlog_frame(f, frame);
+            std::fclose(f);
+            PS_LOG_INFO(kChan, "draw log: frames {} to {} in {}", drawlog_range.front().flip, drawlog_range.back().flip,
+                drawlog_path);
+        }
+        drawlog_range.clear();
+        drawlog_range.shrink_to_fit();
+        drawlog_path.clear();
+        drawlog_on = drawlog_ring != 0;
+    }
+    if (drawlog_ring) {
+        std::lock_guard lock(drawlog_mutex);
+        drawlog_frames.push_back(std::move(drawlog_cur));
+        drawlog_cur = {};
+        if (drawlog_frames.size() > drawlog_ring) {
+            drawlog_cur.draws = std::move(drawlog_frames.front().draws); // its storage, again
+            drawlog_frames.pop_front();
+        }
+    }
+    drawlog_cur.draws.clear();
+}
+
+bool MetalBackend::dump_drawlog(const std::string& path)
+{
+    Impl& m = *impl_;
+    if (!m.drawlog_ring) return false;
+    std::lock_guard lock(m.drawlog_mutex);
+    if (m.drawlog_frames.empty()) return false;
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return false;
+    for (const auto& frame : m.drawlog_frames) Impl::write_drawlog_frame(f, frame);
+    std::fclose(f);
+    return true;
+}
 
 bool MetalBackend::valid() const { return impl_->device != nil; }
 void* MetalBackend::device() const { return (__bridge void*)impl_->device; }
