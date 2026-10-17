@@ -13,9 +13,10 @@
 # every time), then tries each point alone out: what is left is a set where every point matters.
 #
 # gta5: the gate's prologue walk (games/gta5/walk-prologue.txt, 128 s). ac: Assassin's Creed (BLES00158) from a fresh
-# copy of its hdd0 through the install into the garden (games/ac1/walk-garden.txt, 330 s), with the game library
-# PSPOCKET_AC_LIBRARY (default inventory/BLES00158/bench-library/game.dylib) and the installed firmware's dev_flash;
-# each run's hdd0 copy (about 3.4 GB after the install) is removed after it unless --keep.
+# copy of its hdd0, its game folder and save emptied (a first install), through the install into the garden
+# (games/ac1/walk-garden.txt, 330 s), with the game library PSPOCKET_AC_LIBRARY (default <data>/bench-library/
+# game.dylib, data PSPOCKET_AC_DATA, default inventory/BLES00158) and the installed firmware's dev_flash; each run's
+# hdd0 copy (1.3 GB after the install) is removed after it unless --keep, and none is made under 11 GB free.
 # Runs go to inventory/shake/<stamp>/ (game output: never committed, CLAUDE.md rule 1). Exit 0: no run failed.
 set -u
 cd "$(dirname "$0")/.."
@@ -46,6 +47,7 @@ mkdir -p $out
 
 # One run: run_one DIR SEED SPEC. Writes DIR/{run.log,summary.json,shake.log,triage.json}; returns 1 when it failed.
 run_one() {
+  setopt localoptions nullglob
   local dir=$1 seed=$2 sp=$3
   mkdir -p $dir
   local -a cmd
@@ -54,16 +56,21 @@ run_one() {
       --bdvd inventory/gta5/disc.iso --flash inventory/firmware/dev_flash --shader-cache inventory/gta5/shaders
       --press-file games/gta5/walk-prologue.txt)
   else
-    local lib=${PSPOCKET_AC_LIBRARY:-inventory/BLES00158/bench-library/game.dylib}
+    local data=${PSPOCKET_AC_DATA:-inventory/BLES00158}
+    local lib=${PSPOCKET_AC_LIBRARY:-$data/bench-library/game.dylib}
     [[ -f $lib ]] || { echo "shake: no AC game library $lib" >&2; return 2; }
+    local free=$(df -g . | awk 'NR==2{print $4}')
+    (( free >= 11 )) || { echo "shake: ${free} GB free: no hdd0 copy under 11 GB" >&2; return 2; }
     mkdir -p $dir/hdd
-    cp -c -R inventory/BLES00158/hdd0 $dir/hdd/hdd0 || return 2
-    cmd=($boot inventory/BLES00158/decrypt/EBOOT.elf --gpu metal --timeout ${timeout_s:-330} --hdd0 $dir/hdd/hdd0
-      --bdvd inventory/BLES00158/disc.iso --flash inventory/firmware/installed/dev_flash --game-library $lib
+    cp -c -R $data/hdd0 $dir/hdd/hdd0 || return 2
+    # A first install, as the bench's install-garden (games/ac1/bench/cases.json): the game's folder and save emptied.
+    rm -rf $dir/hdd/hdd0/game/BLES00158/USRDIR/* $dir/hdd/hdd0/home/00000001/savedata/BLES00158*
+    cmd=($boot $data/decrypt/EBOOT.elf --gpu metal --timeout ${timeout_s:-330} --hdd0 $dir/hdd/hdd0
+      --bdvd $data/disc.iso --flash inventory/firmware/installed/dev_flash --game-library $lib
       --press-file games/ac1/walk-garden.txt)
   fi
   PSPOCKET_SHAKE="seed=$seed;$sp" PSPOCKET_SHAKE_LOG=$dir/shake.log $cmd --summary $dir/summary.json \
-    --stop-on-stall --livelock 60 > $dir/run.log 2>&1
+    --stop-on-stall --livelock 60 --max-footprint 6 > $dir/run.log 2>&1
   echo $? > $dir/exit
   [[ $game == ac && $keep == 0 ]] && rm -rf $dir/hdd
   python3 scripts/triage.py --summary $dir/summary.json $dir/run.log --json > $dir/triage.json 2>/dev/null

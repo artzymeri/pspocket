@@ -17271,3 +17271,26 @@ mean, within the runs' spread (medians 37 to 45), for 15 to 100 ms more of waits
   pipelines, 2,610 ms). The area past the press draws with programs not seen before, compiled on the RSX thread: these
   runs have no shader cache (inventory/work/ac-data has none) and no --async-shaders, as the bench (--async-shaders 4)
   and the phone (D-158) have. Not the waker rule; nothing to change in lv2.
+
+## D-1050 · 2026-10-17 · Shake mode on Assassin's Creed's first install: the PS3-legal family clean, the waker rule's race found with S16 alone
+
+Shake mode's first runs on the game whose install froze on the phone (D-999), from a fresh install as games/ac1/bench's
+install-garden: scripts/shake.sh ac now empties the copy's game folder and save first (a first install, not the
+installed hdd0 it copied before), reads its data from PSPOCKET_AC_DATA, makes no hdd0 copy under 11 GB free, and every
+shake run has --max-footprint 6 (D-1047).
+
+- **"legal", seeds 1 and 2** (every PS3-legal point at its default): both to their 330 s timeout, triaged with only the
+  interpreted-code buckets; the install, the save (cellSaveDataAutoSave2 four times) and the garden; play means 40.6 and
+  about 41 fps (medians 27.8 and 28.6 with the delays). Seed 1's injections: S1 55,947, S2 1,413,597, S3 21,981,
+  S4 29,330, S5 13, S6 129,503, S8 1,116,479 conditional stores failed, S10 593,744, S11 9,287, S12 6,176, S13 12,
+  S14 1,286.
+- **"adversarial", seeds 11 and 12** (S7, S15, S16 at 20%): both clean, 38.0 and 39.9 fps median; 10,967 woken
+  threads overtook their wakers in seed 11.
+- **The race the rule closes, found**: "S16=1000000;S3=500000:2000" (the woken thread always overtakes, the waker
+  delayed up to 2 ms after half its wakes: D-999's 2 ms send delay, for every wake): seeds 22 and 23 crashed 0.8 s
+  into the boot with D-999's registry fault (SIGBUS reading 0x0b0000f8 in the thread registry's
+  sys_lwmutex_trylock, called from 0x70928, after "event queue destroyed with 1 unread event"), seed 21 ran clean.
+  Seed 22 again: 2 of 8 runs. scripts/shake.sh --ddmin 22 --times 8 --timeout 30: S16 alone still fails (1 of 5), so
+  the minimal set is the overtaking itself: with D-999/D-1041's rule in place (S16 off or at 20%), no run failed.
+- So shake mode reproduces the phone's race on the Mac in seconds when the rule is taken away, and finds nothing new
+  under the PS3-legal family in these four runs; more seeds (and the training case) are the next runs.
