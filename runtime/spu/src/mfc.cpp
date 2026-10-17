@@ -18,6 +18,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <format>
+#include <string>
+#include <string_view>
 #include <mutex>
 #include <vector>
 
@@ -215,16 +218,19 @@ void log_write(u32 cmd, u32 pc, u32 ea, u32 size)
     r.next.store(i + 1, std::memory_order_release);
 }
 
-// PSPOCKET_SPU_WATCH=LO-HI: every SPU write into guest [LO, HI) is logged with its command and SPU position (finding
-// what corrupts a PPU stack or a structure; dev only).
+// PSPOCKET_SPU_WATCH=LO-HI[:get]: every SPU write into guest [LO, HI) is logged with its command and SPU position
+// (finding what corrupts a PPU stack or a structure; dev only); with ":get", every read from it as well (which SPU
+// program reads a render target's memory, D-1055).
 struct SpuWatch {
     u32 lo = 0, hi = 0;
+    bool gets = false;
     SpuWatch()
     {
         if (const char* e = std::getenv("PSPOCKET_SPU_WATCH")) {
             char* end = nullptr;
             lo = static_cast<u32>(std::strtoul(e, &end, 0));
-            if (end && *end == '-') hi = static_cast<u32>(std::strtoul(end + 1, nullptr, 0));
+            if (end && *end == '-') hi = static_cast<u32>(std::strtoul(end + 1, &end, 0));
+            gets = end && std::string_view(end) == ":get";
         }
     }
 };
@@ -261,9 +267,10 @@ int transfer(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 
 int transfer_unobserved(SPUContext* ctx, u32 pc, u32 cmd, u32 lsa, u32 eal, u32 size)
 {
-    if (const SpuWatch& w = spu_watch(); w.hi && !is_get(cmd) && eal < w.hi && eal + size > w.lo) {
-        PS_LOG_WARN("spu", "SPU write into the watched range: cmd {:#x} at SPU pc {:#07x}, LSA {:#07x} -> EA {:#010x}, size {:#x}",
-            cmd, pc, lsa, eal, size);
+    if (const SpuWatch& w = spu_watch(); w.hi && (w.gets || !is_get(cmd)) && eal < w.hi && eal + size > w.lo) {
+        PS_LOG_WARN("spu", "SPU {} the watched range: cmd {:#x} at SPU pc {:#07x}, LSA {:#07x} {} EA {:#010x}, size {:#x}{}",
+            is_get(cmd) ? "read from" : "write into", cmd, pc, lsa, is_get(cmd) ? "<-" : "->", eal, size,
+            ctx->program ? std::format(" (program {})", ctx->program->name ? ctx->program->name : "?") : std::string());
     }
     if (size == 0) return 0;
     if (eal >= PS_SPU_RAW_BASE) return group_mmio(ctx, pc, cmd, lsa, eal, size);

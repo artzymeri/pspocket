@@ -17425,3 +17425,28 @@ on a semaphore acquire after 611 of 999. The causes and the changes:
 - Test: "rsx capture: an unarmed capture waits for its trigger, then records the frames after it". Two frames pass
   unrecorded, then arm(0); the next frame is captured from flip 2 and replays to its pixels, and a second arm is
   refused. The capture's races are between the CPU, the SPUs and the RSX thread: no synthetic test reproduces them.
+
+## D-1055 · 2026-10-17 · Which target's write-back removes the skyfall's black block: 0xc2820000, read as vertices
+
+- `PSPOCKET_RSX_WRITEBACK_AT=FLIP[:EA-EA,...]` (debugging): after flip FLIP, at the first step boundary with no packet
+  or call open, the backend writes back what only the GPU holds over the ranges given. Each range writes back every
+  target overlapping it, so `A-A+1` selects the target at A. With no ranges it writes back everything a capture's
+  start does (local memory, the context memory, the IO-mapped main memory). No capture is made.
+- The readback log line now gives the target's format, pitch, bytes and the flip it was last drawn or sampled at.
+- `PSPOCKET_SPU_WATCH=LO-HI:get` logs SPU reads from the range as well as writes, with the SPU program's name.
+- Bisection on GTA V's skyfall-sea route (`PSPOCKET_EDGE_GPU=0`, `PSPOCKET_PRESS_CLOCK=flips`, write-back at flip
+  5436, the block counted in frames 5440-5484 at 10 % dark or more; inventory/work/wb_try.sh, wb_bisect.sh):
+  - no write-back: the block grows from 4 % at 5428 to 62 % at 5472;
+  - all 59 targets: gone from 5440;
+  - targets 0-29 by address: gone. Targets 30-58: block as without. 15-22: gone. 15-18: gone. 15-16: block. 17
+    alone: gone.
+  - The target: **0xc2820000, 128x128, surface format 0x10, pitch 0x200, 64 KB**, drawn every frame.
+  - The block can come back around flip 5488 in any run, the full write-back's too: the target is drawn again and
+    read the same way.
+- The reader (h1's trace): the RSX's own vertex fetch. GTA V draws the water's near patch with attribute 10 from local
+  0x2820000 (X32 float, stride 4) and attribute 9 from 0x2830000: render to vertex buffer. The Metal backend copied a
+  draw's vertex arrays from guest memory with no check for GPU-newer targets over them. Textures have had the overlay
+  since D-137; vertex arrays had nothing, so the patch's heights were last frame's memory, or zero. h1 fixes the
+  vertex path (D-1034).
+- Test: "PSPOCKET_RSX_WRITEBACK_AT writes back the targets over its ranges after its flip, and no others". A range over
+  the target puts its first frame in memory after flip 1; a range elsewhere leaves memory as it was.

@@ -1063,8 +1063,9 @@ bool MetalBackend::Impl::write_back(Surface& s, const char* why)
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
     stats.readbacks++;
-    PS_LOG_WARN(kChan, "expensive GPU readback: {} {:#010x} {}x{} for {} (#{})", s.depth ? "depth buffer" : "surface",
-        s.address, s.width, s.height, why, stats.readbacks);
+    PS_LOG_WARN(kChan, "expensive GPU readback: {} {:#010x} {}x{} for {} (#{}; format {:#x}, pitch {:#x}, {:#x} bytes, last "
+        "drawn or sampled at flip {})", s.depth ? "depth buffer" : "surface", s.address, s.width, s.height, why,
+        stats.readbacks, s.gcm_format, s.pitch, s.bytes(), s.last_frame);
     store_readback(r);
     s.gpu_newer = false;
     return true;

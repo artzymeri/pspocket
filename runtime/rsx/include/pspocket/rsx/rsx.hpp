@@ -349,6 +349,13 @@ private:
     std::atomic<u32> get_{0};
     std::atomic<FifoLocation> fifo_location_{FifoLocation::Auto};
     std::atomic<CaptureWriter*> capture_{nullptr}; // D-1053
+    // PSPOCKET_RSX_WRITEBACK_AT=FLIP[:EA-EA,...] (D-1055, debugging): after flip FLIP, at the first step boundary with
+    // no packet or call open, the backend writes back to memory what only the GPU holds over the ranges given (all of
+    // local memory, the context memory and the IO-mapped main memory, as a capture's start does, when none is): which
+    // target's write-back changes what the game shows.
+    u64 writeback_at_ = 0;
+    std::vector<std::pair<u32, u64>> writeback_ranges_; // ea, size
+    void writeback_now();
     u32 packet_reg_ = 0;
     u32 packet_inc_ = 0;
     u32 packet_remaining_ = 0;

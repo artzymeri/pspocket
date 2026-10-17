@@ -7024,3 +7024,30 @@ TEST_CASE("rsx capture: an unarmed capture waits for its trigger, then records t
     CHECK(r.present_pixels[0] == after_trigger);
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("PSPOCKET_RSX_WRITEBACK_AT writes back the targets over its ranges after its flip, and no others (D-1055)")
+{
+    REQUIRE_METAL();
+    const auto clears_in_memory = [](E2E& e, u32 value) {
+        u32 n = 0;
+        for (u32 i = 0; i < kW * kH; i++) n += e.local32(kSurfaceOffset + i * 4) == value;
+        return n;
+    };
+    for (const bool over_target : {true, false}) {
+        INFO("the range " << (over_target ? "holds" : "misses") << " the target");
+        const std::string spec = over_target
+            ? std::format("1:{:#x}-{:#x}", PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset + 1)
+            : std::format("1:{:#x}-{:#x}", PS_MEM_RSX_LOCAL_BASE + 0x800000, PS_MEM_RSX_LOCAL_BASE + 0x800001);
+        ::setenv("PSPOCKET_RSX_WRITEBACK_AT", spec.c_str(), 1);
+        E2E e;
+        ::unsetenv("PSPOCKET_RSX_WRITEBACK_AT");
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        e.rsx->set_display_buffer(0, {kSurfaceOffset, kW * 4, kW, kH});
+        const u32 at = capture_frame(e, 0, 0xff102030, 0xff0000ff);
+        CHECK(clears_in_memory(e, 0xff102030) == 0); // drawn on the GPU, not in memory
+        capture_frame(e, at, 0xff203040, 0xff00ff00); // the step after flip 1 writes back the first frame's target
+        e.backend->sync();
+        if (over_target) CHECK(clears_in_memory(e, 0xff102030) > 0);
+        else CHECK(clears_in_memory(e, 0xff102030) == 0);
+    }
+}

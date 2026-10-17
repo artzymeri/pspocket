@@ -178,7 +178,43 @@ Rsx::Rsx(GuestMemory& mem, Backend& backend, Config config)
         const char* mask = std::strchr(f, ':');
         if (!mask || (std::strtoul(mask + 1, nullptr, 0) & 32)) fifo_ab_period_ = static_cast<u32>(std::max(1, std::atoi(f)));
     }
+    // PSPOCKET_RSX_WRITEBACK_AT=FLIP[:EA-EA,...] (D-1055)
+    if (const char* w = std::getenv("PSPOCKET_RSX_WRITEBACK_AT"); w && *w) {
+        char* end = nullptr;
+        writeback_at_ = std::max<u64>(1, std::strtoull(w, &end, 0));
+        if (end && *end == ':') {
+            for (const char* p = end + 1; *p;) {
+                const u64 lo = std::strtoull(p, &end, 0);
+                if (end == p || *end != '-') break;
+                const u64 hi = std::strtoull(end + 1, &end, 0);
+                if (hi > lo) writeback_ranges_.emplace_back(static_cast<u32>(lo), hi - lo);
+                p = *end == ',' ? end + 1 : end;
+                if (*end != ',') break;
+            }
+        }
+    }
     backend_.attach(*this);
+}
+
+void Rsx::writeback_now()
+{
+    std::vector<std::pair<u32, u64>> ranges = writeback_ranges_;
+    if (ranges.empty()) { // what a capture's start writes back (capture.cpp)
+        ranges.emplace_back(PS_MEM_RSX_LOCAL_BASE, config_.local_memory_size);
+        ranges.emplace_back(config_.layout.device_addr, config_.layout.reports_addr + 0x100000 - config_.layout.device_addr);
+        for (u32 page = 0; page < IoMap::kIoPages; page++) {
+            const auto ea = io_map_.io_to_ea(page * IoMap::kPageSize);
+            if (!ea) continue;
+            if (ranges.size() > 2 && ranges.back().first + ranges.back().second == *ea)
+                ranges.back().second += IoMap::kPageSize;
+            else
+                ranges.emplace_back(*ea, IoMap::kPageSize);
+        }
+    }
+    for (const auto& [ea, size] : ranges)
+        backend_.flush_memory(ea, static_cast<u32>(std::min<u64>(size, 0xffffffffull)), "PSPOCKET_RSX_WRITEBACK_AT");
+    PS_LOG_WARN("rsx", "PSPOCKET_RSX_WRITEBACK_AT: wrote back what the GPU held over {} range(s) after flip {}",
+        ranges.size(), flips_.load(std::memory_order_relaxed));
 }
 
 Rsx::~Rsx()
@@ -516,6 +552,11 @@ Rsx::RunStatus Rsx::step(u64 max_words)
     // them while it waits for commands (wait_for_work), without waiting for the GPU.
     backend_.run_deferred(false);
     if (CaptureWriter* c = capture_.load(std::memory_order_acquire)) [[unlikely]] c->before_step(*this); // D-1053
+    if (writeback_at_ && flips_.load(std::memory_order_relaxed) >= writeback_at_ && !packet_remaining_ &&
+        return_stack_.empty()) [[unlikely]] {
+        writeback_at_ = 0;
+        writeback_now();
+    }
     return step_commands(max_words);
 }
 
