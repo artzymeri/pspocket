@@ -17648,3 +17648,17 @@ cheaply, so a bad frame found afterwards can be compared with the frames around 
     choice for that frame.
   - No static draw's index or vertex bytes differ from both neighbours. The wedge's draw is not found yet; next is a
     capture from flip 3700 replayed with --draws.
+
+## D-1037 · 2026-10-17 · The yellow and magenta blob on Michael's head: the sun's flare, a frame behind
+
+- Run early1 (2026-10-16, flip 3300, PSPOCKET_RSX_EARLY_REPORTS=1, a build partway through D-1021 to D-1025) showed
+  a dark magenta disc with a yellow rim on Michael's head as he looked up near the sun. A/B against adc8a5b^ (before
+  D-1021 to D-1028) on the garden route, four runs on the flip clock and the wall clock: neither build got that
+  view again. Over the same flips the old build drew yellow and white blocks in the hedges (flip 3330); the current
+  build drew none (0 saturated yellow or magenta pixels in any frame).
+- Seen with the current build on rain-street (run skye1, flip 3724): as the sun goes behind Michael's head, the sun's
+  lens flare (a star and a blue streak) is drawn over his head for one frame. It is beside his head the frame
+  before, and only a faint streak is left the frame after. The game sizes the flare from the sun's occlusion query,
+  which it reads a frame late. With D-1021 that count arrives whole and the flare looks like a flare. With early
+  reports, the "ready" came with a stale count, which explains early1's saturated colours.
+- Taken as the game's own lag unless the exact mode (D-1029) shows the flare there too, which is not yet checked.
