@@ -17788,13 +17788,13 @@ Work in progress: held for the freeze at GTA V's front door (D-1091).
   | handler time (`done`, before this change) | 5 of 5 | about 29 |
   | handler time, slow flips logged | 5 of 6 | about 29 |
   | gpu (new default) | 3 of 6 | about 29 |
-  | method | 1 of 6 | about 27.6 |
+  | method | 6 of 12 (1 of the first 6, 5 of the next 6) | 27 to 30 |
   | RSX slowed (shake S11 60000:3000, `done`) | 3 of 6 | 24 to 30 |
 
   - No flip took 45 ms or more next to a wedge (`PSPOCKET_LOG_SLOW_FLIPS=MS`), so it is not a hitch.
   - Slowing the RSX does not remove it, so wall time per frame is not the cause either.
   - Slow file reads (S12) move the route itself and cannot be compared.
-  - Open: method time's lower rate (being re-measured), and which game system picks the far LOD for that frame. In
+  - No timestamp mode moves the rate; gpu stays the default for fidelity. Open: which game system picks the far LOD for that frame. In
     cap4's frame 15 the game also skips 4 occlusion probes (abd449a846bf6eb0), the water pre-pass and about 15
     single-draw passes: a different render path for that frame.
 - Seen once in passing: yellow blocks in the lower part of a dark frame (run rs5, flip 5068, RSX slowed), like the
