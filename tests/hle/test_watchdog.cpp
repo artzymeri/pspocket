@@ -27,6 +27,7 @@ loader::WatchdogConfig config(double freeze, double deadlock, double livelock)
     c.freeze_s = freeze;
     c.deadlock_s = deadlock;
     c.livelock_s = livelock;
+    c.first_frame_s = 0; // its own test below
     return c;
 }
 
@@ -61,6 +62,30 @@ TEST_CASE("watchdog: a freeze is frames, then none for the freeze time; once per
         if (j.observe(s)) reported++;
     }
     CHECK(reported == 2);
+}
+
+TEST_CASE("watchdog: no first frame for the first-frame time is reported once, as a freeze (D-1093)", "[hle][watchdog]")
+{
+    loader::WatchdogConfig c = config(10, 0, 0);
+    c.first_frame_s = 60;
+    StallJudge j(c);
+    WatchSample s;
+    int reported = 0;
+    for (int i = 0; i <= 200; i++) { // 100 s, threads polling, no frame (L.A. Noire's "Starting")
+        s.t = i * 0.5;
+        if (const auto r = j.observe(s)) {
+            CHECK(r->first == Stall::Freeze);
+            CHECK(r->second.find("no first frame") != std::string::npos);
+            CHECK(s.t >= 60);
+            reported++;
+        }
+    }
+    CHECK(reported == 1);
+    s.flips = 1; // a frame at last: the first-frame check is done
+    for (int i = 0; i < 10; i++) {
+        s.t += 0.5;
+        CHECK_FALSE(j.observe(s).has_value());
+    }
 }
 
 TEST_CASE("watchdog: a deadlock is every PPU thread blocked for good while the SPUs and the RSX are idle",

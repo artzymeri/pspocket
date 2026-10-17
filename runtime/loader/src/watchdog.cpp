@@ -39,6 +39,13 @@ std::optional<std::pair<Stall, std::string>> StallJudge::observe(const WatchSamp
         out = {Stall::Freeze, std::format("freeze: no frame for {:.0f} s after frame {}", s.t - flips_since_, s.flips)};
     }
 
+    // No first frame (D-1093): a game that never shows one (L.A. Noire stayed on "Starting" with its threads polling,
+    // which is neither a freeze, after frames, nor a deadlock, all blocked) is reported once, as a freeze.
+    if (!out && config_.first_frame_s > 0 && !s.flips && !first_frame_reported_ && s.t >= config_.first_frame_s) {
+        first_frame_reported_ = true;
+        out = {Stall::Freeze, std::format("freeze: no first frame {:.0f} s after the start", s.t)};
+    }
+
     // Deadlock: every PPU thread blocked for good, nothing left running that could wake one.
     const bool stuck = s.ppu_threads && s.ppu_stuck == s.ppu_threads && s.ppu_stuck_for >= config_.deadlock_s;
     if (!stuck) {

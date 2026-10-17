@@ -17828,3 +17828,11 @@ cached in hdd0/game/<TITLE_ID>* (GTA IV's map copies, L.A. Noire's BLES01488_INS
 "Remove with saves" also deletes hdd0/home/00000001/savedata/<TITLE_ID>* and its play time; plain Remove keeps the
 saves, so adding the game again continues where the player was. Not while a game runs or is being prepared.
 LibraryModel.removal(for:) and remove(_:saves:).
+
+## D-1093 · 2026-10-17 · The watchdog reports a game that never shows a first frame
+
+L.A. Noire stayed on "Starting" on the iPhone with nothing in its log: no frame ever came, so D-1043's freeze (frames,
+then none) never applied, and its threads poll with timeouts, so it was no deadlock either. WatchdogConfig::first_frame_s
+(60 s; 0 off) reports once, as a freeze ("freeze: no first frame N s after the start"), with the same thread report
+(what every PPU thread and the RSX wait on) on the Mac and in the phone's log. A test; the other watchdog tests set it
+off.
