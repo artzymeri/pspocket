@@ -1119,6 +1119,10 @@ struct MetalBackend::Impl {
     // encoding of that into `staging` (a copy of `size` bytes of guest memory from `ea`), on the render buffer.
     bool overlay_supported(const Surface& s);
     void encode_overlay(Surface& s, const TransientAllocator::Allocation& staging, u32 ea, u32 size);
+    // Render to vertex buffer (D-1034): targets the GPU drew over a draw's vertex arrays, laid over their copies.
+    std::vector<Surface*> vertex_overlay_scratch;
+    void vertex_targets(const std::vector<DrawScratch::Span>& spans);
+    void overlay_vertex_targets(const std::vector<DrawScratch::Span>& spans, const TransientAllocator::Allocation& data);
     // D-1025: a new target `s` over the memory of GPU-newer targets of other formats or sizes (`sources`, oldest
     // first) starts with what that memory would hold on the RSX: guest memory, the sources laid over it (as a texture
     // over them is decoded), into its texels, all on the GPU. False: a format this cannot do (nothing recorded).

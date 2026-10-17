@@ -545,6 +545,53 @@ void MetalBackend::Impl::evict_unused(u64 unused_flips)
     }
 }
 
+// Render to vertex buffer (D-1034): a draw whose vertex arrays are memory a target was drawn into (GTA V's water
+// simulation draws its 128x128 heights and colours into X32 targets at local 0x2820000 and 0x2830000, and its near water
+// patch reads them as attributes 9 and 10) reads what the GPU drew there, as the RSX does. The copies from guest memory
+// held what the CPU last saw: the near sea's heights from frames, or loads, before, and the patch went off the screen
+// (the black block over the near sea, D-1031). Each target the GPU holds newer over a span is laid over the span's copy
+// as store_readback would have written it (oldest first), on the render buffer before the draw's pass; a target the
+// overlay kernels cannot write is written back first (a wait), before the copy's allocation (a submit may reuse it).
+// vertex_targets finds them before the copies; overlay_vertex_targets lays them over the copies.
+void MetalBackend::Impl::vertex_targets(const std::vector<DrawScratch::Span>& spans)
+{
+    std::vector<Surface*>& found = vertex_overlay_scratch;
+    found.clear();
+    if (spans.empty()) return;
+    const u32 lo = spans.front().ea;
+    u32 hi = 0;
+    for (const auto& sp : spans) hi = std::max(hi, sp.end);
+    const auto covers = [&](const Surface* o, const DrawScratch::Span& sp) {
+        return u64{o->address} < sp.end && sp.ea < u64{o->address} + o->bytes();
+    };
+    for (const auto& c : surfaces) {
+        Surface* o = c.get();
+        if (!o->gpu_newer || o->cpu_newer || !o->initialized) continue;
+        if (u64{o->address} + o->bytes() <= lo || o->address >= hi) continue;
+        bool hit = false;
+        for (const auto& sp : spans) hit = hit || covers(o, sp);
+        if (!hit) continue;
+        if (overlay_supported(*o)) found.push_back(o);
+        else write_back(*o, "a vertex array"); // into guest memory, before the copies are made (a wait)
+    }
+    std::sort(found.begin(), found.end(), [](const Surface* a, const Surface* b) { return a->last_used < b->last_used; });
+}
+
+void MetalBackend::Impl::overlay_vertex_targets(const std::vector<DrawScratch::Span>& spans,
+    const TransientAllocator::Allocation& data)
+{
+    for (Surface* o : vertex_overlay_scratch) {
+        if (!o->gpu_newer) continue;
+        sync_surface(*o); // what its children wrote (D-122)
+        for (const auto& sp : spans) {
+            if (!(u64{o->address} < sp.end && sp.ea < u64{o->address} + o->bytes())) continue;
+            encode_overlay(*o, {data.buffer, data.offset + sp.offset, nullptr}, sp.ea, sp.end - sp.ea);
+            stats.vertex_overlays++;
+        }
+    }
+    vertex_overlay_scratch.clear();
+}
+
 std::vector<Surface*> MetalBackend::Impl::overlays_for(u32 ea, u32 size, u32 pitch, Surface* first)
 {
     std::vector<Surface*> out;

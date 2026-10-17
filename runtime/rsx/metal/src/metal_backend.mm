@@ -2089,6 +2089,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             sp.offset = total;
             total += (sp.end - sp.ea + 15) & ~15u;
         }
+        vertex_targets(spans); // render to vertex buffer (D-1034): write-backs before the allocation
         const u32 edge_end = edge_item ? edge_layout(*edge_item, total, edge_draw) : 0;
         vertex_data = transient.alloc(std::max<u32>(std::max(total, edge_end), 16), 16);
         if (edge_item) {
@@ -2103,6 +2104,7 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
             std::memcpy(vertex_data.data + sp.offset, mem.host(sp.ea), sp.end - sp.ea);
             stats.vertex_bytes_copied += sp.end - sp.ea;
         }
+        overlay_vertex_targets(spans, vertex_data);
         for (const Copy& c : copies) {
             const Span& sp = *std::prev(std::upper_bound(spans.begin(), spans.end(), c.ea,
                 [](u32 ea, const Span& x) { return ea < x.ea; }));

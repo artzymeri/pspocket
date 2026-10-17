@@ -17150,6 +17150,8 @@ Mac.
   4 MB mirrored into memory each flip, D-1030: stays), the positions' invariance between programs (positions
   `[[invariant]]` with preserveInvariance, translation 10: stays; reverted, it recompiles every shader), the stencil
   (07 there, the surface's test passes).
+- **Resolved by D-1034** (2026-10-17): not the game's decision but render to vertex buffer; the near patch's draws read
+  their attributes from targets the GPU had drawn, through stale guest memory. What follows was the plan before that.
 - **Next**: the decision is the game's PPU (its water renderer choosing which patches to draw, from the camera, the
   water heights the SPU or the GPU computes, or the game's GPU timer that D-1021 now feeds with completion times). The
   exact mode (D-1029) would tell whether any RSX ordering feeds it, but on the flip clock its 2 to 8 fps took the route
@@ -17450,3 +17452,36 @@ on a semaphore acquire after 611 of 999. The causes and the changes:
   vertex path (D-1034).
 - Test: "PSPOCKET_RSX_WRITEBACK_AT writes back the targets over its ranges after its flip, and no others". A range over
   the target puts its first frame in memory after flip 1; a range elsewhere leaves memory as it was.
+## D-1034 · 2026-10-17 · Render to vertex buffer: targets the GPU drew are laid over a draw's vertex arrays (GTA V's near-sea black block)
+
+- **The cause of D-1031's block**: GTA V's water simulation draws into 128x128 targets in local memory (surface format
+  F_X32, pitch 0x200, at 0x2810000, 0x2820000 and 0x2830000, drawn every frame), and the near water patch reads two of them
+  as vertex attributes: attribute 9 (X32 float, stride 4) from 0x2830000 and attribute 10 (stride 4) from 0x2820000
+  (trace: indexed draws of 576 vertices, fragment program b54d5f7b9b5313f4, after VERTEX_DATA_ARRAY_OFFSET[9] = 0x2830000).
+  The Metal backend copied vertex arrays from guest memory with no look at targets (textures have had D-137's overlay
+  since early on, vertex arrays never had one). Guest memory held whatever the CPU last saw there, never what the GPU
+  drew, so the patch's vertices were wrong and it drew off the screen; the G-buffer kept the depth pre-pass's depth and
+  no colour, which looked black. Which target matters was found by h2's write-back bisection (D-1055: writing back
+  0x2820000 alone at flip 5436 removes the block) and by the trace (reader: the RSX's vertex fetch, not the PPU or an
+  SPU). It is not EDGE (run edgel1, EDGE lifted: block stays), the occlusion counts, the exact mode's ordering, or
+  depth clamping (D-1031, D-1033).
+- **The fix**: before a draw's vertex spans are copied, the targets the GPU holds newer that overlap them are found
+  (MetalBackend::Impl::vertex_targets). After the copy, each one is laid over the spans it covers with the overlay
+  kernels, oldest first, on the render buffer before the draw's pass (overlay_vertex_targets, encode_overlay), as
+  store_readback would have written it. With overlay_targets off (PSPOCKET_RSX_WRITE_BACK_TARGETS), such a target is
+  written back before the copy's allocation, because a submit can reuse an allocation made before it. The
+  BackendStats::vertex_overlays counter counts these overlays; they also count in the frame report's "targets laid
+  over memory".
+- **Runs** (skyfall-sea route, PSPOCKET_EDGE_GPU=0, flip clock, frames every 6 flips, share of black pixels):
+  - Control (vctl1, the D-1033 build): 1% at 5424, rising to 63% at 5472-5478, gone by 5484 (as h2's sky7).
+  - Fix (vfix2): 0% in every frame from 5394 to 5556, with the same scene (the parachute over the sea).
+- **Cost** (same runs, 300-frame windows):
+  - Laying the targets ends a pass about 8 to 10 more times a frame where the water is drawn: in the city, 107 to 109
+    passes against 97 to 99, and 24 against 16 passes ended by target overlays.
+  - GPU time per frame moved within the runs' noise: city 10.0 to 10.8 ms against 11.1 to 11.4; over the sea 8.3 to
+    9.0 against 7.4 to 9.1.
+  - A later saving: one overlay per target generation, shared by every draw that reads it (several draws a pass read
+    the same two targets).
+- Test: tests/rsx/test_metal.mm "vertex arrays over a target read what the GPU drew there". A target is cleared on the
+  GPU while its memory holds stale colours, and a triangle takes its vertex colours from that memory. It is checked
+  with the overlay and with the write-back.

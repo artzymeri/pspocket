@@ -4311,6 +4311,42 @@ TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet renders,
     CHECK(e.rsx->status().conditional_skips == 1);
 }
 
+TEST_CASE("metal e2e: vertex arrays over a target read what the GPU drew there (render to vertex buffer, D-1034)")
+{
+    // GTA V's near water patch reads its heights and colours as vertex attributes from the X32 targets its water
+    // simulation draws (local 0x2820000, 0x2830000). Copied from guest memory, the arrays held what the CPU last saw
+    // there, and the patch went off the screen (the black block over the near sea, D-1031).
+    REQUIRE_METAL();
+    for (const bool overlay : {true, false}) { // laid over the copy on the GPU, or written back first
+        INFO(std::format("overlay_targets {}", overlay));
+        E2E e(0, {}, 1800, overlay);
+        e.put_local_bytes(kFpOffset, fp_color(false));
+        write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
+        for (u32 v = 0; v < 3; v++) e.put_local32(kSurfaceB + v * 4, 0x00ff00ffu); // stale: green
+        auto b = e.at(0);
+        setup_surface(b, kSurfaceB); // the "simulation": its first pixels become the triangle's colours
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff00ff00u); // bytes ff 00 ff 00: r 255, g 0, b 255, a 0
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        setup_surface(b, kSurfaceOffset);
+        b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0xff202020u);
+        b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+        upload_vertex_program(b);
+        set_fragment_program(b, kFpOffset, 0x40);
+        bind_vertex_arrays(b);
+        b.method(m::NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3, kSurfaceB); // colours from the target's memory
+        draw_triangle(b);
+        REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+        for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+        CHECK(e.failures.empty());
+        REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+        const auto mid = guest_pixel(e, kSurfaceOffset, 32, 40); // a r g b
+        CHECK(mid[1] > 240);
+        CHECK(mid[2] < 16);
+        CHECK(mid[3] > 240);
+        if (overlay) CHECK(e.backend->stats().vertex_overlays >= 1);
+    }
+}
+
 TEST_CASE("metal e2e: a ZPASS report is ready only once the GPU has counted it, written whole (D-1021)")
 {
     // GTA V's queries (0xB21908 begin: count 0, pad 1 by the CPU; 0xB21AD0 ready: pad 0) take a report whose pad is 0
