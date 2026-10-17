@@ -17316,3 +17316,18 @@ the guard still reaches the race on this build and data.
   summary first, right after the fault's line and call site (the memory dump and the thread report take locks and can
   hang), and a second faulting thread writes its line and waits for the first to end the process; the control's
   crashes now have summaries (exit "fault", the first fault's line).
+
+## D-1052 · 2026-10-17 · Shake mode on Assassin's Creed's Animus training; scripts/shake.sh --case
+
+scripts/shake.sh ac takes --case install (the default: the first install into the garden, D-1050) or --case
+training: the bench's training case, the installed game and its save as the data's hdd0 holds them,
+games/ac1/walk-training.txt, 570 s.
+
+- "legal", seeds 31 and 32: both to their 570 s timeout, triaged with only the interpreted-code buckets, medians 55.2
+  and 56.2 fps (the training at 57 to 60 without shake, D-999). Seed 31's injections: S1 105,663, S2 1,965,776,
+  S3 28,529, S4 41,148, S5 11, S6 288,537, S8 1,429,082 conditional stores failed, S10 680,508, S11 17,305,
+  S12 5,454, S13 3, S14 2,122.
+- "adversarial", seed 41: clean, median 56.9 fps.
+- With D-1050's install runs (legal 1, 2; adversarial 11, 12; all points 3 to 6): eleven Assassin's Creed runs under
+  shake mode, none failed; the only failures found are D-999's race with the waker rule taken away (D-1050), which the
+  nightly guard now watches (D-1051).

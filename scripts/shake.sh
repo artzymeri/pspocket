@@ -5,6 +5,7 @@
 #   scripts/shake.sh gta5|ac [--seeds N] [--seed S] [--from S] [--spec SPEC] [--timeout S] [--keep]
 #   scripts/shake.sh gta5|ac --rerun S [--times K]        the same seed K times (3): how often it fails
 #   scripts/shake.sh gta5|ac --ddmin S [--times K]        delta debugging: the fewest points that still fail with S
+#   scripts/shake.sh ac --case training ...                Assassin's Creed's training from the installed game and save
 #   scripts/shake.sh ac --guard [--times K]               the waker rule's guard (D-1051): K boots (8) to 8 s, each
 #                                                         waker delayed up to 2 ms after half its wakes (S3), must all
 #                                                         pass; --guard-control does the same with the rule off and
@@ -27,7 +28,7 @@ cd "$(dirname "$0")/.."
 game=${1:-}
 [[ $game == gta5 || $game == ac ]] || { echo "usage: scripts/shake.sh gta5|ac [options] (see the top of the file)" >&2; exit 64; }
 shift
-seeds=4 seed_from=1 one_seed="" spec=legal timeout_s="" keep=0 rerun="" ddmin="" times=3 guard=""
+seeds=4 seed_from=1 one_seed="" spec=legal timeout_s="" keep=0 rerun="" ddmin="" times=3 guard="" ac_case=install
 while (( $# )); do
   case $1 in
     --seeds) shift; seeds=$1 ;;
@@ -40,6 +41,7 @@ while (( $# )); do
     --ddmin) shift; ddmin=$1 ;;
     --times) shift; times=$1 ;;
     --guard) guard=on ;;
+    --case) shift; ac_case=$1 ;;
     --guard-control) guard=control ;;
     *) echo "shake: unknown option $1" >&2; exit 64 ;;
   esac
@@ -69,11 +71,17 @@ run_one() {
     (( free >= 11 )) || { echo "shake: ${free} GB free: no hdd0 copy under 11 GB" >&2; return 2; }
     mkdir -p $dir/hdd
     cp -c -R $data/hdd0 $dir/hdd/hdd0 || return 2
-    # A first install, as the bench's install-garden (games/ac1/bench/cases.json): the game's folder and save emptied.
-    rm -rf $dir/hdd/hdd0/game/BLES00158/USRDIR/* $dir/hdd/hdd0/home/00000001/savedata/BLES00158*
-    cmd=($boot $data/decrypt/EBOOT.elf --gpu metal --timeout ${timeout_s:-330} --hdd0 $dir/hdd/hdd0
+    local press=games/ac1/walk-garden.txt t=330
+    if [[ $ac_case == training ]]; then
+      # The bench's training: the installed game and its save, the Animus training (walk-training.txt).
+      press=games/ac1/walk-training.txt t=570
+    else
+      # A first install, as the bench's install-garden (games/ac1/bench/cases.json): the game's folder and save emptied.
+      rm -rf $dir/hdd/hdd0/game/BLES00158/USRDIR/* $dir/hdd/hdd0/home/00000001/savedata/BLES00158*
+    fi
+    cmd=($boot $data/decrypt/EBOOT.elf --gpu metal --timeout ${timeout_s:-$t} --hdd0 $dir/hdd/hdd0
       --bdvd $data/disc.iso --flash inventory/firmware/installed/dev_flash --game-library $lib
-      --press-file games/ac1/walk-garden.txt)
+      --press-file $press)
   fi
   PSPOCKET_SHAKE="seed=$seed;$sp" PSPOCKET_SHAKE_LOG=$dir/shake.log $cmd --summary $dir/summary.json \
     --stop-on-stall --livelock 60 --max-footprint 6 > $dir/run.log 2>&1
