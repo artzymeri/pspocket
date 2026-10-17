@@ -17816,3 +17816,15 @@ budget submit, that buffer was never submitted, so the reports the jobs waited f
   the old behaviour. A Metal test: a report's ready word arrives while the RSX waits, with no flip.
 - h2's runs under GPU load: 0 of 15 froze with it, 3 of 11 without (its one-binary interleaved A/B was cut short).
   Taken into main ahead of h2's other changes for the iPhone install.
+
+## D-1092 · 2026-10-17 · Remove Game in the library
+
+The user asked for a way to uninstall a game from the app. The library's Play button has a "…" menu with Remove
+Game…, and a confirmation that names what goes and its size: the disc image when it is in Documents/Games (one added
+from elsewhere with + only leaves the library: the file is the user's), an installed PSN game's folder, the
+executable and translation this iPhone made (Application Support/pspocket-games/<TITLE_ID>), what its sessions
+learnt and translated (pspocket-coverage/<TITLE_ID>, tmp/pspocket-session/<TITLE_ID>), what the game installed or
+cached in hdd0/game/<TITLE_ID>* (GTA IV's map copies, L.A. Noire's BLES01488_INSTALL, its updates) and its cover.
+"Remove with saves" also deletes hdd0/home/00000001/savedata/<TITLE_ID>* and its play time; plain Remove keeps the
+saves, so adding the game again continues where the player was. Not while a game runs or is being prepared.
+LibraryModel.removal(for:) and remove(_:saves:).

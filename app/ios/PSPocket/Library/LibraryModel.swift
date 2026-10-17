@@ -878,6 +878,101 @@ final class LibraryModel {
                                                  withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(store) { try? data.write(to: Self.storeURL, options: .atomic) }
     }
+
+    // MARK: removing a game (D-1092)
+
+    /// What removing a game deletes: its disc image when it is in Games (an image added from elsewhere only leaves the
+    /// library: the file is the user's), an installed game's folder, the executable and translation this iPhone made
+    /// (pspocket-games/<TITLE_ID>), what its sessions learnt and translated (pspocket-coverage, tmp/pspocket-session),
+    /// the data the game installed or cached in hdd0/game/<TITLE_ID>* (GTA IV's map copies, L.A. Noire's install, its
+    /// updates) and its cover; with `saves`, its saves too (hdd0/home/00000001/savedata/<TITLE_ID>*) and its play time.
+    struct Removal {
+        var paths: [URL] = []
+        var saves: [URL] = []
+        var bytes: Int64 = 0
+        var savesBytes: Int64 = 0
+        var forgetsAdded = false // an image added from elsewhere: the library forgets it, the file stays
+    }
+
+    func removal(for entry: LibraryEntry) -> Removal {
+        let fm = FileManager.default
+        var r = Removal()
+        var paths: [URL] = []
+        switch entry.kind {
+        case .installed: paths.append(entry.url)
+        case .disc:
+            if entry.id.hasPrefix("added:") { r.forgetsAdded = true } else { paths.append(entry.url) }
+        }
+        if let id = entry.titleID, !id.isEmpty {
+            paths.append(Self.decryptedGames.appendingPathComponent(id))
+            paths.append(Self.support.appendingPathComponent("pspocket-coverage/\(id)"))
+            paths.append(fm.temporaryDirectory.appendingPathComponent("pspocket-session/\(id)"))
+            let gameDir = Self.hdd0.appendingPathComponent("game")
+            for name in (try? fm.contentsOfDirectory(atPath: gameDir.path)) ?? [] where name.hasPrefix(id) {
+                paths.append(gameDir.appendingPathComponent(name))
+            }
+            for name in (try? fm.contentsOfDirectory(atPath: Self.coversFolder.path)) ?? [] where name.hasPrefix(id) {
+                paths.append(Self.coversFolder.appendingPathComponent(name))
+            }
+            let savedata = Self.hdd0.appendingPathComponent("home/00000001/savedata")
+            for name in (try? fm.contentsOfDirectory(atPath: savedata.path)) ?? [] where name.hasPrefix(id) {
+                r.saves.append(savedata.appendingPathComponent(name))
+            }
+        }
+        var seen = Set<String>()
+        r.paths = paths.filter { fm.fileExists(atPath: $0.path) && seen.insert($0.standardizedFileURL.path).inserted }
+        r.bytes = r.paths.reduce(0) { $0 + Self.size(of: $1) }
+        r.savesBytes = r.saves.reduce(0) { $0 + Self.size(of: $1) }
+        return r
+    }
+
+    /// Removes the game (see Removal); false while a game runs or is being prepared. The library rescans when done.
+    @discardableResult
+    func remove(_ entry: LibraryEntry, saves: Bool) -> Bool {
+        guard boot == nil, game?.running != true else { return false }
+        let plan = removal(for: entry)
+        if plan.forgetsAdded, let uuid = UUID(uuidString: String(entry.id.dropFirst("added:".count))) {
+            added[entry.id]?.stopAccessingSecurityScopedResource()
+            added[entry.id] = nil
+            store.added.removeAll { $0.id == uuid }
+        }
+        if let id = entry.titleID {
+            covers[id] = nil
+            backdrops[id] = nil
+            coverRequested.remove(id)
+            preparationNotes[id] = nil
+            systemChecked.remove(id)
+            if saves { store.stats[id] = nil }
+        }
+        saveSoon()
+        let targets = plan.paths + (saves ? plan.saves : [])
+        let title = entry.displayTitle
+        Self.log.notice("pspocket: removing \(title, privacy: .public): \(targets.count) item(s)")
+        decryptQueue.async { [weak self] in
+            for url in targets { try? FileManager.default.removeItem(at: url) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.notice = "Removed \(title) (\(ByteCountFormatter.string(fromByteCount: plan.bytes + (saves ? plan.savesBytes : 0), countStyle: .file)))"
+                self.rescan()
+            }
+        }
+        return true
+    }
+
+    private static func size(of url: URL) -> Int64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
+        if !isDir.boolValue { return (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0 }
+        var total: Int64 = 0
+        if let e = fm.enumerator(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileSizeKey]) {
+            for case let f as URL in e {
+                let v = try? f.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
+                total += Int64(v?.totalFileAllocatedSize ?? v?.fileSize ?? 0)
+            }
+        }
+        return total
+    }
 }
 
 /// What ps_psn_install_pkg reports while it installs (its callback runs on the install's thread): the files written,

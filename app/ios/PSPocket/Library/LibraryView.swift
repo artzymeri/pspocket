@@ -19,6 +19,8 @@ struct LibraryView: View {
     @State private var flash: String? // "add" or "settings": a controller press shows on the button
     @State private var drag: RowDrag?
     @State private var menu = MenuInput()
+    @State private var removing: LibraryEntry? // Remove Game asked for (D-1092): the confirmation shows
+    @State private var removal = LibraryModel.Removal()
 
     enum IntroPhase: Int { case logo, buildIn, done }
 
@@ -93,6 +95,26 @@ struct LibraryView: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: Self.discTypes) { result in
             if case .success(let url) = result { library.add(url) }
         }
+        .confirmationDialog(removing.map { "Remove \($0.displayTitle)?" } ?? "", isPresented: Binding(
+            get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
+            if let entry = removing {
+                Button("Remove (keep saves) · \(Self.bytes(removal.bytes))", role: .destructive) {
+                    library.remove(entry, saves: false)
+                    removing = nil
+                }
+                if !removal.saves.isEmpty {
+                    Button("Remove with saves · \(Self.bytes(removal.bytes + removal.savesBytes))", role: .destructive) {
+                        library.remove(entry, saves: true)
+                        removing = nil
+                    }
+                }
+                Button("Cancel", role: .cancel) { removing = nil }
+            }
+        } message: {
+            Text(removal.forgetsAdded
+                 ? "Its translation and cached data are deleted, and it leaves the library. The disc image stays where you added it from."
+                 : "The disc image, its translation and its cached data are deleted. Adding it again means translating it again.")
+        }
         .onAppear(perform: start)
         .onDisappear { game.menuInput = nil }
     }
@@ -156,6 +178,8 @@ struct LibraryView: View {
         .fixedSize()
     }
 
+    static func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+
     private func roundButton(_ symbol: String, size: CGFloat, flashed: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
@@ -202,23 +226,43 @@ struct LibraryView: View {
                 .foregroundStyle(Color(red: 235 / 255, green: 235 / 255, blue: 245 / 255).opacity(0.75))
                 .lineLimit(2)
             if entry != nil {
-                Button(action: play) {
-                    HStack(spacing: 8) {
-                        if pad {
-                            ButtonBadge(kind: .cross, inverted: true, diameter: 24)
-                        } else {
-                            Image(systemName: "play.fill").font(.system(size: 20, weight: .semibold))
+                HStack(spacing: 12) {
+                    Button(action: play) {
+                        HStack(spacing: 8) {
+                            if pad {
+                                ButtonBadge(kind: .cross, inverted: true, diameter: 24)
+                            } else {
+                                Image(systemName: "play.fill").font(.system(size: 20, weight: .semibold))
+                            }
+                            Text("Play").font(.system(size: 17, weight: .semibold)).tracking(-0.43)
                         }
-                        Text("Play").font(.system(size: 17, weight: .semibold)).tracking(-0.43)
+                        .foregroundStyle(.black)
+                        .padding(.leading, 14)
+                        .padding(.trailing, 24)
+                        .frame(height: 44)
+                        .background(Capsule().fill(.white))
+                        .shadow(color: .black.opacity(0.35), radius: 9, y: 6)
                     }
-                    .foregroundStyle(.black)
-                    .padding(.leading, 14)
-                    .padding(.trailing, 24)
-                    .frame(height: 44)
-                    .background(Capsule().fill(.white))
-                    .shadow(color: .black.opacity(0.35), radius: 9, y: 6)
+                    .buttonStyle(PressScale(scale: 0.96))
+                    // The game's other actions (D-1092): Remove Game, with a confirmation that says what goes.
+                    Menu {
+                        Button(role: .destructive) {
+                            guard let entry else { return }
+                            removal = library.removal(for: entry)
+                            removing = entry
+                        } label: {
+                            Label("Remove Game…", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
+                    }
+                    .glass(Circle())
+                    .disabled(library.boot != nil)
                 }
-                .buttonStyle(PressScale(scale: 0.96))
                 .padding(.top, 18)
             }
             if let error = library.bootError {
