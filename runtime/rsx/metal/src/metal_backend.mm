@@ -169,6 +169,8 @@ bool MetalBackend::Impl::init()
                                                                     error:&error];
     thumbnail_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_thumbnail"]
                                                                error:&error];
+    predicate_pipeline = [device newComputePipelineStateWithFunction:[kernels newFunctionWithName:@"rsx_predicate"]
+                                                               error:&error];
     if (!edge_init()) edge_pipeline = nil; // EDGE geometry stays on the SPUs (D-988)
     MTLRenderPipelineDescriptor* blit = [MTLRenderPipelineDescriptor new];
     blit.vertexFunction = [kernels newFunctionWithName:@"rsx_fullscreen_vs"];
@@ -177,7 +179,7 @@ bool MetalBackend::Impl::init()
     blit_pipeline = [device newRenderPipelineStateWithDescriptor:blit error:&error];
     if (!decode_pipeline || !read_pipeline || !depth_pipeline || !color_pipeline || !decode3d_pipeline || !blit_pipeline ||
         !color_memory_pipeline || !float_memory_pipeline || !depth_memory_pipeline || !memory_surface_pipeline ||
-        !thumbnail_pipeline) {
+        !thumbnail_pipeline || !predicate_pipeline) {
         PS_LOG_ERROR(kChan, "backend pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
         return false;
     }
@@ -274,6 +276,10 @@ bool MetalBackend::Impl::init()
             pass_times->timestamps ? "yes" : "no", pass_times->gpu_tick_ns);
     }
     if (std::getenv("PSPOCKET_RSX_WRITE_BACK_TARGETS")) config.overlay_targets = false; // D-137's comparison
+    if (config.trace_frame == 1) { // the first frame: traced from the first command (no flip begins it)
+        tracing = true;
+        PS_LOG_INFO("rsx.trace", "frame 1 begins");
+    }
     if (const char* v = std::getenv("PSPOCKET_RSX_NO_STALE_SYNC"); v && *v && std::strcmp(v, "0") != 0)
         stale_sync = false; // D-1056's comparison
     if (std::getenv("PSPOCKET_RSX_NO_PASS_MERGING")) config.merge_passes = false;       // D-945's comparison
@@ -2469,6 +2475,8 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         vs.index_mode = shader::kIndexDrawnU16BE;
         [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
         if (native) {
+            // Its arguments come from the EDGE kernels: a predicate cannot zero them, and it draws (D-1058).
+            if (predicate.active && rsx) rsx->alarms().add(Alarm::ConditionalPending);
             [enc drawIndexedPrimitives:ptype indexType:MTLIndexTypeUInt16 indexBuffer:index_data.buffer
                      indexBufferOffset:drawn_indices[0].offset indirectBuffer:vertex_data.buffer
                   indirectBufferOffset:vertex_data.offset + edge_draw.args];
@@ -2487,13 +2495,23 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         [enc setVertexBytes:&vs length:sizeof(vs) atIndex:shader::slot::kVsParams];
         if (drawn) {
             stats.ranges_indexed_by_metal++;
-            [enc drawIndexedPrimitives:ptype indexCount:rg.count
-                             indexType:drawn_indices[r].size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-                           indexBuffer:index_data.buffer indexBufferOffset:drawn_indices[r].offset];
+            const MTLIndexType itype = drawn_indices[r].size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+            if (const u32 at = predicated({rg.count, 1, 0, 0, 0}); at != ~0u) { // D-1058
+                [enc drawIndexedPrimitives:ptype indexType:itype indexBuffer:index_data.buffer
+                         indexBufferOffset:drawn_indices[r].offset indirectBuffer:predicate.args.buffer
+                      indirectBufferOffset:at];
+                continue;
+            }
+            [enc drawIndexedPrimitives:ptype indexCount:rg.count indexType:itype indexBuffer:index_data.buffer
+                     indexBufferOffset:drawn_indices[r].offset];
             continue;
         }
         const bool restart = r + 1 < restart_begin.size() && restart_begin[r + 1] > restart_begin[r];
         if (native && !restart) {
+            if (const u32 at = predicated({rg.count, 1, rg.first, 0}); at != ~0u) { // D-1058
+                [enc drawPrimitives:ptype indirectBuffer:predicate.args.buffer indirectBufferOffset:at];
+                continue;
+            }
             [enc drawPrimitives:ptype vertexStart:rg.first vertexCount:rg.count];
             continue;
         }
@@ -2510,6 +2528,11 @@ void MetalBackend::Impl::do_draw(const RsxState& state)
         if (list.empty()) continue;
         auto ib = transient.alloc(static_cast<u32>(list.size() * 4), 16);
         std::memcpy(ib.data, list.data(), list.size() * 4);
+        if (const u32 at = predicated({static_cast<u32>(list.size()), 1, 0, 0, 0}); at != ~0u) { // D-1058
+            [enc drawIndexedPrimitives:ctype indexType:MTLIndexTypeUInt32 indexBuffer:ib.buffer indexBufferOffset:ib.offset
+                        indirectBuffer:predicate.args.buffer indirectBufferOffset:at];
+            continue;
+        }
         [enc drawIndexedPrimitives:ctype indexCount:list.size() indexType:MTLIndexTypeUInt32 indexBuffer:ib.buffer
                  indexBufferOffset:ib.offset];
     }
@@ -2799,6 +2822,9 @@ void MetalBackend::draw(const RsxState& state)
 {
     if (!impl_->device) return;
     @autoreleasepool {
+        // Under a GPU predicate (D-1058): its kernel and region in this render buffer, room for the draw's ranges.
+        if (Impl& m = *impl_; m.predicate.active && (m.predicate.cb != m.render_cb || m.predicate.count + 64 > m.predicate.capacity))
+            m.arm_predicate();
         impl_->do_draw(state);
         if (impl_->tracing) impl_->trace_probe(); // PSPOCKET_RSX_TRACE_PROBE (D-1028)
         // A frame's uploads stay allocated until the GPU has run its command buffer: past the budget it goes now, so
@@ -2928,9 +2954,14 @@ void MetalBackend::flip(const FlipRequest& request, const RsxState&)
             for (usize i = 0; i < kAlarmNames.size(); i++)
                 if (w.alarms.v[i]) raised += std::format("{}{} {}", raised.empty() ? "" : ", ", kAlarmNames[i], w.alarms.v[i]);
             PS_LOG_INFO(kChan, "alarms (last {}): {}; {:.2f} targets a frame started with the bytes of those under them; "
-                "{:.2f} reads a frame under a GPU-newer target written back first, {:.2f} left (old, D-1056)",
+                "{:.2f} reads a frame under a GPU-newer target written back first, {:.2f} left (old, D-1056); "
+                "{:.2f} conditional renders a frame decided on the GPU, {:.2f} draw calls under them (D-1058)",
                 w.flips, raised.empty() ? "none" : raised, per_frame(m.stats.targets_carried, m.report_carried),
-                per_frame(m.stats.stale_synced, m.report_stale_synced), per_frame(m.stats.stale_left, m.report_stale_left));
+                per_frame(m.stats.stale_synced, m.report_stale_synced), per_frame(m.stats.stale_left, m.report_stale_left),
+                per_frame(m.stats.gpu_predicates, m.report_gpu_predicates),
+                per_frame(m.stats.predicated_draws, m.report_predicated_draws));
+            m.report_gpu_predicates = m.stats.gpu_predicates;
+            m.report_predicated_draws = m.stats.predicated_draws;
             m.report_carried = m.stats.targets_carried;
             m.report_stale_synced = m.stats.stale_synced;
             m.report_stale_left = m.stats.stale_left;
@@ -3470,6 +3501,7 @@ bool MetalBackend::report_zpass(u32 value_addr, bool whole)
 {
     if (!impl_->device) return false;
     impl_->pending_reports.push_back({value_addr, impl_->zpass_slots, whole});
+    impl_->report_slots[value_addr] = impl_->zpass_slots; // what a predicate on it sums (D-1058)
     impl_->stats.occlusion_reports++;
     std::lock_guard lock(impl_->reports_in_flight->mutex);
     impl_->reports_in_flight->count[value_addr]++;
@@ -3495,6 +3527,82 @@ bool MetalBackend::report_pending(u32 value_addr)
 {
     std::lock_guard lock(impl_->reports_in_flight->mutex);
     return impl_->reports_in_flight->count.contains(value_addr);
+}
+
+bool MetalBackend::predicate_on_gpu(u32 value_addr)
+{
+    Impl& m = *impl_;
+    if (!m.device || !m.predicate_pipeline || m.exact) return false; // the exact mode waits for the count (D-1029)
+    static const bool off = [] {
+        const char* v = std::getenv("PSPOCKET_RSX_NO_GPU_PREDICATE"); // D-1058's comparison: decided on the CPU
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (off) return false;
+    const auto it = m.report_slots.find(value_addr);
+    if (it == m.report_slots.end()) return false;
+    @autoreleasepool {
+        m.predicate.active = true;
+        m.predicate.slots = it->second;
+        m.arm_predicate();
+    }
+    m.stats.gpu_predicates++;
+    return true;
+}
+
+void MetalBackend::end_predicate()
+{
+    impl_->predicate.active = false;
+    impl_->predicate.slots.clear();
+    impl_->predicate.cb = nil;
+}
+
+// The predicate's kernel in the render buffer, after the passes that count (the pass open now ends: Metal writes a
+// pass's counters when it ends), its counters copied together first (they may be in earlier render buffers), and a
+// new region of draw arguments it reads the count of once the buffer runs (the draws after it fill it).
+void MetalBackend::Impl::arm_predicate()
+{
+    end_pass_for(kEndFlush);
+    const u32 n = static_cast<u32>(predicate.slots.size());
+    const TransientAllocator::Allocation counts = transient.alloc(std::max<u32>(n, 1) * 8, 8);
+    if (!n) std::memset(counts.data, 0, 8);
+    predicate.capacity = kPredicateDraws;
+    predicate.args = transient.alloc(16 + 32 * predicate.capacity, 16);
+    std::memset(predicate.args.data, 0, 16);
+    predicate.count = 0;
+    id<MTLCommandBuffer> cb = render_buffer();
+    if (n) {
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        blit.label = @"rsx predicate counters";
+        for (u32 j = 0; j < n; j++)
+            [blit copyFromBuffer:predicate.slots[j].buffer sourceOffset:predicate.slots[j].index * 8ull
+                        toBuffer:counts.buffer destinationOffset:counts.offset + 8ull * j size:8];
+        [blit endEncoding];
+    }
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    enc.label = @"rsx predicate";
+    [enc setComputePipelineState:predicate_pipeline];
+    [enc setBuffer:counts.buffer offset:counts.offset atIndex:0];
+    [enc setBuffer:predicate.args.buffer offset:predicate.args.offset atIndex:1];
+    const u32 slots = std::max<u32>(n, 1);
+    [enc setBytes:&slots length:sizeof slots atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [enc endEncoding];
+    predicate.cb = cb;
+}
+
+u32 MetalBackend::Impl::predicated(std::initializer_list<u32> words)
+{
+    if (!predicate.active) return ~0u;
+    if (predicate.count >= predicate.capacity) {
+        if (rsx) rsx->alarms().add(Alarm::ConditionalPending); // drawn whatever the count (D-1022)
+        return ~0u;
+    }
+    u32* a = reinterpret_cast<u32*>(predicate.args.data + 16 + 32 * predicate.count);
+    u32 i = 0;
+    for (u32 w : words) a[i++] = w;
+    *reinterpret_cast<u32*>(predicate.args.data) = ++predicate.count;
+    stats.predicated_draws++;
+    return predicate.args.offset + 16 + 32 * (predicate.count - 1);
 }
 
 bool MetalBackend::flush_memory(u32 addr, u32 size, const char* why)

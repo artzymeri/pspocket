@@ -118,6 +118,15 @@ public:
         (void)value_addr;
         return false;
     }
+    // Conditional rendering on the GPU (D-1058): the draws from now until end_predicate() run only when the pending
+    // ZPASS report at value_addr (the last report_zpass for it) counts more than zero, as the GPU decides once it has
+    // counted. True when the backend does that; false leaves the decision to the caller (on the count there now).
+    virtual bool predicate_on_gpu(u32 value_addr)
+    {
+        (void)value_addr;
+        return false;
+    }
+    virtual void end_predicate() {}
 };
 
 } // namespace pspocket::rsx

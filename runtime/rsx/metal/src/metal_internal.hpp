@@ -411,6 +411,7 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> color_memory_pipeline = nil, float_memory_pipeline = nil, depth_memory_pipeline = nil;
     id<MTLComputePipelineState> memory_surface_pipeline = nil; // D-1025: guest bytes into a target (rsx_memory_to_surface)
     id<MTLComputePipelineState> thumbnail_pipeline = nil;      // D-1027: the presented image as 64x36 (rsx_thumbnail)
+    id<MTLComputePipelineState> predicate_pipeline = nil;      // D-1058: conditional draws decided on the GPU
     u64 surface_serial = 0; // the last Surface::serial given
     id<MTLTexture> dummy_stencil = nil;              // for Z16 buffers, which have none
     id<MTLRenderPipelineState> blit_pipeline = nil;
@@ -595,6 +596,7 @@ struct MetalBackend::Impl {
     AlarmCounts report_alarms{}; // D-1022
     u64 report_carried = 0;      // D-1025
     u64 report_stale_synced = 0, report_stale_left = 0; // D-1056
+    u64 report_gpu_predicates = 0, report_predicated_draws = 0; // D-1058
     u64 report_depth_bounds = 0; // D-261
     u64 report_feedback_reused = 0, report_feedback_first = 0, report_feedback_invalidated = 0;
     u64 report_feedback_rebound = 0, report_feedback_strict = 0, report_cache_epoch = 0; // D-947
@@ -614,6 +616,23 @@ struct MetalBackend::Impl {
     s32 pass_zpass_slot = -1;                // this pass's counter for that query, -1 until a draw counts
     s32 encoder_zpass_slot = -1;             // the counter the encoder counts into, -1 when it does not count
     std::vector<PendingReport> pending_reports;
+    // Conditional rendering on the GPU (D-1058). The counters of the last report registered at each value address; the
+    // predicate the draws are under: its counters, and in each render buffer a region of indirect draw arguments that
+    // a kernel run before the draws (after the passes that count) zeroes the instance counts of when the counters sum to
+    // zero. Draws under it are indirect draws over their arguments there.
+    std::unordered_map<u32, std::vector<VisibilitySlot>> report_slots;
+    struct GpuPredicate {
+        bool active = false;
+        std::vector<VisibilitySlot> slots;
+        __strong id<MTLCommandBuffer> cb = nil; // the render buffer its kernel and region are in
+        TransientAllocator::Allocation args;    // u32 count, 3 pad, then 32 bytes of arguments a draw
+        u32 count = 0, capacity = 0;
+    } predicate;
+    static constexpr u32 kPredicateDraws = 1024;
+    void arm_predicate();
+    // The draw arguments' place for a draw under the predicate (its words written there): the offset in
+    // predicate.args.buffer, or ~0u when there is none (no predicate, or its region full: the draw runs as it is).
+    u32 predicated(std::initializer_list<u32> words);
     // Reports registered and not written yet, by value address (D-115): the completion handlers count them down.
     struct ReportsInFlight {
         std::mutex mutex;

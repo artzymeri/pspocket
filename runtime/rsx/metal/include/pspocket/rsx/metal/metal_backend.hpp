@@ -141,6 +141,10 @@ struct MetalBackendConfig {
     // the target's pixels laid over a copy of the memory on the GPU (D-137). False (or PSPOCKET_RSX_WRITE_BACK_TARGETS
     // set): the target is written back first, a readback the RSX thread waits for, as before.
     bool overlay_targets = true;
+    // A new target starts with what guest memory holds (D-1058), as in the exact mode (D-1029): rsx-replay's, whose
+    // targets the capture wrote back into memory when it started (a fast run's new target starts undefined: a pooled
+    // texture, D-984, or a new one).
+    bool load_new_targets = false;
     // Occlusion counters in a command buffer's visibility buffer at first; doubled when one runs out (D-1024).
     u32 occlusion_counters = 4096;
     // Called on the RSX thread with each report window (D-148).
@@ -206,6 +210,8 @@ struct BackendStats {
     // Reads of guest memory under a GPU-newer target (D-1056): the target written back first (a live one), or left
     // (one not drawn or sampled for two flips: its memory taken as reused, as run 132's streamed texture).
     u64 stale_synced = 0, stale_left = 0;
+    // Conditional rendering decided on the GPU (D-1058): the predicates set up, and the draw calls made under one.
+    u64 gpu_predicates = 0, predicated_draws = 0;
     u64 surface_textures_reused = 0; // surfaces made with a removed surface's texture of their format and size (D-984)
     u64 surface_corners = 0;     // textures sampled as the top-left corner of a larger target (D-120)
     u64 surface_children = 0;    // targets made inside a larger one, both kept (D-122)
@@ -275,6 +281,8 @@ public:
     bool tracing() const override;
     void trace_note(std::string_view what) override;
     bool report_pending(u32 value_addr) override;
+    bool predicate_on_gpu(u32 value_addr) override; // D-1058
+    void end_predicate() override;
 
     const BackendStats& stats() const;
     // Any thread: frees what can be made again (textures and surfaces unused for 60 flips, finished readbacks) at the

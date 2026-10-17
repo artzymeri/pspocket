@@ -69,3 +69,7 @@ xcuserdata/
 
 # Helper agents' git worktrees (docs/handoff.md): their branches are merged into main, the folders never committed.
 .claude/worktrees/
+
+# Python bytecode
+__pycache__/
+*.pyc

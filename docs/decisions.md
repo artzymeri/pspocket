@@ -14877,7 +14877,6 @@ and the reserved version, MPEG-2.5 without PTS, units of 0 bytes, of part of the
 first output and the information), MPEG-4 AAC (the PCM at 63.5 dB, a frame counter in the information), AC-3 (its
 first frame).
 
-
 ## D-943 · 2026-10-13 · sys_lv2coredump_D725F320 pspocket's own: a retail console's core file
 
 liblv2coredump.sprx is the module that writes a game's crash dumps. libsysmodule loads it as a process starts when
@@ -15090,7 +15089,6 @@ The other four with modules in the firmware stay firmware-first, each needing mo
 - DTS Express (libdtslbrdec: 0x6C720, 0x02080000, four handles, a 0x960-byte block): FFmpeg has no encoder for its
   streams to compare with.
 - MPEG-2 AAC, MP3 Surround, TrueHD and DTS have no module in the firmware.
-
 
 ## D-947 · 2026-10-14 · A target a draw samples while drawing to it: read through the texture cache, not copied each time
 
@@ -16008,7 +16006,6 @@ found none for pspocket-boot (a command-line tool), and the phone's own records 
 - scripts/trace_profile.py summarises a Time Profiler trace: each thread's share of the samples, and one thread's
   functions by their own samples and in all (what the RSX thread's measurements in D-953 and D-984 were read with).
   perftrace prints both for the RSX thread.
-
 
 ## D-958 · 2026-10-15 · Branch weights on lifted SPU code's ways out
 
@@ -17564,3 +17561,61 @@ end reads guest memory was checked for what it does about a target the GPU drew 
 - Test: "vertex arrays over a target read what the GPU drew there" also reads the target over five flips with no new
   drawing into it, and still gets the GPU's bytes. Without the read counted, the reads after the second flip get the
   stale memory.
+
+## D-1058 · 2026-10-17 · Conditional rendering decided on the GPU (plan F6); a capture's replay loads its new targets
+
+- **The race.** NV4097_SET_RENDER_ENABLE mode 2 decided on the CPU from the report's word when the method ran. A count
+  the GPU had not delivered yet rendered the draws (D-115) and counted `conditional_pending`, once a frame or so on the
+  gate walk (2,423 in its 128 s). Which way a decision went depended on the GPU's timing, so fast-mode replays of one
+  capture differed (D-1053).
+- **Now** the backend decides (`Backend::predicate_on_gpu(value_addr)`, `end_predicate()`), whenever it knows the
+  report's counters (the last `report_zpass` at that address), whether the count has arrived or not. The decision
+  then does not depend on timing. The pass open ends (Metal writes a pass's counters when it ends). A blit copies the
+  report's counters together, and a kernel (`rsx_predicate`) runs before the draws. The draws under the predicate are
+  indirect draws whose arguments sit in a region of the render buffer, 32 bytes apart. The kernel sets their instance
+  counts to 0 when the counters sum to zero, reading at run time how many the RSX thread wrote (it writes them before
+  the commit). A predicate that lasts into a new render buffer, or fills its 1,024 places, is armed again there.
+  Fallbacks, each counting `conditional_pending`:
+  - an EDGE draw, whose arguments come from the EDGE kernels;
+  - a full region.
+
+  The exact mode waits for the count as before (D-1029). `PSPOCKET_RSX_NO_GPU_PREDICATE=1` decides on the CPU, for A/B
+  (also in scripts/rsx_bisect.py's switches). The 300-frame alarms line gives predicates and draw calls under them a
+  frame.
+- **Measured on the gate walk** (two runs back to back, the same build; on vs `PSPOCKET_RSX_NO_GPU_PREDICATE=1`):
+
+  | | GPU predicates | CPU (old) |
+  | --- | --- | --- |
+  | `conditional_pending` | 0 | 2,423 |
+  | fps median / slowest window | 29.8 / 29.6 | 29.8 / 29.0 |
+  | render passes a frame (worst) | 83.1 | 83.1 |
+  | RSX ms a frame / µs a draw (from 70 s) | 9.16 / 9.01 | 8.92 / 8.99 |
+  | GPU ms a frame | 6.7-7.3 | 6.9-7.8 |
+
+  games/gta5/gate.json now limits `conditional_pending` to 0.
+- **Replays.** The skyfall capture (40 frames, D-1054) replays to the same 40 frames in each of three fast runs, with no
+  `conditional_pending`; before, each fast replay counted 15 to 17. The gate walk's capture (flips 2400-2401) counts
+  none now, but its first frame still comes out one of two ways (7 runs of 10 one, 3 the other). The two differ in one
+  pixel by 1 level, from the G-buffer's third target at row 317. That difference is not the reports': it stays:
+  - with the reports written early (`PSPOCKET_RSX_EARLY_REPORTS=1`);
+  - with every fast path off (pass merging, the feedback cache, both pools, carrying, the scratch reuse);
+  - with copies made in memory and synchronously;
+  - with transient memory zeroed, and with new targets loaded.
+
+  Frame traces of the two kinds of run are identical, draw by draw (the same binds and decisions). The difference goes
+  away with a GPU wait (`--sync`) anywhere in the G-buffer pass up to about draw 230, and in the exact mode (which
+  waits at every label). It is open (next in docs/improve.md's list): a GPU-side order between that pass and work
+  queued with it, not a decision of the backend's.
+- `rsx-replay` gains:
+  - `--pages FILE`: hashes of local memory's pages at each flip, written back first;
+  - `--sync A-B`: a GPU wait after draws A to B;
+  - `--trace 1`: the backend's frame trace from the first command. `trace_frame = 1` now starts at the first
+    command (no flip begins frame 1).
+  - A replay's new targets start with what memory holds (`MetalBackendConfig::load_new_targets`, as in the exact mode):
+    the capture wrote the targets back when it started. `PSPOCKET_REPLAY_UNDEFINED_TARGETS=1` leaves them undefined, as
+    in a fast run.
+- Tests (Metal e2e):
+  - the D-115 test, rewritten: in fast and exact mode, with the query's draw visible or scissored away, the draw under
+    the report shows exactly when its count is non-zero, against a wrong older count in memory; fast mode decides on
+    the GPU (one predicate, no CPU skip, no alarm) before and after the count arrives, exact mode on the CPU;
+  - the occlusion test: its conditional draws are decided on the GPU with the same pixels.

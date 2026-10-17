@@ -347,7 +347,7 @@ Surface* MetalBackend::Impl::get_color_surface(u32 address, u32 pitch, u32 width
     const bool carried = made && carry_into(*made, carry);
     if (!carried) carry.clear();
     evict_overlapping(address, pitch ? pitch : row, row, height, inner, parent, made, carry);
-    if (exact && made && !carried && !(inner && inner->initialized) && !parent) {
+    if ((exact || config.load_new_targets) && made && !carried && !(inner && inner->initialized) && !parent) {
         end_pass_for(kEndOther); // D-1029: it starts with what memory holds
         upload_surface_from_guest(*made);
     }
@@ -427,7 +427,7 @@ Surface* MetalBackend::Impl::get_depth_surface(u32 address, u32 pitch, u32 width
     Surface* made = make_surface(address, pitch, width, height, format, true, false, depth_surface_format(format));
     if (!made || !carry_into(*made, carry)) carry.clear();
     evict_overlapping(address, pitch ? pitch : row, row, height, nullptr, nullptr, made, carry);
-    if (exact && made && !made->initialized) {
+    if ((exact || config.load_new_targets) && made && !made->initialized) {
         end_pass_for(kEndOther); // D-1029: it starts with what memory holds
         upload_surface_from_guest(*made);
     }

@@ -441,6 +441,7 @@ private:
     u32 epoch_put_ = ~0u;
     Alarms alarms_;
     bool render_enabled_ = true; // NV4097_SET_RENDER_ENABLE: false while the report it names was zero (D-102)
+    bool gpu_predicate_ = false; // ... decided by the backend on the GPU, the report still pending (D-1058)
     std::mutex fail_mutex_;
     std::unordered_set<std::string> reported_;
 };

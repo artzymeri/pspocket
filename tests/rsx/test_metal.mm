@@ -4270,7 +4270,8 @@ TEST_CASE("metal e2e: occlusion queries count the samples that pass, and conditi
     draw_triangle(c);
     c.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
     REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    CHECK(e.rsx->status().conditional_skips == 1);
+    CHECK(e.rsx->status().conditional_skips == 0); // decided on the GPU (D-1058), the count known or not
+    CHECK(e.backend->stats().predicated_draws == 1);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceB, 32, 48) == std::array<u8, 4>{0, 0, 0, 0});
     auto d = e.at(c.offset());
@@ -4279,51 +4280,78 @@ TEST_CASE("metal e2e: occlusion queries count the samples that pass, and conditi
     draw_triangle(d);
     d.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
     REQUIRE(e.submit(d) == Rsx::RunStatus::Idle);
-    CHECK(e.rsx->status().conditional_skips == 1);
+    CHECK(e.rsx->status().conditional_skips == 0);
+    CHECK(e.backend->stats().predicated_draws == 2);
     REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceB, kW * kH * 4));
     CHECK(guest_pixel(e, kSurfaceB, 32, 48) != std::array<u8, 4>{0, 0, 0, 0});
 }
 
-TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet renders, whatever the older count (D-115)")
+TEST_CASE("metal e2e: a draw under a report the GPU has not counted yet is decided by the GPU on the count, as the "
+          "exact mode decides it, whatever the older count (D-115, D-1058)")
 {
     // On the iPhone, a query's count often arrived after the draw that tested it: an older zero skipped parts of
-    // characters for a frame, and the passes after them shaded the holes black or red.
+    // characters for a frame (D-115: such draws rendered whatever the count). Now the GPU decides once it has counted
+    // (D-1058): the conditional draw goes to the GPU as an indirect draw whose instance count a kernel zeroes when the
+    // query's counters sum to zero. The query counts a first triangle (visible, or scissored away); the second, under
+    // it, shows only when the first counted. The exact mode (it waits for the count, D-1029) gives the same picture.
     REQUIRE_METAL();
-    E2E e;
-    e.put_local_bytes(kFpOffset, fp_color(false));
-    write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff});
-    ps_write32(e.mem.base(), e.config.layout.report_addr(1) + 8, 0); // an older count of zero
-    auto b = e.at(0);
-    setup_surface(b, kSurfaceOffset);
-    b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
-    b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
-    upload_vertex_program(b);
-    set_fragment_program(b, kFpOffset, 0x40);
-    bind_vertex_arrays(b);
-    b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
-    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
-    b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
-    b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x10); // not counted until the GPU runs it
-    b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
-    b.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x10);
-    draw_triangle(b);
-    b.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
-    REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
-    for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
-    CHECK(e.failures.empty());
-    CHECK(e.rsx->status().conditional_skips == 0);
-    CHECK(e.rsx->alarms().get(Alarm::ConditionalPending) == 1); // decided on a count not there yet (D-1022)
-    REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
-    CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) == std::array<u8, 4>{0xff, 0xff, 0x00, 0x00});
-    // Once counted (no draw: zero), the same test skips.
-    e.backend->sync();
-    CHECK_FALSE(e.backend->report_pending(e.config.layout.report_addr(1) + 8));
-    auto c = e.at(b.offset());
-    c.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x10);
-    draw_triangle(c);
-    c.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
-    REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
-    CHECK(e.rsx->status().conditional_skips == 1);
+    for (const bool exact : {false, true})
+        for (const bool visible : {true, false}) {
+            INFO((exact ? "exact" : "fast") << ", the query's draw " << (visible ? "visible" : "scissored away"));
+            if (exact) ::setenv("PSPOCKET_RSX_EXACT", "1", 1);
+            E2E e;
+            ::unsetenv("PSPOCKET_RSX_EXACT");
+            e.put_local_bytes(kFpOffset, fp_color(false));
+            write_triangle(e, {0xff0000ff, 0xff0000ff, 0xff0000ff}); // red
+            ps_write32(e.mem.base(), e.config.layout.report_addr(1) + 8, visible ? 0 : 1); // an older count, wrong
+            auto b = e.at(0);
+            setup_surface(b, kSurfaceOffset);
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor);
+            upload_vertex_program(b);
+            set_fragment_program(b, kFpOffset, 0x40);
+            bind_vertex_arrays(b);
+            b.method(m::NV4097_SET_CONTEXT_DMA_REPORT, loc::kDmaReportLocal);
+            b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
+            b.method(m::NV4097_CLEAR_REPORT_VALUE, reports::kZpassPixelCount);
+            if (!visible) b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {0u << 16, 0u << 16}); // nothing passes
+            draw_triangle(b); // the query's draw
+            if (!visible) b.method(m::NV4097_SET_SCISSOR_HORIZONTAL, {kW << 16, kH << 16});
+            b.method(m::NV4097_GET_REPORT, (reports::kZpassPixelCount << 24) | 0x10); // counted when the GPU runs it
+            b.method(m::NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
+            b.method(m::NV4097_SET_COLOR_CLEAR_VALUE, 0);
+            b.method(m::NV4097_CLEAR_SURFACE, clear::kColor); // what the query's draw drew goes
+            b.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x10);
+            draw_triangle(b); // under it
+            b.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
+            REQUIRE(e.submit(b) == Rsx::RunStatus::Idle);
+            for (const auto& f : e.failures) UNSCOPED_INFO(f.message);
+            CHECK(e.failures.empty());
+            // Fast: the GPU decided, the CPU skipped nothing; exact: the CPU decided on the count it waited for.
+            const u32 skipped = exact && !visible ? 1u : 0u;
+            CHECK(e.rsx->status().conditional_skips == skipped);
+            CHECK(e.rsx->alarms().get(Alarm::ConditionalPending) == 0);
+            if (!exact) CHECK(e.backend->stats().gpu_predicates == 1);
+            if (!exact) CHECK(e.backend->stats().predicated_draws == 1);
+            REQUIRE(e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4));
+            CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) ==
+                  (visible ? std::array<u8, 4>{0xff, 0xff, 0x00, 0x00} : std::array<u8, 4>{0, 0, 0, 0}));
+            // Once counted, the same test: the same answer (fast: on the GPU again, whether counted or not, so the
+            // decision does not depend on the GPU's timing; exact: on the CPU).
+            e.backend->sync();
+            CHECK_FALSE(e.backend->report_pending(e.config.layout.report_addr(1) + 8));
+            auto c = e.at(b.offset());
+            c.method(m::NV4097_SET_RENDER_ENABLE, (2u << 24) | 0x10);
+            draw_triangle(c);
+            c.method(m::NV4097_SET_RENDER_ENABLE, 1u << 24);
+            REQUIRE(e.submit(c) == Rsx::RunStatus::Idle);
+            CHECK(e.rsx->status().conditional_skips == (exact && !visible ? 2u : 0u));
+            if (!exact) CHECK(e.backend->stats().predicated_draws == 2);
+            e.backend->flush_memory(PS_MEM_RSX_LOCAL_BASE + kSurfaceOffset, kW * kH * 4); // nothing newer: exact
+            e.backend->sync();
+            CHECK(guest_pixel(e, kSurfaceOffset, 32, 48) ==
+                  (visible ? std::array<u8, 4>{0xff, 0xff, 0x00, 0x00} : std::array<u8, 4>{0, 0, 0, 0}));
+        }
 }
 
 TEST_CASE("metal e2e: vertex arrays over a target read what the GPU drew there (render to vertex buffer, D-1034)")

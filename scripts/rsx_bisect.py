@@ -34,6 +34,7 @@ SWITCHES = [
     ("PSPOCKET_RSX_NO_DEPTH_CLAMP=1", "depth clamping"),
     ("PSPOCKET_RSX_EARLY_REPORTS=1", "reports written whole after the GPU (D-1021): the early ones instead"),
     ("PSPOCKET_RSX_UNINIT_TARGETS=1", "uninitialised targets as memory holds them (D-1023)"),
+    ("PSPOCKET_RSX_NO_GPU_PREDICATE=1", "conditional rendering decided on the GPU (D-1058): on the CPU instead"),
 ]
 
 

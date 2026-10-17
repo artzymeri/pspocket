@@ -419,9 +419,15 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
     // The report is read when the method runs: occlusion results arrive once the GPU has counted (D-102). A count the
     // GPU has not delivered yet renders (D-115): what is there is an older count, and a draw it skipped left holes the
     // later passes shaded black or red (the iPhone's slower GPU, characters' clothes). RPCS3 defers the evaluation to
-    // the GPU instead.
+    // the GPU instead, and so does the backend when it can (D-1058): the draws go to the GPU, which runs them only if
+    // the report's count is non-zero once it has counted. It does so whether the count has arrived yet or not: which it
+    // is depends on the GPU's timing, and a decision that does not makes the same frames every run (rsx-replay).
     const u32 mode = value >> 24;
     if (backend_.tracing()) backend_.trace_note(std::format("SET_RENDER_ENABLE {:#x} (get {:#x})", value, get()));
+    if (gpu_predicate_) {
+        backend_.end_predicate();
+        gpu_predicate_ = false;
+    }
     if (mode == 1) {
         render_enabled_ = true;
         return;
@@ -430,6 +436,11 @@ void Rsx::m_set_render_enable(u32 reg, u32 value)
         const auto ea = translate(value & 0xffffff, state_.regs[m::NV4097_SET_CONTEXT_DMA_REPORT], 16);
         if (!ea) {
             fifo_error(std::format("NV4097_SET_RENDER_ENABLE: bad report offset {:#x}", value & 0xffffff));
+            return;
+        }
+        if (!config_.exact && backend_.predicate_on_gpu(*ea + 8)) { // decided by the GPU on the count (D-1058)
+            gpu_predicate_ = true;
+            render_enabled_ = true;
             return;
         }
         bool pending = backend_.report_pending(*ea + 8);

@@ -399,6 +399,20 @@ kernel void rsx_thumbnail(texture2d<float, access::read> src [[texture(0)]], dev
     o[0] = uchar(sum.x / n); o[1] = uchar(sum.y / n); o[2] = uchar(sum.z / n); o[3] = 255u;
 }
 
+// Conditional rendering on the GPU (D-1058): a ZPASS report's counters (copied together) sum to zero, so the draws under
+// it run no instance: each one's arguments in `args` (32 bytes apart after a 16-byte header whose first word counts
+// them; the instance count is the second word of both argument layouts) get an instance count of 0.
+kernel void rsx_predicate(device const ulong* counts [[buffer(0)]], device uint* args [[buffer(1)]],
+                          constant uint& n [[buffer(2)]], uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    ulong sum = 0;
+    for (uint i = 0; i < n; i++) sum += counts[i];
+    if (sum != 0) return;
+    const uint draws = args[0];
+    for (uint i = 0; i < draws; i++) args[4u + i * 8u + 1u] = 0u;
+}
+
 // Reads a texture back as float4 per texel (nearest sampling at texel centres: works for every format, BCn included).
 kernel void rsx_read_texture(texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]],
                              device float4* out [[buffer(0)]], constant uint4& size [[buffer(1)]],

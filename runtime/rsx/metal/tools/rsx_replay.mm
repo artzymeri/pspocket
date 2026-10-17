@@ -1,14 +1,21 @@
 // rsx-replay: an RSX capture (pspocket-boot --rsx-capture, pspocket/rsx/capture.hpp, D-1053) run through the RSX and
 // the Metal backend alone: no game, no lv2, the same frames every run.
 //
-//   rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet] [--verbose]
+//   rsx-replay CAPTURE_DIR [--frames DIR] [--draws FILE] [--describe N] [--quiet] [--verbose] [--pages FILE]
+//              [--sync A-B] [--trace 1]
 //
 // Prints one line a flip: its index in the capture and a hash of the presented frame (the backend's output, read
 // back), then a summary. --frames DIR saves each as DIR/frame-NNN.png. --draws FILE writes, after every draw and
 // clear, a hash of each colour target it drew to as guest memory holds it once written back (the backend flushed
 // over the target: slow), one line each: "N draw|clear EA WxH HASH" (scripts/rsx_bisect.py compares two runs'
 // lines to find the first that differs). --describe N prints what draw or clear N had bound: its targets, programs,
-// depth, stencil and blend state, textures. The backend runs as the environment says: PSPOCKET_RSX_EXACT=1, and every
+// depth, stencil and blend state, textures. --pages FILE writes, at each flip, a hash of every 4 KB page of local
+// memory as the GPU has it (written back first): two runs' files say which targets parted. --sync A-B writes back
+// what draws A to B drew, as --draws does, without the hashes (a wait for the GPU after each: which waits make a race
+// go). --trace 1 is the backend's frame trace from the first command (the capture's first frame). A new target starts
+// with what memory holds (the capture wrote the targets back when it started; D-1058); with
+// PSPOCKET_REPLAY_UNDEFINED_TARGETS=1 it is undefined, as in a fast run. The backend runs as the environment says:
+// PSPOCKET_RSX_EXACT=1, and every
 // switch of its fast paths (PSPOCKET_RSX_NO_CARRY, PSPOCKET_RSX_NO_SURFACE_POOL, ...). Exit 0: replayed with no
 // deviation; 1: a deviation (the RSX processed other words than the capture's); 2: not a capture this build reads.
 
@@ -62,7 +69,29 @@ public:
         b_.clear(mask, s);
         note("clear", s);
     }
-    void flip(const FlipRequest& r, const RsxState& s) override { b_.flip(r, s); }
+    void flip(const FlipRequest& r, const RsxState& s) override
+    {
+        if (pages_) { // --pages: local memory as the GPU has it, before the flip's present (a sync point a frame)
+            b_.flush_memory(PS_MEM_RSX_LOCAL_BASE, local_size_, "rsx-replay --pages");
+            flips_++;
+            for (u32 a = 0; a < local_size_; a += 4096) {
+                const u8* p = mem_.host(PS_MEM_RSX_LOCAL_BASE + a);
+                std::fprintf(pages_, "%llu %#010x %016llx\n", static_cast<unsigned long long>(flips_),
+                    PS_MEM_RSX_LOCAL_BASE + a, static_cast<unsigned long long>(fnv(p, 4096)));
+            }
+        }
+        b_.flip(r, s);
+    }
+    void set_sync(u64 lo, u64 hi)
+    {
+        sync_lo_ = lo;
+        sync_hi_ = hi;
+    }
+    void set_pages(std::FILE* f, u32 local_size)
+    {
+        pages_ = f;
+        local_size_ = local_size;
+    }
     void draw_skipped(const RsxState& s, std::string_view why) override { b_.draw_skipped(s, why); }
     bool tracing() const override { return b_.tracing(); }
     void trace_note(std::string_view what) override { b_.trace_note(what); }
@@ -82,13 +111,16 @@ public:
     void clear_zpass() override { b_.clear_zpass(); }
     bool report_zpass(u32 a, bool whole) override { return b_.report_zpass(a, whole); }
     bool report_pending(u32 a) override { return b_.report_pending(a); }
+    bool predicate_on_gpu(u32 a) override { return b_.predicate_on_gpu(a); }
+    void end_predicate() override { b_.end_predicate(); }
 
 private:
     void note(const char* what, const RsxState& s)
     {
         n_++;
         if (n_ == describe_) describe(what, s);
-        if (!out_) return;
+        const bool sync = n_ >= sync_lo_ && n_ <= sync_hi_;
+        if (!out_ && !sync) return;
         const SurfaceInfo si = s.surface();
         std::array<u32, kMaxColorTargets> idx{};
         const u32 count = si.active_targets(idx);
@@ -100,6 +132,7 @@ private:
             const u32 bytes = c.pitch * h;
             if (!mem_.is_committed(ea) || !mem_.is_committed(ea + bytes - 1)) continue;
             b_.flush_memory(ea, bytes, "rsx-replay --draws");
+            if (!out_) continue;
             std::fprintf(out_, "%llu %s %#010x %ux%u %016llx\n", static_cast<unsigned long long>(n_), what, ea, w, h,
                 static_cast<unsigned long long>(fnv(mem_.host(ea), bytes)));
         }
@@ -139,6 +172,10 @@ private:
     std::FILE* out_;
     u64 describe_ = 0;
     u64 n_ = 0;
+    std::FILE* pages_ = nullptr;
+    u64 sync_lo_ = ~0ull, sync_hi_ = 0;
+    u32 local_size_ = 0;
+    u64 flips_ = 0;
 };
 
 } // namespace
@@ -150,7 +187,9 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string dir = argv[1];
-    std::string frames_dir, draws_path;
+    std::string frames_dir, draws_path, pages_path;
+    u64 sync_lo = ~0ull, sync_hi = 0;
+    u64 trace_frame = 0;
     bool quiet = false, verbose = false;
     u64 describe = 0;
     for (int i = 2; i < argc; i++) {
@@ -159,6 +198,13 @@ int main(int argc, char** argv)
         else if (a == "--draws" && i + 1 < argc) draws_path = argv[++i];
         else if (a == "--quiet") quiet = true;
         else if (a == "--verbose") verbose = true;
+        else if (a == "--trace" && i + 1 < argc) trace_frame = std::strtoull(argv[++i], nullptr, 0); // the backend's frame trace
+        else if (a == "--pages" && i + 1 < argc) pages_path = argv[++i];
+        else if (a == "--sync" && i + 1 < argc) { // draws A-B written back as --draws does, without the hashes
+            char* end = nullptr;
+            sync_lo = std::strtoull(argv[++i], &end, 0);
+            sync_hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 0) : sync_lo;
+        }
         else if (a == "--describe" && i + 1 < argc) describe = std::strtoull(argv[++i], nullptr, 0);
         else {
             std::fprintf(stderr, "rsx-replay: unknown option %s\n", argv[i]);
@@ -190,6 +236,8 @@ int main(int argc, char** argv)
                 out_h = b->height;
                 break;
             }
+        mc.trace_frame = trace_frame;
+        mc.load_new_targets = !std::getenv("PSPOCKET_REPLAY_UNDEFINED_TARGETS"); // D-1058
         mc.output_width = out_w;
         mc.output_height = out_h;
         std::mutex lines_mutex;
@@ -209,6 +257,9 @@ int main(int argc, char** argv)
             return 2;
         }
         Observer observer(*backend, mem, draws, describe);
+        std::FILE* pages = pages_path.empty() ? nullptr : std::fopen(pages_path.c_str(), "w");
+        if (pages) observer.set_pages(pages, info.config.local_memory_size);
+        observer.set_sync(sync_lo, sync_hi);
         Rsx rsx(mem, observer, info.config);
         ReplayResult result;
         ReplayOptions ro;
@@ -219,6 +270,7 @@ int main(int argc, char** argv)
         }
         backend->sync();
         if (draws) std::fclose(draws);
+        if (pages) std::fclose(pages);
         {
             std::lock_guard lock(lines_mutex);
             for (const std::string& l : lines) std::printf("%s\n", l.c_str());

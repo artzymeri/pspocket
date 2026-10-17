@@ -34,6 +34,10 @@ The user: problems must be found and fixed automatically, for any game. The plan
    detectors (asked of h1), routes on game time (h2). Done: Assassin's Creed's first install passes on the Mac (run
    333); the bench runs every night at 03:00 from a launchd job and grows its baseline from clean nights (D-1067);
    GTA V's rain-street and buzzard cases.
+6. **Replay determinism** (D-1058, open): with conditional rendering decided on the GPU, the skyfall capture replays
+   to the same frames every fast run. The gate walk's capture still has one pixel of its first frame one level apart
+   between runs, from the G-buffer pass (traces identical; a GPU wait anywhere up to about its draw 230 removes it).
+   Next: find the GPU-side order behind it with rsx-replay --pages and --sync.
 
 ## The last 10% to a steady 30 (research, 2026-10-15 evening)
 
