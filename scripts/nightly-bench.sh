@@ -1,7 +1,8 @@
 #!/bin/zsh
 # The bench every night (D-1067): a launchd job of the user's runs scripts/bench.py --game all --mode all --nightly
 # --accept-clean at 03:00 (runs without a failure or warning join the baseline; bench.py skips a busy Mac: another
-# pspocket-boot or ninja, load over 4, under 15 GB free) and keeps the newest 14 nights of inventory/bench/night-*.
+# pspocket-boot or ninja, load over 4, under 15 GB free) and keeps the newest 14 nights of inventory/bench/night-*;
+# then the waker rule's guard on Assassin's Creed (scripts/shake.sh ac --guard, D-1051).
 #
 #   scripts/nightly-bench.sh install [HH:MM]   write and load ~/Library/LaunchAgents/com.pspocket.bench.plist
 #   scripts/nightly-bench.sh remove            unload and delete it
@@ -46,6 +47,14 @@ run)
     out=inventory/bench/night-$(date +%Y%m%d)-$(git rev-parse --short HEAD)
     python3 scripts/bench.py --game all --mode all --nightly --accept-clean --out $out
     rc=$?
+    # The waker rule's guard (D-1051): eight short boots of Assassin's Creed under D-999's race recipe, when its data
+    # and the library the bench just made are there and the bench ran (rc 3: a busy Mac, skipped too).
+    if (( rc != 3 )) && [[ -f inventory/BLES00158/disc.iso && -f inventory/BLES00158/bench-library/game.dylib ]]; then
+        scripts/shake.sh ac --guard > $out/waker-guard.txt 2>&1
+        g=$?
+        tail -1 $out/waker-guard.txt
+        (( g == 0 )) || rc=1
+    fi
     # The newest 14 nights stay; each keeps its worst frames only (bench_check.py).
     nights=(inventory/bench/night-*(N/On))
     for d in ${nights[15,-1]}; do rm -rf $d; done

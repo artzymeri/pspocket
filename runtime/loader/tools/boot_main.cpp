@@ -505,8 +505,21 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
     }
     write_err(buf, std::min<int>(n, sizeof buf - 1));
     // For the summary (D-1043): the fault's line, without its newlines. Best effort, as the report below.
+    // A second thread faulting while the first is reported (Assassin's Creed's registry race faults two at once,
+    // D-1051): its line, then it waits; the first ends the process. Two reports at once ended it without a summary.
+    static std::atomic<int> faulting{0};
+    if (faulting.fetch_add(1) > 0) {
+        for (;;) pause();
+    }
     std::string fault_line(buf, static_cast<usize>(std::clamp(n, 0, static_cast<int>(sizeof buf) - 1)));
     std::erase(fault_line, '\n');
+    // The summary first (D-1043, D-1051): what follows (the memory dump, the thread report) takes locks and can hang.
+    if (g_kernel.load()) {
+        g_fault_signal = sig;
+        signal(SIGALRM, on_report_timeout);
+        alarm(5);
+        emit_summary("fault", fault_line);
+    }
     report_host_frames(uctx);
     if (c) report_call_site(*c);
     if (!t) {
@@ -541,12 +554,6 @@ void on_fault(int sig, siginfo_t* info, void* uctx)
         const std::string report =
             thread_report(*kernel, std::format("guest fault in PPU thread {:#x}", t ? t->id : 0));
         write_err(report.data(), static_cast<int>(report.size()));
-    }
-    if (g_kernel.load()) {
-        g_fault_signal = sig;
-        signal(SIGALRM, on_report_timeout);
-        alarm(5);
-        emit_summary("fault", fault_line);
     }
     _exit(128 + sig);
 }

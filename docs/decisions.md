@@ -17294,3 +17294,25 @@ shake run has --max-footprint 6 (D-1047).
   the minimal set is the overtaking itself: with D-999/D-1041's rule in place (S16 off or at 20%), no run failed.
 - So shake mode reproduces the phone's race on the Mac in seconds when the rule is taken away, and finds nothing new
   under the PS3-legal family in these four runs; more seeds (and the training case) are the next runs.
+
+## D-1051 · 2026-10-17 · The waker rule's guard: Assassin's Creed's boot under D-999's race recipe, every night
+
+D-1050 found D-999's registry race again with shake mode when the woken thread overtakes its waker (S16). A guard
+that keeps the rule from regressing unseen: `scripts/shake.sh ac --guard [--times K]` boots Assassin's Creed (a fresh
+install, as D-1050's runs) K times (8) for 8 s, each boot with its own seed and "S3=500000:2000": the waker held up to
+2 ms after half its wakes, D-999's PSPOCKET_LV2_SEND_DELAY_US=2000 for every kind of wake. It passes when no boot
+fails (fault, fatal, stall, footprint). Not S16 itself: S16 is the rule switched off (the woken thread going first at
+once), so with it a boot crashes whatever lv2 does; the guard keeps the race's timing and leaves the rule to hold it.
+`--guard-control` runs the same with the rule off (PSPOCKET_LV2_SENDER_FIRST=0) and passes when a boot crashes: that
+the guard still reaches the race on this build and data.
+
+- Measured: the guard, 8 boots then 16, none failed (75 s for eight); the control, 8 boots, 4 crashed twice over
+  (SIGBUS reading 0x0b0000f8 in the registry's sys_lwmutex_trylock, 0.8 s in), so eight boots miss a broken rule about
+  one time in 200.
+- scripts/nightly-bench.sh runs the guard after the bench (when inventory/BLES00158 has the disc and the bench made its
+  library; not on a night the bench skipped), its line in the night's waker-guard.txt; a failure fails the night.
+- Found by the control: two threads faulted at once (the registry race faults the saver and the main thread) and the
+  run ended with no summary, both fault handlers writing their reports. pspocket-boot's fault handler now writes the
+  summary first, right after the fault's line and call site (the memory dump and the thread report take locks and can
+  hang), and a second faulting thread writes its line and waits for the first to end the process; the control's
+  crashes now have summaries (exit "fault", the first fault's line).

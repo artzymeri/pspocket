@@ -5,6 +5,10 @@
 #   scripts/shake.sh gta5|ac [--seeds N] [--seed S] [--from S] [--spec SPEC] [--timeout S] [--keep]
 #   scripts/shake.sh gta5|ac --rerun S [--times K]        the same seed K times (3): how often it fails
 #   scripts/shake.sh gta5|ac --ddmin S [--times K]        delta debugging: the fewest points that still fail with S
+#   scripts/shake.sh ac --guard [--times K]               the waker rule's guard (D-1051): K boots (8) to 8 s, each
+#                                                         waker delayed up to 2 ms after half its wakes (S3), must all
+#                                                         pass; --guard-control does the same with the rule off and
+#                                                         passes when a boot crashes (the guard can see the race)
 #
 # SPEC is PSPOCKET_SHAKE's text without the seed: "legal" (the default: every PS3-legal point), "all", "adversarial",
 # or points ("S1;S3=200000:1000;S8"). A run fails when triage finds a fault, a fatal error, a deadlock, a freeze, a
@@ -23,7 +27,7 @@ cd "$(dirname "$0")/.."
 game=${1:-}
 [[ $game == gta5 || $game == ac ]] || { echo "usage: scripts/shake.sh gta5|ac [options] (see the top of the file)" >&2; exit 64; }
 shift
-seeds=4 seed_from=1 one_seed="" spec=legal timeout_s="" keep=0 rerun="" ddmin="" times=3
+seeds=4 seed_from=1 one_seed="" spec=legal timeout_s="" keep=0 rerun="" ddmin="" times=3 guard=""
 while (( $# )); do
   case $1 in
     --seeds) shift; seeds=$1 ;;
@@ -35,6 +39,8 @@ while (( $# )); do
     --rerun) shift; rerun=$1 ;;
     --ddmin) shift; ddmin=$1 ;;
     --times) shift; times=$1 ;;
+    --guard) guard=on ;;
+    --guard-control) guard=control ;;
     *) echo "shake: unknown option $1" >&2; exit 64 ;;
   esac
   shift
@@ -101,6 +107,25 @@ fails() {
 }
 
 echo "==> shake $game: spec \"$spec\" ($out)"
+# The waker rule's guard (D-1051): D-999's race recipe (the waker held up to 2 ms after half its wakes) on Assassin's
+# Creed's first boot, where the thread registry crashed 0.8 s in when the woken thread overtook its waker (D-1050: with
+# S16 a quarter of the boots crash). With the rule (D-999, D-1041) none may; --guard-control turns the rule off
+# (PSPOCKET_LV2_SENDER_FIRST=0) and expects a crash, which shows the guard still reaches the race.
+if [[ -n $guard ]]; then
+  [[ $game == ac ]] || { echo "shake: --guard is Assassin's Creed's" >&2; exit 64; }
+  [[ $times == 3 ]] && times=8
+  timeout_s=${timeout_s:-8}
+  [[ $guard == control ]] && export PSPOCKET_LV2_SENDER_FIRST=0
+  failed=0
+  for (( k = 1; k <= times; k++ )); do run_one $out/guard-$k $((100 + k)) "S3=500000:2000" || (( failed++ )); done
+  if [[ $guard == control ]]; then
+    echo "waker guard control (rule off): $failed of $times boots crashed$( (( failed )) && echo ': the guard sees the race' || echo ': NOT reproduced, the guard may be blind')"
+    exit $(( failed == 0 ))
+  fi
+  echo "waker guard: $failed of $times boots failed$( (( failed )) && echo ': the waker rule regressed (D-999, D-1041)' )"
+  exit $(( failed > 0 ))
+fi
+
 if [[ -n $rerun ]]; then
   failed=0
   for (( k = 1; k <= times; k++ )); do run_one $out/seed$rerun-$k $rerun "$spec" || (( failed++ )); done
